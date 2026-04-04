@@ -77,11 +77,24 @@ func logInfo(_ message: String) { Logger.write(.info, message) }
 func logDebug(_ message: String) { Logger.write(.debug, message) }
 func logError(_ message: String) { Logger.write(.error, message) }
 
+// FMP Constants
+let FMP_PREFIX_SIZE = 4
+let FMP_PHASE_ESTABLISHED: UInt8 = 0x0
+let FMP_PHASE_MSG1: UInt8 = 0x1
+let FMP_PHASE_MSG2: UInt8 = 0x2
+let FMP_ESTABLISHED_REMAINING_HEADER = 12
+let FMP_AEAD_TAG_SIZE = 16
+let FMP_MSG1_PAYLOAD_LEN: UInt16 = 110
+let FMP_MSG2_PAYLOAD_LEN: UInt16 = 65
+
 class L2CAPChannelHandler: NSObject, StreamDelegate {
     var inputStream: InputStream?
     var outputStream: OutputStream?
+    var tcpInputStream: InputStream?
+    var tcpOutputStream: OutputStream?
     var onClosed: (() -> Void)?
     private var closed = false
+    private let readQueue = DispatchQueue(label: "com.fips.tcp-reader", qos: .utility)
     
     func open(channel: CBL2CAPChannel) {
         inputStream = channel.inputStream
@@ -98,16 +111,152 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         logInfo("=== L2CAP CHANNEL OPENED ===")
     }
     
+    func connectTCP(host: String, port: Int) {
+        logInfo("Connecting to TCP \(host):\(port)")
+        
+        var input: InputStream?
+        var output: OutputStream?
+        
+        Stream.getStreamsToHost(withName: host, port: port, inputStream: &input, outputStream: &output)
+        
+        guard let tcpIn = input, let tcpOut = output else {
+            logError("TCP: Failed to create streams")
+            close()
+            return
+        }
+        
+        tcpInputStream = tcpIn
+        tcpOutputStream = tcpOut
+        
+        tcpIn.delegate = self
+        tcpIn.schedule(in: .main, forMode: .default)
+        tcpIn.open()
+        
+        tcpOut.delegate = self
+        tcpOut.schedule(in: .main, forMode: .default)
+        tcpOut.open()
+        
+        logInfo("TCP connected to \(host):\(port)")
+        
+        // Start TCP reader thread
+        startTCPReader()
+    }
+    
+    private func startTCPReader() {
+        readQueue.async { [weak self] in
+            self?.readTCPLoop()
+        }
+    }
+    
+    private func readTCPLoop() {
+        guard let tcpIn = tcpInputStream else { return }
+        
+        while !closed {
+            // Read 4-byte FMP prefix
+            var prefix = [UInt8](repeating: 0, count: FMP_PREFIX_SIZE)
+            let prefixRead = tcpIn.read(&prefix, maxLength: FMP_PREFIX_SIZE)
+            
+            if prefixRead <= 0 {
+                if !closed {
+                    logError("TCP→BLE: Failed to read prefix (read \(prefixRead) bytes)")
+                    DispatchQueue.main.async { [weak self] in self?.close() }
+                }
+                return
+            }
+            
+            if prefixRead < FMP_PREFIX_SIZE {
+                logError("TCP→BLE: Incomplete prefix (\(prefixRead)/\(FMP_PREFIX_SIZE) bytes)")
+                DispatchQueue.main.async { [weak self] in self?.close() }
+                return
+            }
+            
+            // Parse FMP header
+            let version = prefix[0] >> 4
+            let phase = prefix[0] & 0x0F
+            let payloadLen = UInt16(prefix[2]) | (UInt16(prefix[3]) << 8)
+            
+            if version != 0 {
+                logError("TCP→BLE: Unknown FMP version: \(version)")
+                DispatchQueue.main.async { [weak self] in self?.close() }
+                return
+            }
+            
+            // Calculate remaining bytes based on phase
+            let remaining: Int
+            switch phase {
+            case FMP_PHASE_ESTABLISHED:
+                remaining = FMP_ESTABLISHED_REMAINING_HEADER + Int(payloadLen) + FMP_AEAD_TAG_SIZE
+            case FMP_PHASE_MSG1:
+                remaining = Int(payloadLen)
+            case FMP_PHASE_MSG2:
+                remaining = Int(payloadLen)
+            default:
+                logError("TCP→BLE: Unknown phase: \(phase)")
+                DispatchQueue.main.async { [weak self] in self?.close() }
+                return
+            }
+            
+            // Read remaining bytes
+            var remainingBytes = [UInt8](repeating: 0, count: remaining)
+            var totalRead = 0
+            while totalRead < remaining {
+                let read = tcpIn.read(&remainingBytes, maxLength: remaining - totalRead)
+                if read <= 0 {
+                    if !closed {
+                        logError("TCP→BLE: Failed to read remaining bytes")
+                        DispatchQueue.main.async { [weak self] in self?.close() }
+                    }
+                    return
+                }
+                totalRead += read
+            }
+            
+            // Combine prefix + remaining into complete packet
+            var packet = prefix
+            packet.append(contentsOf: remainingBytes)
+            
+            // Forward to BLE
+            let totalSize = packet.count
+            let packetData = Data(packet)
+            let phaseNum = phase
+            DispatchQueue.main.async { [weak self] in
+                guard let bleOut = self?.outputStream else { return }
+                var packetBytes = [UInt8](packetData)
+                let written = bleOut.write(&packetBytes, maxLength: totalSize)
+                if written != totalSize {
+                    logError("TCP→BLE: Write failed (wrote \(written)/\(totalSize) bytes)")
+                    self?.close()
+                } else {
+                    let phaseName = phaseNum == 0 ? "established" : phaseNum == 1 ? "msg1" : "msg2"
+                    logInfo("TCP→BLE: \(totalSize) bytes (phase \(phaseName))")
+                    logHexDump(data: packetData, prefix: "TCP→BLE")
+                }
+            }
+        }
+    }
+    
     func stream(_ stream: Stream, handle eventCode: Stream.Event) {
         if stream == inputStream {
             switch eventCode {
             case .hasBytesAvailable:
-                readAndEcho()
+                readAndForward()
             case .errorOccurred:
-                logError("RX ERROR: \(stream.streamError?.localizedDescription ?? "unknown")")
+                logError("BLE RX ERROR: \(stream.streamError?.localizedDescription ?? "unknown")")
                 close()
             case .endEncountered:
-                logInfo("RX CLOSED: stream ended")
+                logInfo("BLE RX CLOSED: stream ended")
+                close()
+            default:
+                break
+            }
+        } else if stream == tcpInputStream {
+            // TCP stream events handled in readTCPLoop
+            switch eventCode {
+            case .errorOccurred:
+                logError("TCP RX ERROR: \(stream.streamError?.localizedDescription ?? "unknown")")
+                close()
+            case .endEncountered:
+                logInfo("TCP RX CLOSED: stream ended")
                 close()
             default:
                 break
@@ -115,33 +264,23 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         }
     }
     
-    private func readAndEcho() {
-        guard let input = inputStream else { return }
-        var buffer = [UInt8](repeating: 0, count: 1024)
+    private func readAndForward() {
+        guard let input = inputStream, let tcpOut = tcpOutputStream else { return }
+        var buffer = [UInt8](repeating: 0, count: 4096)
 
         let bytesRead = input.read(&buffer, maxLength: buffer.count)
         if bytesRead > 0 {
             let data = Data(bytes: buffer, count: bytesRead)
-            if let message = String(data: data, encoding: .utf8) {
-                let msg = message.trimmingCharacters(in: .newlines)
-                logDebug("RX: \(msg) (\(bytesRead) bytes)")
+            
+            // Forward directly to TCP (raw forwarding)
+            let written = tcpOut.write(buffer, maxLength: bytesRead)
+            
+            if written != bytesRead {
+                logError("BLE→TCP: Write failed (wrote \(written)/\(bytesRead) bytes)")
+                close()
             } else {
-                logDebug("RX: binary data (\(bytesRead) bytes)")
-            }
-
-            // Echo back with "PONG" if we received "PING"
-            if let output = outputStream {
-                let response: Data
-                if let str = String(data: data, encoding: .utf8), str.trimmingCharacters(in: .newlines).uppercased() == "PING" {
-                    response = "PONG\n".data(using: .utf8)!
-                    logInfo("TX: PONG")
-                } else {
-                    response = data
-                    logDebug("TX: echo (\(bytesRead) bytes)")
-                }
-                _ = response.withUnsafeBytes { ptr in
-                    output.write(ptr.baseAddress!.assumingMemoryBound(to: UInt8.self), maxLength: response.count)
-                }
+                logInfo("BLE→TCP: \(bytesRead) bytes")
+                logHexDump(data: data, prefix: "BLE→TCP")
             }
         }
     }
@@ -158,9 +297,23 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         outputStream?.remove(from: .main, forMode: .default)
         inputStream?.close()
         outputStream?.close()
+        
+        tcpInputStream?.delegate = nil
+        tcpOutputStream?.delegate = nil
+        tcpInputStream?.remove(from: .main, forMode: .default)
+        tcpOutputStream?.remove(from: .main, forMode: .default)
+        tcpInputStream?.close()
+        tcpOutputStream?.close()
+        
         logInfo("=== L2CAP CHANNEL CLOSED ===")
         onClosed?()
     }
+}
+
+func logHexDump(data: Data, prefix: String) {
+    let bytes = [UInt8](data.prefix(16))
+    let hex = bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+    logDebug("\(prefix) hex: \(hex)")
 }
 
 class PeripheralManager: NSObject, CBPeripheralManagerDelegate {
@@ -169,6 +322,8 @@ class PeripheralManager: NSObject, CBPeripheralManagerDelegate {
     var service: CBMutableService!
     var channelHandler: L2CAPChannelHandler?
     var openChannel: CBL2CAPChannel?
+    var daemonHost: String = "127.0.0.1"
+    var daemonPort: Int = 4443
     
     override init() {
         super.init()
@@ -263,6 +418,8 @@ class PeripheralManager: NSObject, CBPeripheralManagerDelegate {
         }
         channelHandler = handler
         channelHandler?.open(channel: channel)
+        
+        handler.connectTCP(host: daemonHost, port: daemonPort)
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
@@ -272,4 +429,18 @@ class PeripheralManager: NSObject, CBPeripheralManagerDelegate {
 }
 
 let manager = PeripheralManager()
+
+if CommandLine.arguments.count > 1 {
+    let addr = CommandLine.arguments[1]
+    if let colonIdx = addr.range(of: ":") {
+        manager.daemonHost = String(addr[..<colonIdx.lowerBound])
+        if let port = Int(String(addr[colonIdx.upperBound...])) {
+            manager.daemonPort = port
+        }
+    } else {
+        manager.daemonHost = addr
+    }
+    logInfo("Daemon address: \(manager.daemonHost):\(manager.daemonPort)")
+}
+
 RunLoop.main.run()
