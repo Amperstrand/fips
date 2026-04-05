@@ -24,6 +24,7 @@ pub mod io;
 pub mod pool;
 pub mod stats;
 
+
 use super::{
     ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
     TransportError, TransportId, TransportState, TransportType,
@@ -51,11 +52,15 @@ pub const DEFAULT_PSM: u16 = 0x0085;
 /// Concrete BLE transport type for use in TransportHandle.
 ///
 /// Production builds with the `ble` feature use `BluerIo` (real BlueZ stack).
-/// Test builds and builds without `ble` use `MockBleIo`.
+/// Production builds with `ble-macos` feature use `BluestIo` (real CoreBluetooth stack).
+/// Test builds and builds without BLE features use `MockBleIo`.
 #[cfg(all(feature = "ble", not(test)))]
 pub type DefaultBleTransport = BleTransport<io::BluerIo>;
 
-#[cfg(any(not(feature = "ble"), test))]
+#[cfg(all(feature = "ble-macos", not(test)))]
+pub type DefaultBleTransport = BleTransport<io::BluestIo>;
+
+#[cfg(any(all(not(feature = "ble"), not(feature = "ble-macos")), test))]
 pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
 
 

@@ -107,10 +107,6 @@ pub trait BleIo: Send + Sync + 'static {
     fn adapter_name(&self) -> &str;
 }
 
-// ============================================================================
-// BluerIo — Production BLE I/O via BlueZ D-Bus
-// ============================================================================
-
 #[cfg(feature = "ble")]
 mod bluer_impl {
     use super::*;
@@ -495,6 +491,13 @@ pub use bluer_impl::{BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SER
 // ============================================================================
 // Mock BLE I/O (for testing without hardware)
 // ============================================================================
+
+#[cfg(feature = "ble-macos")]
+#[path = "bluest.rs"]
+mod bluest;
+
+#[cfg(feature = "ble-macos")]
+pub use bluest::{BluestAcceptor, BluestIo, BluestScanner, BluestStream, FIPS_SERVICE_UUID};
 
 /// Mock BLE stream backed by tokio channels.
 pub struct MockBleStream {

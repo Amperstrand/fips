@@ -92,13 +92,39 @@ impl BleAddr {
 
     /// Convert to a bluer `Address`.
     pub fn to_bluer_address(&self) -> bluer::Address {
-        bluer::Address(self.device)
+        match self.device {
+            BleDeviceAddr::Mac(mac) => bluer::Address(mac),
+            BleDeviceAddr::Uuid(_) => panic!("Cannot convert UUID device address to bluer Address"),
+        }
     }
 
     /// Convert to a bluer L2CAP `SocketAddr` with the given PSM.
     pub fn to_socket_addr(&self, psm: u16) -> bluer::l2cap::SocketAddr {
         bluer::l2cap::SocketAddr::new(self.to_bluer_address(), bluer::AddressType::LeRandom, psm)
     }
+}
+
+// ============================================================================
+// bluest type conversions (behind ble-macos feature)
+// ============================================================================
+
+#[cfg(feature = "ble-macos")]
+impl BleAddr {
+    /// Construct from a bluest `DeviceId` and adapter name.
+    pub fn from_bluest(device_id: bluest::DeviceId, adapter: &str) -> Self {
+        let id_str = device_id.to_string();
+        let uuid = uuid_from_bluest_device_id(&id_str);
+        Self {
+            adapter: adapter.to_string(),
+            device: BleDeviceAddr::Uuid(uuid),
+        }
+    }
+}
+
+#[cfg(feature = "ble-macos")]
+fn uuid_from_bluest_device_id(id_str: &str) -> [u8; 16] {
+    let uuid = uuid::Uuid::parse_str(id_str).unwrap_or_else(|_| uuid::Uuid::nil());
+    *uuid.as_bytes()
 }
 
 impl std::fmt::Display for BleAddr {
