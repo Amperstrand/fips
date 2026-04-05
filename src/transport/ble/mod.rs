@@ -1066,12 +1066,13 @@ async fn scan_probe_loop<I: io::BleIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::addr::BleDeviceAddr;
     use io::MockBleIo;
 
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
-            device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            device: BleDeviceAddr::Mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n]),
         }
     }
 
