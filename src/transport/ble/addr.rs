@@ -11,6 +11,7 @@ pub struct BleAddr {
     pub adapter: String,
     /// 6-byte Bluetooth device address.
     pub device: [u8; 6],
+    pub rssi: Option<i16>,
 }
 
 impl BleAddr {
@@ -31,6 +32,7 @@ impl BleAddr {
         Ok(Self {
             adapter: adapter.to_string(),
             device,
+            rssi: None,
         })
     }
 
@@ -61,10 +63,11 @@ impl BleAddr {
 #[cfg(feature = "ble")]
 impl BleAddr {
     /// Construct from a bluer `Address` and adapter name.
-    pub fn from_bluer(addr: bluer::Address, adapter: &str) -> Self {
+    pub fn from_bluer(addr: bluer::Address, adapter: &str, rssi: Option<i16>) -> Self {
         Self {
             adapter: adapter.to_string(),
             device: addr.0,
+            rssi,
         }
     }
 
@@ -81,7 +84,10 @@ impl BleAddr {
 
 impl std::fmt::Display for BleAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string_repr())
+        match self.rssi {
+            Some(rssi) => write!(f, "{} rssi={}", self.to_string_repr(), rssi),
+            None => write!(f, "{}", self.to_string_repr()),
+        }
     }
 }
 

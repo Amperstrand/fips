@@ -929,6 +929,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                 let pool_guard = pool.lock().await;
                 pending_addrs.retain(|a| !pool_guard.contains(&a.to_transport_addr()));
                 drop(pool_guard);
+                pending_addrs.sort_by_key(|a| std::cmp::Reverse(a.rssi.unwrap_or(i16::MIN)));
                 if let Some(a) = pending_addrs.first().cloned() {
                     a
                 } else {
@@ -1081,6 +1082,7 @@ mod tests {
         BleAddr {
             adapter: "hci0".to_string(),
             device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            rssi: None,
         }
     }
 

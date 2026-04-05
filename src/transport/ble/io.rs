@@ -225,7 +225,7 @@ mod bluer_impl {
                 .await
                 .map_err(|e| map_io_err("accept", e))?;
 
-            let remote = BleAddr::from_bluer(peer_sa.addr, &self.adapter_name);
+            let remote = BleAddr::from_bluer(peer_sa.addr, &self.adapter_name, None);
             BluerStream::new(conn, remote)
         }
     }
@@ -250,9 +250,9 @@ mod bluer_impl {
                         if let Ok(device) = self.adapter.device(addr) {
                             match device.uuids().await {
                                 Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
-                                    let ble_addr =
-                                        BleAddr::from_bluer(addr, &self.adapter_name);
-                                    debug!(addr = %ble_addr, "BLE scanner: FIPS peer found");
+                                    let rssi = device.rssi().ok();
+                                    let ble_addr = BleAddr::from_bluer(addr, &self.adapter_name, rssi);
+                                    debug!(addr = %ble_addr, rssi = ?rssi, "BLE scanner: FIPS peer found");
                                     return Some(ble_addr);
                                 }
                                 Ok(_) => {
@@ -707,6 +707,7 @@ mod tests {
         BleAddr {
             adapter: "hci0".to_string(),
             device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            rssi: None,
         }
     }
 
