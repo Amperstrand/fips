@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::transport::{TransportAddr, TransportError};
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleDeviceAddr};
 
 /// A single BLE connection in the pool.
 pub struct BleConnection<S> {
@@ -151,9 +151,7 @@ impl<S> ConnectionPool<S> {
                 .min_by_key(|(_, c)| c.established_at)
                 .map(|(addr, _)| addr.clone())
                 .ok_or_else(|| {
-                    TransportError::NotSupported(
-                        "BLE pool full: all connections are static".into(),
-                    )
+                    TransportError::NotSupported("BLE pool full: all connections are static".into())
                 })
         } else {
             // Non-static peer evicts oldest non-static
@@ -163,9 +161,7 @@ impl<S> ConnectionPool<S> {
                 .min_by_key(|(_, c)| c.established_at)
                 .map(|(addr, _)| addr.clone())
                 .ok_or_else(|| {
-                    TransportError::NotSupported(
-                        "BLE pool full: all connections are static".into(),
-                    )
+                    TransportError::NotSupported("BLE pool full: all connections are static".into())
                 })
         }
     }
@@ -186,7 +182,7 @@ mod tests {
     fn test_ble_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
-            device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            device: BleDeviceAddr::Mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n]),
         }
     }
 

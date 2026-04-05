@@ -8,7 +8,7 @@ use crate::transport::{DiscoveredPeer, TransportId};
 use secp256k1::XOnlyPublicKey;
 use std::sync::Mutex;
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleDeviceAddr};
 
 /// Buffer for discovered BLE peers, drained by `discover()`.
 ///
@@ -74,7 +74,7 @@ mod tests {
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
-            device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            device: BleDeviceAddr::Mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n]),
         }
     }
 
