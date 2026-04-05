@@ -596,6 +596,11 @@ pub struct BleConfig {
     /// this long before probing the same address again. Default: 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_cooldown_secs: Option<u64>,
+
+    /// Disable the cross-probe tie-breaker for leaf peers that don't
+    /// need coordinated dual-initiation handling. Default: false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_tiebreaker: Option<bool>,
 }
 
 impl BleConfig {
@@ -649,6 +654,10 @@ impl BleConfig {
     pub fn probe_cooldown_secs(&self) -> u64 {
         self.probe_cooldown_secs
             .unwrap_or(DEFAULT_BLE_PROBE_COOLDOWN_SECS)
+    }
+
+    pub fn disable_tiebreaker(&self) -> bool {
+        self.disable_tiebreaker.unwrap_or(false)
     }
 }
 
