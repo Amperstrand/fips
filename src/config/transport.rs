@@ -330,7 +330,7 @@ impl TcpConfig {
     /// Get the maximum number of inbound connections. Default: 256.
     pub fn max_inbound_connections(&self) -> usize {
         self.max_inbound_connections
-            .unwrap_or(DEFAULT_TOR_MAX_INBOUND)
+            .unwrap_or(DEFAULT_TCP_MAX_INBOUND)
     }
 }
 
@@ -457,13 +457,6 @@ impl DirectoryServiceConfig {
             .as_deref()
             .unwrap_or(DEFAULT_DIRECTORY_BIND_ADDR)
     }
-
-    /// Local bind address for the listener. Default: "127.0.0.1:8443".
-    pub fn bind_addr(&self) -> &str {
-        self.bind_addr
-            .as_deref()
-            .unwrap_or(DEFAULT_DIRECTORY_BIND_ADDR)
-    }
 }
 
 impl TorConfig {
@@ -486,13 +479,6 @@ impl TorConfig {
             .unwrap_or(DEFAULT_TOR_CONTROL_ADDR)
     }
 
-    /// Get the control port address. Default: "/run/tor/control".
-    pub fn control_addr(&self) -> &str {
-        self.control_addr
-            .as_deref()
-            .unwrap_or(DEFAULT_TOR_CONTROL_ADDR)
-    }
-
     /// Get the control auth string. Default: "cookie".
     pub fn control_auth(&self) -> &str {
         self.control_auth.as_deref().unwrap_or("cookie")
@@ -503,12 +489,6 @@ impl TorConfig {
         self.cookie_path
             .as_deref()
             .unwrap_or(DEFAULT_TOR_COOKIE_PATH)
-    }
-
-    /// Get the connect timeout in milliseconds. Default: 120000.
-    pub fn connect_timeout_ms(&self) -> u64 {
-        self.connect_timeout_ms
-            .unwrap_or(DEFAULT_TOR_CONNECT_TIMEOUT_MS)
     }
 
     /// Get the connect timeout in milliseconds. Default: 120000.
