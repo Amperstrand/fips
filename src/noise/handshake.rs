@@ -9,6 +9,7 @@ use rand::Rng;
 use secp256k1::{ecdh::shared_secret_point, Keypair, PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use tracing::debug;
 
 /// Symmetric state during handshake.
 ///
