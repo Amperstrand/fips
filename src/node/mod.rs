@@ -784,6 +784,46 @@ impl Node {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            let ble_instances: Vec<_> = self
+                .config
+                .transports
+                .ble
+                .iter()
+                .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
+                .collect();
+
+            #[cfg(all(feature = "ble-macos", not(test)))]
+            for (name, ble_config) in ble_instances {
+                let transport_id = self.allocate_transport_id();
+                let adapter = ble_config.adapter().to_string();
+                let mtu = ble_config.mtu();
+                match crate::transport::ble::io::BluestIo::new(&adapter, mtu).await {
+                    Ok(io) => {
+                        let mut ble = crate::transport::ble::BleTransport::new(
+                            transport_id,
+                            name,
+                            ble_config,
+                            io,
+                            packet_tx.clone(),
+                        );
+                        ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        transports.push(TransportHandle::Ble(ble));
+                    }
+                    Err(e) => {
+                        tracing::warn!(adapter = %adapter, error = %e, "failed to initialize BLE adapter (macOS/bluest)");
+                    }
+                }
+            }
+
+            #[cfg(any(not(feature = "ble-macos"), test))]
+            if !ble_instances.is_empty() {
+                #[cfg(not(test))]
+                tracing::warn!("BLE transport configured but 'ble-macos' feature not enabled at compile time");
+            }
+        }
+
         transports
     }
 
