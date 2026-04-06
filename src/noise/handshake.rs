@@ -1,8 +1,8 @@
 use super::{
     CipherState, HandshakeProgress, HandshakeRole, NoiseError, NoisePattern, NoiseSession,
-    EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE,
-    PROTOCOL_NAME_IK, PROTOCOL_NAME_XK, PUBKEY_SIZE,
-    XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE, XK_HANDSHAKE_MSG3_SIZE,
+    EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, PROTOCOL_NAME_IK,
+    PROTOCOL_NAME_XK, PUBKEY_SIZE, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE,
+    XK_HANDSHAKE_MSG3_SIZE,
 };
 use hkdf::Hkdf;
 use rand::Rng;
@@ -343,8 +343,12 @@ impl HandshakeState {
             });
         }
 
-        let remote_static = self.remote_static.expect("initiator must have remote static");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_message_1");
+        let remote_static = self
+            .remote_static
+            .expect("initiator must have remote static");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_message_1");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -462,7 +466,9 @@ impl HandshakeState {
         }
 
         let re = self.remote_ephemeral.expect("should have remote ephemeral");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_message_2");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_message_2");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -572,7 +578,9 @@ impl HandshakeState {
             });
         }
 
-        let remote_static = self.remote_static.expect("initiator must have remote static");
+        let remote_static = self
+            .remote_static
+            .expect("initiator must have remote static");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -657,7 +665,9 @@ impl HandshakeState {
         }
 
         let re = self.remote_ephemeral.expect("should have remote ephemeral");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_xk_message_2");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_xk_message_2");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -755,8 +765,12 @@ impl HandshakeState {
             });
         }
 
-        let re = self.remote_ephemeral.expect("should have remote ephemeral after msg2");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_xk_message_3");
+        let re = self
+            .remote_ephemeral
+            .expect("should have remote ephemeral after msg2");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_xk_message_3");
 
         let mut message = Vec::with_capacity(XK_HANDSHAKE_MSG3_SIZE);
 
@@ -813,7 +827,10 @@ impl HandshakeState {
 
         // -> se: DH(e, rs), mix into key
         // (responder uses their ephemeral with initiator's now-known static)
-        let ephemeral = self.ephemeral_keypair.as_ref().expect("should have ephemeral after msg2");
+        let ephemeral = self
+            .ephemeral_keypair
+            .as_ref()
+            .expect("should have ephemeral after msg2");
         let se = self.ecdh(&ephemeral.secret_key(), &rs);
         self.symmetric.mix_key(&se);
 
@@ -851,6 +868,15 @@ impl HandshakeState {
             HandshakeRole::Initiator => (c1, c2),
             HandshakeRole::Responder => (c2, c1),
         };
+
+        // Log key fingerprints for debugging session key derivation
+        debug!(
+            role = ?self.role,
+            send_key_fp = %hex::encode(&send_cipher.key[..8]),
+            recv_key_fp = %hex::encode(&recv_cipher.key[..8]),
+            handshake_hash_fp = %hex::encode(&handshake_hash[..8]),
+            "Session keys derived from handshake"
+        );
 
         Ok(NoiseSession::from_handshake(
             self.role,
