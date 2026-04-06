@@ -200,6 +200,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.local_pubkey,
                         Arc::clone(&self.discovery_buffer),
                         local_node_addr,
+                        self.config.disable_tiebreaker(),
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
@@ -238,6 +239,7 @@ impl<I: BleIo> BleTransport<I> {
                         local_node_addr,
                         self.packet_tx.clone(),
                         self.transport_id,
+                        self.config.disable_tiebreaker(),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -775,6 +777,7 @@ async fn accept_loop<A>(
     local_pubkey: Option<[u8; 32]>,
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_node_addr: Option<NodeAddr>,
+    disable_tiebreaker: bool,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -807,14 +810,16 @@ async fn accept_loop<A>(
                             // Cross-probe tie-breaker: smaller NodeAddr's
                             // outbound wins. If we're smaller, our outbound
                             // should win — drop this inbound.
-                            if let Some(ref our_addr) = local_node_addr {
-                                let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
-                                if our_addr < &peer_addr {
-                                    debug!(
-                                        addr = %ta,
-                                        "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
-                                    );
-                                    continue;
+                            if !disable_tiebreaker {
+                                if let Some(ref our_addr) = local_node_addr {
+                                    let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
+                                    if our_addr < &peer_addr {
+                                        debug!(
+                                            addr = %ta,
+                                            "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
+                                        );
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -937,6 +942,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     local_node_addr: Option<NodeAddr>,
     packet_tx: PacketTx,
     transport_id: TransportId,
+    disable_tiebreaker: bool,
 ) {
     // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
@@ -1037,15 +1043,17 @@ async fn scan_probe_loop<I: io::BleIo>(
 
                 // Cross-probe tie-breaker: smaller NodeAddr's outbound wins.
                 // If we lose, drop connection — accept_loop handles inbound.
-                if let Some(ref our_addr) = local_node_addr {
-                    let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
-                    if our_addr >= &peer_addr {
-                        debug!(
-                            addr = %addr,
-                            "BLE probe tie-breaker: yielding to peer's outbound"
-                        );
-                        buffer.add_peer_with_pubkey(&addr, peer_pubkey);
-                        continue;
+                if !disable_tiebreaker {
+                    if let Some(ref our_addr) = local_node_addr {
+                        let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
+                        if our_addr >= &peer_addr {
+                            debug!(
+                                addr = %addr,
+                                "BLE probe tie-breaker: yielding to peer's outbound"
+                            );
+                            buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                            continue;
+                        }
                     }
                 }
 
