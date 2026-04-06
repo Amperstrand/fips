@@ -372,7 +372,7 @@ impl<I: BleIo> BleTransport<I> {
 
         // Pre-handshake pubkey exchange (temporary, pre-XX)
         if let Some(ref our_pubkey) = self.local_pubkey {
-            match pubkey_exchange(&stream, our_pubkey).await {
+            match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Initiator).await {
                 Ok(peer_pubkey) => {
                     debug!(addr = %addr, "BLE outbound pubkey exchange complete");
                     self.discovery_buffer
@@ -492,7 +492,7 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(Ok(stream)) => {
                     // Pre-handshake pubkey exchange (temporary, pre-XX)
                     if let Some(ref our_pubkey) = local_pubkey {
-                        match pubkey_exchange(&stream, our_pubkey).await {
+                        match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Initiator).await {
                             Ok(peer_pubkey) => {
                                 debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
                                 discovery_buffer
@@ -682,33 +682,71 @@ const PUBKEY_EXCHANGE_SIZE: usize = 33;
 /// forever — killing scan_probe_loop, accept_loop, or the event loop.
 const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
 
+/// Role in the pubkey exchange handshake.
+///
+/// Used to prevent race conditions in BLE L2CAP where both sides might
+/// send simultaneously before either starts receiving. The initiator
+/// (connector) sends first; the responder (acceptor) receives first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PubkeyExchangeRole {
+    /// Initiator: send pubkey first, then receive peer's pubkey.
+    /// Used by outbound connections (scan_probe_loop).
+    Initiator,
+    /// Responder: receive peer's pubkey first, then send ours.
+    /// Used by inbound connections (accept_loop).
+    Responder,
+}
+
 /// Exchange public keys over a newly established L2CAP connection.
 ///
-/// Both sides send `[0x00][our_pubkey:32]` and receive the peer's.
+/// Uses role-based asymmetric handshake to prevent race conditions:
+/// - Initiator (connector) sends first, then receives
+/// - Responder (acceptor) receives first, then sends
+///
 /// Returns the peer's XOnlyPublicKey on success.
 async fn pubkey_exchange<S: BleStream>(
     stream: &S,
     local_pubkey: &[u8; 32],
+    role: PubkeyExchangeRole,
 ) -> Result<XOnlyPublicKey, TransportError> {
-    // Send our pubkey
     let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
     msg[0] = PUBKEY_EXCHANGE_PREFIX;
     msg[1..].copy_from_slice(local_pubkey);
-    stream.send(&msg).await?;
 
-    // Receive peer's pubkey (with timeout to prevent indefinite blocking)
     let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE];
     let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
-    let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
-        Ok(result) => result?,
-        Err(_) => return Err(TransportError::Timeout),
-    };
-    if n != PUBKEY_EXCHANGE_SIZE {
-        return Err(TransportError::RecvFailed(format!(
-            "pubkey exchange: expected {} bytes, got {}",
-            PUBKEY_EXCHANGE_SIZE, n
-        )));
+
+    match role {
+        PubkeyExchangeRole::Initiator => {
+            stream.send(&msg).await?;
+
+            let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(TransportError::Timeout),
+            };
+            if n != PUBKEY_EXCHANGE_SIZE {
+                return Err(TransportError::RecvFailed(format!(
+                    "pubkey exchange: expected {} bytes, got {}",
+                    PUBKEY_EXCHANGE_SIZE, n
+                )));
+            }
+        }
+        PubkeyExchangeRole::Responder => {
+            let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(TransportError::Timeout),
+            };
+            if n != PUBKEY_EXCHANGE_SIZE {
+                return Err(TransportError::RecvFailed(format!(
+                    "pubkey exchange: expected {} bytes, got {}",
+                    PUBKEY_EXCHANGE_SIZE, n
+                )));
+            }
+
+            stream.send(&msg).await?;
+        }
     }
+
     if buf[0] != PUBKEY_EXCHANGE_PREFIX {
         return Err(TransportError::RecvFailed(format!(
             "pubkey exchange: bad prefix 0x{:02X}",
@@ -761,7 +799,7 @@ async fn accept_loop<A>(
 
                 // Pre-handshake pubkey exchange (temporary, pre-XX)
                 if let Some(ref our_pubkey) = local_pubkey {
-                    match pubkey_exchange(&stream, our_pubkey).await {
+                    match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Responder).await {
                         Ok(peer_pubkey) => {
                             debug!(addr = %ta, "BLE inbound pubkey exchange complete");
                             discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
@@ -993,7 +1031,7 @@ async fn scan_probe_loop<I: io::BleIo>(
 
         // Pubkey exchange, then promote connection to pool
         let ta = addr.to_transport_addr();
-        match pubkey_exchange(&stream, &our_pubkey).await {
+        match pubkey_exchange(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
             Ok(peer_pubkey) => {
                 debug!(addr = %addr, "BLE probe complete");
 
