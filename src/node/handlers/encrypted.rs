@@ -94,6 +94,14 @@ impl Node {
                 }
             };
 
+            debug!(
+                peer = %self.peer_display_name(&node_addr),
+                counter = header.counter,
+                aad_hex = %hex::encode(&header.header_bytes),
+                ciphertext_len = ciphertext.len(),
+                "Attempting decryption with AAD"
+            );
+
             match session.decrypt_with_replay_check_and_aad(
                 ciphertext,
                 header.counter,
