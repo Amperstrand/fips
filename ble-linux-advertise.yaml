@@ -1,0 +1,21 @@
+node:
+  identity:
+    persistent: true
+  log_level: debug
+  control:
+    socket_path: "/tmp/fips-linux-control.sock"
+
+tun:
+  enabled: false
+
+dns:
+  enabled: false
+
+transports:
+  ble:
+    advertise: true
+    scan: false
+    auto_connect: false
+    accept_connections: true
+    adapter: "hci0"
+    psm: 133

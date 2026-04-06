@@ -1,0 +1,19 @@
+node:
+  leaf_only: true
+  log_level: debug
+tun:
+  enabled: false
+dns:
+  enabled: false
+transports:
+  ble:
+    mtu: 2048
+    psm: 133
+    advertise: true
+    scan: false
+    auto_connect: false
+    accept_connections: true
+    connect_timeout_ms: 10000
+    # Disable tie-breaker for unidirectional topology (we advertise, Linux probes)
+    disable_tiebreaker: true
+peers: []

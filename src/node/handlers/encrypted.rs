@@ -213,22 +213,54 @@ impl Node {
 
     /// Increment decrypt failure counter and force-remove peer if threshold exceeded.
     fn handle_decrypt_failure(&mut self, node_addr: &crate::NodeAddr) {
-        if let Some(peer) = self.peers.get_mut(node_addr) {
-            let count = peer.increment_decrypt_failures();
-            if count >= DECRYPT_FAILURE_THRESHOLD {
-                warn!(
-                    peer = %self.peer_display_name(node_addr),
-                    consecutive_failures = count,
-                    "Excessive decryption failures, removing peer"
-                );
-                let addr = *node_addr;
-                self.remove_active_peer(node_addr);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                self.schedule_reconnect(addr, now_ms);
+            if let Some(peer) = self.peers.get_mut(node_addr) {
+                let count = peer.increment_decrypt_failures();
+                if count >= DECRYPT_FAILURE_THRESHOLD {
+                    warn!(
+                        peer = %self.peer_display_name(node_addr),
+                        consecutive_failures = count,
+                        "Excessive decryption failures, removing peer"
+                    );
+
+                    let addr = *node_addr;
+                    self.remove_active_peer(node_addr);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                        self.schedule_reconnect(addr, now_ms);
+                    }
+                } else {
+                    debug!(
+                        peer = %self.peer_display_name(node_addr),
+                        counter = header.counter,
+                        send_nonce = session.send_nonce(),
+                        recv_nonce = session.recv_nonce(),
+                        ciphertext_len = ciphertext.len(),
+                        aad_len = aad.len(),
+                        "Decryption with AAD"
+                    );
+                }
             }
+        }
+    }
+} else {
+        // No session found - shouldn't too aggressive
+        debug!(
+            peer = %self.peer_display_name(node_addr),
+            counter = header.counter,
+            "Decryption failed but no established session"
+        );
+    }
+} else {
+        // No active peer
+        debug!(
+            src = %self.peer_display_name(node_addr),
+            counter = header.counter
+            "No active peer for decryption"
+        );
+    }
+}
         }
     }
 }
