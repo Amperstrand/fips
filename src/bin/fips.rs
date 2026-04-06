@@ -7,8 +7,76 @@ use fips::config::{resolve_identity, IdentitySource};
 use fips::version;
 use fips::{Config, Node};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
+
+// macOS CFRunLoop support for CoreBluetooth NSStream callbacks
+#[cfg(target_os = "macos")]
+mod run_loop {
+    use super::*;
+    use std::ffi::c_void;
+    
+    static RUN_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+    
+    unsafe extern "C" {
+        fn CFRunLoopRun();
+        fn CFRunLoopStop(rl: *mut c_void);
+        fn CFRunLoopGetMain() -> *mut c_void;
+    }
+    
+    /// Start the main run loop in a background thread.
+    /// Required for CoreBluetooth NSStream callbacks to fire.
+    pub fn start() {
+        if RUN_LOOP_ACTIVE.load(Ordering::Relaxed) {
+            debug!("macOS run loop already active");
+            return;
+        }
+        
+        RUN_LOOP_ACTIVE.store(true, Ordering::Relaxed);
+        
+        thread::spawn(move || {
+            info!("macOS: Starting CFRunLoop for CoreBluetooth NSStream callbacks");
+            unsafe {
+                // Run the main run loop - this blocks until stopped
+                CFRunLoopRun();
+            }
+            info!("macOS: CFRunLoop exited");
+            RUN_LOOP_ACTIVE.store(false, Ordering::Relaxed);
+        });
+        
+        // Give the run loop thread a moment to start
+        thread::sleep(Duration::from_millis(100));
+        debug!("macOS: CFRunLoop thread started");
+    }
+    
+    /// Stop the main run loop during shutdown.
+    pub fn stop() {
+        if !RUN_LOOP_ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        
+        info!("macOS: Stopping CFRunLoop");
+        unsafe {
+            let main_loop = CFRunLoopGetMain();
+            if !main_loop.is_null() {
+                CFRunLoopStop(main_loop);
+            }
+        }
+        
+        // Wait for run loop thread to exit
+        thread::sleep(Duration::from_millis(100));
+        info!("macOS: CFRunLoop stopped");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod run_loop {
+    pub fn start() {}
+    pub fn stop() {}
+}
 
 /// FIPS mesh network daemon
 #[derive(Parser, Debug)]
@@ -104,6 +172,10 @@ async fn main() {
     info!("     state: {}", node.state());
     info!(" leaf_only: {}", node.is_leaf_only());
 
+    // Start macOS CFRunLoop for CoreBluetooth NSStream callbacks
+    // This MUST be started before node.start() so BLE can receive data
+    run_loop::start();
+
     // Start the node (initializes TUN, spawns I/O threads)
     if let Err(e) = node.start().await {
         error!("Failed to start node: {}", e);
@@ -127,6 +199,8 @@ async fn main() {
     }
 
     info!("FIPS shutting down");
+
+    run_loop::stop();
 
     // Stop the node (shuts down transports, TUN, I/O threads)
     if let Err(e) = node.stop().await {

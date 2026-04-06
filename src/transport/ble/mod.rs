@@ -206,8 +206,10 @@ impl<I: BleIo> BleTransport<I> {
                 }
                 Err(e) => {
                     warn!(adapter = %adapter, error = %e, "failed to start BLE listener");
-                    self.state = TransportState::Failed;
-                    return Err(e);
+                    if !matches!(e, TransportError::NotSupported(_)) {
+                        self.state = TransportState::Failed;
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -325,6 +327,7 @@ impl<I: BleIo> BleTransport<I> {
 
         match conn.stream.send(data).await {
             Ok(()) => {
+                debug!(addr = %addr, bytes = data.len(), "BLE send: packet sent");
                 self.stats.record_send(data.len());
                 Ok(data.len())
             }
@@ -684,6 +687,77 @@ const PUBKEY_EXCHANGE_SIZE: usize = 33;
 /// forever — killing scan_probe_loop, accept_loop, or the event loop.
 const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
 
+#[cfg(feature = "ble-macos")]
+const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = true;
+
+#[cfg(not(feature = "ble-macos"))]
+const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
+
+async fn recv_pubkey_frame<S: BleStream>(
+    stream: &S,
+    buf: &mut [u8; PUBKEY_EXCHANGE_SIZE],
+    role: PubkeyExchangeRole,
+) -> Result<(), TransportError> {
+    let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
+    let role_name = match role {
+        PubkeyExchangeRole::Initiator => "initiator",
+        PubkeyExchangeRole::Responder => "responder",
+    };
+
+    tokio::time::timeout(timeout, async {
+        let mut offset = 0;
+        while offset < PUBKEY_EXCHANGE_SIZE {
+            debug!(
+                role = role_name,
+                read_offset = offset,
+                remaining = PUBKEY_EXCHANGE_SIZE - offset,
+                "BLE pubkey exchange recv start"
+            );
+
+            let n = stream.recv(&mut buf[offset..]).await?;
+
+            debug!(
+                role = role_name,
+                read_offset = offset,
+                bytes_read = n,
+                "BLE pubkey exchange recv complete"
+            );
+
+            if n == 0 {
+                return Err(TransportError::RecvFailed(
+                    "pubkey exchange: peer closed before full frame".into(),
+                ));
+            }
+
+            offset += n;
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|_| TransportError::Timeout)?
+}
+
+async fn send_pubkey_frame<S: BleStream>(
+    stream: &S,
+    local_pubkey: &[u8; 32],
+    role: PubkeyExchangeRole,
+) -> Result<(), TransportError> {
+    let role_name = match role {
+        PubkeyExchangeRole::Initiator => "initiator",
+        PubkeyExchangeRole::Responder => "responder",
+    };
+
+    let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
+    msg[0] = PUBKEY_EXCHANGE_PREFIX;
+    msg[1..].copy_from_slice(local_pubkey);
+
+    debug!(role = role_name, bytes = msg.len(), "BLE pubkey exchange send start");
+    stream.send(&msg).await?;
+    debug!(role = role_name, bytes = msg.len(), "BLE pubkey exchange send complete");
+    Ok(())
+}
+
 /// Role in the pubkey exchange handshake.
 ///
 /// Used to prevent race conditions in BLE L2CAP where both sides might
@@ -711,43 +785,31 @@ async fn pubkey_exchange<S: BleStream>(
     local_pubkey: &[u8; 32],
     role: PubkeyExchangeRole,
 ) -> Result<XOnlyPublicKey, TransportError> {
-    let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
-    msg[0] = PUBKEY_EXCHANGE_PREFIX;
-    msg[1..].copy_from_slice(local_pubkey);
-
     let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE];
-    let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
+    let role_name = match role {
+        PubkeyExchangeRole::Initiator => "initiator",
+        PubkeyExchangeRole::Responder => "responder",
+    };
+
+    let start = std::time::Instant::now();
+    debug!(role = role_name, "BLE pubkey exchange start");
 
     match role {
         PubkeyExchangeRole::Initiator => {
-            stream.send(&msg).await?;
-
-            let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
-                Ok(result) => result?,
-                Err(_) => return Err(TransportError::Timeout),
-            };
-            if n != PUBKEY_EXCHANGE_SIZE {
-                return Err(TransportError::RecvFailed(format!(
-                    "pubkey exchange: expected {} bytes, got {}",
-                    PUBKEY_EXCHANGE_SIZE, n
-                )));
-            }
+            debug!(role = role_name, "BLE pubkey exchange: sending our pubkey");
+            send_pubkey_frame(stream, local_pubkey, role).await?;
+            debug!(role = role_name, elapsed_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange: sent, now receiving peer pubkey");
+            recv_pubkey_frame(stream, &mut buf, role).await?;
         }
         PubkeyExchangeRole::Responder => {
-            let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
-                Ok(result) => result?,
-                Err(_) => return Err(TransportError::Timeout),
-            };
-            if n != PUBKEY_EXCHANGE_SIZE {
-                return Err(TransportError::RecvFailed(format!(
-                    "pubkey exchange: expected {} bytes, got {}",
-                    PUBKEY_EXCHANGE_SIZE, n
-                )));
-            }
-
-            stream.send(&msg).await?;
+            debug!(role = role_name, "BLE pubkey exchange: receiving peer pubkey");
+            recv_pubkey_frame(stream, &mut buf, role).await?;
+            debug!(role = role_name, elapsed_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange: received, now sending our pubkey");
+            send_pubkey_frame(stream, local_pubkey, role).await?;
         }
     }
+
+    debug!(role = role_name, prefix = buf[0], "BLE pubkey exchange frame complete");
 
     if buf[0] != PUBKEY_EXCHANGE_PREFIX {
         return Err(TransportError::RecvFailed(format!(
@@ -756,8 +818,11 @@ async fn pubkey_exchange<S: BleStream>(
         )));
     }
 
-    XOnlyPublicKey::from_slice(&buf[1..])
-        .map_err(|e| TransportError::RecvFailed(format!("pubkey exchange: invalid key: {}", e)))
+    let peer_pubkey = XOnlyPublicKey::from_slice(&buf[1..])
+        .map_err(|e| TransportError::RecvFailed(format!("pubkey exchange: invalid key: {}", e)))?;
+    
+    debug!(role = role_name, total_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange complete");
+    Ok(peer_pubkey)
 }
 
 // Beacon loop removed — advertising is now continuous (started once
@@ -896,6 +961,7 @@ async fn receive_loop<S: BleStream>(
                 break;
             }
             Ok(n) => {
+                debug!(addr = %addr, bytes = n, "BLE receive: packet received");
                 stats.record_recv(n);
                 let packet = ReceivedPacket::new(transport_id, addr.clone(), buf[..n].to_vec());
                 if packet_tx.send(packet).await.is_err() {
@@ -914,6 +980,58 @@ async fn receive_loop<S: BleStream>(
     // Remove from pool
     let mut pool = pool.lock().await;
     pool.remove(&addr);
+}
+
+async fn promote_probe_connection<S: BleStream + 'static>(
+    stream: S,
+    addr: BleAddr,
+    pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
+    packet_tx: PacketTx,
+    transport_id: TransportId,
+    stats: Arc<BleStats>,
+) {
+    let ta = addr.to_transport_addr();
+    let send_mtu = stream.send_mtu();
+    let recv_mtu = stream.recv_mtu();
+    let stream = Arc::new(stream);
+
+    let recv_task = tokio::spawn(receive_loop(
+        Arc::clone(&stream),
+        ta.clone(),
+        Arc::clone(&pool),
+        packet_tx,
+        transport_id,
+        Arc::clone(&stats),
+        recv_mtu,
+    ));
+
+    let conn = BleConnection {
+        stream,
+        recv_task: Some(recv_task),
+        send_mtu,
+        recv_mtu,
+        established_at: tokio::time::Instant::now(),
+        is_static: false,
+        addr,
+    };
+
+    let mut pool_guard = pool.lock().await;
+    match pool_guard.insert(ta.clone(), conn) {
+        Ok(Some(evicted)) => {
+            stats.record_pool_eviction();
+            debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
+        }
+        Ok(None) => {
+            debug!(addr = %ta, "BLE probe promoted to pool");
+        }
+        Err(e) => {
+            warn!(addr = %ta, error = %e, "BLE pool full, probe connection dropped");
+            stats.record_connection_rejected();
+            return;
+        }
+    }
+    drop(pool_guard);
+    stats.record_connection_established();
 }
 
 /// Combined scan + probe loop.
@@ -1036,7 +1154,28 @@ async fn scan_probe_loop<I: io::BleIo>(
         };
 
         // Pubkey exchange, then promote connection to pool
-        let ta = addr.to_transport_addr();
+        if ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION {
+            match send_pubkey_frame(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
+                Ok(()) => {
+                    promote_probe_connection(
+                        stream,
+                        addr.clone(),
+                        Arc::clone(&pool),
+                        packet_tx.clone(),
+                        transport_id,
+                        Arc::clone(&stats),
+                    )
+                    .await;
+                    pending_addrs.retain(|a| a != &addr);
+                    continue;
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE probe pubkey send failed");
+                    continue;
+                }
+            }
+        }
+
         match pubkey_exchange(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
             Ok(peer_pubkey) => {
                 debug!(addr = %addr, "BLE probe complete");
@@ -1058,52 +1197,38 @@ async fn scan_probe_loop<I: io::BleIo>(
                 }
 
                 // Promote connection to pool — no second L2CAP connect needed
-                let send_mtu = stream.send_mtu();
-                let recv_mtu = stream.recv_mtu();
-                let stream = Arc::new(stream);
-
-                let recv_task = tokio::spawn(receive_loop(
-                    Arc::clone(&stream),
-                    ta.clone(),
+                promote_probe_connection(
+                    stream,
+                    addr.clone(),
                     Arc::clone(&pool),
                     packet_tx.clone(),
                     transport_id,
                     Arc::clone(&stats),
-                    recv_mtu,
-                ));
-
-                let conn = BleConnection {
-                    stream,
-                    recv_task: Some(recv_task),
-                    send_mtu,
-                    recv_mtu,
-                    established_at: tokio::time::Instant::now(),
-                    is_static: false,
-                    addr: addr.clone(),
-                };
-
-                let mut pool_guard = pool.lock().await;
-                match pool_guard.insert(ta.clone(), conn) {
-                    Ok(Some(evicted)) => {
-                        stats.record_pool_eviction();
-                        debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
-                    }
-                    Ok(None) => {
-                        debug!(addr = %ta, "BLE probe promoted to pool");
-                    }
-                    Err(e) => {
-                        warn!(addr = %ta, error = %e, "BLE pool full, probe connection dropped");
-                        stats.record_connection_rejected();
-                    }
-                }
-                drop(pool_guard);
-                stats.record_connection_established();
+                )
+                .await;
                 pending_addrs.retain(|a| a != &addr);
 
                 // Report to node layer for auto-connect / handshake
                 buffer.add_peer_with_pubkey(&addr, peer_pubkey);
             }
             Err(e) => {
+                if matches!(e, TransportError::Timeout) && ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION {
+                    debug!(
+                        addr = %addr,
+                        "BLE probe pubkey exchange timed out; promoting connection for inbound handshake fallback"
+                    );
+                    promote_probe_connection(
+                        stream,
+                        addr.clone(),
+                        Arc::clone(&pool),
+                        packet_tx.clone(),
+                        transport_id,
+                        Arc::clone(&stats),
+                    )
+                    .await;
+                    pending_addrs.retain(|a| a != &addr);
+                    continue;
+                }
                 debug!(addr = %addr, error = %e, "BLE probe pubkey exchange failed");
             }
         }
@@ -1118,7 +1243,9 @@ async fn scan_probe_loop<I: io::BleIo>(
 mod tests {
     use super::*;
     use super::addr::BleDeviceAddr;
-    use io::MockBleIo;
+    use io::{MockBleIo, MockBleStream};
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex as TokioMutex;
 
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
@@ -1140,6 +1267,71 @@ mod tests {
             tx,
         );
         (transport, rx)
+    }
+
+    fn test_pubkey(seed: u8) -> [u8; 32] {
+        let mut secret = [0u8; 32];
+        secret.fill(seed);
+        secret[31] = seed.saturating_add(1);
+        let secp = secp256k1::Secp256k1::new();
+        let secret_key = secp256k1::SecretKey::from_slice(&secret).unwrap();
+        let (pubkey, _) = secret_key.public_key(&secp).x_only_public_key();
+        pubkey.serialize()
+    }
+
+    struct FragmentingBleStream {
+        addr: BleAddr,
+        send_mtu: u16,
+        recv_mtu: u16,
+        rx: TokioMutex<VecDeque<Vec<u8>>>,
+        sent: TokioMutex<Vec<Vec<u8>>>,
+    }
+
+    impl FragmentingBleStream {
+        fn new(addr: BleAddr, chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                addr,
+                send_mtu: 2048,
+                recv_mtu: 2048,
+                rx: TokioMutex::new(VecDeque::from(chunks)),
+                sent: TokioMutex::new(Vec::new()),
+            }
+        }
+
+        async fn sent_frames(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().await.clone()
+        }
+    }
+
+    impl BleStream for FragmentingBleStream {
+        async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+            self.sent.lock().await.push(data.to_vec());
+            Ok(())
+        }
+
+        async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let mut rx = self.rx.lock().await;
+            match rx.pop_front() {
+                Some(chunk) => {
+                    let len = chunk.len().min(buf.len());
+                    buf[..len].copy_from_slice(&chunk[..len]);
+                    Ok(len)
+                }
+                None => Ok(0),
+            }
+        }
+
+        fn send_mtu(&self) -> u16 {
+            self.send_mtu
+        }
+
+        fn recv_mtu(&self) -> u16 {
+            self.recv_mtu
+        }
+
+        fn remote_addr(&self) -> &BleAddr {
+            &self.addr
+        }
     }
 
     #[test]
@@ -1174,6 +1366,71 @@ mod tests {
 
         transport.stop_async().await.unwrap();
         assert_eq!(transport.state(), TransportState::Down);
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_exchange_completes_for_role_asymmetry() {
+        let (stream_a, stream_b) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
+        let pubkey_a = test_pubkey(3);
+        let pubkey_b = test_pubkey(9);
+
+        let initiator = pubkey_exchange(&stream_a, &pubkey_a, PubkeyExchangeRole::Initiator);
+        let responder = pubkey_exchange(&stream_b, &pubkey_b, PubkeyExchangeRole::Responder);
+        let (peer_from_initiator, peer_from_responder) = tokio::join!(initiator, responder);
+
+        assert_eq!(peer_from_initiator.unwrap().serialize(), pubkey_b);
+        assert_eq!(peer_from_responder.unwrap().serialize(), pubkey_a);
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_exchange_initiator_accepts_fragmented_frame() {
+        let peer_pubkey = test_pubkey(21);
+        let mut frame = [0u8; PUBKEY_EXCHANGE_SIZE];
+        frame[0] = PUBKEY_EXCHANGE_PREFIX;
+        frame[1..].copy_from_slice(&peer_pubkey);
+
+        let stream = FragmentingBleStream::new(
+            test_addr(2),
+            vec![frame[..7].to_vec(), frame[7..19].to_vec(), frame[19..].to_vec()],
+        );
+
+        let received = pubkey_exchange(
+            &stream,
+            &test_pubkey(11),
+            PubkeyExchangeRole::Initiator,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(received.serialize(), peer_pubkey);
+        let sent = stream.sent_frames().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), PUBKEY_EXCHANGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_exchange_responder_accepts_fragmented_frame() {
+        let peer_pubkey = test_pubkey(31);
+        let local_pubkey = test_pubkey(32);
+        let mut frame = [0u8; PUBKEY_EXCHANGE_SIZE];
+        frame[0] = PUBKEY_EXCHANGE_PREFIX;
+        frame[1..].copy_from_slice(&peer_pubkey);
+
+        let stream = FragmentingBleStream::new(
+            test_addr(3),
+            vec![frame[..1].to_vec(), frame[1..16].to_vec(), frame[16..].to_vec()],
+        );
+
+        let received = pubkey_exchange(&stream, &local_pubkey, PubkeyExchangeRole::Responder)
+            .await
+            .unwrap();
+
+        assert_eq!(received.serialize(), peer_pubkey);
+
+        let sent = stream.sent_frames().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], PUBKEY_EXCHANGE_PREFIX);
+        assert_eq!(&sent[0][1..], &local_pubkey);
     }
 
     #[tokio::test(start_paused = true)]
