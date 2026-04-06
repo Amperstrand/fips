@@ -81,22 +81,22 @@ impl Node {
 
         // Decrypt: try current session first, then previous (drain fallback)
         let ciphertext = &packet.data[header.ciphertext_offset()..];
-        let peer_display = self.peer_display_name(&node_addr);
+        
+        // Get display name before mutable borrow
+        let peer_name = self.peer_display_name(&node_addr);
+        
         let plaintext = {
             let peer = self.peers.get_mut(&node_addr).unwrap();
             let session = match peer.noise_session_mut() {
                 Some(s) => s,
                 None => {
-                    warn!(
-                        peer = %peer_display,
-                        "Peer in index map has no session"
-                    );
+                    warn!(peer = %peer_name, "Peer in index map has no session");
                     return;
                 }
             };
 
             debug!(
-                peer = %peer_display,
+                peer = %peer_name,
                 counter = header.counter,
                 aad_hex = %hex::encode(&header.header_bytes),
                 ciphertext_len = ciphertext.len(),
@@ -114,7 +114,7 @@ impl Node {
                 }
                 Err(e) => {
                     // Current session failed — try previous session (drain window)
-                    let prev_ok = if let Some(prev_session) = peer.previous_session_mut() {
+                    if let Some(prev_session) = peer.previous_session_mut() {
                         match prev_session.decrypt_with_replay_check_and_aad(
                             ciphertext,
                             header.counter,
@@ -122,20 +122,18 @@ impl Node {
                         ) {
                             Ok(p) => {
                                 peer.reset_decrypt_failures();
-                                Some(p)
+                                p
                             }
-                            Err(_) => None,
+                            Err(_) => {
+                                self.log_decrypt_failure(&node_addr, &header, &e);
+                                self.handle_decrypt_failure(&node_addr);
+                                return;
+                            }
                         }
                     } else {
-                        None
-                    };
-                    match prev_ok {
-                        Some(p) => p,
-                        None => {
-                            self.log_decrypt_failure(&node_addr, &header, &e);
-                            self.handle_decrypt_failure(&node_addr);
-                            return;
-                        }
+                        self.log_decrypt_failure(&node_addr, &header, &e);
+                        self.handle_decrypt_failure(&node_addr);
+                        return;
                     }
                 }
             }
