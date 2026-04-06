@@ -1,9 +1,10 @@
 //! BLE L2CAP Transport Implementation
 //!
 //! Provides BLE-based transport for FIPS peer communication using L2CAP
-//! Connection-Oriented Channels (CoC) in SeqPacket mode. L2CAP CoC
-//! preserves message boundaries (unlike TCP byte streams), so no FMP
-//! framing is needed — each send/recv is one FIPS packet.
+//! Connection-Oriented Channels (CoC) in SeqPacket mode. While SeqPacket
+//! nominally preserves message boundaries, some BLE controllers (notably
+//! ESP32) may coalesce back-to-back sends into a single recv(). The
+//! receive loop handles this by splitting on FMP frame boundaries.
 //!
 //! ## Architecture
 //!
@@ -944,6 +945,10 @@ async fn accept_loop<A>(
 }
 
 /// Receive loop: reads packets from a BLE stream and delivers to node.
+///
+/// Some BLE controllers coalesce back-to-back sends into a single recv()
+/// call despite SeqPacket semantics. This loop splits coalesced data on
+/// FMP frame boundaries using the payload_len field in each 4-byte prefix.
 async fn receive_loop<S: BleStream>(
     stream: Arc<S>,
     addr: TransportAddr,
@@ -961,12 +966,44 @@ async fn receive_loop<S: BleStream>(
                 break;
             }
             Ok(n) => {
-                debug!(addr = %addr, bytes = n, "BLE receive: packet received");
-                stats.record_recv(n);
-                let packet = ReceivedPacket::new(transport_id, addr.clone(), buf[..n].to_vec());
-                if packet_tx.send(packet).await.is_err() {
-                    trace!("BLE packet_tx closed, stopping receive loop");
-                    break;
+                let mut remaining = &buf[..n];
+                let mut frame_count = 0u32;
+                while !remaining.is_empty() {
+                    if remaining.len() < crate::node::wire::COMMON_PREFIX_SIZE {
+                        debug!(
+                            addr = %addr,
+                            leftover = remaining.len(),
+                            "BLE receive: leftover bytes shorter than FMP prefix, discarding"
+                        );
+                        break;
+                    }
+                    let prefix = u16::from_le_bytes([remaining[2], remaining[3]]);
+                    let frame_len = crate::node::wire::COMMON_PREFIX_SIZE + prefix as usize;
+                    if frame_len == crate::node::wire::COMMON_PREFIX_SIZE || frame_len > remaining.len() {
+                        debug!(
+                            addr = %addr,
+                            frame_len,
+                            remaining = remaining.len(),
+                            "BLE receive: invalid or incomplete frame, discarding rest"
+                        );
+                        break;
+                    }
+                    let frame_data = remaining[..frame_len].to_vec();
+                    if frame_count == 0 {
+                        stats.record_recv(n);
+                    } else {
+                        stats.record_recv(frame_len);
+                    }
+                    frame_count += 1;
+                    let packet = ReceivedPacket::new(transport_id, addr.clone(), frame_data);
+                    if packet_tx.send(packet).await.is_err() {
+                        trace!("BLE packet_tx closed, stopping receive loop");
+                        break;
+                    }
+                    remaining = &remaining[frame_len..];
+                }
+                if frame_count > 1 {
+                    debug!(addr = %addr, frames = frame_count, "BLE receive: split coalesced frames");
                 }
             }
             Err(e) => {
