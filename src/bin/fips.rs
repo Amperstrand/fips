@@ -1,63 +1,58 @@
-//! FIPS daemon binary
-//!
-//! Loads configuration and creates the top-level node instance.
-
 use clap::Parser;
 use fips::config::{resolve_identity, IdentitySource};
 use fips::version;
 use fips::{Config, Node};
 use std::path::PathBuf;
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-// macOS CFRunLoop support for CoreBluetooth NSStream callbacks
 #[cfg(target_os = "macos")]
 mod run_loop {
     use super::*;
     use std::ffi::c_void;
-    
+
     static RUN_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
-    
+
     unsafe extern "C" {
         fn CFRunLoopRun();
         fn CFRunLoopStop(rl: *mut c_void);
         fn CFRunLoopGetMain() -> *mut c_void;
     }
-    
-    /// Start the main run loop in a background thread.
-    /// Required for CoreBluetooth NSStream callbacks to fire.
-    pub fn start() {
-        if RUN_LOOP_ACTIVE.load(Ordering::Relaxed) {
+
+    pub fn run() {
+        if RUN_LOOP_ACTIVE.swap(true, Ordering::Relaxed) {
             debug!("macOS run loop already active");
             return;
         }
-        
-        RUN_LOOP_ACTIVE.store(true, Ordering::Relaxed);
-        
-        thread::spawn(move || {
-            info!("macOS: Starting CFRunLoop for CoreBluetooth NSStream callbacks");
+
+        info!("macOS: Running CFRunLoop on main thread for CoreBluetooth callbacks");
+        while RUN_LOOP_ACTIVE.load(Ordering::Relaxed) {
             unsafe {
-                // Run the main run loop - this blocks until stopped
                 CFRunLoopRun();
             }
-            info!("macOS: CFRunLoop exited");
-            RUN_LOOP_ACTIVE.store(false, Ordering::Relaxed);
-        });
-        
-        // Give the run loop thread a moment to start
-        thread::sleep(Duration::from_millis(100));
-        debug!("macOS: CFRunLoop thread started");
+
+            if RUN_LOOP_ACTIVE.load(Ordering::Relaxed) {
+                warn!("macOS: CFRunLoop returned unexpectedly; restarting main run loop");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        info!("macOS: CFRunLoop exited");
     }
-    
-    /// Stop the main run loop during shutdown.
+
+    pub fn is_active() -> bool {
+        RUN_LOOP_ACTIVE.load(Ordering::Relaxed)
+    }
+
     pub fn stop() {
-        if !RUN_LOOP_ACTIVE.load(Ordering::Relaxed) {
+        if !RUN_LOOP_ACTIVE.swap(false, Ordering::Relaxed) {
             return;
         }
-        
+
         info!("macOS: Stopping CFRunLoop");
         unsafe {
             let main_loop = CFRunLoopGetMain();
@@ -65,20 +60,18 @@ mod run_loop {
                 CFRunLoopStop(main_loop);
             }
         }
-        
-        // Wait for run loop thread to exit
-        thread::sleep(Duration::from_millis(100));
-        info!("macOS: CFRunLoop stopped");
+
+        info!("macOS: CFRunLoop stop requested");
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod run_loop {
-    pub fn start() {}
+    pub fn run() {}
+    pub fn is_active() -> bool { true }
     pub fn stop() {}
 }
 
-/// FIPS mesh network daemon
 #[derive(Parser, Debug)]
 #[command(
     name = "fips",
@@ -87,23 +80,19 @@ mod run_loop {
     about
 )]
 struct Args {
-    /// Path to configuration file (overrides default search paths)
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
     let args = Args::parse();
 
-    // Load configuration before initializing logging so we can use
-    // the config's log_level as the tracing filter default.
     let (config, loaded_paths) = if let Some(config_path) = &args.config {
         match Config::load_file(config_path) {
             Ok(config) => (config, vec![config_path.clone()]),
             Err(e) => {
                 eprintln!("Failed to load configuration from {}: {}", config_path.display(), e);
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     } else {
@@ -111,12 +100,11 @@ async fn main() {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("Failed to load configuration: {}", e);
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     };
 
-    // Initialize logging: RUST_LOG env var overrides config if set
     let log_level = config.node.log_level();
     let filter = EnvFilter::builder()
         .with_default_directive(log_level.into())
@@ -137,12 +125,11 @@ async fn main() {
         }
     }
 
-    // Identity provisioning: config nsec > key file > generate ephemeral
     let resolved = match resolve_identity(&config, &loaded_paths) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to resolve identity: {}", e);
-            std::process::exit(1);
+            process::exit(1);
         }
     };
     match &resolved.source {
@@ -152,19 +139,68 @@ async fn main() {
         IdentitySource::Ephemeral => info!("Using ephemeral identity (new keypair each start)"),
     }
 
-    // Create node with resolved identity
     let mut config = config;
     config.node.identity.nsec = Some(resolved.nsec);
+
+    #[cfg(target_os = "macos")]
+    {
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            while !run_loop::is_active() {
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let exit_code = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build tokio runtime: {}", e);
+                    1
+                })
+                .map(|rt| rt.block_on(run_node(config)))
+                .unwrap_or(1);
+
+            run_loop::stop();
+            let _ = exit_tx.send(exit_code);
+        });
+
+        run_loop::run();
+
+        let exit_code = exit_rx.recv().unwrap_or(1);
+        if exit_code != 0 {
+            process::exit(exit_code);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let exit_code = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                error!("Failed to build tokio runtime: {}", e);
+                1
+            })
+            .map(|rt| rt.block_on(run_node(config)))
+            .unwrap_or(1);
+
+        if exit_code != 0 {
+            process::exit(exit_code);
+        }
+    }
+}
+
+async fn run_node(config: Config) -> i32 {
     debug!("Creating node");
     let mut node = match Node::new(config) {
         Ok(node) => node,
         Err(e) => {
             error!("Failed to create node: {}", e);
-            std::process::exit(1);
+            return 1;
         }
     };
 
-    // Log node information
     info!("Node created:");
     info!("      npub: {}", node.npub());
     info!("   node_addr: {}", hex::encode(node.node_addr().as_bytes()));
@@ -172,20 +208,13 @@ async fn main() {
     info!("     state: {}", node.state());
     info!(" leaf_only: {}", node.is_leaf_only());
 
-    // Start macOS CFRunLoop for CoreBluetooth NSStream callbacks
-    // This MUST be started before node.start() so BLE can receive data
-    run_loop::start();
-
-    // Start the node (initializes TUN, spawns I/O threads)
     if let Err(e) = node.start().await {
         error!("Failed to start node: {}", e);
-        std::process::exit(1);
+        return 1;
     }
 
     info!("FIPS running, press Ctrl+C to exit");
 
-    // Run the RX event loop until shutdown signal.
-    // stop() drops the packet channel, causing run_rx_loop to exit.
     tokio::select! {
         result = node.run_rx_loop() => {
             match result {
@@ -200,12 +229,10 @@ async fn main() {
 
     info!("FIPS shutting down");
 
-    run_loop::stop();
-
-    // Stop the node (shuts down transports, TUN, I/O threads)
     if let Err(e) = node.stop().await {
         warn!("Error during shutdown: {}", e);
     }
 
     info!("FIPS shutdown complete");
+    0
 }

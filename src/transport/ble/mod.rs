@@ -688,7 +688,7 @@ const PUBKEY_EXCHANGE_SIZE: usize = 33;
 const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
 
 #[cfg(feature = "ble-macos")]
-const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = true;
+const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
 
 #[cfg(not(feature = "ble-macos"))]
 const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
