@@ -196,72 +196,152 @@ pub enum BleDeviceAddr {
 
 ---
 
-## Next Steps for Testing
+## Hardware Testing Status (2026-04-06)
 
-### 1. Hardware Setup
+### Linux Node Running
+- **Branch**: `macos-support` (commit `6768f55` + local uncommitted borrow fix)
+- **Config**: `ble-linux-advertise.yaml` (TUN + DNS + BLE advertise + scan + auto_connect)
+- **npub**: `npub1pljlvfkgmdpp3wwl3ttkelngmgyf0xe4ljufgsrwn2vpyrmcwmrszq30ty`
+- **IPv6**: `fdf2:c2d4:951c:c70e:3511:d77d:2db8:45a`
+- **TUN**: `fips0`, MTU 1280, effective 1971
+- **DNS**: `127.0.0.1:5354`
+- **BLE**: advertise + scan + auto_connect on `hci0`, PSM 133
+- **Logs**: `/tmp/fips-ble.log`
 
-- [ ] macOS machine with Bluetooth 4.0+ (Bluetooth Low Energy)
-- [ ] Linux machine with Bluetooth 4.0+ and BlueZ
-- [ ] Both machines in Bluetooth range
+### ESP32 Peers Observed (Working)
+- Two ESP32 (microfips) peers connected and are exchanging keepalives:
+  - `hci0/02:00:00:00:00:FF` → `npub1ccz8...mnyd`
+  - `hci0/05:00:00:00:00:FF` → `npub1979a...zcrp`
+- Pubkey exchange and Noise IK handshake completed successfully
+- 37-byte keepalive packets received every ~10s from each
 
-### 2. Linux Node Setup
+### Known Issue: Cross-Probe Handshake Confusion Between ESP32 Peers
+Both ESP32s probe each other and Linux simultaneously. When two probes for the same
+peer arrive from different BLE connections (inbound + outbound), the node layer
+detects "Cross-connection detected: have outbound, received inbound msg1" but the
+Noise IK handshake still gets confused — both sides try to initiate, msg3 never
+arrives. The tie-breaker should prevent this but both connections sometimes survive
+into the pool.
 
-```bash
-# On Linux
-sudo apt install bluez libdbus-1-dev
-cargo build --release --features ble
-sudo ./target/release/fips --config linux-ble-config.yaml
-```
-
-### 3. macOS Node Setup
-
-```bash
-# On macOS
-cargo build --release --features ble-macos
-./target/release/fips --config macos-ble-config.yaml
-```
-
-### 4. Verify Communication
-
-```bash
-# On macOS, check for discovered Linux peer
-fipsctl show peers
-
-# On Linux, check for connected macOS peer
-fipsctl show peers
-
-# Test data transfer
-ping6 <linux-node-npub>.fips
-```
-
-### 5. Integration Test Run
-
-```bash
-# On macOS (requires Bluetooth hardware)
-cargo test --features ble-macos --test ble_macos -- --nocapture
-```
+### macOS Peer: NOT YET CONNECTED
+- **Mac BLE address**: `14:7D:DA:7D:4C:31`
+- **No Mac BLE activity in logs** — Mac never discovered Linux's advertisements
+- See "macOS Connection Issue Analysis" below
 
 ---
 
-## Troubleshooting
+## macOS Connection Issue Analysis (2026-04-06)
 
-### macOS: "Bluetooth adapter not found"
-- Ensure Bluetooth is enabled in System Preferences
-- Check CoreBluetooth permissions (may need to grant Bluetooth permission)
+### Root Constraint: Mac is Central-Only
 
-### macOS: "Device not found during scan"
-- Verify Linux is advertising: `bluetoothctl` → `scan on`
-- Check FIPS service UUID in Linux logs
-- Ensure devices are in range
+The Mac **cannot** play the peripheral (acceptor) role. CoreBluetooth does not support:
+- L2CAP server / listening (`listen()` → `NotSupported`)
+- BLE advertising (`start_advertising()` → `NotSupported`)
+- Accepting inbound connections (`accept()` → `NotSupported`)
 
-### Linux: "Permission denied" on BLE
-- Run as root or add user to `bluetooth` group
-- Check D-Bus permissions for BlueZ
+This means the connection flow is **strictly asymmetric**:
+```
+Mac (Central)                    Linux (Peripheral)
+     |  1. Scan for FIPS UUID         |
+     |------------------------------>|
+     |  2. Discover Linux             |
+     |<------------------------------|
+     |  3. Connect outbound           |
+     |------------------------------>|
+     |  4. Accept inbound             |
+     |  5. Send pubkey (Initiator)    |
+     |------------------------------>|
+     |  6. Recv pubkey, send (Resp.)  |
+     |<------------------------------|
+     |  7. Recv pubkey                |
+     |  8. Noise IK msg1 (Mac sends)  |
+     |------------------------------>|
+     |  9. Noise IK msg2 (Linux resp) |
+     |<------------------------------|
+     |  10. Noise IK msg3 (Mac sends) |
+     |------------------------------>|
+     |  LINK ESTABLISHED              |
+```
 
-### Connection fails at L2CAP
-- Verify PSM 0x0085 is available (not in use)
-- Check MTU negotiation in logs
-- Ensure both sides use same FIPS service UUID
+### Cross-Probe Tie-Breaker Implications
+
+The tie-breaker in `mod.rs` is correct for this asymmetry:
+- **scan_probe_loop**: if `our_addr >= peer_addr`, drop outbound (yield to peer)
+- **accept_loop**: if `our_addr < peer_addr`, drop inbound (our outbound wins)
+
+For Mac↔Linux: **Linux's NodeAddr must be ≥ Mac's** so Linux drops its outbound probe
+and the Mac's inbound connection is kept. This ensures Mac = initiator, Linux = responder.
+
+Since Mac can ONLY connect outbound (never accept), the tie-breaker is effectively:
+- Linux should **always** yield outbound probes to Mac
+- Linux should **always** accept inbound from Mac
+- This is guaranteed if `linux_node_addr >= mac_node_addr`
+
+### Why the Mac Never Appeared in Logs
+
+The Mac address `14:7D:DA:7D:4C:31` does not appear anywhere in `/tmp/fips-ble.log`.
+Possible causes:
+1. Mac FIPS node is not running or not scanning
+2. Mac's `bluest` scanner isn't discovering Linux's advertisements
+3. CoreBluetooth permissions not granted to the FIPS binary
+4. Previous session's "Mac drops after pubkey exchange" observation was from a different
+   log that has been rotated — the Mac may have connected once but is not currently running
+
+### What the Mac-Side LLM Should Check
+
+1. Is the Mac FIPS node running with `--features ble-macos`?
+2. Does the Mac scanner discover the Linux node? (FIPS service UUID: `9c90b790-2cc5-42c0-9f87-c9cc40648f4c`)
+3. If discovered, does L2CAP channel open succeed on PSM 133?
+4. If channel opens, does pubkey exchange complete? (Mac sends first as Initiator)
+5. If pubkey exchange completes, does Noise IK handshake begin? (Mac sends msg1)
+
+### Brief for Mac-Side LLM
+
+> **Context**: Linux FIPS node running on `macos-support` branch with BLE advertising
+> on hci0, PSM 133, service UUID `9c90b790-2cc5-42c0-9f87-c9cc40648f4c`.
+>
+> **Constraint**: Mac can only be BLE central (initiator). CoreBluetooth does not support
+> peripheral role — `listen()`, `start_advertising()`, `accept()` all return NotSupported.
+> See `src/transport/ble/bluest.rs` lines 1-6.
+>
+> **Expected flow**: Mac scans → discovers Linux → connects outbound → pubkey exchange
+> (Mac sends first) → Noise IK handshake (Mac initiates msg1) → encrypted link → mesh peering.
+>
+> **Linux peer**: npub `npub1pljlvfkgmdpp3wwl3ttkelngmgyf0xe4ljufgsrwn2vpyrmcwmrszq30ty`
+> (IPv6: `fdf2:c2d4:951c:c70e:3511:d77d:2db8:45a`)
+>
+> **Relevant files**: `src/transport/ble/bluest.rs` (Mac BLE I/O, central-only),
+> `src/transport/ble/mod.rs` (pubkey exchange, accept/probe loops, shared logic),
+> `src/transport/ble/io.rs` (BleIo trait definition).
+>
+> **Known risk**: CoreBluetooth L2CAP CoC is known to be flaky — connections can silently
+> drop, especially if the app backgrounds or channel setup is delayed.
+
+---
+
+## Next Steps
+
+### Immediate (Mac-side)
+- [ ] Verify Mac FIPS node is running with `ble-macos` feature
+- [ ] Check Mac-side logs for BLE scan results (any FIPS UUID peers discovered?)
+- [ ] If not scanning, check CoreBluetooth permissions
+- [ ] If scanning but not discovering, verify Linux is still advertising
+
+### After Mac Discovers Linux
+- [ ] Verify L2CAP channel opens on PSM 133
+- [ ] Verify pubkey exchange completes (Mac sends first, Linux responds)
+- [ ] Verify Noise IK handshake completes (msg1 → msg2 → msg3)
+- [ ] Verify FIPS mesh peering establishes
+
+### After Link Established
+- [ ] Test DNS resolution: `ping6 npub1pljlvfkgmdpp3wwl3ttkelngmgyf0xe4ljufgsrwn2vpyrmcwmrszq30ty.fips`
+- [ ] Test SSH: `ssh -6 npub1pljlvfkgmdpp3wwl3ttkelngmgyf0xe4ljufgsrwn2vpyrmcwmrszq30ty.fips`
+- [ ] Verify sshd listens on fips0 TUN interface
+
+### Longer-Term
+- [ ] Commit and push the borrow fix in `encrypted.rs` to `macos-support`
+- [ ] Point Mac LLM to microfips issue #63 (ESP32 leaf node identification)
+- [ ] Investigate ESP32 cross-probe handshake confusion (both sides initiating)
 
 ---
 
