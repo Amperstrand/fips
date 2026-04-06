@@ -1,9 +1,8 @@
+# FIPS Node Configuration — BLE + UDP
+
 node:
   identity:
     persistent: true
-  log_level: debug
-  control:
-    socket_path: "/tmp/fips-linux-control.sock"
 
 tun:
   enabled: true
@@ -16,10 +15,15 @@ dns:
   port: 5354
 
 transports:
+  udp:
+    bind_addr: "0.0.0.0:2121"
+
   ble:
+    adapter: "hci0"
+    mtu: 2048
     advertise: true
     scan: true
     auto_connect: true
     accept_connections: true
-    adapter: "hci0"
-    psm: 133
+
+peers: []
