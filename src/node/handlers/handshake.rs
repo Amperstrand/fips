@@ -157,6 +157,30 @@ impl Node {
             possible_restart = true;
         }
 
+        // Stale link detection: if the peer exists but its link has been
+        // removed (e.g., by heartbeat timeout or transport disconnect),
+        // the peer is orphaned — its session state is stale and will
+        // interfere with re-handshake. Remove it so we process this
+        // MSG1 as a fresh connection.
+        //
+        // This is generic (not BLE-specific) and handles the race between
+        // transport disconnect and node-level heartbeat timeout for all
+        // transports.
+        if possible_restart {
+            let stale_addr = self.peers.get(&peer_node_addr)
+                .filter(|p| !self.links.contains_key(&p.link_id()))
+                .map(|_| peer_node_addr);
+
+            if let Some(stale_addr) = stale_addr {
+                info!(
+                    peer = %self.peer_display_name(&stale_addr),
+                    "Stale peer detected (link gone), removing before re-handshake"
+                );
+                self.remove_active_peer(&stale_addr);
+                possible_restart = false;
+            }
+        }
+
         // Epoch-based restart detection and duplicate msg1 handling.
         //
         // If we fell through from the addr_to_link check above with
