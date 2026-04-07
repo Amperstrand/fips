@@ -13,9 +13,10 @@ dns:
 transports:
   ble:
     enabled: true
+    advertise: false
+    accept_connections: false
     scan: true
     auto_connect: true
-    disable_tiebreaker: true
 
 logging:
   level: debug

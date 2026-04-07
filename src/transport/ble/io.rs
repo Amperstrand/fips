@@ -12,6 +12,48 @@ use super::addr::{BleAddr, BleDeviceAddr};
 // BLE I/O Traits
 // ============================================================================
 
+/// Connection role policy advertised during BLE pre-handshake negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BleConnectionRolePolicy {
+    /// This backend can complete either inbound or outbound BLE roles.
+    #[default]
+    Flexible = 0,
+    /// This backend can only complete outbound BLE connections it initiates.
+    OutboundOnly = 1,
+    /// This backend can only complete inbound BLE connections it accepts.
+    InboundOnly = 2,
+}
+
+impl BleConnectionRolePolicy {
+    /// Decode a wire-format role policy byte.
+    pub fn from_wire(value: u8) -> Result<Self, TransportError> {
+        match value {
+            0 => Ok(Self::Flexible),
+            1 => Ok(Self::OutboundOnly),
+            2 => Ok(Self::InboundOnly),
+            _ => Err(TransportError::RecvFailed(format!(
+                "pubkey exchange: invalid BLE role policy {}",
+                value
+            ))),
+        }
+    }
+
+    /// Encode this role policy for the wire format.
+    pub const fn to_wire(self) -> u8 {
+        self as u8
+    }
+
+    /// Whether outbound BLE connections are supported.
+    pub const fn supports_outbound(self) -> bool {
+        !matches!(self, Self::InboundOnly)
+    }
+
+    /// Whether inbound BLE connections are supported.
+    pub const fn supports_inbound(self) -> bool {
+        !matches!(self, Self::OutboundOnly)
+    }
+}
+
 /// A connected L2CAP stream for sending and receiving data.
 pub trait BleStream: Send + Sync {
     /// Send data over the L2CAP connection.
@@ -105,6 +147,11 @@ pub trait BleIo: Send + Sync + 'static {
 
     /// Get the adapter name (e.g., "hci0").
     fn adapter_name(&self) -> &str;
+
+    /// Get the BLE connection role policy for this backend.
+    fn role_policy(&self) -> BleConnectionRolePolicy {
+        BleConnectionRolePolicy::Flexible
+    }
 }
 
 #[cfg(feature = "ble")]
@@ -606,6 +653,7 @@ type ConnectHandler =
 pub struct MockBleIo {
     adapter: String,
     local_addr: BleAddr,
+    role_policy: BleConnectionRolePolicy,
     accept_tx: tokio::sync::mpsc::Sender<MockBleStream>,
     accept_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<MockBleStream>>>,
     scan_tx: tokio::sync::mpsc::Sender<BleAddr>,
@@ -621,6 +669,7 @@ impl MockBleIo {
         Self {
             adapter: adapter.to_string(),
             local_addr,
+            role_policy: BleConnectionRolePolicy::Flexible,
             accept_tx,
             accept_rx: std::sync::Mutex::new(Some(accept_rx)),
             scan_tx,
@@ -645,6 +694,12 @@ impl MockBleIo {
         F: Fn(&BleAddr, u16) -> Result<MockBleStream, TransportError> + Send + Sync + 'static,
     {
         *self.connect_handler.lock().unwrap() = Some(Box::new(handler));
+    }
+
+    /// Override the mock BLE role policy.
+    pub fn with_role_policy(mut self, role_policy: BleConnectionRolePolicy) -> Self {
+        self.role_policy = role_policy;
+        self
     }
 }
 
@@ -695,6 +750,10 @@ impl BleIo for MockBleIo {
 
     fn adapter_name(&self) -> &str {
         &self.adapter
+    }
+
+    fn role_policy(&self) -> BleConnectionRolePolicy {
+        self.role_policy
     }
 }
 
@@ -793,6 +852,13 @@ mod tests {
         let io = MockBleIo::new("hci0", test_addr(1));
         assert_eq!(io.local_addr().unwrap(), test_addr(1));
         assert_eq!(io.adapter_name(), "hci0");
+    }
+
+    #[test]
+    fn test_mock_io_role_policy_override() {
+        let io = MockBleIo::new("hci0", test_addr(1))
+            .with_role_policy(BleConnectionRolePolicy::OutboundOnly);
+        assert_eq!(io.role_policy(), BleConnectionRolePolicy::OutboundOnly);
     }
 
     #[tokio::test]

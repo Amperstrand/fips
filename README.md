@@ -70,8 +70,9 @@ On **Linux**, the BLE transport requires BlueZ and libdbus. On
 Debian/Ubuntu: `sudo apt install bluez libdbus-1-dev`. Then build with
 BLE enabled: `cargo build --release --features ble`.
 
-On **macOS**, BLE and Ethernet transports are not available. A standard
-`cargo build --release` produces binaries with UDP, TCP, and Tor support.
+On **macOS**, Ethernet is not available. A standard `cargo build --release`
+produces binaries with UDP, TCP, and Tor support. To build BLE central-role
+support on macOS, enable `ble-macos`: `cargo build --release --features ble-macos`.
 
 ## Installation
 

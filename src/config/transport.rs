@@ -577,11 +577,6 @@ pub struct BleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_cooldown_secs: Option<u64>,
 
-    /// Disable cross-probe tie-breaker. Useful for unidirectional topologies
-    /// where only one side probes (e.g., MCU advertises, FIPS probes).
-    /// Default: false (tie-breaker enabled).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disable_tiebreaker: Option<bool>,
 }
 
 impl BleConfig {
@@ -637,10 +632,6 @@ impl BleConfig {
             .unwrap_or(DEFAULT_BLE_PROBE_COOLDOWN_SECS)
     }
 
-    /// Whether to disable cross-probe tie-breaker. Default: false.
-    pub fn disable_tiebreaker(&self) -> bool {
-        self.disable_tiebreaker.unwrap_or(false)
-    }
 }
 
 // ============================================================================

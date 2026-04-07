@@ -514,9 +514,11 @@ discover and connect via L2CAP. When `scan` is enabled, the transport
 continuously scans for other FIPS nodes' advertisements. Discovered
 peers are probed immediately (L2CAP connect + pubkey exchange) with a
 cooldown (`probe_cooldown_secs`) to prevent rapid re-probing of the same
-address. If two nodes probe each other at the same time (cross-probe),
-a deterministic tie-breaker based on NodeAddr comparison ensures only
-one connection is established.
+address. During the pre-handshake pubkey exchange, peers also negotiate
+their BLE connection role policy (`Flexible`, outbound-only, or inbound-only).
+Flexible peers still use the deterministic NodeAddr tie-breaker when both
+probe at the same time; asymmetric peers keep only orientations both sides
+can complete.
 
 **Connection pool.** The `max_connections` parameter limits the number of
 concurrent BLE connections. When the pool is full, the least-recently-used
@@ -798,10 +800,10 @@ transports:
   #   mtu: 2048                       # default MTU (negotiated per-link)
   #   max_connections: 7              # max concurrent BLE connections
   #   connect_timeout_ms: 10000       # outbound connect timeout
-  #   advertise: true                 # broadcast BLE beacons
+  #   advertise: true                 # broadcast BLE beacons (only if inbound role is supported)
   #   scan: true                      # listen for BLE beacons
   #   auto_connect: false             # connect to discovered peers
-  #   accept_connections: true         # accept incoming L2CAP connections
+  #   accept_connections: true        # accept incoming L2CAP connections
   #   probe_cooldown_secs: 30         # cooldown before re-probing same address
 
 peers:                               # static peer list

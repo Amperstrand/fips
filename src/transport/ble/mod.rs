@@ -34,7 +34,7 @@ use crate::config::BleConfig;
 use crate::identity::NodeAddr;
 use addr::BleAddr;
 use discovery::DiscoveryBuffer;
-use io::{BleIo, BleScanner, BleStream};
+use io::{BleConnectionRolePolicy, BleIo, BleScanner, BleStream};
 use pool::{BleConnection, ConnectionPool};
 use stats::BleStats;
 
@@ -102,7 +102,7 @@ pub struct BleTransport<I: BleIo> {
     /// Our public key for pre-handshake identity exchange.
     ///
     /// BLE advertisements carry only the FIPS UUID, not the pubkey.
-    /// After L2CAP connection, both sides exchange `[0x00][pubkey:32]`
+    /// After L2CAP connection, both sides exchange `[0x00][role:1][pubkey:32]`
     /// so the node layer can initiate the IK handshake.
     /// Temporary — removed when FMP switches to XX.
     local_pubkey: Option<[u8; 32]>,
@@ -173,6 +173,7 @@ impl<I: BleIo> BleTransport<I> {
 
         let psm = self.config.psm();
         let adapter = self.io.adapter_name().to_string();
+        let role_policy = self.io.role_policy();
 
         // Pre-compute local NodeAddr for cross-probe tie-breaking
         let local_node_addr = self.local_pubkey.and_then(|pk| {
@@ -183,72 +184,84 @@ impl<I: BleIo> BleTransport<I> {
 
         // Start L2CAP listener for inbound connections
         if self.config.accept_connections() {
-            match self.io.listen(psm).await {
-                Ok(acceptor) => {
-                    let pool = Arc::clone(&self.pool);
-                    let packet_tx = self.packet_tx.clone();
-                    let transport_id = self.transport_id;
-                    let stats = Arc::clone(&self.stats);
-                    let max_conns = self.config.max_connections();
+            if role_policy.supports_inbound() {
+                match self.io.listen(psm).await {
+                    Ok(acceptor) => {
+                        let pool = Arc::clone(&self.pool);
+                        let packet_tx = self.packet_tx.clone();
+                        let transport_id = self.transport_id;
+                        let stats = Arc::clone(&self.stats);
+                        let max_conns = self.config.max_connections();
 
-                    self.accept_task = Some(tokio::spawn(accept_loop(
-                        acceptor,
-                        pool,
-                        packet_tx,
-                        transport_id,
-                        stats,
-                        max_conns,
-                        self.local_pubkey,
-                        Arc::clone(&self.discovery_buffer),
-                        local_node_addr,
-                        self.config.disable_tiebreaker(),
-                    )));
-                    debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
-                }
-                Err(e) => {
-                    warn!(adapter = %adapter, error = %e, "failed to start BLE listener");
-                    if !matches!(e, TransportError::NotSupported(_)) {
-                        self.state = TransportState::Failed;
-                        return Err(e);
+                        self.accept_task = Some(tokio::spawn(accept_loop(
+                            acceptor,
+                            pool,
+                            packet_tx,
+                            transport_id,
+                            stats,
+                            max_conns,
+                            self.local_pubkey,
+                            Arc::clone(&self.discovery_buffer),
+                            local_node_addr,
+                            role_policy,
+                        )));
+                        debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
+                    }
+                    Err(e) => {
+                        warn!(adapter = %adapter, error = %e, "failed to start BLE listener");
+                        if !matches!(e, TransportError::NotSupported(_)) {
+                            self.state = TransportState::Failed;
+                            return Err(e);
+                        }
                     }
                 }
+            } else {
+                warn!(adapter = %adapter, role_policy = ?role_policy, "BLE backend cannot accept inbound connections; skipping listen");
             }
         }
 
         // Start continuous advertising
         if self.config.advertise() {
-            if let Err(e) = self.io.start_advertising().await {
-                warn!(adapter = %adapter, error = %e, "failed to start BLE advertising");
+            if role_policy.supports_inbound() {
+                if let Err(e) = self.io.start_advertising().await {
+                    warn!(adapter = %adapter, error = %e, "failed to start BLE advertising");
+                } else {
+                    self.stats.record_advertisement();
+                    debug!(adapter = %adapter, "BLE advertising started (continuous)");
+                }
             } else {
-                self.stats.record_advertisement();
-                debug!(adapter = %adapter, "BLE advertising started (continuous)");
+                warn!(adapter = %adapter, role_policy = ?role_policy, "BLE backend cannot complete inbound BLE role; skipping advertising");
             }
         }
 
         // Start combined scan + probe loop
         if self.config.scan() {
-            match self.io.start_scanning().await {
-                Ok(scanner) => {
-                    self.scan_probe_task = Some(tokio::spawn(scan_probe_loop::<I>(
-                        scanner,
-                        Arc::clone(&self.io),
-                        Arc::clone(&self.pool),
-                        Arc::clone(&self.discovery_buffer),
-                        Arc::clone(&self.stats),
-                        self.local_pubkey,
-                        self.config.psm(),
-                        self.config.connect_timeout_ms(),
-                        self.config.probe_cooldown_secs(),
-                        local_node_addr,
-                        self.packet_tx.clone(),
-                        self.transport_id,
-                        self.config.disable_tiebreaker(),
-                    )));
-                    debug!(adapter = %adapter, "BLE scan+probe loop started");
+            if role_policy.supports_outbound() {
+                match self.io.start_scanning().await {
+                    Ok(scanner) => {
+                        self.scan_probe_task = Some(tokio::spawn(scan_probe_loop::<I>(
+                            scanner,
+                            Arc::clone(&self.io),
+                            Arc::clone(&self.pool),
+                            Arc::clone(&self.discovery_buffer),
+                            Arc::clone(&self.stats),
+                            self.local_pubkey,
+                            self.config.psm(),
+                            self.config.connect_timeout_ms(),
+                            self.config.probe_cooldown_secs(),
+                            local_node_addr,
+                            self.packet_tx.clone(),
+                            self.transport_id,
+                            role_policy,
+                        )));
+                        debug!(adapter = %adapter, "BLE scan+probe loop started");
+                    }
+                    Err(e) => {
+                        warn!(adapter = %adapter, error = %e, "failed to start BLE scanning");
+                    }
                 }
-                Err(e) => {
-                    warn!(adapter = %adapter, error = %e, "failed to start BLE scanning");
-                }
+            } else {
+                warn!(adapter = %adapter, role_policy = ?role_policy, "BLE backend cannot initiate outbound connections; skipping scan");
             }
         }
 
@@ -350,6 +363,12 @@ impl<I: BleIo> BleTransport<I> {
     /// Retained for manual debugging / testing scenarios.
     #[allow(dead_code)]
     async fn connect_inline(&self, addr: &TransportAddr) -> Result<(), TransportError> {
+        if !self.io.role_policy().supports_outbound() {
+            return Err(TransportError::NotSupported(
+                "BLE backend cannot initiate outbound connections".into(),
+            ));
+        }
+
         let ble_addr = BleAddr::parse(
             addr.as_str()
                 .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?,
@@ -378,11 +397,18 @@ impl<I: BleIo> BleTransport<I> {
 
         // Pre-handshake pubkey exchange (temporary, pre-XX)
         if let Some(ref our_pubkey) = self.local_pubkey {
-            match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Initiator).await {
-                Ok(peer_pubkey) => {
+            match pubkey_exchange(
+                &stream,
+                our_pubkey,
+                PubkeyExchangeRole::Initiator,
+                self.io.role_policy(),
+            )
+            .await
+            {
+                Ok(peer) => {
                     debug!(addr = %addr, "BLE outbound pubkey exchange complete");
                     self.discovery_buffer
-                        .add_peer_with_pubkey(&ble_addr, peer_pubkey);
+                        .add_peer_with_pubkey(&ble_addr, peer.pubkey);
                 }
                 Err(e) => {
                     warn!(addr = %addr, error = %e, "BLE outbound pubkey exchange failed");
@@ -451,6 +477,12 @@ impl<I: BleIo> BleTransport<I> {
     /// Spawns a background task that connects with timeout and promotes
     /// to the pool on success. Poll `connection_state_sync()` to check.
     pub async fn connect_async(&self, addr: &TransportAddr) -> Result<(), TransportError> {
+        if !self.io.role_policy().supports_outbound() {
+            return Err(TransportError::NotSupported(
+                "BLE backend cannot initiate outbound connections".into(),
+            ));
+        }
+
         // Already connected?
         {
             let pool = self.pool.lock().await;
@@ -483,6 +515,7 @@ impl<I: BleIo> BleTransport<I> {
         let addr_clone = addr.clone();
         let local_pubkey = self.local_pubkey;
         let discovery_buffer = Arc::clone(&self.discovery_buffer);
+        let role_policy = self.io.role_policy();
 
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -498,11 +531,18 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(Ok(stream)) => {
                     // Pre-handshake pubkey exchange (temporary, pre-XX)
                     if let Some(ref our_pubkey) = local_pubkey {
-                        match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Initiator).await {
-                            Ok(peer_pubkey) => {
+                        match pubkey_exchange(
+                            &stream,
+                            our_pubkey,
+                            PubkeyExchangeRole::Initiator,
+                            role_policy,
+                        )
+                        .await
+                        {
+                            Ok(peer) => {
                                 debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
                                 discovery_buffer
-                                    .add_peer_with_pubkey(&ble_addr, peer_pubkey);
+                                    .add_peer_with_pubkey(&ble_addr, peer.pubkey);
                             }
                             Err(e) => {
                                 warn!(
@@ -678,8 +718,10 @@ impl<I: BleIo> Transport for BleTransport<I> {
 /// Temporary — removed when FMP switches from IK to XX handshake.
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
 
-/// Pre-handshake pubkey exchange message size: `[0x00][pubkey:32]`.
-const PUBKEY_EXCHANGE_SIZE: usize = 33;
+/// Pre-handshake pubkey exchange message size: `[0x00][role:1][pubkey:32]`.
+const PUBKEY_EXCHANGE_SIZE: usize = 34;
+const PUBKEY_EXCHANGE_ROLE_INDEX: usize = 1;
+const PUBKEY_EXCHANGE_PUBKEY_START: usize = 2;
 
 /// Timeout for pubkey exchange recv (seconds).
 ///
@@ -693,6 +735,8 @@ const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
 
 #[cfg(not(feature = "ble-macos"))]
 const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
+
+const ROLE_MISMATCH_BACKOFF_SECS: u64 = 600;
 
 async fn recv_pubkey_frame<S: BleStream>(
     stream: &S,
@@ -743,6 +787,7 @@ async fn send_pubkey_frame<S: BleStream>(
     stream: &S,
     local_pubkey: &[u8; 32],
     role: PubkeyExchangeRole,
+    role_policy: BleConnectionRolePolicy,
 ) -> Result<(), TransportError> {
     let role_name = match role {
         PubkeyExchangeRole::Initiator => "initiator",
@@ -751,7 +796,8 @@ async fn send_pubkey_frame<S: BleStream>(
 
     let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
     msg[0] = PUBKEY_EXCHANGE_PREFIX;
-    msg[1..].copy_from_slice(local_pubkey);
+    msg[PUBKEY_EXCHANGE_ROLE_INDEX] = role_policy.to_wire();
+    msg[PUBKEY_EXCHANGE_PUBKEY_START..].copy_from_slice(local_pubkey);
 
     debug!(role = role_name, bytes = msg.len(), "BLE pubkey exchange send start");
     stream.send(&msg).await?;
@@ -774,6 +820,69 @@ enum PubkeyExchangeRole {
     Responder,
 }
 
+impl PubkeyExchangeRole {
+    const fn opposite(self) -> Self {
+        match self {
+            Self::Initiator => Self::Responder,
+            Self::Responder => Self::Initiator,
+        }
+    }
+}
+
+impl BleConnectionRolePolicy {
+    const fn supports(self, role: PubkeyExchangeRole) -> bool {
+        match role {
+            PubkeyExchangeRole::Initiator => self.supports_outbound(),
+            PubkeyExchangeRole::Responder => self.supports_inbound(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PubkeyExchangePeer {
+    pubkey: XOnlyPublicKey,
+    role_policy: BleConnectionRolePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleResolution {
+    Keep,
+    DropTieBreaker,
+    DropPolicyMismatch,
+}
+
+fn resolve_connection_role(
+    local_role_policy: BleConnectionRolePolicy,
+    peer_role_policy: BleConnectionRolePolicy,
+    local_role: PubkeyExchangeRole,
+    local_node_addr: Option<&NodeAddr>,
+    peer_pubkey: &XOnlyPublicKey,
+) -> RoleResolution {
+    if !local_role_policy.supports(local_role)
+        || !peer_role_policy.supports(local_role.opposite())
+    {
+        return RoleResolution::DropPolicyMismatch;
+    }
+
+    if local_role_policy == BleConnectionRolePolicy::Flexible
+        && peer_role_policy == BleConnectionRolePolicy::Flexible
+        && let Some(our_addr) = local_node_addr
+    {
+        let peer_addr = NodeAddr::from_pubkey(peer_pubkey);
+        match local_role {
+            PubkeyExchangeRole::Initiator if our_addr >= &peer_addr => {
+                return RoleResolution::DropTieBreaker;
+            }
+            PubkeyExchangeRole::Responder if our_addr < &peer_addr => {
+                return RoleResolution::DropTieBreaker;
+            }
+            _ => {}
+        }
+    }
+
+    RoleResolution::Keep
+}
+
 /// Exchange public keys over a newly established L2CAP connection.
 ///
 /// Uses role-based asymmetric handshake to prevent race conditions:
@@ -785,7 +894,8 @@ async fn pubkey_exchange<S: BleStream>(
     stream: &S,
     local_pubkey: &[u8; 32],
     role: PubkeyExchangeRole,
-) -> Result<XOnlyPublicKey, TransportError> {
+    role_policy: BleConnectionRolePolicy,
+) -> Result<PubkeyExchangePeer, TransportError> {
     let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE];
     let role_name = match role {
         PubkeyExchangeRole::Initiator => "initiator",
@@ -798,7 +908,7 @@ async fn pubkey_exchange<S: BleStream>(
     match role {
         PubkeyExchangeRole::Initiator => {
             debug!(role = role_name, "BLE pubkey exchange: sending our pubkey");
-            send_pubkey_frame(stream, local_pubkey, role).await?;
+            send_pubkey_frame(stream, local_pubkey, role, role_policy).await?;
             debug!(role = role_name, elapsed_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange: sent, now receiving peer pubkey");
             recv_pubkey_frame(stream, &mut buf, role).await?;
         }
@@ -806,7 +916,7 @@ async fn pubkey_exchange<S: BleStream>(
             debug!(role = role_name, "BLE pubkey exchange: receiving peer pubkey");
             recv_pubkey_frame(stream, &mut buf, role).await?;
             debug!(role = role_name, elapsed_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange: received, now sending our pubkey");
-            send_pubkey_frame(stream, local_pubkey, role).await?;
+            send_pubkey_frame(stream, local_pubkey, role, role_policy).await?;
         }
     }
 
@@ -819,11 +929,15 @@ async fn pubkey_exchange<S: BleStream>(
         )));
     }
 
-    let peer_pubkey = XOnlyPublicKey::from_slice(&buf[1..])
+    let peer_role_policy = BleConnectionRolePolicy::from_wire(buf[PUBKEY_EXCHANGE_ROLE_INDEX])?;
+    let peer_pubkey = XOnlyPublicKey::from_slice(&buf[PUBKEY_EXCHANGE_PUBKEY_START..])
         .map_err(|e| TransportError::RecvFailed(format!("pubkey exchange: invalid key: {}", e)))?;
     
     debug!(role = role_name, total_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange complete");
-    Ok(peer_pubkey)
+    Ok(PubkeyExchangePeer {
+        pubkey: peer_pubkey,
+        role_policy: peer_role_policy,
+    })
 }
 
 // Beacon loop removed — advertising is now continuous (started once
@@ -843,7 +957,7 @@ async fn accept_loop<A>(
     local_pubkey: Option<[u8; 32]>,
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_node_addr: Option<NodeAddr>,
-    disable_tiebreaker: bool,
+    local_role_policy: BleConnectionRolePolicy,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -868,24 +982,41 @@ async fn accept_loop<A>(
 
                 // Pre-handshake pubkey exchange (temporary, pre-XX)
                 if let Some(ref our_pubkey) = local_pubkey {
-                    match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Responder).await {
-                        Ok(peer_pubkey) => {
+                    match pubkey_exchange(
+                        &stream,
+                        our_pubkey,
+                        PubkeyExchangeRole::Responder,
+                        local_role_policy,
+                    )
+                    .await
+                    {
+                        Ok(peer) => {
                             debug!(addr = %ta, "BLE inbound pubkey exchange complete");
-                            discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                            discovery_buffer.add_peer_with_pubkey(&addr, peer.pubkey);
 
-                            // Cross-probe tie-breaker: smaller NodeAddr's
-                            // outbound wins. If we're smaller, our outbound
-                            // should win — drop this inbound.
-                            if !disable_tiebreaker {
-                                if let Some(ref our_addr) = local_node_addr {
-                                    let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
-                                    if our_addr < &peer_addr {
-                                        debug!(
-                                            addr = %ta,
-                                            "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
-                                        );
-                                        continue;
-                                    }
+                            match resolve_connection_role(
+                                local_role_policy,
+                                peer.role_policy,
+                                PubkeyExchangeRole::Responder,
+                                local_node_addr.as_ref(),
+                                &peer.pubkey,
+                            ) {
+                                RoleResolution::Keep => {}
+                                RoleResolution::DropTieBreaker => {
+                                    debug!(
+                                        addr = %ta,
+                                        "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
+                                    );
+                                    continue;
+                                }
+                                RoleResolution::DropPolicyMismatch => {
+                                    warn!(
+                                        addr = %ta,
+                                        local_role_policy = ?local_role_policy,
+                                        peer_role_policy = ?peer.role_policy,
+                                        "BLE inbound role policy mismatch; dropping connection"
+                                    );
+                                    continue;
                                 }
                             }
                         }
@@ -1130,14 +1261,16 @@ async fn scan_probe_loop<I: io::BleIo>(
     local_node_addr: Option<NodeAddr>,
     packet_tx: PacketTx,
     transport_id: TransportId,
-    disable_tiebreaker: bool,
+    local_role_policy: BleConnectionRolePolicy,
 ) {
     // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
+    let mut role_mismatch_until: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
     // Addresses discovered but not yet connected — retried after cooldown
     // even if the scanner doesn't fire again (BlueZ deduplicates).
     let mut pending_addrs: Vec<BleAddr> = Vec::new();
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
+    let role_mismatch_backoff = std::time::Duration::from_secs(ROLE_MISMATCH_BACKOFF_SECS);
     let retry_interval = tokio::time::interval(std::time::Duration::from_secs(cooldown_secs));
     tokio::pin!(retry_interval);
     retry_interval.tick().await; // consume initial tick
@@ -1167,6 +1300,9 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         };
 
+        let now = tokio::time::Instant::now();
+        role_mismatch_until.retain(|_, until| *until > now);
+
         trace!(addr = %addr, "BLE scan result");
         stats.record_scan_result();
 
@@ -1189,6 +1325,14 @@ async fn scan_probe_loop<I: io::BleIo>(
             .get(&addr)
             .is_some_and(|last| last.elapsed() < cooldown)
         {
+            continue;
+        }
+
+        if role_mismatch_until
+            .get(&addr)
+            .is_some_and(|until| *until > tokio::time::Instant::now())
+        {
+            trace!(addr = %addr, "BLE scan result suppressed by role mismatch backoff");
             continue;
         }
 
@@ -1225,7 +1369,14 @@ async fn scan_probe_loop<I: io::BleIo>(
 
         // Pubkey exchange, then promote connection to pool
         if ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION {
-            match send_pubkey_frame(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
+            match send_pubkey_frame(
+                &stream,
+                &our_pubkey,
+                PubkeyExchangeRole::Initiator,
+                local_role_policy,
+            )
+            .await
+            {
                 Ok(()) => {
                     promote_probe_connection(
                         stream,
@@ -1246,23 +1397,45 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         }
 
-        match pubkey_exchange(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
-            Ok(peer_pubkey) => {
+        match pubkey_exchange(
+            &stream,
+            &our_pubkey,
+            PubkeyExchangeRole::Initiator,
+            local_role_policy,
+        )
+        .await
+        {
+            Ok(peer) => {
                 debug!(addr = %addr, "BLE probe complete");
 
-                // Cross-probe tie-breaker: smaller NodeAddr's outbound wins.
-                // If we lose, drop connection — accept_loop handles inbound.
-                if !disable_tiebreaker {
-                    if let Some(ref our_addr) = local_node_addr {
-                        let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
-                        if our_addr >= &peer_addr {
-                            debug!(
-                                addr = %addr,
-                                "BLE probe tie-breaker: yielding to peer's outbound"
-                            );
-                            buffer.add_peer_with_pubkey(&addr, peer_pubkey);
-                            continue;
-                        }
+                match resolve_connection_role(
+                    local_role_policy,
+                    peer.role_policy,
+                    PubkeyExchangeRole::Initiator,
+                    local_node_addr.as_ref(),
+                    &peer.pubkey,
+                ) {
+                    RoleResolution::Keep => {}
+                    RoleResolution::DropTieBreaker => {
+                        debug!(
+                            addr = %addr,
+                            "BLE probe tie-breaker: yielding to peer's outbound"
+                        );
+                        buffer.add_peer_with_pubkey(&addr, peer.pubkey);
+                        continue;
+                    }
+                    RoleResolution::DropPolicyMismatch => {
+                        warn!(
+                            addr = %addr,
+                            local_role_policy = ?local_role_policy,
+                            peer_role_policy = ?peer.role_policy,
+                            backoff_secs = ROLE_MISMATCH_BACKOFF_SECS,
+                            "BLE probe role policy mismatch; backing off"
+                        );
+                        role_mismatch_until
+                            .insert(addr.clone(), tokio::time::Instant::now() + role_mismatch_backoff);
+                        pending_addrs.retain(|a| a != &addr);
+                        continue;
                     }
                 }
 
@@ -1279,7 +1452,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                 pending_addrs.retain(|a| a != &addr);
 
                 // Report to node layer for auto-connect / handshake
-                buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                buffer.add_peer_with_pubkey(&addr, peer.pubkey);
             }
             Err(e) => {
                 if matches!(e, TransportError::Timeout) && ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION {
@@ -1439,17 +1612,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_outbound_only_backend_skips_inbound_tasks() {
+        let io = MockBleIo::new("hci0", test_addr(1))
+            .with_role_policy(BleConnectionRolePolicy::OutboundOnly);
+        let (mut transport, _rx) = make_transport(io);
+
+        transport.start_async().await.unwrap();
+
+        assert!(transport.accept_task.is_none());
+        assert!(transport.scan_probe_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_inbound_only_backend_skips_scan_task() {
+        let io = MockBleIo::new("hci0", test_addr(1))
+            .with_role_policy(BleConnectionRolePolicy::InboundOnly);
+        let (mut transport, _rx) = make_transport(io);
+
+        transport.start_async().await.unwrap();
+
+        assert!(transport.accept_task.is_some());
+        assert!(transport.scan_probe_task.is_none());
+    }
+
+    #[tokio::test]
     async fn test_pubkey_exchange_completes_for_role_asymmetry() {
         let (stream_a, stream_b) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
         let pubkey_a = test_pubkey(3);
         let pubkey_b = test_pubkey(9);
 
-        let initiator = pubkey_exchange(&stream_a, &pubkey_a, PubkeyExchangeRole::Initiator);
-        let responder = pubkey_exchange(&stream_b, &pubkey_b, PubkeyExchangeRole::Responder);
+        let initiator = pubkey_exchange(
+            &stream_a,
+            &pubkey_a,
+            PubkeyExchangeRole::Initiator,
+            BleConnectionRolePolicy::Flexible,
+        );
+        let responder = pubkey_exchange(
+            &stream_b,
+            &pubkey_b,
+            PubkeyExchangeRole::Responder,
+            BleConnectionRolePolicy::Flexible,
+        );
         let (peer_from_initiator, peer_from_responder) = tokio::join!(initiator, responder);
 
-        assert_eq!(peer_from_initiator.unwrap().serialize(), pubkey_b);
-        assert_eq!(peer_from_responder.unwrap().serialize(), pubkey_a);
+        let peer_from_initiator = peer_from_initiator.unwrap();
+        let peer_from_responder = peer_from_responder.unwrap();
+        assert_eq!(peer_from_initiator.pubkey.serialize(), pubkey_b);
+        assert_eq!(peer_from_responder.pubkey.serialize(), pubkey_a);
+        assert_eq!(peer_from_initiator.role_policy, BleConnectionRolePolicy::Flexible);
+        assert_eq!(peer_from_responder.role_policy, BleConnectionRolePolicy::Flexible);
     }
 
     #[tokio::test]
@@ -1457,7 +1668,8 @@ mod tests {
         let peer_pubkey = test_pubkey(21);
         let mut frame = [0u8; PUBKEY_EXCHANGE_SIZE];
         frame[0] = PUBKEY_EXCHANGE_PREFIX;
-        frame[1..].copy_from_slice(&peer_pubkey);
+        frame[PUBKEY_EXCHANGE_ROLE_INDEX] = BleConnectionRolePolicy::OutboundOnly.to_wire();
+        frame[PUBKEY_EXCHANGE_PUBKEY_START..].copy_from_slice(&peer_pubkey);
 
         let stream = FragmentingBleStream::new(
             test_addr(2),
@@ -1468,11 +1680,13 @@ mod tests {
             &stream,
             &test_pubkey(11),
             PubkeyExchangeRole::Initiator,
+            BleConnectionRolePolicy::Flexible,
         )
         .await
         .unwrap();
 
-        assert_eq!(received.serialize(), peer_pubkey);
+        assert_eq!(received.pubkey.serialize(), peer_pubkey);
+        assert_eq!(received.role_policy, BleConnectionRolePolicy::OutboundOnly);
         let sent = stream.sent_frames().await;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].len(), PUBKEY_EXCHANGE_SIZE);
@@ -1484,23 +1698,31 @@ mod tests {
         let local_pubkey = test_pubkey(32);
         let mut frame = [0u8; PUBKEY_EXCHANGE_SIZE];
         frame[0] = PUBKEY_EXCHANGE_PREFIX;
-        frame[1..].copy_from_slice(&peer_pubkey);
+        frame[PUBKEY_EXCHANGE_ROLE_INDEX] = BleConnectionRolePolicy::Flexible.to_wire();
+        frame[PUBKEY_EXCHANGE_PUBKEY_START..].copy_from_slice(&peer_pubkey);
 
         let stream = FragmentingBleStream::new(
             test_addr(3),
             vec![frame[..1].to_vec(), frame[1..16].to_vec(), frame[16..].to_vec()],
         );
 
-        let received = pubkey_exchange(&stream, &local_pubkey, PubkeyExchangeRole::Responder)
-            .await
-            .unwrap();
+        let received = pubkey_exchange(
+            &stream,
+            &local_pubkey,
+            PubkeyExchangeRole::Responder,
+            BleConnectionRolePolicy::InboundOnly,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(received.serialize(), peer_pubkey);
+        assert_eq!(received.pubkey.serialize(), peer_pubkey);
+        assert_eq!(received.role_policy, BleConnectionRolePolicy::Flexible);
 
         let sent = stream.sent_frames().await;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0][0], PUBKEY_EXCHANGE_PREFIX);
-        assert_eq!(&sent[0][1..], &local_pubkey);
+        assert_eq!(sent[0][PUBKEY_EXCHANGE_ROLE_INDEX], BleConnectionRolePolicy::InboundOnly.to_wire());
+        assert_eq!(&sent[0][PUBKEY_EXCHANGE_PUBKEY_START..], &local_pubkey);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1588,6 +1810,46 @@ mod tests {
         // accept_loop (inbound): drops when our_addr < peer_addr
         // Smaller node accepting from larger → drops inbound (outbound wins)
         // This means: smaller always uses outbound, larger always uses inbound
+    }
+
+    #[test]
+    fn test_role_resolution_respects_asymmetric_policies() {
+        let local_pubkey = XOnlyPublicKey::from_slice(&test_pubkey(1)).unwrap();
+        let peer_pubkey = XOnlyPublicKey::from_slice(&test_pubkey(2)).unwrap();
+        let local_addr = NodeAddr::from_pubkey(&local_pubkey);
+
+        assert_eq!(
+            resolve_connection_role(
+                BleConnectionRolePolicy::OutboundOnly,
+                BleConnectionRolePolicy::Flexible,
+                PubkeyExchangeRole::Initiator,
+                Some(&local_addr),
+                &peer_pubkey,
+            ),
+            RoleResolution::Keep
+        );
+
+        assert_eq!(
+            resolve_connection_role(
+                BleConnectionRolePolicy::Flexible,
+                BleConnectionRolePolicy::OutboundOnly,
+                PubkeyExchangeRole::Initiator,
+                Some(&local_addr),
+                &peer_pubkey,
+            ),
+            RoleResolution::DropPolicyMismatch
+        );
+
+        assert_eq!(
+            resolve_connection_role(
+                BleConnectionRolePolicy::OutboundOnly,
+                BleConnectionRolePolicy::InboundOnly,
+                PubkeyExchangeRole::Initiator,
+                Some(&local_addr),
+                &peer_pubkey,
+            ),
+            RoleResolution::Keep
+        );
     }
 
     #[test]

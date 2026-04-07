@@ -9,11 +9,9 @@ transports:
   ble:
     mtu: 2048
     psm: 133
-    advertise: true
-    scan: false
-    auto_connect: false
-    accept_connections: true
+    advertise: false
+    scan: true
+    auto_connect: true
+    accept_connections: false
     connect_timeout_ms: 10000
-    # Disable tie-breaker for unidirectional topology (we advertise, Linux probes)
-    disable_tiebreaker: true
 peers: []

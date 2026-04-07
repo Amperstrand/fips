@@ -8,7 +8,7 @@
 use crate::transport::TransportError;
 
 use super::super::addr::{BleAddr, BleDeviceAddr};
-use super::{BleIo, BleStream, BleAcceptor, BleScanner};
+use super::{BleAcceptor, BleConnectionRolePolicy, BleIo, BleScanner, BleStream};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -246,5 +246,9 @@ impl BleIo for BluestIo {
 
     fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    fn role_policy(&self) -> BleConnectionRolePolicy {
+        BleConnectionRolePolicy::OutboundOnly
     }
 }

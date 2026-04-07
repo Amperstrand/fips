@@ -6,7 +6,7 @@
 
 #[cfg(all(target_os = "macos", feature = "ble-macos"))]
 mod tests {
-    use crate::transport::ble::io::{BluestIo, BleIo};
+    use crate::transport::ble::io::{BleConnectionRolePolicy, BleIo, BluestIo};
     use crate::transport::TransportError;
 
     #[tokio::test]
@@ -71,5 +71,11 @@ mod tests {
     async fn test_bluest_io_adapter_name() {
         let io = BluestIo::new("default", 2048).await.expect("BluestIo::new");
         assert_eq!(io.adapter_name(), "default");
+    }
+
+    #[tokio::test]
+    async fn test_bluest_io_role_policy_is_outbound_only() {
+        let io = BluestIo::new("default", 2048).await.expect("BluestIo::new");
+        assert_eq!(io.role_policy(), BleConnectionRolePolicy::OutboundOnly);
     }
 }
