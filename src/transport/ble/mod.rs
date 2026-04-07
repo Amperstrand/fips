@@ -947,6 +947,37 @@ async fn accept_loop<A>(
 /// Receive loop: reads packets from a BLE stream and delivers to node.
 ///
 /// Some BLE controllers coalesce back-to-back sends into a single recv()
+/// Calculate the total frame length from a frame prefix.
+///
+/// # Arguments
+/// * `prefix` - The first 4 bytes of an FMP frame
+///
+/// # Returns
+/// * `Some(frame_len)` if the prefix is valid
+/// * `None` if the prefix is too short
+///
+/// # Wire Format
+/// - Bytes [0,1]: version/phase + flags
+/// - Bytes [2,3]: payload_len (little-endian u16)
+/// - For established frames (phase 0x0): header(16) + payload_len + tag(16)
+/// - For handshake frames (phase 0x1/0x2): prefix(4) + payload_len
+fn calculate_frame_len(prefix: &[u8]) -> Option<usize> {
+    if prefix.len() < crate::node::wire::COMMON_PREFIX_SIZE {
+        return None;
+    }
+
+    let phase = prefix[0] & 0x0F;
+    let payload_len = u16::from_le_bytes([prefix[2], prefix[3]]) as usize;
+
+    let frame_len = if phase == crate::node::wire::PHASE_ESTABLISHED {
+        crate::node::wire::ESTABLISHED_HEADER_SIZE + payload_len + crate::noise::TAG_SIZE
+    } else {
+        crate::node::wire::COMMON_PREFIX_SIZE + payload_len
+    };
+
+    Some(frame_len)
+}
+
 /// call despite SeqPacket semantics. This loop splits coalesced data on
 /// FMP frame boundaries using the payload_len field in each 4-byte prefix.
 async fn receive_loop<S: BleStream>(
@@ -969,17 +1000,19 @@ async fn receive_loop<S: BleStream>(
                 let mut remaining = &buf[..n];
                 let mut frame_count = 0u32;
                 while !remaining.is_empty() {
-                    if remaining.len() < crate::node::wire::COMMON_PREFIX_SIZE {
-                        debug!(
-                            addr = %addr,
-                            leftover = remaining.len(),
-                            "BLE receive: leftover bytes shorter than FMP prefix, discarding"
-                        );
-                        break;
-                    }
-                    let prefix = u16::from_le_bytes([remaining[2], remaining[3]]);
-                    let frame_len = crate::node::wire::COMMON_PREFIX_SIZE + prefix as usize;
-                    if frame_len == crate::node::wire::COMMON_PREFIX_SIZE || frame_len > remaining.len() {
+                    let frame_len = match calculate_frame_len(remaining) {
+                        Some(len) => len,
+                        None => {
+                            debug!(
+                                addr = %addr,
+                                leftover = remaining.len(),
+                                "BLE receive: leftover bytes shorter than FMP prefix, discarding"
+                            );
+                            break;
+                        }
+                    };
+
+                    if frame_len < crate::node::wire::COMMON_PREFIX_SIZE || frame_len > remaining.len() {
                         debug!(
                             addr = %addr,
                             frame_len,
@@ -1555,5 +1588,90 @@ mod tests {
         // accept_loop (inbound): drops when our_addr < peer_addr
         // Smaller node accepting from larger → drops inbound (outbound wins)
         // This means: smaller always uses outbound, larger always uses inbound
+    }
+
+    #[test]
+    fn test_calculate_frame_len_prefix_too_short() {
+        // Less than 4 bytes should return None
+        assert!(calculate_frame_len(&[]).is_none());
+        assert!(calculate_frame_len(&[0x00]).is_none());
+        assert!(calculate_frame_len(&[0x00, 0x00]).is_none());
+        assert!(calculate_frame_len(&[0x00, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn test_calculate_frame_len_established_frame() {
+        // Established frame (phase 0x0): header(16) + payload_len + tag(16)
+        // payload_len = 0 (minimum)
+        let prefix = [0x00, 0x00, 0x00, 0x00]; // phase=0, payload_len=0
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 0 + 16); // = 32 bytes total
+
+        // payload_len = 100
+        let prefix = [0x00, 0x00, 0x64, 0x00]; // phase=0, payload_len=100
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 100 + 16); // = 132 bytes total
+
+        // payload_len = 1280 (max MTU)
+        let prefix = [0x00, 0x00, 0x00, 0x05]; // phase=0, payload_len=1280 (0x0500 LE)
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 1280 + 16); // = 1312 bytes total
+    }
+
+    #[test]
+    fn test_calculate_frame_len_handshake_msg1() {
+        // Handshake msg1 (phase 0x1): prefix(4) + payload_len
+        let prefix = [0x01, 0x00, 0x20, 0x00]; // phase=1, payload_len=32
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 4 + 32); // = 36 bytes total
+    }
+
+    #[test]
+    fn test_calculate_frame_len_handshake_msg2() {
+        // Handshake msg2 (phase 0x2): prefix(4) + payload_len
+        let prefix = [0x02, 0x00, 0x30, 0x00]; // phase=2, payload_len=48
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 4 + 48); // = 52 bytes total
+    }
+
+    #[test]
+    fn test_calculate_frame_len_phase_with_flags() {
+        // Phase can have flags in high nibble of first byte
+        // Established with flags (0x10 = phase 0, flag bit 4 set)
+        let prefix = [0x10, 0x00, 0x40, 0x00]; // phase=0 (0x10 & 0x0F), payload_len=64
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 64 + 16); // = 96 bytes total (established)
+
+        // Handshake msg1 with flags (0x11 = phase 1, flag bit 4 set)
+        let prefix = [0x11, 0x00, 0x20, 0x00]; // phase=1 (0x11 & 0x0F), payload_len=32
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 4 + 32); // = 36 bytes total (handshake)
+    }
+
+    #[test]
+    fn test_calculate_frame_len_various_payload_sizes() {
+        // Test various payload sizes for established frames
+        for payload_len in [0, 1, 16, 64, 128, 256, 512, 1000, 1280] {
+            let prefix = [
+                0x00, // phase 0 (established)
+                0x00,
+                (payload_len & 0xFF) as u8,
+                ((payload_len >> 8) & 0xFF) as u8,
+            ];
+            let frame_len = calculate_frame_len(&prefix).unwrap();
+            assert_eq!(frame_len, 16 + payload_len as usize + 16);
+        }
+
+        // Test various payload sizes for handshake frames
+        for payload_len in [0, 1, 16, 32, 48, 64, 128] {
+            let prefix = [
+                0x01, // phase 1 (handshake msg1)
+                0x00,
+                (payload_len & 0xFF) as u8,
+                ((payload_len >> 8) & 0xFF) as u8,
+            ];
+            let frame_len = calculate_frame_len(&prefix).unwrap();
+            assert_eq!(frame_len, 4 + payload_len as usize);
+        }
     }
 }
