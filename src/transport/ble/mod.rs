@@ -89,6 +89,9 @@ pub struct BleTransport<I: BleIo> {
     pool: Arc<Mutex<ConnectionPool<Arc<I::Stream>>>>,
     /// Pending connection attempts.
     connecting: Arc<Mutex<HashMap<TransportAddr, ConnectingEntry>>>,
+    /// Addresses where inbound has won cross-connection resolution.
+    /// Outbound background tasks check this before inserting into the pool.
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
     /// Accept loop task handle.
@@ -131,6 +134,7 @@ impl<I: BleIo> BleTransport<I> {
             io: Arc::new(io),
             pool: Arc::new(Mutex::new(ConnectionPool::new(max_conns))),
             connecting: Arc::new(Mutex::new(HashMap::new())),
+            blocked_outbound_addrs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             packet_tx,
             accept_task: None,
             scan_probe_task: None,
@@ -202,6 +206,7 @@ impl<I: BleIo> BleTransport<I> {
                         Arc::clone(&self.discovery_buffer),
                         local_node_addr,
                         self.config.disable_tiebreaker(),
+                        Arc::clone(&self.blocked_outbound_addrs),
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
@@ -243,6 +248,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.packet_tx.clone(),
                         self.transport_id,
                         self.config.disable_tiebreaker(),
+                        Arc::clone(&self.blocked_outbound_addrs),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -415,6 +421,7 @@ impl<I: BleIo> BleTransport<I> {
             self.transport_id,
             Arc::clone(&self.stats),
             recv_mtu,
+            Arc::clone(&self.blocked_outbound_addrs),
         ));
 
         let conn = BleConnection {
@@ -475,6 +482,7 @@ impl<I: BleIo> BleTransport<I> {
         let io = Arc::clone(&self.io);
         let pool = Arc::clone(&self.pool);
         let connecting = Arc::clone(&self.connecting);
+        let blocked_outbound_addrs = Arc::clone(&self.blocked_outbound_addrs);
         let packet_tx = self.packet_tx.clone();
         let transport_id = self.transport_id;
         let stats = Arc::clone(&self.stats);
@@ -526,6 +534,7 @@ impl<I: BleIo> BleTransport<I> {
                         transport_id,
                         Arc::clone(&stats),
                         recv_mtu,
+                        Arc::clone(&blocked_outbound_addrs),
                     ));
 
                     let conn = BleConnection {
@@ -539,6 +548,10 @@ impl<I: BleIo> BleTransport<I> {
                     };
 
                     let mut pool = pool.lock().await;
+                    if blocked_outbound_addrs.lock().await.contains(&addr_clone) {
+                        debug!(addr = %addr_clone, "Outbound blocked (inbound won cross-connection), dropping");
+                        return;
+                    }
                     match pool.insert(addr_clone.clone(), conn) {
                         Ok(Some(evicted)) => {
                             stats.record_pool_eviction();
@@ -594,10 +607,11 @@ impl<I: BleIo> BleTransport<I> {
 
     /// Close a specific connection.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
+        self.blocked_outbound_addrs.lock().await.insert(addr.clone());
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            debug!(addr = %addr, "BLE connection closed");
-            drop(conn); // recv_task aborted via Drop
+            info!(addr = %addr, "BLE connection closed, outbound blocked for this address");
+            drop(conn);
         }
     }
 
@@ -844,6 +858,7 @@ async fn accept_loop<A>(
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_node_addr: Option<NodeAddr>,
     disable_tiebreaker: bool,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -907,6 +922,7 @@ async fn accept_loop<A>(
                     transport_id,
                     Arc::clone(&stats),
                     recv_mtu,
+                    Arc::clone(&blocked_outbound_addrs),
                 ));
 
                 let conn = BleConnection {
@@ -988,6 +1004,7 @@ async fn receive_loop<S: BleStream>(
     transport_id: TransportId,
     stats: Arc<BleStats>,
     recv_mtu: u16,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
 ) {
     let mut buf = vec![0u8; recv_mtu as usize];
     loop {
@@ -1047,9 +1064,9 @@ async fn receive_loop<S: BleStream>(
         }
     }
 
-    // Remove from pool
     let mut pool = pool.lock().await;
     pool.remove(&addr);
+    blocked_outbound_addrs.lock().await.remove(&addr);
 }
 
 async fn promote_probe_connection<S: BleStream + 'static>(
@@ -1059,6 +1076,7 @@ async fn promote_probe_connection<S: BleStream + 'static>(
     packet_tx: PacketTx,
     transport_id: TransportId,
     stats: Arc<BleStats>,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
 ) {
     let ta = addr.to_transport_addr();
     let send_mtu = stream.send_mtu();
@@ -1073,6 +1091,7 @@ async fn promote_probe_connection<S: BleStream + 'static>(
         transport_id,
         Arc::clone(&stats),
         recv_mtu,
+        Arc::clone(&blocked_outbound_addrs),
     ));
 
     let conn = BleConnection {
@@ -1131,6 +1150,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     packet_tx: PacketTx,
     transport_id: TransportId,
     disable_tiebreaker: bool,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
 ) {
     // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
@@ -1234,6 +1254,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         packet_tx.clone(),
                         transport_id,
                         Arc::clone(&stats),
+                        Arc::clone(&blocked_outbound_addrs),
                     )
                     .await;
                     pending_addrs.retain(|a| a != &addr);
@@ -1274,6 +1295,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     packet_tx.clone(),
                     transport_id,
                     Arc::clone(&stats),
+                    Arc::clone(&blocked_outbound_addrs),
                 )
                 .await;
                 pending_addrs.retain(|a| a != &addr);
@@ -1294,6 +1316,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         packet_tx.clone(),
                         transport_id,
                         Arc::clone(&stats),
+                        Arc::clone(&blocked_outbound_addrs),
                     )
                     .await;
                     pending_addrs.retain(|a| a != &addr);
