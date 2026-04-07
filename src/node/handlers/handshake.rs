@@ -105,12 +105,15 @@ impl Node {
                 if is_active_peer {
                     possible_restart = true;
                 } else {
-                    debug!(
+                    info!(
                         transport_id = %packet.transport_id,
                         remote_addr = %packet.remote_addr,
                         existing_link_id = %existing_link_id,
-                        "Cross-connection detected: have outbound, received inbound msg1"
+                        "Cross-connection detected: closing stale outbound transport socket"
                     );
+                    if let Some(transport) = self.transports.get(&packet.transport_id) {
+                        transport.close_connection(&packet.remote_addr).await;
+                    }
                 }
             }
         }
@@ -426,6 +429,7 @@ impl Node {
                             our_index = %our_index,
                             "Inbound peer promoted to active"
                         );
+
                         // Send initial tree announce to new peer
                         if let Err(e) = self.send_tree_announce_to_peer(&node_addr).await {
                             debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send initial TreeAnnounce");
@@ -978,14 +982,7 @@ impl Node {
                 })
             }
         } else {
-            // No existing promoted peer. There may be a pending outbound
-            // connection to the same peer (cross-connection in progress).
-            // Do NOT clean it up yet — we need the outbound to stay alive
-            // so that when the peer's msg2 arrives, we can learn the peer's
-            // inbound session index and update their_index on the promoted
-            // peer. The outbound will be cleaned up in handle_msg2 or by
-            // the 30s handshake timeout.
-            let pending_to_same_peer: Vec<LinkId> = self
+            let _pending_to_same_peer: Vec<LinkId> = self
                 .connections
                 .iter()
                 .filter(|(_, conn)| {
@@ -995,15 +992,6 @@ impl Node {
                 })
                 .map(|(lid, _)| *lid)
                 .collect();
-
-            for pending_link_id in &pending_to_same_peer {
-                debug!(
-                    peer = %self.peer_display_name(&peer_node_addr),
-                    pending_link_id = %pending_link_id,
-                    promoted_link_id = %link_id,
-                    "Deferring cleanup of pending outbound (awaiting msg2 for index update)"
-                );
-            }
 
             // Normal promotion
             if self.max_peers > 0 && self.peers.len() >= self.max_peers {
