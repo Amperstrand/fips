@@ -110,15 +110,10 @@
     </div>
 
     <script>
-        // Configuration - UPDATE THIS
         const CONFIG = {
-            // Option 1: Use a proxy server (recommended)
-            proxyUrl: 'http://localhost:8080/api',
-            
-            // Option 2: Paste JSON data directly
-            staticData: null,  // Set to JSON string for offline mode
-            
-            refreshInterval: 5000  // ms
+            proxyUrl: '/api',
+            staticData: null,
+            refreshInterval: 5000
         };
 
         let cy = null;
