@@ -883,6 +883,10 @@ fn resolve_connection_role(
     RoleResolution::Keep
 }
 
+fn remove_pending_addr(pending_addrs: &mut Vec<BleAddr>, addr: &BleAddr) {
+    pending_addrs.retain(|a| a != addr);
+}
+
 /// Exchange public keys over a newly established L2CAP connection.
 ///
 /// Uses role-based asymmetric handshake to prevent race conditions:
@@ -1270,7 +1274,6 @@ async fn scan_probe_loop<I: io::BleIo>(
     // even if the scanner doesn't fire again (BlueZ deduplicates).
     let mut pending_addrs: Vec<BleAddr> = Vec::new();
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
-    let role_mismatch_backoff = std::time::Duration::from_secs(ROLE_MISMATCH_BACKOFF_SECS);
     let retry_interval = tokio::time::interval(std::time::Duration::from_secs(cooldown_secs));
     tokio::pin!(retry_interval);
     retry_interval.tick().await; // consume initial tick
@@ -1310,7 +1313,7 @@ async fn scan_probe_loop<I: io::BleIo>(
         {
             let pool_guard = pool.lock().await;
             if pool_guard.contains(&addr.to_transport_addr()) {
-                pending_addrs.retain(|a| a != &addr);
+                remove_pending_addr(&mut pending_addrs, &addr);
                 continue;
             }
         }
@@ -1387,7 +1390,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         Arc::clone(&stats),
                     )
                     .await;
-                    pending_addrs.retain(|a| a != &addr);
+                    remove_pending_addr(&mut pending_addrs, &addr);
                     continue;
                 }
                 Err(e) => {
@@ -1433,8 +1436,12 @@ async fn scan_probe_loop<I: io::BleIo>(
                             "BLE probe role policy mismatch; backing off"
                         );
                         role_mismatch_until
-                            .insert(addr.clone(), tokio::time::Instant::now() + role_mismatch_backoff);
-                        pending_addrs.retain(|a| a != &addr);
+                            .insert(
+                                addr.clone(),
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(ROLE_MISMATCH_BACKOFF_SECS),
+                            );
+                        remove_pending_addr(&mut pending_addrs, &addr);
                         continue;
                     }
                 }
@@ -1449,7 +1456,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     Arc::clone(&stats),
                 )
                 .await;
-                pending_addrs.retain(|a| a != &addr);
+                remove_pending_addr(&mut pending_addrs, &addr);
 
                 // Report to node layer for auto-connect / handshake
                 buffer.add_peer_with_pubkey(&addr, peer.pubkey);
@@ -1469,7 +1476,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         Arc::clone(&stats),
                     )
                     .await;
-                    pending_addrs.retain(|a| a != &addr);
+                    remove_pending_addr(&mut pending_addrs, &addr);
                     continue;
                 }
                 debug!(addr = %addr, error = %e, "BLE probe pubkey exchange failed");

@@ -6,7 +6,7 @@
 
 use crate::transport::TransportError;
 
-use super::addr::{BleAddr, BleDeviceAddr};
+use super::addr::BleAddr;
 
 // ============================================================================
 // BLE I/O Traits
@@ -764,6 +764,7 @@ impl BleIo for MockBleIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::ble::addr::BleDeviceAddr;
 
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
