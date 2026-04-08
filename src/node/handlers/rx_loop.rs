@@ -32,6 +32,14 @@ impl Node {
         let mut packet_rx = self.packet_rx.take()
             .ok_or(NodeError::NotStarted)?;
 
+        let (mut disconnect_rx, _disconnect_guard) = match self.disconnect_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
         // Take the TUN outbound receiver, or create a dummy channel that never
         // produces messages (when TUN is disabled). Holding the sender prevents
         // the channel from closing.
@@ -108,6 +116,26 @@ impl Node {
                         ).await
                     };
                     let _ = response_tx.send(response);
+                }
+                Some(disconnect) = disconnect_rx.recv() => {
+                    info!(
+                        transport_id = %disconnect.transport_id,
+                        addr = %disconnect.remote_addr,
+                        "Transport disconnect: resetting session state"
+                    );
+                    if let Some(&link_id) = self.addr_to_link.get(&(disconnect.transport_id, disconnect.remote_addr.clone())) {
+                        let peer_addr = self.peers.iter()
+                            .find(|(_, peer)| peer.link_id() == link_id)
+                            .map(|(addr, _)| *addr);
+                        if let Some(addr) = peer_addr {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            self.remove_active_peer(&addr);
+                            self.schedule_reconnect(addr, now_ms);
+                        }
+                    }
                 }
                 _ = tick.tick() => {
                     self.check_timeouts();

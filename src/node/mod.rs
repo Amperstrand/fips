@@ -301,6 +301,8 @@ pub struct Node {
     packet_tx: Option<PacketTx>,
     /// Packet receiver (for event loop).
     packet_rx: Option<PacketRx>,
+    /// Disconnect notification receiver (transport → Node).
+    disconnect_rx: Option<crate::transport::DisconnectRx>,
 
     // === Connections (Handshake Phase) ===
     /// Pending connections (handshake in progress).
@@ -385,6 +387,10 @@ pub struct Node {
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
     msg1_rate_limiter: HandshakeRateLimiter,
+    /// Per-peer counter for competing MSG1s (MSG1 received while handshake
+    /// is already in progress or recently completed). After MAX_COMPETING_MSG1
+    /// from the same peer, the connection is dropped.
+    competing_msg1_counts: std::collections::HashMap<NodeAddr, u32>,
     /// Rate limiter for ICMP Packet Too Big messages.
     icmp_rate_limiter: IcmpRateLimiter,
     /// Rate limiter for routing error signals (CoordsRequired / PathBroken).
@@ -513,6 +519,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -538,6 +545,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            competing_msg1_counts: std::collections::HashMap::new(),
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
@@ -624,6 +632,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -649,6 +658,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            competing_msg1_counts: std::collections::HashMap::new(),
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
@@ -678,7 +688,11 @@ impl Node {
     /// Create transport instances from configuration.
     ///
     /// Returns a vector of TransportHandles for all configured transports.
-    async fn create_transports(&mut self, packet_tx: &PacketTx) -> Vec<TransportHandle> {
+    async fn create_transports(
+        &mut self,
+        packet_tx: &PacketTx,
+        #[allow(unused_variables)] disconnect_tx: &crate::transport::DisconnectTx,
+    ) -> Vec<TransportHandle> {
         let mut transports = Vec::new();
 
         // Collect UDP configs with optional names to avoid borrow conflicts
@@ -769,6 +783,7 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -809,6 +824,7 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {

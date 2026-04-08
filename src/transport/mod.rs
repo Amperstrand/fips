@@ -85,6 +85,34 @@ pub fn packet_channel(buffer: usize) -> (PacketTx, PacketRx) {
 }
 
 // ============================================================================
+// Transport Disconnect Notifications
+// ============================================================================
+
+/// A transport-level disconnect notification.
+///
+/// Sent when a connection-oriented transport detects a dropped connection,
+/// allowing the Node layer to immediately reset session state instead of
+/// waiting for heartbeat timeout.
+#[derive(Debug, Clone)]
+pub struct TransportDisconnect {
+    /// Transport that detected the disconnect.
+    pub transport_id: TransportId,
+    /// Remote address of the disconnected peer.
+    pub remote_addr: TransportAddr,
+}
+
+/// Channel sender for disconnect notifications.
+pub type DisconnectTx = tokio::sync::mpsc::Sender<TransportDisconnect>;
+
+/// Channel receiver for disconnect notifications.
+pub type DisconnectRx = tokio::sync::mpsc::Receiver<TransportDisconnect>;
+
+/// Create a disconnect notification channel with the given buffer size.
+pub fn disconnect_channel(buffer: usize) -> (DisconnectTx, DisconnectRx) {
+    tokio::sync::mpsc::channel(buffer)
+}
+
+// ============================================================================
 // Transport Identifiers
 // ============================================================================
 

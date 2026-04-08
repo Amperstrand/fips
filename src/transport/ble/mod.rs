@@ -109,6 +109,8 @@ pub struct BleTransport<I: BleIo> {
     /// so the node layer can initiate the IK handshake.
     /// Temporary — removed when FMP switches to XX.
     local_pubkey: Option<[u8; 32]>,
+    /// Channel for notifying Node of BLE connection drops.
+    disconnect_tx: Option<super::DisconnectTx>,
 }
 
 /// A pending background connection attempt.
@@ -141,6 +143,7 @@ impl<I: BleIo> BleTransport<I> {
             discovery_buffer: Arc::new(DiscoveryBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
+            disconnect_tx: None,
         }
     }
 
@@ -166,6 +169,15 @@ impl<I: BleIo> BleTransport<I> {
     /// won't have identity information for auto-connect.
     pub fn set_local_pubkey(&mut self, pubkey: [u8; 32]) {
         self.local_pubkey = Some(pubkey);
+    }
+
+    /// Set the disconnect notification channel.
+    ///
+    /// Must be called before `start_async()`. When a BLE connection drops,
+    /// the transport sends a `TransportDisconnect` so the Node layer can
+    /// immediately reset session state instead of waiting for heartbeat timeout.
+    pub fn set_disconnect_tx(&mut self, tx: super::DisconnectTx) {
+        self.disconnect_tx = Some(tx);
     }
 
     /// Start the transport asynchronously.
@@ -207,6 +219,7 @@ impl<I: BleIo> BleTransport<I> {
                         local_node_addr,
                         self.config.disable_tiebreaker(),
                         Arc::clone(&self.blocked_outbound_addrs),
+                        self.disconnect_tx.clone(),
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
@@ -249,6 +262,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.transport_id,
                         self.config.disable_tiebreaker(),
                         Arc::clone(&self.blocked_outbound_addrs),
+                        self.disconnect_tx.clone(),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -422,6 +436,7 @@ impl<I: BleIo> BleTransport<I> {
             Arc::clone(&self.stats),
             recv_mtu,
             Arc::clone(&self.blocked_outbound_addrs),
+            self.disconnect_tx.clone(),
         ));
 
         let conn = BleConnection {
@@ -491,6 +506,7 @@ impl<I: BleIo> BleTransport<I> {
         let addr_clone = addr.clone();
         let local_pubkey = self.local_pubkey;
         let discovery_buffer = Arc::clone(&self.discovery_buffer);
+        let disconnect_tx = self.disconnect_tx.clone();
 
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -535,6 +551,7 @@ impl<I: BleIo> BleTransport<I> {
                         Arc::clone(&stats),
                         recv_mtu,
                         Arc::clone(&blocked_outbound_addrs),
+                        disconnect_tx.clone(),
                     ));
 
                     let conn = BleConnection {
@@ -859,6 +876,7 @@ async fn accept_loop<A>(
     local_node_addr: Option<NodeAddr>,
     disable_tiebreaker: bool,
     blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -923,6 +941,7 @@ async fn accept_loop<A>(
                     Arc::clone(&stats),
                     recv_mtu,
                     Arc::clone(&blocked_outbound_addrs),
+                    disconnect_tx.clone(),
                 ));
 
                 let conn = BleConnection {
@@ -1005,6 +1024,7 @@ async fn receive_loop<S: BleStream>(
     stats: Arc<BleStats>,
     recv_mtu: u16,
     blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) {
     let mut buf = vec![0u8; recv_mtu as usize];
     loop {
@@ -1067,6 +1087,14 @@ async fn receive_loop<S: BleStream>(
     let mut pool = pool.lock().await;
     pool.remove(&addr);
     blocked_outbound_addrs.lock().await.remove(&addr);
+
+    if let Some(ref tx) = disconnect_tx {
+        let _ = tx.send(super::TransportDisconnect {
+            transport_id,
+            remote_addr: addr.clone(),
+        }).await;
+        info!(addr = %addr, transport_id = %transport_id, "BLE disconnect notified");
+    }
 }
 
 async fn promote_probe_connection<S: BleStream + 'static>(
@@ -1077,6 +1105,7 @@ async fn promote_probe_connection<S: BleStream + 'static>(
     transport_id: TransportId,
     stats: Arc<BleStats>,
     blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) {
     let ta = addr.to_transport_addr();
     let send_mtu = stream.send_mtu();
@@ -1092,6 +1121,7 @@ async fn promote_probe_connection<S: BleStream + 'static>(
         Arc::clone(&stats),
         recv_mtu,
         Arc::clone(&blocked_outbound_addrs),
+        disconnect_tx.clone(),
     ));
 
     let conn = BleConnection {
@@ -1151,8 +1181,8 @@ async fn scan_probe_loop<I: io::BleIo>(
     transport_id: TransportId,
     disable_tiebreaker: bool,
     blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) {
-    // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
     // Addresses discovered but not yet connected — retried after cooldown
     // even if the scanner doesn't fire again (BlueZ deduplicates).
@@ -1255,6 +1285,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         transport_id,
                         Arc::clone(&stats),
                         Arc::clone(&blocked_outbound_addrs),
+                        disconnect_tx.clone(),
                     )
                     .await;
                     pending_addrs.retain(|a| a != &addr);
@@ -1296,6 +1327,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     transport_id,
                     Arc::clone(&stats),
                     Arc::clone(&blocked_outbound_addrs),
+                    disconnect_tx.clone(),
                 )
                 .await;
                 pending_addrs.retain(|a| a != &addr);
@@ -1317,6 +1349,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         transport_id,
                         Arc::clone(&stats),
                         Arc::clone(&blocked_outbound_addrs),
+                        disconnect_tx.clone(),
                     )
                     .await;
                     pending_addrs.retain(|a| a != &addr);

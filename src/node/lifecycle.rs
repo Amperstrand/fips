@@ -537,8 +537,10 @@ impl Node {
         self.packet_tx = Some(packet_tx.clone());
         self.packet_rx = Some(packet_rx);
 
-        // Initialize transports first (before TUN)
-        let transport_handles = self.create_transports(&packet_tx).await;
+        let (disconnect_tx, disconnect_rx) = crate::transport::disconnect_channel(64);
+        self.disconnect_rx = Some(disconnect_rx);
+
+        let transport_handles = self.create_transports(&packet_tx, &disconnect_tx).await;
 
         for mut handle in transport_handles {
             let transport_id = handle.transport_id();
