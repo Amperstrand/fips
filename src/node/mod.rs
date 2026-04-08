@@ -756,7 +756,6 @@ impl Node {
         }
 
         // Create BLE transport instances
-        #[cfg(target_os = "linux")]
         {
             let ble_instances: Vec<_> = self
                 .config
@@ -766,7 +765,7 @@ impl Node {
                 .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
                 .collect();
 
-            #[cfg(all(feature = "ble", not(test)))]
+            #[cfg(all(feature = "ble", target_os = "linux", not(test)))]
             for (name, ble_config) in ble_instances {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
