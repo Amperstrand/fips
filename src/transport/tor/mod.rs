@@ -27,8 +27,9 @@ mod mock_control;
 mod mock_socks5;
 
 use super::{
-    ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
-    TransportError, TransportId, TransportState, TransportType,
+    ConnectionState, DisconnectTx, DiscoveredPeer, PacketTx, ReceivedPacket, Transport,
+    TransportAddr, TransportDisconnect, TransportError, TransportId, TransportState,
+    TransportType,
 };
 use crate::config::TorConfig;
 use crate::transport::tcp::stream::read_fmp_packet;
@@ -166,6 +167,8 @@ pub struct TorTransport {
     connecting: ConnectingPool,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
+    /// Channel for notifying Node when a live connection disappears.
+    disconnect_tx: Option<DisconnectTx>,
     /// Transport statistics.
     stats: Arc<TorStats>,
     /// Accept loop task handle (active when onion service is running).
@@ -197,6 +200,7 @@ impl TorTransport {
             pool: Arc::new(Mutex::new(HashMap::new())),
             connecting: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
+            disconnect_tx: None,
             stats: Arc::new(TorStats::new()),
             accept_task: None,
             onion_address: None,
@@ -224,6 +228,11 @@ impl TorTransport {
     /// Get the cached Tor daemon monitoring info (if available).
     pub fn cached_monitoring(&self) -> Option<TorMonitoringInfo> {
         self.cached_monitoring.read().ok()?.clone()
+    }
+
+    /// Set the disconnect notification channel used for immediate peer cleanup.
+    pub fn set_disconnect_tx(&mut self, tx: DisconnectTx) {
+        self.disconnect_tx = Some(tx);
     }
 
     /// Get the Tor transport mode.
@@ -384,6 +393,7 @@ impl TorTransport {
         // Spawn accept loop (same as control_port mode)
         let transport_id = self.transport_id;
         let packet_tx = self.packet_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         let pool = self.pool.clone();
         let mtu = self.config.mtu();
         let max_inbound = self.config.max_inbound_connections();
@@ -394,6 +404,7 @@ impl TorTransport {
                 listener,
                 transport_id,
                 packet_tx,
+                disconnect_tx,
                 pool,
                 mtu,
                 max_inbound,
@@ -788,6 +799,7 @@ impl TorTransport {
 
         let transport_id = self.transport_id;
         let packet_tx = self.packet_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
@@ -799,6 +811,7 @@ impl TorTransport {
                 transport_id,
                 remote_addr.clone(),
                 packet_tx,
+                disconnect_tx,
                 pool,
                 mtu,
                 recv_stats,
@@ -1008,6 +1021,7 @@ impl TorTransport {
 
         let transport_id = self.transport_id;
         let packet_tx = self.packet_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
@@ -1018,6 +1032,7 @@ impl TorTransport {
                 transport_id,
                 remote_addr.clone(),
                 packet_tx,
+                disconnect_tx,
                 pool,
                 mtu,
                 recv_stats,
@@ -1129,6 +1144,7 @@ async fn tor_receive_loop(
     transport_id: TransportId,
     remote_addr: TransportAddr,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     pool: ConnectionPool,
     mtu: u16,
     stats: Arc<TorStats>,
@@ -1172,6 +1188,13 @@ async fn tor_receive_loop(
                 break;
             }
         }
+    }
+
+    if let Some(tx) = disconnect_tx {
+        let _ = tx.try_send(TransportDisconnect {
+            transport_id,
+            remote_addr: remote_addr.clone(),
+        });
     }
 
     // Clean up: remove ourselves from the pool
@@ -1229,6 +1252,7 @@ async fn tor_accept_loop(
     listener: TcpListener,
     transport_id: TransportId,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     pool: ConnectionPool,
     mtu: u16,
     max_inbound: usize,
@@ -1309,6 +1333,7 @@ async fn tor_accept_loop(
         let recv_stats = stats.clone();
         let recv_addr = remote_addr.clone();
         let recv_tx = packet_tx.clone();
+        let recv_disconnect_tx = disconnect_tx.clone();
 
         let recv_task = tokio::spawn(async move {
             tor_receive_loop(
@@ -1316,6 +1341,7 @@ async fn tor_accept_loop(
                 transport_id,
                 recv_addr,
                 recv_tx,
+                recv_disconnect_tx,
                 recv_pool,
                 mtu,
                 recv_stats,

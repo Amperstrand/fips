@@ -25,8 +25,9 @@ pub mod pool;
 pub mod stats;
 
 use super::{
-    ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
-    TransportError, TransportId, TransportState, TransportType,
+    ConnectionState, DisconnectTx, DiscoveredPeer, PacketTx, ReceivedPacket, Transport,
+    TransportAddr, TransportDisconnect, TransportError, TransportId, TransportState,
+    TransportType,
 };
 use crate::config::BleConfig;
 use crate::identity::NodeAddr;
@@ -94,6 +95,8 @@ pub struct BleTransport<I: BleIo> {
     connecting: Arc<Mutex<HashMap<TransportAddr, ConnectingEntry>>>,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
+    /// Channel for notifying Node when a live connection disappears.
+    disconnect_tx: Option<DisconnectTx>,
     /// Accept loop task handle.
     accept_task: Option<JoinHandle<()>>,
     /// Combined scan + probe loop task handle.
@@ -135,6 +138,7 @@ impl<I: BleIo> BleTransport<I> {
             pool: Arc::new(Mutex::new(ConnectionPool::new(max_conns))),
             connecting: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
+            disconnect_tx: None,
             accept_task: None,
             scan_probe_task: None,
             discovery_buffer: Arc::new(DiscoveryBuffer::new(transport_id)),
@@ -167,6 +171,11 @@ impl<I: BleIo> BleTransport<I> {
         self.local_pubkey = Some(pubkey);
     }
 
+    /// Set the disconnect notification channel used for immediate peer cleanup.
+    pub fn set_disconnect_tx(&mut self, tx: DisconnectTx) {
+        self.disconnect_tx = Some(tx);
+    }
+
     /// Start the transport asynchronously.
     pub async fn start_async(&mut self) -> Result<(), TransportError> {
         if !self.state.can_start() {
@@ -190,6 +199,7 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(acceptor) => {
                     let pool = Arc::clone(&self.pool);
                     let packet_tx = self.packet_tx.clone();
+                    let disconnect_tx = self.disconnect_tx.clone();
                     let transport_id = self.transport_id;
                     let stats = Arc::clone(&self.stats);
                     let max_conns = self.config.max_connections();
@@ -198,6 +208,7 @@ impl<I: BleIo> BleTransport<I> {
                         acceptor,
                         pool,
                         packet_tx,
+                        disconnect_tx,
                         transport_id,
                         stats,
                         max_conns,
@@ -241,6 +252,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.config.probe_cooldown_secs(),
                         local_node_addr,
                         self.packet_tx.clone(),
+                        self.disconnect_tx.clone(),
                         self.transport_id,
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
@@ -410,6 +422,7 @@ impl<I: BleIo> BleTransport<I> {
             addr.clone(),
             Arc::clone(&self.pool),
             self.packet_tx.clone(),
+            self.disconnect_tx.clone(),
             self.transport_id,
             Arc::clone(&self.stats),
             recv_mtu,
@@ -474,6 +487,7 @@ impl<I: BleIo> BleTransport<I> {
         let pool = Arc::clone(&self.pool);
         let connecting = Arc::clone(&self.connecting);
         let packet_tx = self.packet_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         let transport_id = self.transport_id;
         let stats = Arc::clone(&self.stats);
         let psm = self.config.psm();
@@ -521,6 +535,7 @@ impl<I: BleIo> BleTransport<I> {
                         addr_clone.clone(),
                         Arc::clone(&pool),
                         packet_tx,
+                        disconnect_tx,
                         transport_id,
                         Arc::clone(&stats),
                         recv_mtu,
@@ -735,6 +750,7 @@ async fn accept_loop<A>(
     mut acceptor: A,
     pool: Arc<Mutex<ConnectionPool<Arc<A::Stream>>>>,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     transport_id: TransportId,
     stats: Arc<BleStats>,
     _max_conns: usize,
@@ -799,6 +815,7 @@ async fn accept_loop<A>(
                     ta.clone(),
                     Arc::clone(&pool),
                     packet_tx.clone(),
+                    disconnect_tx.clone(),
                     transport_id,
                     Arc::clone(&stats),
                     recv_mtu,
@@ -845,6 +862,7 @@ async fn receive_loop<S: BleStream>(
     addr: TransportAddr,
     pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     transport_id: TransportId,
     stats: Arc<BleStats>,
     recv_mtu: u16,
@@ -870,6 +888,13 @@ async fn receive_loop<S: BleStream>(
                 break;
             }
         }
+    }
+
+    if let Some(tx) = disconnect_tx {
+        let _ = tx.try_send(TransportDisconnect {
+            transport_id,
+            remote_addr: addr.clone(),
+        });
     }
 
     // Remove from pool
@@ -902,6 +927,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     cooldown_secs: u64,
     local_node_addr: Option<NodeAddr>,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     transport_id: TransportId,
 ) {
     // Track last probe time per address for cooldown
@@ -1025,6 +1051,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     ta.clone(),
                     Arc::clone(&pool),
                     packet_tx.clone(),
+                    disconnect_tx.clone(),
                     transport_id,
                     Arc::clone(&stats),
                     recv_mtu,
@@ -1075,7 +1102,7 @@ async fn scan_probe_loop<I: io::BleIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use io::MockBleIo;
+    use io::{MockBleIo, MockBleStream};
 
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
@@ -1172,6 +1199,34 @@ mod tests {
 
         let peers = transport.discovery_buffer.take();
         assert_eq!(peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_receive_loop_emits_disconnect_event_on_close() {
+        let (stream, peer_stream) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
+        let remote_addr = stream.remote_addr().to_transport_addr();
+        let pool = Arc::new(Mutex::new(ConnectionPool::new(4)));
+        let (packet_tx, _packet_rx) = tokio::sync::mpsc::channel(4);
+        let (disconnect_tx, mut disconnect_rx) = crate::transport::disconnect_channel(4);
+        let stats = Arc::new(BleStats::new());
+
+        let task = tokio::spawn(receive_loop(
+            Arc::new(stream),
+            remote_addr.clone(),
+            Arc::clone(&pool),
+            packet_tx,
+            Some(disconnect_tx),
+            TransportId::new(1),
+            stats,
+            2048,
+        ));
+
+        drop(peer_stream);
+        task.await.unwrap();
+
+        let disconnect = disconnect_rx.try_recv().expect("disconnect event should be emitted");
+        assert_eq!(disconnect.transport_id, TransportId::new(1));
+        assert_eq!(disconnect.remote_addr, remote_addr);
     }
 
     #[test]

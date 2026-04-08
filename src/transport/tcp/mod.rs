@@ -27,8 +27,9 @@ pub mod stream;
 
 use super::resolve_socket_addr;
 use super::{
-    ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
-    TransportError, TransportId, TransportState, TransportType,
+    ConnectionState, DisconnectTx, DiscoveredPeer, PacketTx, ReceivedPacket, Transport,
+    TransportAddr, TransportDisconnect, TransportError, TransportId, TransportState,
+    TransportType,
 };
 use crate::config::TcpConfig;
 use stats::TcpStats;
@@ -105,6 +106,8 @@ pub struct TcpTransport {
     connecting: ConnectingPool,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
+    /// Channel for notifying Node when a live connection disappears.
+    disconnect_tx: Option<DisconnectTx>,
     /// Accept loop task handle (if listener bound).
     accept_task: Option<JoinHandle<()>>,
     /// Local listener address (after start, if bind_addr configured).
@@ -129,6 +132,7 @@ impl TcpTransport {
             pool: Arc::new(Mutex::new(HashMap::new())),
             connecting: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
+            disconnect_tx: None,
             accept_task: None,
             local_addr: None,
             stats: Arc::new(TcpStats::new()),
@@ -148,6 +152,11 @@ impl TcpTransport {
     /// Get the transport statistics.
     pub fn stats(&self) -> &Arc<TcpStats> {
         &self.stats
+    }
+
+    /// Set the disconnect notification channel used for immediate peer cleanup.
+    pub fn set_disconnect_tx(&mut self, tx: DisconnectTx) {
+        self.disconnect_tx = Some(tx);
     }
 
     /// Start the transport asynchronously.
@@ -180,6 +189,7 @@ impl TcpTransport {
             // Spawn accept loop
             let transport_id = self.transport_id;
             let packet_tx = self.packet_tx.clone();
+            let disconnect_tx = self.disconnect_tx.clone();
             let pool = self.pool.clone();
             let stats = self.stats.clone();
             let cfg = AcceptConfig {
@@ -192,7 +202,7 @@ impl TcpTransport {
             };
 
             let accept_task = tokio::spawn(async move {
-                accept_loop(listener, transport_id, packet_tx, pool, cfg, stats).await;
+                accept_loop(listener, transport_id, packet_tx, disconnect_tx, pool, cfg, stats).await;
             });
             self.accept_task = Some(accept_task);
         }
@@ -379,13 +389,14 @@ impl TcpTransport {
 
         let transport_id = self.transport_id;
         let packet_tx = self.packet_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
         let mtu = mss_mtu;
 
         let recv_task = tokio::spawn(async move {
-            tcp_receive_loop(read_half, transport_id, remote_addr.clone(), packet_tx, pool, mtu, recv_stats).await;
+            tcp_receive_loop(read_half, transport_id, remote_addr.clone(), packet_tx, disconnect_tx, pool, mtu, recv_stats).await;
         });
 
         let conn = TcpConnection {
@@ -613,6 +624,7 @@ impl TcpTransport {
 
         let transport_id = self.transport_id;
         let packet_tx = self.packet_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
@@ -623,6 +635,7 @@ impl TcpTransport {
                 transport_id,
                 remote_addr.clone(),
                 packet_tx,
+                disconnect_tx,
                 pool,
                 mss_mtu,
                 recv_stats,
@@ -733,6 +746,7 @@ async fn accept_loop(
     listener: TcpListener,
     transport_id: TransportId,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     pool: ConnectionPool,
     cfg: AcceptConfig,
     stats: Arc<TcpStats>,
@@ -804,6 +818,7 @@ async fn accept_loop(
 
                 let recv_pool = pool.clone();
                 let recv_packet_tx = packet_tx.clone();
+                let recv_disconnect_tx = disconnect_tx.clone();
                 let recv_stats = stats.clone();
                 let recv_addr = remote_addr.clone();
 
@@ -813,6 +828,7 @@ async fn accept_loop(
                         transport_id,
                         recv_addr,
                         recv_packet_tx,
+                        recv_disconnect_tx,
                         recv_pool,
                         conn_mtu,
                         recv_stats,
@@ -864,6 +880,7 @@ async fn tcp_receive_loop(
     transport_id: TransportId,
     remote_addr: TransportAddr,
     packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
     pool: ConnectionPool,
     mtu: u16,
     stats: Arc<TcpStats>,
@@ -912,6 +929,13 @@ async fn tcp_receive_loop(
                 break;
             }
         }
+    }
+
+    if let Some(tx) = disconnect_tx {
+        let _ = tx.try_send(TransportDisconnect {
+            transport_id,
+            remote_addr: remote_addr.clone(),
+        });
     }
 
     // Clean up: remove ourselves from the pool
