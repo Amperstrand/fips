@@ -811,3 +811,135 @@ fn test_promote_clears_retry_pending() {
         "retry_pending should be cleared on successful promotion"
     );
 }
+
+#[test]
+fn test_transport_disconnect_cleans_pending_connection_and_schedules_retry() {
+    let peer_identity_full = Identity::generate();
+    let peer_npub = peer_identity_full.npub();
+    let peer_identity = PeerIdentity::from_pubkey_full(peer_identity_full.pubkey_full());
+    let peer_node_addr = *peer_identity.node_addr();
+
+    let mut config = Config::new();
+    config.peers.push(crate::config::PeerConfig::new(
+        peer_npub,
+        "tcp",
+        "127.0.0.1:4001",
+    ));
+
+    let mut node = Node::new(config).unwrap();
+    let link_id = LinkId::new(1);
+    let transport_id = TransportId::new(1);
+    let remote_addr = TransportAddr::from_string("127.0.0.1:4001");
+    let now_ms = 1_000;
+
+    let link = Link::new_with_timestamp(
+        link_id,
+        transport_id,
+        remote_addr.clone(),
+        LinkDirection::Outbound,
+        std::time::Duration::from_millis(50),
+        now_ms,
+    );
+    node.add_link(link).unwrap();
+
+    let mut conn = PeerConnection::outbound(link_id, peer_identity, now_ms);
+    conn.set_transport_id(transport_id);
+    conn.set_source_addr(remote_addr.clone());
+    node.add_connection(conn).unwrap();
+
+    node.handle_transport_disconnect(crate::transport::TransportDisconnect {
+        transport_id,
+        remote_addr,
+    });
+
+    assert_eq!(node.connection_count(), 0, "pending connection should be removed");
+    assert_eq!(node.link_count(), 0, "link should be removed with pending connection cleanup");
+    assert!(
+        node.retry_pending.contains_key(&peer_node_addr),
+        "outbound pending connection should schedule retry on disconnect"
+    );
+}
+
+#[test]
+fn test_transport_disconnect_removes_active_peer_and_schedules_reconnect() {
+    let peer_identity_full = Identity::generate();
+    let peer_npub = peer_identity_full.npub();
+    let peer_identity = PeerIdentity::from_pubkey_full(peer_identity_full.pubkey_full());
+    let peer_node_addr = *peer_identity.node_addr();
+
+    let mut config = Config::new();
+    config.peers.push(crate::config::PeerConfig::new(
+        peer_npub,
+        "tcp",
+        "127.0.0.1:5000",
+    ));
+
+    let mut node = Node::new(config).unwrap();
+    let link_id = LinkId::new(7);
+    let transport_id = TransportId::new(1);
+    let remote_addr = TransportAddr::from_string("127.0.0.1:5000");
+    let current_time_ms = 1_000;
+
+    let msg1;
+    let mut conn = PeerConnection::outbound(link_id, peer_identity, current_time_ms);
+    {
+        let our_keypair = node.identity.keypair();
+        msg1 = conn
+            .start_handshake(our_keypair, node.startup_epoch, current_time_ms)
+            .unwrap();
+    }
+
+    let mut responder = PeerConnection::inbound(LinkId::new(999), current_time_ms);
+    let mut resp_epoch = [0u8; 8];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut resp_epoch);
+    let msg2 = responder
+        .receive_handshake_init(peer_identity_full.keypair(), resp_epoch, &msg1, current_time_ms)
+        .unwrap();
+    conn.complete_handshake(&msg2, current_time_ms).unwrap();
+
+    let our_index = node.index_allocator.allocate().unwrap();
+    conn.set_our_index(our_index);
+    conn.set_their_index(crate::utils::index::SessionIndex::new(42));
+    conn.set_transport_id(transport_id);
+    conn.set_source_addr(remote_addr.clone());
+
+    node.add_link(Link::new_with_timestamp(
+        link_id,
+        transport_id,
+        remote_addr.clone(),
+        LinkDirection::Outbound,
+        std::time::Duration::from_millis(50),
+        current_time_ms,
+    ))
+    .unwrap();
+    node.add_connection(conn).unwrap();
+    node.promote_connection(link_id, peer_identity, current_time_ms + 1_000)
+        .unwrap();
+
+    assert!(node.get_peer(&peer_node_addr).is_some());
+
+    node.handle_transport_disconnect(crate::transport::TransportDisconnect {
+        transport_id,
+        remote_addr,
+    });
+
+    assert!(node.get_peer(&peer_node_addr).is_none(), "peer should be removed immediately");
+    assert!(
+        node.retry_pending.contains_key(&peer_node_addr),
+        "active auto-connect peer should schedule reconnect on transport disconnect"
+    );
+}
+
+#[test]
+fn test_transport_disconnect_ignores_unknown_address() {
+    let mut node = make_node();
+
+    node.handle_transport_disconnect(crate::transport::TransportDisconnect {
+        transport_id: TransportId::new(77),
+        remote_addr: TransportAddr::from_string("127.0.0.1:6553"),
+    });
+
+    assert_eq!(node.peer_count(), 0);
+    assert_eq!(node.connection_count(), 0);
+    assert!(node.retry_pending.is_empty());
+}

@@ -7,6 +7,7 @@
 use super::spanning_tree::*;
 use super::*;
 use crate::protocol::{Disconnect, DisconnectReason};
+use crate::transport::TransportDisconnect;
 
 /// 3-node chain: middle node disconnects one peer.
 ///
@@ -312,6 +313,71 @@ async fn test_disconnect_clears_session() {
         nodes[1].node.session_count(), 0,
         "Session must be cleaned up when peer is removed (regression: issue #5)"
     );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// Transport-level disconnect must clear peer and session state immediately.
+#[tokio::test]
+async fn test_transport_disconnect_clears_session() {
+    use crate::identity::Identity;
+    use crate::node::session::{EndToEndState, SessionEntry};
+    use crate::noise::HandshakeState;
+
+    let edges = vec![(0, 1)];
+    let mut nodes = run_tree_test(2, &edges, false).await;
+    verify_tree_convergence(&nodes);
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+
+    let remote_identity = Identity::generate();
+    {
+        let our_identity = nodes[1].node.identity();
+
+        let mut initiator = HandshakeState::new_initiator(
+            our_identity.keypair(),
+            remote_identity.pubkey_full(),
+        );
+        let mut responder = HandshakeState::new_responder(remote_identity.keypair());
+        let mut init_epoch = [0u8; 8];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut init_epoch);
+        initiator.set_local_epoch(init_epoch);
+        let mut resp_epoch = [0u8; 8];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut resp_epoch);
+        responder.set_local_epoch(resp_epoch);
+        let msg1 = initiator.write_message_1().unwrap();
+        responder.read_message_1(&msg1).unwrap();
+        let msg2 = responder.write_message_2().unwrap();
+        initiator.read_message_2(&msg2).unwrap();
+        let session = initiator.into_session().unwrap();
+
+        let entry = SessionEntry::new(
+            node0_addr,
+            remote_identity.pubkey_full(),
+            EndToEndState::Established(session),
+            1_000,
+            true,
+        );
+        nodes[1].node.sessions.insert(node0_addr, entry);
+    }
+
+    assert_eq!(nodes[1].node.session_count(), 1);
+    assert_eq!(nodes[1].node.peer_count(), 1);
+
+    let peer = nodes[1].node.get_peer(&node0_addr).unwrap();
+    let link = nodes[1].node.get_link(&peer.link_id()).unwrap();
+    let disconnect = TransportDisconnect {
+        transport_id: link.transport_id(),
+        remote_addr: link.remote_addr().clone(),
+    };
+
+    nodes[1].node.handle_transport_disconnect(disconnect);
+
+    assert!(nodes[1].node.get_peer(&node0_addr).is_none());
+    assert_eq!(nodes[1].node.peer_count(), 0);
+    assert_eq!(nodes[1].node.session_count(), 0);
+    assert!(nodes[0].node.get_peer(&node1_addr).is_some());
 
     cleanup_nodes(&mut nodes).await;
 }
