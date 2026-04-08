@@ -1,10 +1,12 @@
 //! RX event loop and packet dispatch.
 
-use crate::control::{commands, ControlSocket};
 use crate::control::queries;
+use crate::control::{ControlSocket, commands};
+use crate::node::wire::{
+    COMMON_PREFIX_SIZE, CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2,
+};
 use crate::node::{Node, NodeError};
 use crate::transport::ReceivedPacket;
-use crate::node::wire::{CommonPrefix, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, FMP_VERSION, COMMON_PREFIX_SIZE};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -29,8 +31,15 @@ impl Node {
     /// This method takes ownership of the packet_rx channel and runs
     /// until the channel is closed (typically when stop() is called).
     pub async fn run_rx_loop(&mut self) -> Result<(), NodeError> {
-        let mut packet_rx = self.packet_rx.take()
-            .ok_or(NodeError::NotStarted)?;
+        let mut packet_rx = self.packet_rx.take().ok_or(NodeError::NotStarted)?;
+
+        let (mut disconnect_rx, _disconnect_guard) = match self.disconnect_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
 
         // Take the TUN outbound receiver, or create a dummy channel that never
         // produces messages (when TUN is disabled). Holding the sender prevents
@@ -53,12 +62,12 @@ impl Node {
             }
         };
 
-        let mut tick = tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
 
         // Set up control socket channel
-        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<
-            crate::control::ControlMessage,
-        >(32);
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::channel::<crate::control::ControlMessage>(32);
 
         if self.config.node.control.enabled {
             let config = self.config.node.control.clone();
@@ -108,6 +117,26 @@ impl Node {
                         ).await
                     };
                     let _ = response_tx.send(response);
+                }
+                Some(disconnect) = disconnect_rx.recv() => {
+                    info!(
+                        transport_id = %disconnect.transport_id,
+                        addr = %disconnect.remote_addr,
+                        "Transport disconnect: resetting session state"
+                    );
+                    if let Some(&link_id) = self.addr_to_link.get(&(disconnect.transport_id, disconnect.remote_addr.clone())) {
+                        let peer_addr = self.peers.iter()
+                            .find(|(_, peer)| peer.link_id() == link_id)
+                            .map(|(addr, _)| *addr);
+                        if let Some(addr) = peer_addr {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            self.remove_active_peer(&addr);
+                            self.schedule_reconnect(addr, now_ms);
+                        }
+                    }
                 }
                 _ = tick.tick() => {
                     self.check_timeouts();

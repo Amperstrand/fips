@@ -25,8 +25,8 @@ pub mod pool;
 pub mod stats;
 
 use super::{
-    ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
-    TransportError, TransportId, TransportState, TransportType,
+    ConnectionState, DisconnectTx, DiscoveredPeer, PacketTx, ReceivedPacket, Transport,
+    TransportAddr, TransportDisconnect, TransportError, TransportId, TransportState, TransportType,
 };
 use crate::config::BleConfig;
 use crate::identity::NodeAddr;
@@ -36,11 +36,11 @@ use io::{BleIo, BleScanner, BleStream};
 use pool::{BleConnection, ConnectionPool};
 use stats::BleStats;
 
+use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use secp256k1::XOnlyPublicKey;
 use tracing::{debug, info, trace, warn};
 
 /// Default FIPS L2CAP PSM (Protocol Service Multiplexer).
@@ -57,7 +57,6 @@ pub type DefaultBleTransport = BleTransport<io::BluerIo>;
 
 #[cfg(any(not(feature = "ble"), test))]
 pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
-
 
 // ============================================================================
 // BLE Transport
@@ -100,6 +99,7 @@ pub struct BleTransport<I: BleIo> {
     /// so the node layer can initiate the IK handshake.
     /// Temporary — removed when FMP switches to XX.
     local_pubkey: Option<[u8; 32]>,
+    disconnect_tx: Option<DisconnectTx>,
 }
 
 /// A pending background connection attempt.
@@ -131,6 +131,7 @@ impl<I: BleIo> BleTransport<I> {
             discovery_buffer: Arc::new(DiscoveryBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
+            disconnect_tx: None,
         }
     }
 
@@ -156,6 +157,10 @@ impl<I: BleIo> BleTransport<I> {
     /// won't have identity information for auto-connect.
     pub fn set_local_pubkey(&mut self, pubkey: [u8; 32]) {
         self.local_pubkey = Some(pubkey);
+    }
+
+    pub fn set_disconnect_tx(&mut self, tx: DisconnectTx) {
+        self.disconnect_tx = Some(tx);
     }
 
     /// Start the transport asynchronously.
@@ -185,6 +190,7 @@ impl<I: BleIo> BleTransport<I> {
                     let transport_id = self.transport_id;
                     let stats = Arc::clone(&self.stats);
                     let max_conns = self.config.max_connections();
+                    let disconnect_tx = self.disconnect_tx.clone();
 
                     self.accept_task = Some(tokio::spawn(accept_loop(
                         acceptor,
@@ -197,6 +203,7 @@ impl<I: BleIo> BleTransport<I> {
                         Arc::clone(&self.discovery_buffer),
                         local_node_addr,
                         disable_tiebreaker,
+                        disconnect_tx,
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
@@ -234,6 +241,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.config.probe_cooldown_secs(),
                         local_node_addr,
                         disable_tiebreaker,
+                        self.disconnect_tx.clone(),
                         self.packet_tx.clone(),
                         self.transport_id,
                     )));
@@ -407,6 +415,7 @@ impl<I: BleIo> BleTransport<I> {
             self.transport_id,
             Arc::clone(&self.stats),
             recv_mtu,
+            self.disconnect_tx.clone(),
         ));
 
         let conn = BleConnection {
@@ -475,6 +484,7 @@ impl<I: BleIo> BleTransport<I> {
         let addr_clone = addr.clone();
         let local_pubkey = self.local_pubkey;
         let discovery_buffer = Arc::clone(&self.discovery_buffer);
+        let disconnect_tx = self.disconnect_tx.clone();
 
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -493,8 +503,7 @@ impl<I: BleIo> BleTransport<I> {
                         match pubkey_exchange(&stream, our_pubkey).await {
                             Ok(peer_pubkey) => {
                                 debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
-                                discovery_buffer
-                                    .add_peer_with_pubkey(&ble_addr, peer_pubkey);
+                                discovery_buffer.add_peer_with_pubkey(&ble_addr, peer_pubkey);
                             }
                             Err(e) => {
                                 warn!(
@@ -518,6 +527,7 @@ impl<I: BleIo> BleTransport<I> {
                         transport_id,
                         Arc::clone(&stats),
                         recv_mtu,
+                        disconnect_tx.clone(),
                     ));
 
                     let conn = BleConnection {
@@ -736,6 +746,7 @@ async fn accept_loop<A>(
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_node_addr: Option<NodeAddr>,
     disable_tiebreaker: bool,
+    disconnect_tx: Option<DisconnectTx>,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -799,6 +810,7 @@ async fn accept_loop<A>(
                     transport_id,
                     Arc::clone(&stats),
                     recv_mtu,
+                    disconnect_tx.clone(),
                 ));
 
                 let conn = BleConnection {
@@ -845,6 +857,7 @@ async fn receive_loop<S: BleStream>(
     transport_id: TransportId,
     stats: Arc<BleStats>,
     recv_mtu: u16,
+    disconnect_tx: Option<DisconnectTx>,
 ) {
     let mut buf = vec![0u8; recv_mtu as usize];
     loop {
@@ -872,6 +885,16 @@ async fn receive_loop<S: BleStream>(
     // Remove from pool
     let mut pool = pool.lock().await;
     pool.remove(&addr);
+
+    if let Some(ref tx) = disconnect_tx {
+        let _ = tx
+            .send(TransportDisconnect {
+                transport_id,
+                remote_addr: addr.clone(),
+            })
+            .await;
+        info!(addr = %addr, transport_id = %transport_id, "BLE disconnect notified");
+    }
 }
 
 /// Combined scan + probe loop.
@@ -899,6 +922,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     cooldown_secs: u64,
     local_node_addr: Option<NodeAddr>,
     disable_tiebreaker: bool,
+    disconnect_tx: Option<DisconnectTx>,
     packet_tx: PacketTx,
     transport_id: TransportId,
 ) {
@@ -1028,6 +1052,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     transport_id,
                     Arc::clone(&stats),
                     recv_mtu,
+                    disconnect_tx.clone(),
                 ));
 
                 let conn = BleConnection {
@@ -1086,16 +1111,13 @@ mod tests {
 
     fn make_transport(
         io: MockBleIo,
-    ) -> (BleTransport<MockBleIo>, tokio::sync::mpsc::Receiver<ReceivedPacket>) {
+    ) -> (
+        BleTransport<MockBleIo>,
+        tokio::sync::mpsc::Receiver<ReceivedPacket>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let config = BleConfig::default();
-        let transport = BleTransport::new(
-            TransportId::new(1),
-            None,
-            config,
-            io,
-            tx,
-        );
+        let transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
         (transport, rx)
     }
 
@@ -1186,7 +1208,10 @@ mod tests {
         let io = MockBleIo::new("hci0", test_addr(1));
         let (transport, _rx) = make_transport(io);
         let addr = test_addr(2).to_transport_addr();
-        assert_eq!(transport.connection_state_sync(&addr), ConnectionState::None);
+        assert_eq!(
+            transport.connection_state_sync(&addr),
+            ConnectionState::None
+        );
     }
 
     /// Verify that the cross-probe tie-breaker follows the same convention

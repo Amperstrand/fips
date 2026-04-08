@@ -4,26 +4,26 @@
 //! underlying communication mechanisms (UDP, Ethernet, Tor, etc.) over
 //! which FIPS links are established.
 
-pub mod udp;
 pub mod tcp;
 pub mod tor;
+pub mod udp;
 
 pub mod ethernet;
 
 pub mod ble;
 
-use secp256k1::XOnlyPublicKey;
-use udp::UdpTransport;
-use tcp::TcpTransport;
-use tor::control::TorMonitoringInfo;
-use tor::TorTransport;
-use ethernet::EthernetTransport;
 #[cfg(target_os = "linux")]
 use ble::DefaultBleTransport;
+use ethernet::EthernetTransport;
+use secp256k1::XOnlyPublicKey;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tcp::TcpTransport;
 use thiserror::Error;
+use tor::TorTransport;
+use tor::control::TorMonitoringInfo;
+use udp::UdpTransport;
 
 // ============================================================================
 // Packet Channel Types
@@ -81,6 +81,34 @@ pub type PacketRx = tokio::sync::mpsc::Receiver<ReceivedPacket>;
 
 /// Create a packet channel with the given buffer size.
 pub fn packet_channel(buffer: usize) -> (PacketTx, PacketRx) {
+    tokio::sync::mpsc::channel(buffer)
+}
+
+// ============================================================================
+// Transport Disconnect Notifications
+// ============================================================================
+
+/// A transport-level disconnect notification.
+///
+/// Sent when a connection-oriented transport detects a dropped connection,
+/// allowing the Node layer to immediately reset session state instead of
+/// waiting for heartbeat timeout.
+#[derive(Debug, Clone)]
+pub struct TransportDisconnect {
+    /// Transport that detected the disconnect.
+    pub transport_id: TransportId,
+    /// Remote address of the disconnected peer.
+    pub remote_addr: TransportAddr,
+}
+
+/// Channel sender for disconnect notifications.
+pub type DisconnectTx = tokio::sync::mpsc::Sender<TransportDisconnect>;
+
+/// Channel receiver for disconnect notifications.
+pub type DisconnectRx = tokio::sync::mpsc::Receiver<TransportDisconnect>;
+
+/// Create a disconnect notification channel with the given buffer size.
+pub fn disconnect_channel(buffer: usize) -> (DisconnectTx, DisconnectRx) {
     tokio::sync::mpsc::channel(buffer)
 }
 
@@ -1065,7 +1093,7 @@ impl TransportHandle {
     /// Poll `connection_state()` to check when the connection is ready.
     pub async fn connect(&self, addr: &TransportAddr) -> Result<(), TransportError> {
         match self {
-            TransportHandle::Udp(_) => Ok(()), // connectionless
+            TransportHandle::Udp(_) => Ok(()),      // connectionless
             TransportHandle::Ethernet(_) => Ok(()), // connectionless
             TransportHandle::Tcp(t) => t.connect_async(addr).await,
             TransportHandle::Tor(t) => t.connect_async(addr).await,
@@ -1599,10 +1627,8 @@ mod tests {
         let addr_b = TransportAddr::from_string("10.0.0.1:5000");
         let addr_unknown = TransportAddr::from_string("172.16.0.1:6000");
 
-        let transport = PerLinkMtuTransport::new(
-            1280,
-            vec![(addr_a.clone(), 512), (addr_b.clone(), 247)],
-        );
+        let transport =
+            PerLinkMtuTransport::new(1280, vec![(addr_a.clone(), 512), (addr_b.clone(), 247)]);
 
         // Known addresses return their per-link MTU
         assert_eq!(transport.link_mtu(&addr_a), 512);
