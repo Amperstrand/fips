@@ -8,6 +8,8 @@ use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use crate::node::wire::{build_msg2, Msg1Header, Msg2Header};
 use crate::PeerIdentity;
 use std::time::Duration;
+
+const MAX_COMPETING_MSG1: u32 = 3;
 use tracing::{debug, info, warn};
 
 impl Node {
@@ -152,6 +154,25 @@ impl Node {
         };
 
         let peer_node_addr = *peer_identity.node_addr();
+
+        // Verify initiator's static pubkey against configured peers.
+        // If we have configured static peers, the initiator must match one
+        // of them. Unknown initiators are rejected to prevent unauthenticated
+        // peers from completing a Noise handshake. When no peers are
+        // configured (discovery-only mode), any initiator is accepted.
+        if !self.config.peers.is_empty() {
+            let pubkey_matches = self.config.peers.iter().any(|p| {
+                p.npub == peer_identity.short_npub()
+            });
+            if !pubkey_matches {
+                warn!(
+                    initiator_npub = %peer_identity.short_npub(),
+                    "Rejecting MSG1 from unconfigured peer"
+                );
+                self.msg1_rate_limiter.complete_handshake();
+                return;
+            }
+        }
 
         // Identity-based restart/rekey detection: if the peer is already
         // active but addr_to_link didn't match (different source address, e.g.,
@@ -372,6 +393,28 @@ impl Node {
         }
         // If possible_restart was true but peer is no longer in self.peers
         // (removed by another path), fall through to process as new connection.
+
+        // Per-peer competing MSG1 rate limit: if the peer already exists
+        // (wasn't handled as restart/rekey above), count it as a competing
+        // MSG1. A misbehaving peer sending MSG1 in a loop can exhaust DH
+        // resources — drop after MAX_COMPETING_MSG1.
+        if self.peers.contains_key(&peer_node_addr) {
+            let peer_name = self.peer_display_name(&peer_node_addr);
+            let count = self.competing_msg1_counts.entry(peer_node_addr).or_insert(0);
+            *count += 1;
+            if *count > MAX_COMPETING_MSG1 {
+                warn!(
+                    peer = %peer_name,
+                    count = *count,
+                    max = MAX_COMPETING_MSG1,
+                    "Dropping competing MSG1: exceeded MAX_COMPETING_MSG1"
+                );
+                self.msg1_rate_limiter.complete_handshake();
+                return;
+            }
+        } else {
+            self.competing_msg1_counts.remove(&peer_node_addr);
+        }
 
         // Note: we don't early-return if peer is already in self.peers here.
         // promote_connection handles cross-connection resolution via tie-breaker.
