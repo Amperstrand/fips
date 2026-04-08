@@ -36,8 +36,8 @@ RUN printf '%s\n' \
     'no-resolv' \
     >> /etc/dnsmasq.conf
 
-COPY fips fipsctl fipstop /usr/local/bin/
-RUN chmod +x /usr/local/bin/fips /usr/local/bin/fipsctl /usr/local/bin/fipstop
+COPY fips fipsctl /usr/local/bin/
+RUN chmod +x /usr/local/bin/fips /usr/local/bin/fipsctl
 
 # Static web page for HTTP server (chaos/static modes)
 RUN printf 'Fuck IPs!\n' > /root/index.html
