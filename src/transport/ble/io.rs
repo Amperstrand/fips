@@ -107,7 +107,7 @@ pub trait BleIo: Send + Sync + 'static {
     fn adapter_name(&self) -> &str;
 }
 
-#[cfg(feature = "ble")]
+#[cfg(all(feature = "ble", target_os = "linux"))]
 mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
@@ -485,7 +485,7 @@ mod bluer_impl {
     }
 }
 
-#[cfg(feature = "ble")]
+#[cfg(all(feature = "ble", target_os = "linux"))]
 pub use bluer_impl::{BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SERVICE_UUID};
 
 // ============================================================================

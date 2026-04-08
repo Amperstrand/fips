@@ -55,10 +55,10 @@ pub const DEFAULT_PSM: u16 = 0x0085;
 /// Production builds with the `ble` feature use `BluerIo` (real BlueZ stack).
 /// Production builds with `ble-macos` feature use `BluestIo` (real CoreBluetooth stack).
 /// Test builds and builds without BLE features use `MockBleIo`.
-#[cfg(all(feature = "ble", not(test)))]
+#[cfg(all(feature = "ble", target_os = "linux", not(test)))]
 pub type DefaultBleTransport = BleTransport<io::BluerIo>;
 
-#[cfg(all(feature = "ble-macos", not(test)))]
+#[cfg(all(feature = "ble-macos", target_os = "macos", not(test)))]
 pub type DefaultBleTransport = BleTransport<io::BluestIo>;
 
 #[cfg(any(all(not(feature = "ble"), not(feature = "ble-macos")), test))]
