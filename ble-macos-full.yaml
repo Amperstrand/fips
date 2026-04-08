@@ -1,0 +1,25 @@
+node:
+  identity:
+    persistent: true
+  log_level: debug
+  control:
+    socket_path: "/tmp/fips-macos-control.sock"
+
+tun:
+  enabled: true
+  name: utun
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    advertise: false
+    scan: true
+    auto_connect: true
+    accept_connections: true
+    psm: 133
+    probe_cooldown_secs: 5

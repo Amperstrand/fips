@@ -41,6 +41,14 @@ impl Node {
             }
         };
 
+        let (mut disconnect_rx, _disconnect_guard) = match self.disconnect_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
         // Take the TUN outbound receiver, or create a dummy channel that never
         // produces messages (when TUN is disabled). Holding the sender prevents
         // the channel from closing.

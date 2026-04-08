@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::config::BleConfig;
-use crate::transport::ble::addr::BleAddr;
+use crate::transport::ble::addr::{BleAddr, BleDeviceAddr};
 use crate::transport::ble::io::{MockBleIo, MockBleStream};
 use crate::transport::ble::BleTransport;
 use crate::transport::{packet_channel, Transport, TransportHandle, TransportId};
@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 fn ble_addr(n: u8) -> BleAddr {
     BleAddr {
         adapter: "hci0".to_string(),
-        device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+        device: BleDeviceAddr::Mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n]),
     }
 }
 

@@ -1,0 +1,229 @@
+F1: Plan Compliance Audit — macOS BLE L2CAP Support
+====================================================
+Date: 2026-04-06
+Auditor: F1 oracle agent
+
+Plan: .sisyphus/plans/macos-ble.md
+Scope: All Must Have (8), Must NOT Have (9), Tasks (10)
+
+====================================================
+MUST HAVE CHECKLIST
+====================================================
+
+[1] BluestIo implementing all 7 BleIo trait methods
+    STATUS: PASS
+    EVIDENCE: src/transport/ble/bluest.rs implements listen, connect,
+    start_advertising, stop_advertising, start_scanning, local_addr,
+    adapter_name — all 7 methods of the BleIo trait.
+
+[2] Central role: start_scanning, connect produce working BLE connections
+    STATUS: PASS
+    EVIDENCE: bluest.rs start_scanning() creates BluestScanner wrapping
+    bluest Adapter::discover_devices(). connect() calls
+    Device::open_l2cap_channel(psm, secure=false) producing BluestStream.
+    Both use real bluest API calls with proper error handling.
+
+[3] Peripheral role: listen, start_advertising, stop_advertising return
+    TransportError with clear message
+    STATUS: PASS
+    EVIDENCE: All three methods return
+    Err(TransportError::NotSupported("... central-only ...".into()))
+    with descriptive messages.
+
+[4] BleAddr support for UUID-based device identification
+    STATUS: PASS
+    EVIDENCE: src/transport/ble/addr.rs defines
+    BleDeviceAddr::Uuid([u8; 16]) variant. BleAddr::from_bluest_id()
+    and BleAddr::to_bluest_id() handle conversion. Display/parse
+    support UUID format.
+
+[5] All cfg gates widened to include macOS
+    STATUS: PARTIAL FAIL
+    EVIDENCE:
+    - transport/mod.rs: PASS — 21 instances of
+      cfg(any(target_os = "linux", target_os = "macos"))
+    - node/mod.rs create_transports: PASS — cfg(all(feature = "ble-macos",
+      not(test))) block creates BluestIo on macOS
+    - io.rs: PASS — cfg(feature = "ble-macos") mod bluest + re-export
+    - ble/mod.rs: PASS — DefaultBleTransport = BluestIo on macOS
+    - Cargo.toml: PASS — bluest gated to cfg(target_os = "macos")
+    - node/lifecycle.rs: FAIL — BLE address resolution in
+      initiate_peer_connection (line 123) is still
+      #[cfg(target_os = "linux")] only. macOS falls to the
+      #[cfg(not(target_os = "linux"))] branch which logs
+      "BLE transport not available on this platform" and skips.
+    - node/mod.rs resolve_ble_addr: FAIL — function at line 883 is
+      gated with #[cfg(target_os = "linux")] only, not widened.
+    IMPACT: macOS nodes cannot initiate BLE connections to statically
+    configured BLE peers. Scan-based auto-connect (via BleTransport)
+    still works, but explicit peer addresses with transport="ble"
+    in config will be silently skipped on macOS.
+
+[6] DefaultBleTransport resolves to BluestIo on macOS (non-test builds)
+    STATUS: PASS
+    EVIDENCE: ble/mod.rs line 60-61:
+    #[cfg(all(feature = "ble-macos", not(test)))]
+    pub type DefaultBleTransport = BleTransport<io::BluestIo>;
+
+[7] bluest pinned to specific version in Cargo.toml
+    STATUS: PASS (minor version discrepancy)
+    EVIDENCE: Cargo.toml has bluest = { version = "0.6.9", ... }
+    Plan specified v0.6.10. However, 0.6.9 is a valid pin and the
+    crate compiles and works. This is acceptable — the plan's version
+    was a recommendation, not a strict requirement, and pinning to
+    a specific version satisfies the intent.
+
+[8] Error mapping from bluest errors to TransportError
+    STATUS: PASS
+    EVIDENCE: bluest.rs maps errors to:
+    - TransportError::Io (general bluest errors via io::Error::other)
+    - TransportError::LinkFailed (connection failures)
+    - TransportError::SendFailed / RecvFailed (stream I/O)
+    - TransportError::InvalidAddress (bad address format)
+    All use existing TransportError variants with context strings.
+
+MUST HAVE SUMMARY: 7/8 PASS, 1 PARTIAL FAIL (cfg gates not fully widened)
+
+====================================================
+MUST NOT HAVE CHECKLIST
+====================================================
+
+[1] NO peripheral role implementation — stubbed only
+    STATUS: PASS
+    EVIDENCE: listen, start_advertising, stop_advertising all return
+    NotSupported immediately. No CBPeripheralManager, no advertising
+    logic, no L2CAP listening in BluestIo.
+
+[2] NO changes to BluerIo (Linux backend must be untouched)
+    STATUS: PASS
+    EVIDENCE: git diff shows bluer_impl module in io.rs is unchanged.
+    Only additions: removal of a section comment, addition of bluest
+    module declaration and re-export after the bluer_impl block.
+
+[3] NO new TransportError variants
+    STATUS: PASS
+    EVIDENCE: TransportError enum in transport/mod.rs has exactly the
+    same variants: NotStarted, AlreadyStarted, StartFailed,
+    ShutdownFailed, LinkFailed, SendFailed, RecvFailed, InvalidAddress,
+    MtuExceeded, Timeout, ConnectionRefused, NotSupported, Io.
+    No additions.
+
+[4] NO GATT-based transport — L2CAP CoC only
+    STATUS: PASS
+    EVIDENCE: grep for "GATT" and "gatt" in transport/ble/ returns
+    no matches. BluestIo uses Device::open_l2cap_channel() exclusively.
+
+[5] NO exploration of bluest APIs beyond Adapter, Device, L2capChannel,
+    scan, connect
+    STATUS: PASS
+    EVIDENCE: bluest.rs imports only: bluest::{Adapter, Device,
+    DeviceId, L2capChannel, L2capChannelReader, L2capChannelWriter}.
+    No GATT, peripheral, or other APIs used.
+
+[6] NO abstraction layers or trait changes to BleIo
+    STATUS: PASS
+    EVIDENCE: BleIo trait in io.rs is identical to pre-macOS version.
+    Same 7 methods, same associated types (Stream, Acceptor, Scanner),
+    same signatures. BluestIo implements BleIo as-is.
+
+[7] NO protocol changes — same UUID, same PSM, same pre-handshake
+    STATUS: PASS
+    EVIDENCE: FIPS_SERVICE_UUID in bluest.rs matches
+    9c90b790-2cc5-42c0-9f87-c9cc40648f4c. PSM uses DEFAULT_PSM
+    from mod.rs. Pre-handshake handled by BleTransport layer (unchanged).
+
+[8] NO excessive error mapping
+    STATUS: PASS
+    EVIDENCE: bluest.rs maps all bluest errors to TransportError::Io
+    with context string (e.g., "connect: {error}"). Specific
+    TransportError variants used only where semantically appropriate
+    (LinkFailed for connection, SendFailed/RecvFailed for I/O).
+
+[9] NO over-engineering of MTU negotiation
+    STATUS: PASS
+    EVIDENCE: BluestStream stores write_mtu from L2capChannel, uses
+    DEFAULT_MTU (2048) as recv_mtu fallback. No complex negotiation.
+
+MUST NOT HAVE SUMMARY: 9/9 PASS
+
+====================================================
+TASK COMPLETION
+====================================================
+
+All 10 tasks are marked [x] (complete) in the plan.
+
+Evidence file audit:
+  task-1:  MISSING (expected task-1-macos-feature-check.txt, task-1-linux-unchanged.txt)
+  task-2:  MISSING (expected task-2-cfg-gate-audit.txt, task-2-default-build.txt)
+  task-3:  MISSING (expected task-3-addr-compat.txt, task-3-uuid-parsing.txt)
+  task-4:  MISSING (expected task-4-mock-alias.txt, task-4-reexport-check.txt)
+  task-5:  MISSING (expected task-5-bluest-check.txt, task-5-stubs-check.txt, task-5-existing-tests.txt)
+  task-6:  MISSING (expected task-6-stream-bounds.txt, task-6-acceptor-stub.txt)
+  task-7:  MISSING (expected task-7-scanner-check.txt, task-7-uuid-check.txt, task-7-no-todo.txt)
+  task-8:  PRESENT (task-8-connect-check.txt, task-8-no-todo.txt) — 2/3 (task-8-error-types.txt MISSING)
+  task-9:  MISSING (expected task-9-integration-test.txt, task-9-wiring.txt, task-9-test-output.txt)
+  task-10: PRESENT (task-10-verification-report.txt, task-10-test-results.txt,
+           task-10-clippy.txt, task-10-macos-release.txt) — 4/4
+
+Evidence files present: 6 of ~24 expected (25%)
+NOTE: Evidence file gaps indicate tasks were completed without saving
+QA artifacts as required by the plan's verification strategy. The
+implementation itself is present and functional, but the audit trail
+is incomplete.
+
+TASK SUMMARY: 10/10 tasks implemented, evidence incomplete
+
+====================================================
+DELIVERABLES CHECK
+====================================================
+
+[✓] src/transport/ble/bluest.rs — 224 lines, complete BluestIo impl
+[✓] Updated Cargo.toml — bluest 0.6.9 with l2cap+unstable features
+[✓] Updated src/transport/ble/mod.rs — DefaultBleTransport for macOS
+[✓] Updated src/transport/ble/io.rs — bluest module + re-export
+[✓] Updated src/transport/ble/addr.rs — BleDeviceAddr::Uuid variant
+[✓] Updated src/transport/mod.rs — cfg gates widened (21 instances)
+[✓] Updated src/node/mod.rs — create_transports with macOS BLE block
+[✗] Updated src/node/lifecycle.rs — cfg gates NOT widened (still Linux-only)
+[✓] src/node/tests/ble_macos.rs — 76 lines, 7 integration tests
+
+DELIVERABLES: 8/9 present
+
+====================================================
+ISSUES FOUND
+====================================================
+
+ISSUE 1 (MEDIUM): Incomplete cfg gate widening in node/lifecycle.rs
+  - resolve_ble_addr() at node/mod.rs:883 is #[cfg(target_os = "linux")]
+  - BLE branch at lifecycle.rs:123 is #[cfg(target_os = "linux")]
+  - Impact: Static BLE peer addresses in config won't resolve on macOS
+  - Mitigation: BleTransport scan+auto-connect still works (the primary
+    macOS use case), so this is functional but not fully plan-compliant
+  - Fix: Widen both to #[cfg(any(target_os = "linux", target_os = "macos"))]
+
+ISSUE 2 (LOW): Evidence files incomplete
+  - Only 6 of ~24 expected evidence files exist
+  - Tasks 1-7 and 9 have no QA artifacts saved
+  - Impact: Audit trail incomplete, but implementation is verified present
+
+ISSUE 3 (LOW): bluest version 0.6.9 vs plan's 0.6.10
+  - Plan specified v0.6.10, implementation uses v0.6.9
+  - Impact: None — both versions work, pin intent is satisfied
+
+====================================================
+VERDICT
+====================================================
+
+Must Have [7/8] | Must NOT Have [9/9] | Tasks [10/10] | VERDICT: CONDITIONAL APPROVE
+
+Rationale: The implementation is substantially complete and functional.
+All Must NOT Have guardrails are satisfied (9/9). 7 of 8 Must Have items
+fully pass. The one partial failure (cfg gates in lifecycle.rs) has limited
+practical impact because the primary macOS BLE workflow (scan-based
+auto-connect) works correctly — only static BLE peer config resolution
+is affected. The evidence file gaps are a process issue, not a code issue.
+
+Conditions for full APPROVE:
+1. Widen cfg gates in node/lifecycle.rs:123 and node/mod.rs:883 to
+   include target_os = "macos"
+2. (Optional) Backfill missing evidence files for tasks 1-7, 9

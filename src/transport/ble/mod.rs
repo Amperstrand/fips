@@ -1,9 +1,10 @@
 //! BLE L2CAP Transport Implementation
 //!
 //! Provides BLE-based transport for FIPS peer communication using L2CAP
-//! Connection-Oriented Channels (CoC) in SeqPacket mode. L2CAP CoC
-//! preserves message boundaries (unlike TCP byte streams), so no FMP
-//! framing is needed — each send/recv is one FIPS packet.
+//! Connection-Oriented Channels (CoC) in SeqPacket mode. While SeqPacket
+//! nominally preserves message boundaries, some BLE controllers (notably
+//! ESP32) may coalesce back-to-back sends into a single recv(). The
+//! receive loop handles this by splitting on FMP frame boundaries.
 //!
 //! ## Architecture
 //!
@@ -24,9 +25,10 @@ pub mod io;
 pub mod pool;
 pub mod stats;
 
+
 use super::{
-    ConnectionState, DisconnectTx, DiscoveredPeer, PacketTx, ReceivedPacket, Transport,
-    TransportAddr, TransportDisconnect, TransportError, TransportId, TransportState, TransportType,
+    ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
+    TransportError, TransportId, TransportState, TransportType,
 };
 use crate::config::BleConfig;
 use crate::identity::NodeAddr;
@@ -36,11 +38,11 @@ use io::{BleIo, BleScanner, BleStream};
 use pool::{BleConnection, ConnectionPool};
 use stats::BleStats;
 
-use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use secp256k1::XOnlyPublicKey;
 use tracing::{debug, info, trace, warn};
 
 /// Default FIPS L2CAP PSM (Protocol Service Multiplexer).
@@ -51,12 +53,17 @@ pub const DEFAULT_PSM: u16 = 0x0085;
 /// Concrete BLE transport type for use in TransportHandle.
 ///
 /// Production builds with the `ble` feature use `BluerIo` (real BlueZ stack).
-/// Test builds and builds without `ble` use `MockBleIo`.
-#[cfg(all(feature = "ble", not(test)))]
+/// Production builds with `ble-macos` feature use `BluestIo` (real CoreBluetooth stack).
+/// Test builds and builds without BLE features use `MockBleIo`.
+#[cfg(all(feature = "ble", target_os = "linux", not(test)))]
 pub type DefaultBleTransport = BleTransport<io::BluerIo>;
 
-#[cfg(any(not(feature = "ble"), test))]
+#[cfg(all(feature = "ble-macos", target_os = "macos", not(test)))]
+pub type DefaultBleTransport = BleTransport<io::BluestIo>;
+
+#[cfg(any(all(not(feature = "ble"), not(feature = "ble-macos")), test))]
 pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
+
 
 // ============================================================================
 // BLE Transport
@@ -82,6 +89,9 @@ pub struct BleTransport<I: BleIo> {
     pool: Arc<Mutex<ConnectionPool<Arc<I::Stream>>>>,
     /// Pending connection attempts.
     connecting: Arc<Mutex<HashMap<TransportAddr, ConnectingEntry>>>,
+    /// Addresses where inbound has won cross-connection resolution.
+    /// Outbound background tasks check this before inserting into the pool.
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
     /// Accept loop task handle.
@@ -99,7 +109,8 @@ pub struct BleTransport<I: BleIo> {
     /// so the node layer can initiate the IK handshake.
     /// Temporary — removed when FMP switches to XX.
     local_pubkey: Option<[u8; 32]>,
-    disconnect_tx: Option<DisconnectTx>,
+    /// Channel for notifying Node of BLE connection drops.
+    disconnect_tx: Option<super::DisconnectTx>,
 }
 
 /// A pending background connection attempt.
@@ -125,6 +136,7 @@ impl<I: BleIo> BleTransport<I> {
             io: Arc::new(io),
             pool: Arc::new(Mutex::new(ConnectionPool::new(max_conns))),
             connecting: Arc::new(Mutex::new(HashMap::new())),
+            blocked_outbound_addrs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             packet_tx,
             accept_task: None,
             scan_probe_task: None,
@@ -159,7 +171,12 @@ impl<I: BleIo> BleTransport<I> {
         self.local_pubkey = Some(pubkey);
     }
 
-    pub fn set_disconnect_tx(&mut self, tx: DisconnectTx) {
+    /// Set the disconnect notification channel.
+    ///
+    /// Must be called before `start_async()`. When a BLE connection drops,
+    /// the transport sends a `TransportDisconnect` so the Node layer can
+    /// immediately reset session state instead of waiting for heartbeat timeout.
+    pub fn set_disconnect_tx(&mut self, tx: super::DisconnectTx) {
         self.disconnect_tx = Some(tx);
     }
 
@@ -172,7 +189,6 @@ impl<I: BleIo> BleTransport<I> {
 
         let psm = self.config.psm();
         let adapter = self.io.adapter_name().to_string();
-        let disable_tiebreaker = self.config.disable_tiebreaker();
 
         // Pre-compute local NodeAddr for cross-probe tie-breaking
         let local_node_addr = self.local_pubkey.and_then(|pk| {
@@ -190,7 +206,6 @@ impl<I: BleIo> BleTransport<I> {
                     let transport_id = self.transport_id;
                     let stats = Arc::clone(&self.stats);
                     let max_conns = self.config.max_connections();
-                    let disconnect_tx = self.disconnect_tx.clone();
 
                     self.accept_task = Some(tokio::spawn(accept_loop(
                         acceptor,
@@ -202,15 +217,18 @@ impl<I: BleIo> BleTransport<I> {
                         self.local_pubkey,
                         Arc::clone(&self.discovery_buffer),
                         local_node_addr,
-                        disable_tiebreaker,
-                        disconnect_tx,
+                        self.config.disable_tiebreaker(),
+                        Arc::clone(&self.blocked_outbound_addrs),
+                        self.disconnect_tx.clone(),
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
                 Err(e) => {
                     warn!(adapter = %adapter, error = %e, "failed to start BLE listener");
-                    self.state = TransportState::Failed;
-                    return Err(e);
+                    if !matches!(e, TransportError::NotSupported(_)) {
+                        self.state = TransportState::Failed;
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -240,10 +258,11 @@ impl<I: BleIo> BleTransport<I> {
                         self.config.connect_timeout_ms(),
                         self.config.probe_cooldown_secs(),
                         local_node_addr,
-                        disable_tiebreaker,
-                        self.disconnect_tx.clone(),
                         self.packet_tx.clone(),
                         self.transport_id,
+                        self.config.disable_tiebreaker(),
+                        Arc::clone(&self.blocked_outbound_addrs),
+                        self.disconnect_tx.clone(),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -329,6 +348,7 @@ impl<I: BleIo> BleTransport<I> {
 
         match conn.stream.send(data).await {
             Ok(()) => {
+                debug!(addr = %addr, bytes = data.len(), "BLE send: packet sent");
                 self.stats.record_send(data.len());
                 Ok(data.len())
             }
@@ -378,7 +398,7 @@ impl<I: BleIo> BleTransport<I> {
 
         // Pre-handshake pubkey exchange (temporary, pre-XX)
         if let Some(ref our_pubkey) = self.local_pubkey {
-            match pubkey_exchange(&stream, our_pubkey).await {
+            match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Initiator).await {
                 Ok(peer_pubkey) => {
                     debug!(addr = %addr, "BLE outbound pubkey exchange complete");
                     self.discovery_buffer
@@ -415,6 +435,7 @@ impl<I: BleIo> BleTransport<I> {
             self.transport_id,
             Arc::clone(&self.stats),
             recv_mtu,
+            Arc::clone(&self.blocked_outbound_addrs),
             self.disconnect_tx.clone(),
         ));
 
@@ -476,6 +497,7 @@ impl<I: BleIo> BleTransport<I> {
         let io = Arc::clone(&self.io);
         let pool = Arc::clone(&self.pool);
         let connecting = Arc::clone(&self.connecting);
+        let blocked_outbound_addrs = Arc::clone(&self.blocked_outbound_addrs);
         let packet_tx = self.packet_tx.clone();
         let transport_id = self.transport_id;
         let stats = Arc::clone(&self.stats);
@@ -500,10 +522,11 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(Ok(stream)) => {
                     // Pre-handshake pubkey exchange (temporary, pre-XX)
                     if let Some(ref our_pubkey) = local_pubkey {
-                        match pubkey_exchange(&stream, our_pubkey).await {
+                        match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Initiator).await {
                             Ok(peer_pubkey) => {
                                 debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
-                                discovery_buffer.add_peer_with_pubkey(&ble_addr, peer_pubkey);
+                                discovery_buffer
+                                    .add_peer_with_pubkey(&ble_addr, peer_pubkey);
                             }
                             Err(e) => {
                                 warn!(
@@ -527,6 +550,7 @@ impl<I: BleIo> BleTransport<I> {
                         transport_id,
                         Arc::clone(&stats),
                         recv_mtu,
+                        Arc::clone(&blocked_outbound_addrs),
                         disconnect_tx.clone(),
                     ));
 
@@ -541,6 +565,10 @@ impl<I: BleIo> BleTransport<I> {
                     };
 
                     let mut pool = pool.lock().await;
+                    if blocked_outbound_addrs.lock().await.contains(&addr_clone) {
+                        debug!(addr = %addr_clone, "Outbound blocked (inbound won cross-connection), dropping");
+                        return;
+                    }
                     match pool.insert(addr_clone.clone(), conn) {
                         Ok(Some(evicted)) => {
                             stats.record_pool_eviction();
@@ -596,10 +624,11 @@ impl<I: BleIo> BleTransport<I> {
 
     /// Close a specific connection.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
+        self.blocked_outbound_addrs.lock().await.insert(addr.clone());
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            debug!(addr = %addr, "BLE connection closed");
-            drop(conn); // recv_task aborted via Drop
+            info!(addr = %addr, "BLE connection closed, outbound blocked for this address");
+            drop(conn);
         }
     }
 
@@ -690,33 +719,130 @@ const PUBKEY_EXCHANGE_SIZE: usize = 33;
 /// forever — killing scan_probe_loop, accept_loop, or the event loop.
 const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
 
+#[cfg(feature = "ble-macos")]
+const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
+
+#[cfg(not(feature = "ble-macos"))]
+const ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION: bool = false;
+
+async fn recv_pubkey_frame<S: BleStream>(
+    stream: &S,
+    buf: &mut [u8; PUBKEY_EXCHANGE_SIZE],
+    role: PubkeyExchangeRole,
+) -> Result<(), TransportError> {
+    let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
+    let role_name = match role {
+        PubkeyExchangeRole::Initiator => "initiator",
+        PubkeyExchangeRole::Responder => "responder",
+    };
+
+    tokio::time::timeout(timeout, async {
+        let mut offset = 0;
+        while offset < PUBKEY_EXCHANGE_SIZE {
+            debug!(
+                role = role_name,
+                read_offset = offset,
+                remaining = PUBKEY_EXCHANGE_SIZE - offset,
+                "BLE pubkey exchange recv start"
+            );
+
+            let n = stream.recv(&mut buf[offset..]).await?;
+
+            debug!(
+                role = role_name,
+                read_offset = offset,
+                bytes_read = n,
+                "BLE pubkey exchange recv complete"
+            );
+
+            if n == 0 {
+                return Err(TransportError::RecvFailed(
+                    "pubkey exchange: peer closed before full frame".into(),
+                ));
+            }
+
+            offset += n;
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|_| TransportError::Timeout)?
+}
+
+async fn send_pubkey_frame<S: BleStream>(
+    stream: &S,
+    local_pubkey: &[u8; 32],
+    role: PubkeyExchangeRole,
+) -> Result<(), TransportError> {
+    let role_name = match role {
+        PubkeyExchangeRole::Initiator => "initiator",
+        PubkeyExchangeRole::Responder => "responder",
+    };
+
+    let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
+    msg[0] = PUBKEY_EXCHANGE_PREFIX;
+    msg[1..].copy_from_slice(local_pubkey);
+
+    debug!(role = role_name, bytes = msg.len(), "BLE pubkey exchange send start");
+    stream.send(&msg).await?;
+    debug!(role = role_name, bytes = msg.len(), "BLE pubkey exchange send complete");
+    Ok(())
+}
+
+/// Role in the pubkey exchange handshake.
+///
+/// Used to prevent race conditions in BLE L2CAP where both sides might
+/// send simultaneously before either starts receiving. The initiator
+/// (connector) sends first; the responder (acceptor) receives first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PubkeyExchangeRole {
+    /// Initiator: send pubkey first, then receive peer's pubkey.
+    /// Used by outbound connections (scan_probe_loop).
+    Initiator,
+    /// Responder: receive peer's pubkey first, then send ours.
+    /// Used by inbound connections (accept_loop).
+    Responder,
+}
+
 /// Exchange public keys over a newly established L2CAP connection.
 ///
-/// Both sides send `[0x00][our_pubkey:32]` and receive the peer's.
+/// Uses role-based asymmetric handshake to prevent race conditions:
+/// - Initiator (connector) sends first, then receives
+/// - Responder (acceptor) receives first, then sends
+///
 /// Returns the peer's XOnlyPublicKey on success.
 async fn pubkey_exchange<S: BleStream>(
     stream: &S,
     local_pubkey: &[u8; 32],
+    role: PubkeyExchangeRole,
 ) -> Result<XOnlyPublicKey, TransportError> {
-    // Send our pubkey
-    let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
-    msg[0] = PUBKEY_EXCHANGE_PREFIX;
-    msg[1..].copy_from_slice(local_pubkey);
-    stream.send(&msg).await?;
-
-    // Receive peer's pubkey (with timeout to prevent indefinite blocking)
     let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE];
-    let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
-    let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
-        Ok(result) => result?,
-        Err(_) => return Err(TransportError::Timeout),
+    let role_name = match role {
+        PubkeyExchangeRole::Initiator => "initiator",
+        PubkeyExchangeRole::Responder => "responder",
     };
-    if n != PUBKEY_EXCHANGE_SIZE {
-        return Err(TransportError::RecvFailed(format!(
-            "pubkey exchange: expected {} bytes, got {}",
-            PUBKEY_EXCHANGE_SIZE, n
-        )));
+
+    let start = std::time::Instant::now();
+    debug!(role = role_name, "BLE pubkey exchange start");
+
+    match role {
+        PubkeyExchangeRole::Initiator => {
+            debug!(role = role_name, "BLE pubkey exchange: sending our pubkey");
+            send_pubkey_frame(stream, local_pubkey, role).await?;
+            debug!(role = role_name, elapsed_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange: sent, now receiving peer pubkey");
+            recv_pubkey_frame(stream, &mut buf, role).await?;
+        }
+        PubkeyExchangeRole::Responder => {
+            debug!(role = role_name, "BLE pubkey exchange: receiving peer pubkey");
+            recv_pubkey_frame(stream, &mut buf, role).await?;
+            debug!(role = role_name, elapsed_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange: received, now sending our pubkey");
+            send_pubkey_frame(stream, local_pubkey, role).await?;
+        }
     }
+
+    debug!(role = role_name, prefix = buf[0], "BLE pubkey exchange frame complete");
+
     if buf[0] != PUBKEY_EXCHANGE_PREFIX {
         return Err(TransportError::RecvFailed(format!(
             "pubkey exchange: bad prefix 0x{:02X}",
@@ -724,8 +850,11 @@ async fn pubkey_exchange<S: BleStream>(
         )));
     }
 
-    XOnlyPublicKey::from_slice(&buf[1..])
-        .map_err(|e| TransportError::RecvFailed(format!("pubkey exchange: invalid key: {}", e)))
+    let peer_pubkey = XOnlyPublicKey::from_slice(&buf[1..])
+        .map_err(|e| TransportError::RecvFailed(format!("pubkey exchange: invalid key: {}", e)))?;
+    
+    debug!(role = role_name, total_ms = start.elapsed().as_millis() as u64, "BLE pubkey exchange complete");
+    Ok(peer_pubkey)
 }
 
 // Beacon loop removed — advertising is now continuous (started once
@@ -746,7 +875,8 @@ async fn accept_loop<A>(
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_node_addr: Option<NodeAddr>,
     disable_tiebreaker: bool,
-    disconnect_tx: Option<DisconnectTx>,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -771,7 +901,7 @@ async fn accept_loop<A>(
 
                 // Pre-handshake pubkey exchange (temporary, pre-XX)
                 if let Some(ref our_pubkey) = local_pubkey {
-                    match pubkey_exchange(&stream, our_pubkey).await {
+                    match pubkey_exchange(&stream, our_pubkey, PubkeyExchangeRole::Responder).await {
                         Ok(peer_pubkey) => {
                             debug!(addr = %ta, "BLE inbound pubkey exchange complete");
                             discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
@@ -810,6 +940,7 @@ async fn accept_loop<A>(
                     transport_id,
                     Arc::clone(&stats),
                     recv_mtu,
+                    Arc::clone(&blocked_outbound_addrs),
                     disconnect_tx.clone(),
                 ));
 
@@ -849,6 +980,41 @@ async fn accept_loop<A>(
 }
 
 /// Receive loop: reads packets from a BLE stream and delivers to node.
+///
+/// Some BLE controllers coalesce back-to-back sends into a single recv()
+/// Calculate the total frame length from a frame prefix.
+///
+/// # Arguments
+/// * `prefix` - The first 4 bytes of an FMP frame
+///
+/// # Returns
+/// * `Some(frame_len)` if the prefix is valid
+/// * `None` if the prefix is too short
+///
+/// # Wire Format
+/// - Bytes [0,1]: version/phase + flags
+/// - Bytes [2,3]: payload_len (little-endian u16)
+/// - For established frames (phase 0x0): header(16) + payload_len + tag(16)
+/// - For handshake frames (phase 0x1/0x2): prefix(4) + payload_len
+fn calculate_frame_len(prefix: &[u8]) -> Option<usize> {
+    if prefix.len() < crate::node::wire::COMMON_PREFIX_SIZE {
+        return None;
+    }
+
+    let phase = prefix[0] & 0x0F;
+    let payload_len = u16::from_le_bytes([prefix[2], prefix[3]]) as usize;
+
+    let frame_len = if phase == crate::node::wire::PHASE_ESTABLISHED {
+        crate::node::wire::ESTABLISHED_HEADER_SIZE + payload_len + crate::noise::TAG_SIZE
+    } else {
+        crate::node::wire::COMMON_PREFIX_SIZE + payload_len
+    };
+
+    Some(frame_len)
+}
+
+/// call despite SeqPacket semantics. This loop splits coalesced data on
+/// FMP frame boundaries using the payload_len field in each 4-byte prefix.
 async fn receive_loop<S: BleStream>(
     stream: Arc<S>,
     addr: TransportAddr,
@@ -857,7 +1023,8 @@ async fn receive_loop<S: BleStream>(
     transport_id: TransportId,
     stats: Arc<BleStats>,
     recv_mtu: u16,
-    disconnect_tx: Option<DisconnectTx>,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) {
     let mut buf = vec![0u8; recv_mtu as usize];
     loop {
@@ -867,11 +1034,46 @@ async fn receive_loop<S: BleStream>(
                 break;
             }
             Ok(n) => {
-                stats.record_recv(n);
-                let packet = ReceivedPacket::new(transport_id, addr.clone(), buf[..n].to_vec());
-                if packet_tx.send(packet).await.is_err() {
-                    trace!("BLE packet_tx closed, stopping receive loop");
-                    break;
+                let mut remaining = &buf[..n];
+                let mut frame_count = 0u32;
+                while !remaining.is_empty() {
+                    let frame_len = match calculate_frame_len(remaining) {
+                        Some(len) => len,
+                        None => {
+                            debug!(
+                                addr = %addr,
+                                leftover = remaining.len(),
+                                "BLE receive: leftover bytes shorter than FMP prefix, discarding"
+                            );
+                            break;
+                        }
+                    };
+
+                    if frame_len < crate::node::wire::COMMON_PREFIX_SIZE || frame_len > remaining.len() {
+                        debug!(
+                            addr = %addr,
+                            frame_len,
+                            remaining = remaining.len(),
+                            "BLE receive: invalid or incomplete frame, discarding rest"
+                        );
+                        break;
+                    }
+                    let frame_data = remaining[..frame_len].to_vec();
+                    if frame_count == 0 {
+                        stats.record_recv(n);
+                    } else {
+                        stats.record_recv(frame_len);
+                    }
+                    frame_count += 1;
+                    let packet = ReceivedPacket::new(transport_id, addr.clone(), frame_data);
+                    if packet_tx.send(packet).await.is_err() {
+                        trace!("BLE packet_tx closed, stopping receive loop");
+                        break;
+                    }
+                    remaining = &remaining[frame_len..];
+                }
+                if frame_count > 1 {
+                    debug!(addr = %addr, frames = frame_count, "BLE receive: split coalesced frames");
                 }
             }
             Err(e) => {
@@ -882,19 +1084,73 @@ async fn receive_loop<S: BleStream>(
         }
     }
 
-    // Remove from pool
     let mut pool = pool.lock().await;
     pool.remove(&addr);
+    blocked_outbound_addrs.lock().await.remove(&addr);
 
     if let Some(ref tx) = disconnect_tx {
-        let _ = tx
-            .send(TransportDisconnect {
-                transport_id,
-                remote_addr: addr.clone(),
-            })
-            .await;
+        let _ = tx.send(super::TransportDisconnect {
+            transport_id,
+            remote_addr: addr.clone(),
+        }).await;
         info!(addr = %addr, transport_id = %transport_id, "BLE disconnect notified");
     }
+}
+
+async fn promote_probe_connection<S: BleStream + 'static>(
+    stream: S,
+    addr: BleAddr,
+    pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
+    packet_tx: PacketTx,
+    transport_id: TransportId,
+    stats: Arc<BleStats>,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
+) {
+    let ta = addr.to_transport_addr();
+    let send_mtu = stream.send_mtu();
+    let recv_mtu = stream.recv_mtu();
+    let stream = Arc::new(stream);
+
+    let recv_task = tokio::spawn(receive_loop(
+        Arc::clone(&stream),
+        ta.clone(),
+        Arc::clone(&pool),
+        packet_tx,
+        transport_id,
+        Arc::clone(&stats),
+        recv_mtu,
+        Arc::clone(&blocked_outbound_addrs),
+        disconnect_tx.clone(),
+    ));
+
+    let conn = BleConnection {
+        stream,
+        recv_task: Some(recv_task),
+        send_mtu,
+        recv_mtu,
+        established_at: tokio::time::Instant::now(),
+        is_static: false,
+        addr,
+    };
+
+    let mut pool_guard = pool.lock().await;
+    match pool_guard.insert(ta.clone(), conn) {
+        Ok(Some(evicted)) => {
+            stats.record_pool_eviction();
+            debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
+        }
+        Ok(None) => {
+            debug!(addr = %ta, "BLE probe promoted to pool");
+        }
+        Err(e) => {
+            warn!(addr = %ta, error = %e, "BLE pool full, probe connection dropped");
+            stats.record_connection_rejected();
+            return;
+        }
+    }
+    drop(pool_guard);
+    stats.record_connection_established();
 }
 
 /// Combined scan + probe loop.
@@ -921,12 +1177,12 @@ async fn scan_probe_loop<I: io::BleIo>(
     connect_timeout_ms: u64,
     cooldown_secs: u64,
     local_node_addr: Option<NodeAddr>,
-    disable_tiebreaker: bool,
-    disconnect_tx: Option<DisconnectTx>,
     packet_tx: PacketTx,
     transport_id: TransportId,
+    disable_tiebreaker: bool,
+    blocked_outbound_addrs: Arc<Mutex<std::collections::HashSet<TransportAddr>>>,
+    disconnect_tx: Option<super::DisconnectTx>,
 ) {
-    // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
     // Addresses discovered but not yet connected — retried after cooldown
     // even if the scanner doesn't fire again (BlueZ deduplicates).
@@ -1018,8 +1274,31 @@ async fn scan_probe_loop<I: io::BleIo>(
         };
 
         // Pubkey exchange, then promote connection to pool
-        let ta = addr.to_transport_addr();
-        match pubkey_exchange(&stream, &our_pubkey).await {
+        if ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION {
+            match send_pubkey_frame(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
+                Ok(()) => {
+                    promote_probe_connection(
+                        stream,
+                        addr.clone(),
+                        Arc::clone(&pool),
+                        packet_tx.clone(),
+                        transport_id,
+                        Arc::clone(&stats),
+                        Arc::clone(&blocked_outbound_addrs),
+                        disconnect_tx.clone(),
+                    )
+                    .await;
+                    pending_addrs.retain(|a| a != &addr);
+                    continue;
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE probe pubkey send failed");
+                    continue;
+                }
+            }
+        }
+
+        match pubkey_exchange(&stream, &our_pubkey, PubkeyExchangeRole::Initiator).await {
             Ok(peer_pubkey) => {
                 debug!(addr = %addr, "BLE probe complete");
 
@@ -1040,53 +1319,42 @@ async fn scan_probe_loop<I: io::BleIo>(
                 }
 
                 // Promote connection to pool — no second L2CAP connect needed
-                let send_mtu = stream.send_mtu();
-                let recv_mtu = stream.recv_mtu();
-                let stream = Arc::new(stream);
-
-                let recv_task = tokio::spawn(receive_loop(
-                    Arc::clone(&stream),
-                    ta.clone(),
+                promote_probe_connection(
+                    stream,
+                    addr.clone(),
                     Arc::clone(&pool),
                     packet_tx.clone(),
                     transport_id,
                     Arc::clone(&stats),
-                    recv_mtu,
+                    Arc::clone(&blocked_outbound_addrs),
                     disconnect_tx.clone(),
-                ));
-
-                let conn = BleConnection {
-                    stream,
-                    recv_task: Some(recv_task),
-                    send_mtu,
-                    recv_mtu,
-                    established_at: tokio::time::Instant::now(),
-                    is_static: false,
-                    addr: addr.clone(),
-                };
-
-                let mut pool_guard = pool.lock().await;
-                match pool_guard.insert(ta.clone(), conn) {
-                    Ok(Some(evicted)) => {
-                        stats.record_pool_eviction();
-                        debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
-                    }
-                    Ok(None) => {
-                        debug!(addr = %ta, "BLE probe promoted to pool");
-                    }
-                    Err(e) => {
-                        warn!(addr = %ta, error = %e, "BLE pool full, probe connection dropped");
-                        stats.record_connection_rejected();
-                    }
-                }
-                drop(pool_guard);
-                stats.record_connection_established();
+                )
+                .await;
                 pending_addrs.retain(|a| a != &addr);
 
                 // Report to node layer for auto-connect / handshake
                 buffer.add_peer_with_pubkey(&addr, peer_pubkey);
             }
             Err(e) => {
+                if matches!(e, TransportError::Timeout) && ALLOW_OUTBOUND_PROBE_TIMEOUT_PROMOTION {
+                    debug!(
+                        addr = %addr,
+                        "BLE probe pubkey exchange timed out; promoting connection for inbound handshake fallback"
+                    );
+                    promote_probe_connection(
+                        stream,
+                        addr.clone(),
+                        Arc::clone(&pool),
+                        packet_tx.clone(),
+                        transport_id,
+                        Arc::clone(&stats),
+                        Arc::clone(&blocked_outbound_addrs),
+                        disconnect_tx.clone(),
+                    )
+                    .await;
+                    pending_addrs.retain(|a| a != &addr);
+                    continue;
+                }
                 debug!(addr = %addr, error = %e, "BLE probe pubkey exchange failed");
             }
         }
@@ -1100,25 +1368,96 @@ async fn scan_probe_loop<I: io::BleIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use io::MockBleIo;
+    use super::addr::BleDeviceAddr;
+    use io::{MockBleIo, MockBleStream};
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex as TokioMutex;
 
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
-            device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            device: BleDeviceAddr::Mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n]),
         }
     }
 
     fn make_transport(
         io: MockBleIo,
-    ) -> (
-        BleTransport<MockBleIo>,
-        tokio::sync::mpsc::Receiver<ReceivedPacket>,
-    ) {
+    ) -> (BleTransport<MockBleIo>, tokio::sync::mpsc::Receiver<ReceivedPacket>) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let config = BleConfig::default();
-        let transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        let transport = BleTransport::new(
+            TransportId::new(1),
+            None,
+            config,
+            io,
+            tx,
+        );
         (transport, rx)
+    }
+
+    fn test_pubkey(seed: u8) -> [u8; 32] {
+        let mut secret = [0u8; 32];
+        secret.fill(seed);
+        secret[31] = seed.saturating_add(1);
+        let secp = secp256k1::Secp256k1::new();
+        let secret_key = secp256k1::SecretKey::from_slice(&secret).unwrap();
+        let (pubkey, _) = secret_key.public_key(&secp).x_only_public_key();
+        pubkey.serialize()
+    }
+
+    struct FragmentingBleStream {
+        addr: BleAddr,
+        send_mtu: u16,
+        recv_mtu: u16,
+        rx: TokioMutex<VecDeque<Vec<u8>>>,
+        sent: TokioMutex<Vec<Vec<u8>>>,
+    }
+
+    impl FragmentingBleStream {
+        fn new(addr: BleAddr, chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                addr,
+                send_mtu: 2048,
+                recv_mtu: 2048,
+                rx: TokioMutex::new(VecDeque::from(chunks)),
+                sent: TokioMutex::new(Vec::new()),
+            }
+        }
+
+        async fn sent_frames(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().await.clone()
+        }
+    }
+
+    impl BleStream for FragmentingBleStream {
+        async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+            self.sent.lock().await.push(data.to_vec());
+            Ok(())
+        }
+
+        async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let mut rx = self.rx.lock().await;
+            match rx.pop_front() {
+                Some(chunk) => {
+                    let len = chunk.len().min(buf.len());
+                    buf[..len].copy_from_slice(&chunk[..len]);
+                    Ok(len)
+                }
+                None => Ok(0),
+            }
+        }
+
+        fn send_mtu(&self) -> u16 {
+            self.send_mtu
+        }
+
+        fn recv_mtu(&self) -> u16 {
+            self.recv_mtu
+        }
+
+        fn remote_addr(&self) -> &BleAddr {
+            &self.addr
+        }
     }
 
     #[test]
@@ -1153,6 +1492,71 @@ mod tests {
 
         transport.stop_async().await.unwrap();
         assert_eq!(transport.state(), TransportState::Down);
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_exchange_completes_for_role_asymmetry() {
+        let (stream_a, stream_b) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
+        let pubkey_a = test_pubkey(3);
+        let pubkey_b = test_pubkey(9);
+
+        let initiator = pubkey_exchange(&stream_a, &pubkey_a, PubkeyExchangeRole::Initiator);
+        let responder = pubkey_exchange(&stream_b, &pubkey_b, PubkeyExchangeRole::Responder);
+        let (peer_from_initiator, peer_from_responder) = tokio::join!(initiator, responder);
+
+        assert_eq!(peer_from_initiator.unwrap().serialize(), pubkey_b);
+        assert_eq!(peer_from_responder.unwrap().serialize(), pubkey_a);
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_exchange_initiator_accepts_fragmented_frame() {
+        let peer_pubkey = test_pubkey(21);
+        let mut frame = [0u8; PUBKEY_EXCHANGE_SIZE];
+        frame[0] = PUBKEY_EXCHANGE_PREFIX;
+        frame[1..].copy_from_slice(&peer_pubkey);
+
+        let stream = FragmentingBleStream::new(
+            test_addr(2),
+            vec![frame[..7].to_vec(), frame[7..19].to_vec(), frame[19..].to_vec()],
+        );
+
+        let received = pubkey_exchange(
+            &stream,
+            &test_pubkey(11),
+            PubkeyExchangeRole::Initiator,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(received.serialize(), peer_pubkey);
+        let sent = stream.sent_frames().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), PUBKEY_EXCHANGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_pubkey_exchange_responder_accepts_fragmented_frame() {
+        let peer_pubkey = test_pubkey(31);
+        let local_pubkey = test_pubkey(32);
+        let mut frame = [0u8; PUBKEY_EXCHANGE_SIZE];
+        frame[0] = PUBKEY_EXCHANGE_PREFIX;
+        frame[1..].copy_from_slice(&peer_pubkey);
+
+        let stream = FragmentingBleStream::new(
+            test_addr(3),
+            vec![frame[..1].to_vec(), frame[1..16].to_vec(), frame[16..].to_vec()],
+        );
+
+        let received = pubkey_exchange(&stream, &local_pubkey, PubkeyExchangeRole::Responder)
+            .await
+            .unwrap();
+
+        assert_eq!(received.serialize(), peer_pubkey);
+
+        let sent = stream.sent_frames().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], PUBKEY_EXCHANGE_PREFIX);
+        assert_eq!(&sent[0][1..], &local_pubkey);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1208,10 +1612,7 @@ mod tests {
         let io = MockBleIo::new("hci0", test_addr(1));
         let (transport, _rx) = make_transport(io);
         let addr = test_addr(2).to_transport_addr();
-        assert_eq!(
-            transport.connection_state_sync(&addr),
-            ConnectionState::None
-        );
+        assert_eq!(transport.connection_state_sync(&addr), ConnectionState::None);
     }
 
     /// Verify that the cross-probe tie-breaker follows the same convention
@@ -1243,5 +1644,90 @@ mod tests {
         // accept_loop (inbound): drops when our_addr < peer_addr
         // Smaller node accepting from larger → drops inbound (outbound wins)
         // This means: smaller always uses outbound, larger always uses inbound
+    }
+
+    #[test]
+    fn test_calculate_frame_len_prefix_too_short() {
+        // Less than 4 bytes should return None
+        assert!(calculate_frame_len(&[]).is_none());
+        assert!(calculate_frame_len(&[0x00]).is_none());
+        assert!(calculate_frame_len(&[0x00, 0x00]).is_none());
+        assert!(calculate_frame_len(&[0x00, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn test_calculate_frame_len_established_frame() {
+        // Established frame (phase 0x0): header(16) + payload_len + tag(16)
+        // payload_len = 0 (minimum)
+        let prefix = [0x00, 0x00, 0x00, 0x00]; // phase=0, payload_len=0
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 0 + 16); // = 32 bytes total
+
+        // payload_len = 100
+        let prefix = [0x00, 0x00, 0x64, 0x00]; // phase=0, payload_len=100
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 100 + 16); // = 132 bytes total
+
+        // payload_len = 1280 (max MTU)
+        let prefix = [0x00, 0x00, 0x00, 0x05]; // phase=0, payload_len=1280 (0x0500 LE)
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 1280 + 16); // = 1312 bytes total
+    }
+
+    #[test]
+    fn test_calculate_frame_len_handshake_msg1() {
+        // Handshake msg1 (phase 0x1): prefix(4) + payload_len
+        let prefix = [0x01, 0x00, 0x20, 0x00]; // phase=1, payload_len=32
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 4 + 32); // = 36 bytes total
+    }
+
+    #[test]
+    fn test_calculate_frame_len_handshake_msg2() {
+        // Handshake msg2 (phase 0x2): prefix(4) + payload_len
+        let prefix = [0x02, 0x00, 0x30, 0x00]; // phase=2, payload_len=48
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 4 + 48); // = 52 bytes total
+    }
+
+    #[test]
+    fn test_calculate_frame_len_phase_with_flags() {
+        // Phase can have flags in high nibble of first byte
+        // Established with flags (0x10 = phase 0, flag bit 4 set)
+        let prefix = [0x10, 0x00, 0x40, 0x00]; // phase=0 (0x10 & 0x0F), payload_len=64
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 16 + 64 + 16); // = 96 bytes total (established)
+
+        // Handshake msg1 with flags (0x11 = phase 1, flag bit 4 set)
+        let prefix = [0x11, 0x00, 0x20, 0x00]; // phase=1 (0x11 & 0x0F), payload_len=32
+        let frame_len = calculate_frame_len(&prefix).unwrap();
+        assert_eq!(frame_len, 4 + 32); // = 36 bytes total (handshake)
+    }
+
+    #[test]
+    fn test_calculate_frame_len_various_payload_sizes() {
+        // Test various payload sizes for established frames
+        for payload_len in [0, 1, 16, 64, 128, 256, 512, 1000, 1280] {
+            let prefix = [
+                0x00, // phase 0 (established)
+                0x00,
+                (payload_len & 0xFF) as u8,
+                ((payload_len >> 8) & 0xFF) as u8,
+            ];
+            let frame_len = calculate_frame_len(&prefix).unwrap();
+            assert_eq!(frame_len, 16 + payload_len as usize + 16);
+        }
+
+        // Test various payload sizes for handshake frames
+        for payload_len in [0, 1, 16, 32, 48, 64, 128] {
+            let prefix = [
+                0x01, // phase 1 (handshake msg1)
+                0x00,
+                (payload_len & 0xFF) as u8,
+                ((payload_len >> 8) & 0xFF) as u8,
+            ];
+            let frame_len = calculate_frame_len(&prefix).unwrap();
+            assert_eq!(frame_len, 4 + payload_len as usize);
+        }
     }
 }

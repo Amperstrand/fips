@@ -6,6 +6,8 @@ use crate::node::{MAX_COMPETING_MSG1, Node, NodeError};
 use crate::peer::{ActivePeer, PeerConnection, PromotionResult, cross_connection_winner};
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use std::time::Duration;
+
+const MAX_COMPETING_MSG1: u32 = 3;
 use tracing::{debug, info, warn};
 
 impl Node {
@@ -101,12 +103,15 @@ impl Node {
                 if is_active_peer {
                     possible_restart = true;
                 } else {
-                    debug!(
+                    info!(
                         transport_id = %packet.transport_id,
                         remote_addr = %packet.remote_addr,
                         existing_link_id = %existing_link_id,
-                        "Cross-connection detected: have outbound, received inbound msg1"
+                        "Cross-connection detected: closing stale outbound transport socket"
                     );
+                    if let Some(transport) = self.transports.get(&packet.transport_id) {
+                        transport.close_connection(&packet.remote_addr).await;
+                    }
                 }
             }
         }
@@ -151,15 +156,24 @@ impl Node {
 
         let peer_node_addr = *peer_identity.node_addr();
 
-        if self.config.node.require_configured_peers
-            && !self.configured_peer_addrs.contains(&peer_node_addr)
-        {
-            warn!(
-                peer = %self.peer_display_name(&peer_node_addr),
-                "Rejecting msg1 from unconfigured peer"
-            );
-            self.msg1_rate_limiter.complete_handshake();
-            return;
+        // Verify initiator's static pubkey against configured peers.
+        // If we have configured static peers, the initiator must match one
+        // of them. Unknown initiators are rejected to prevent unauthenticated
+        // peers from completing a Noise handshake. When no peers are
+        // configured (discovery-only mode), any initiator is accepted.
+        if !self.config.peers.is_empty() {
+            let pubkey_matches = self.config.peers.iter().any(|p| {
+                p.npub == peer_identity.short_npub()
+            });
+            if !pubkey_matches {
+                warn!(
+                    initiator_npub = %peer_identity.short_npub(),
+                    "Rejecting MSG1 from unconfigured peer"
+                );
+                self.msg1_rate_limiter.complete_handshake();
+                return;
+            }
+        }
         }
 
         // Identity-based restart/rekey detection: if the peer is already
@@ -179,9 +193,7 @@ impl Node {
         // transport disconnect and node-level heartbeat timeout for all
         // transports.
         if possible_restart {
-            let stale_addr = self
-                .peers
-                .get(&peer_node_addr)
+            let stale_addr = self.peers.get(&peer_node_addr)
                 .filter(|p| !self.links.contains_key(&p.link_id()))
                 .map(|_| peer_node_addr);
 
@@ -397,6 +409,28 @@ impl Node {
         // If possible_restart was true but peer is no longer in self.peers
         // (removed by another path), fall through to process as new connection.
 
+        // Per-peer competing MSG1 rate limit: if the peer already exists
+        // (wasn't handled as restart/rekey above), count it as a competing
+        // MSG1. A misbehaving peer sending MSG1 in a loop can exhaust DH
+        // resources — drop after MAX_COMPETING_MSG1.
+        if self.peers.contains_key(&peer_node_addr) {
+            let peer_name = self.peer_display_name(&peer_node_addr);
+            let count = self.competing_msg1_counts.entry(peer_node_addr).or_insert(0);
+            *count += 1;
+            if *count > MAX_COMPETING_MSG1 {
+                warn!(
+                    peer = %peer_name,
+                    count = *count,
+                    max = MAX_COMPETING_MSG1,
+                    "Dropping competing MSG1: exceeded MAX_COMPETING_MSG1"
+                );
+                self.msg1_rate_limiter.complete_handshake();
+                return;
+            }
+        } else {
+            self.competing_msg1_counts.remove(&peer_node_addr);
+        }
+
         // Note: we don't early-return if peer is already in self.peers here.
         // promote_connection handles cross-connection resolution via tie-breaker.
 
@@ -478,6 +512,7 @@ impl Node {
                             our_index = %our_index,
                             "Inbound peer promoted to active"
                         );
+
                         // Send initial tree announce to new peer
                         if let Err(e) = self.send_tree_announce_to_peer(&node_addr).await {
                             debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send initial TreeAnnounce");
@@ -1029,14 +1064,7 @@ impl Node {
                 })
             }
         } else {
-            // No existing promoted peer. There may be a pending outbound
-            // connection to the same peer (cross-connection in progress).
-            // Do NOT clean it up yet — we need the outbound to stay alive
-            // so that when the peer's msg2 arrives, we can learn the peer's
-            // inbound session index and update their_index on the promoted
-            // peer. The outbound will be cleaned up in handle_msg2 or by
-            // the 30s handshake timeout.
-            let pending_to_same_peer: Vec<LinkId> = self
+            let _pending_to_same_peer: Vec<LinkId> = self
                 .connections
                 .iter()
                 .filter(|(_, conn)| {
@@ -1046,15 +1074,6 @@ impl Node {
                 })
                 .map(|(lid, _)| *lid)
                 .collect();
-
-            for pending_link_id in &pending_to_same_peer {
-                debug!(
-                    peer = %self.peer_display_name(&peer_node_addr),
-                    pending_link_id = %pending_link_id,
-                    promoted_link_id = %link_id,
-                    "Deferring cleanup of pending outbound (awaiting msg2 for index update)"
-                );
-            }
 
             // Normal promotion
             if self.max_peers > 0 && self.peers.len() >= self.max_peers {

@@ -7,6 +7,8 @@ use std::time::Duration;
 mod bloom;
 #[cfg(target_os = "linux")]
 mod ble;
+#[cfg(target_os = "macos")]
+mod ble_macos;
 mod disconnect;
 mod discovery;
 mod ethernet;

@@ -74,11 +74,15 @@ Requires Rust 1.85+ (edition 2024) and a Unix-like OS with TUN support
 | TCP       |  ✅   |  ✅   |   ❌    |
 | Ethernet  |  ✅   |  ✅   |   ❌    |
 | Tor       |  ✅   |  ✅   |   ❌    |
-| BLE       |  ✅   |  ❌   |   ❌    |
+| BLE       |  ✅   |  🚧   |   ❌    |
 
 On **Linux**, the BLE transport requires BlueZ and libdbus. On
 Debian/Ubuntu: `sudo apt install bluez libdbus-1-dev`. Then build with
 BLE enabled: `cargo build --release --features ble`.
+
+On **macOS**, BLE support is experimental via CoreBluetooth (`--features ble-macos`).
+Ethernet transport is also supported. A standard `cargo build --release` produces
+binaries with UDP, TCP, and Tor support.
 
 ## Installation
 

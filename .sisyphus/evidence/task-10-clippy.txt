@@ -1,0 +1,69 @@
+   Compiling fips v0.3.0-dev (/Users/macbook/src/fips)
+warning: unused import: `BleDeviceAddr`
+  --> src/transport/ble/discovery.rs:11:28
+   |
+11 | use super::addr::{BleAddr, BleDeviceAddr};
+   |                            ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `BleDeviceAddr`
+ --> src/transport/ble/io.rs:9:28
+  |
+9 | use super::addr::{BleAddr, BleDeviceAddr};
+  |                            ^^^^^^^^^^^^^
+
+warning: unused import: `BleDeviceAddr`
+  --> src/transport/ble/pool.rs:13:28
+   |
+13 | use super::addr::{BleAddr, BleDeviceAddr};
+   |                            ^^^^^^^^^^^^^
+
+warning: unused import: `Write`
+ --> src/upper/tun.rs:9:21
+  |
+9 | use std::io::{Read, Write};
+  |                     ^^^^^
+
+warning: variable does not need to be mutable
+   --> src/upper/tun.rs:235:16
+    |
+235 |     pub fn run(mut self) {
+    |                ----^^^^
+    |                |
+    |                help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: the loop variable `i` is used to index `mac`
+   --> src/transport/ethernet/socket_macos.rs:458:30
+    |
+458 |                     for i in 0..6 {
+    |                              ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+    |
+458 -                     for i in 0..6 {
+458 +                     for (i, <item>) in mac.iter_mut().enumerate() {
+    |
+
+warning: `format!` in `format!` args
+  --> src/transport/ble/addr.rs:57:17
+   |
+57 | /                 format!(
+58 | |                     "{}/{}",
+59 | |                     self.adapter,
+60 | |                     format!(
+...  |
+68 | |                 )
+   | |_________________^
+   |
+   = help: combine the `format!(..)` arguments with the outer `format!(..)` call
+   = help: or consider changing `format!` to `format_args!`
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#format_in_format_args
+   = note: `#[warn(clippy::format_in_format_args)]` on by default
+
+warning: `fips` (lib) generated 7 warnings (run `cargo clippy --fix --lib -p fips` to apply 4 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.78s

@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FIPS Mesh Visualizer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape.js/3.28.0/cytoscape.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        #cy {
+            width: 100%;
+            height: 100vh;
+            position: absolute;
+            left: 0;
+            top: 0;
+        }
+        .panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(20, 20, 20, 0.95);
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            min-width: 300px;
+            max-height: 80vh;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+        .panel h3 {
+            margin: 0 0 10px 0;
+            color: #4a9eff;
+            font-size: 14px;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            margin: 5px 0;
+        }
+        .metric-label {
+            color: #888;
+        }
+        .metric-value {
+            color: #0f0;
+            font-weight: bold;
+        }
+        .status-bar {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(20, 20, 20, 0.95);
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 10px 15px;
+            font-size: 12px;
+        }
+        .status-ok { color: #0f0; }
+        .status-error { color: #f44; }
+        .controls {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(20, 20, 20, 0.95);
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 10px 15px;
+        }
+        button {
+            background: #333;
+            border: 1px solid #555;
+            color: #fff;
+            padding: 5px 10px;
+            margin: 0 5px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #444;
+        }
+        button.active {
+            background: #4a9eff;
+            border-color: #4a9eff;
+        }
+    </style>
+</head>
+<body>
+    <div id="cy"></div>
+    
+    <div class="status-bar" id="status">
+        <span class="status-ok">● Connected</span> | 
+        <span id="node-count">0 nodes</span>
+    </div>
+
+    <div class="panel" id="info-panel" style="display:none;">
+        <h3>Node Details</h3>
+        <div id="node-info"></div>
+    </div>
+
+    <div class="controls">
+        <button onclick="refreshData()" class="active">Refresh</button>
+        <button onclick="toggleLayout('circle')">Circle</button>
+        <button onclick="toggleLayout('breadthfirst')">Tree</button>
+        <button onclick="toggleLayout('cose')">Force</button>
+    </div>
+
+    <script>
+        const CONFIG = {
+            proxyUrl: '/api',
+            staticData: null,
+            refreshInterval: 5000
+        };
+
+        let cy = null;
+        let peersData = [];
+        let treeData = null;
+        let currentLayout = 'circle';
+
+        // Initialize Cytoscape
+        document.addEventListener('DOMContentLoaded', () => {
+            cy = cytoscape({
+                container: document.getElementById('cy'),
+                elements: [],
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'background-color': '#4a9eff',
+                            'label': 'data(label)',
+                            'color': '#fff',
+                            'text-valign': 'center',
+                            'text-halign': 'center',
+                            'font-size': '10px',
+                            'width': 'data(size)',
+                            'height': 'data(size)',
+                            'border-width': 2,
+                            'border-color': '#666',
+                            'text-outline-color': '#000',
+                            'text-outline-opacity': 1,
+                            'text-outline-width': 2
+                        }
+                    },
+                    {
+                        selector: 'node.root',
+                        style: {
+                            'background-color': '#0f0',
+                            'border-color': '#0a0'
+                        }
+                    },
+                    {
+                        selector: 'node.self',
+                        style: {
+                            'background-color': '#f80',
+                            'border-color': '#a50'
+                        }
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'width': 'data(width)',
+                            'line-color': 'data(color)',
+                            'curve-style': 'bezier',
+                            'opacity': 0.8,
+                            'label': 'data(label)',
+                            'font-size': '8px',
+                            'color': '#aaa',
+                            'text-rotation': 'autorotate'
+                        }
+                    },
+                    {
+                        selector: 'edge.highlighted',
+                        style: {
+                            'width': 4,
+                            'line-color': '#4a9eff',
+                            'opacity': 1
+                        }
+                    }
+                ],
+                layout: {
+                    name: 'circle',
+                    animate: true,
+                    fit: true
+                }
+            });
+
+            cy.on('tap', 'node', (evt) => {
+                showNodeInfo(evt.target.data());
+            });
+
+            // Start refresh loop
+            refreshData();
+            setInterval(refreshData, CONFIG.refreshInterval);
+        });
+
+        async function refreshData() {
+            try {
+                let data;
+                
+                if (CONFIG.staticData) {
+                    data = JSON.parse(CONFIG.staticData);
+                } else {
+                    const response = await fetch(CONFIG.proxyUrl);
+                    data = await response.json();
+                }
+
+                peersData = data.peers || [];
+                treeData = data.tree || {};
+                
+                updateGraph();
+                updateStatus();
+            } catch (error) {
+                document.getElementById('status').innerHTML = 
+                    `<span class="status-error">✗ Error: ${error.message}</span>`;
+            }
+        }
+
+        function updateGraph() {
+            const elements = [];
+            const myNodeAddr = treeData.my_node_addr;
+            const rootAddr = treeData.root;
+            
+            // Add nodes
+            peersData.forEach(peer => {
+                const isRoot = peer.node_addr === rootAddr;
+                const isSelf = peer.node_addr === myNodeAddr;
+                
+                // Size based on connectivity
+                const size = peer.is_parent ? 50 : (peer.is_child ? 40 : 30);
+                
+                elements.push({
+                    data: {
+                        id: peer.node_addr,
+                        label: peer.display_name || peer.node_addr.substring(0, 8),
+                        size: size,
+                        type: isSelf ? 'self' : (isRoot ? 'root' : 'peer'),
+                        npub: peer.npub,
+                        srtt: peer.mmp?.srtt_ms,
+                        loss: peer.mmp?.loss_rate,
+                        goodput: peer.mmp?.goodput_bps,
+                        transport: peer.transport_type,
+                        direction: peer.direction
+                    },
+                    classes: isSelf ? 'self' : (isRoot ? 'root' : '')
+                });
+
+                // Add edges for tree structure
+                if (peer.is_child && treeData.parent_id) {
+                    elements.push({
+                        data: {
+                            id: `edge-${peer.node_addr}`,
+                            source: myNodeAddr,
+                            target: peer.node_addr,
+                            width: 2,
+                            color: '#4a9eff',
+                            label: `${peer.mmp?.srtt_ms || '?'}ms`
+                        }
+                    });
+                }
+            });
+
+            // Add self node
+            if (myNodeAddr) {
+                elements.push({
+                    data: {
+                        id: myNodeAddr,
+                        label: 'Self',
+                        size: 60,
+                        type: 'self'
+                    },
+                    classes: 'self'
+                });
+
+                // Add parent edge
+                if (treeData.parent_id) {
+                    elements.push({
+                        data: {
+                            id: 'edge-parent',
+                            source: myNodeAddr,
+                            target: treeData.parent_id,
+                            width: 3,
+                            color: '#0f0',
+                            label: 'parent'
+                        }
+                    });
+                }
+            }
+
+            cy.json({ elements });
+            cy.layout({ name: currentLayout }).run();
+            
+            document.getElementById('node-count').textContent = `${peersData.length} nodes`;
+        }
+
+        function showNodeInfo(data) {
+            const panel = document.getElementById('info-panel');
+            const info = document.getElementById('node-info');
+            
+            panel.style.display = 'block';
+            
+            let html = '';
+            for (const [key, value] of Object.entries(data)) {
+                if (typeof value === 'object') continue;
+                html += `<div class="metric">
+                    <span class="metric-label">${key}:</span>
+                    <span class="metric-value">${formatValue(key, value)}</span>
+                </div>`;
+            }
+            
+            info.innerHTML = html;
+        }
+
+        function formatValue(key, value) {
+            if (key.includes('bytes')) return formatBytes(value);
+            if (key.includes('bps')) return formatBps(value);
+            if (key.includes('ms')) return `${value}ms`;
+            if (typeof value === 'number') return value.toFixed(2);
+            return value;
+        }
+
+        function formatBytes(bytes) {
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let i = 0;
+            while (bytes >= 1024 && i < units.length - 1) {
+                bytes /= 1024;
+                i++;
+            }
+            return `${bytes.toFixed(1)} ${units[i]}`;
+        }
+
+        function formatBps(bps) {
+            const units = ['B/s', 'KB/s', 'MB/s'];
+            let i = 0;
+            while (bps >= 1024 && i < units.length - 1) {
+                bps /= 1024;
+                i++;
+            }
+            return `${bps.toFixed(1)} ${units[i]}`;
+        }
+
+        function updateStatus() {
+            const status = document.getElementById('status');
+            const now = new Date().toLocaleTimeString();
+            status.innerHTML = `<span class="status-ok">● Connected</span> | ${now}`;
+        }
+
+        function toggleLayout(name) {
+            currentLayout = name;
+            cy.layout({ name, animate: true }).run();
+            
+            // Update button states
+            document.querySelectorAll('.controls button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.target.classList.add('active');
+        }
+    </script>
+</body>
+</html>

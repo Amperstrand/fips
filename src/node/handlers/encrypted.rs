@@ -81,18 +81,27 @@ impl Node {
 
         // Decrypt: try current session first, then previous (drain fallback)
         let ciphertext = &packet.data[header.ciphertext_offset()..];
+        
+        // Get display name before mutable borrow
+        let peer_name = self.peer_display_name(&node_addr);
+        
         let plaintext = {
             let peer = self.peers.get_mut(&node_addr).unwrap();
             let session = match peer.noise_session_mut() {
                 Some(s) => s,
                 None => {
-                    warn!(
-                        peer = %self.peer_display_name(&node_addr),
-                        "Peer in index map has no session"
-                    );
+                    warn!(peer = %peer_name, "Peer in index map has no session");
                     return;
                 }
             };
+
+            debug!(
+                peer = %peer_name,
+                counter = header.counter,
+                aad_hex = %hex::encode(&header.header_bytes),
+                ciphertext_len = ciphertext.len(),
+                "Attempting decryption with AAD"
+            );
 
             match session.decrypt_with_replay_check_and_aad(
                 ciphertext,
@@ -221,6 +230,7 @@ impl Node {
                     consecutive_failures = count,
                     "Excessive decryption failures, removing peer"
                 );
+
                 let addr = *node_addr;
                 self.remove_active_peer(node_addr);
                 let now_ms = std::time::SystemTime::now()

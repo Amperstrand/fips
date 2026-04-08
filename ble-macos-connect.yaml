@@ -1,0 +1,21 @@
+node:
+  identity:
+    persistent: true
+  log_level: debug
+  control:
+    socket_path: "/tmp/fips-macos-control.sock"
+
+tun:
+  enabled: false
+
+dns:
+  enabled: false
+
+transports:
+  ble:
+    advertise: false
+    scan: true
+    auto_connect: true
+    accept_connections: true
+    psm: 133
+    probe_cooldown_secs: 5

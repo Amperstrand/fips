@@ -9,6 +9,7 @@ use crate::transport::{
 };
 use crate::upper::tun::{TunDevice, TunState, run_tun_reader, shutdown_tun_interface};
 use crate::{NodeAddr, PeerIdentity};
+use std::os::unix::io::AsRawFd;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -788,6 +789,7 @@ impl Node {
                     libc::write(fd, b"x".as_ptr() as *const libc::c_void, 1);
                     libc::close(fd);
                 }
+            }
             }
 
             // Wait for threads to finish

@@ -399,6 +399,10 @@ pub struct Node {
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
     msg1_rate_limiter: HandshakeRateLimiter,
+    /// Per-peer counter for competing MSG1s (MSG1 received while handshake
+    /// is already in progress or recently completed). After MAX_COMPETING_MSG1
+    /// from the same peer, the connection is dropped.
+    competing_msg1_counts: std::collections::HashMap<NodeAddr, u32>,
     /// Rate limiter for ICMP Packet Too Big messages.
     icmp_rate_limiter: IcmpRateLimiter,
     /// Rate limiter for routing error signals (CoordsRequired / PathBroken).
@@ -562,6 +566,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            competing_msg1_counts: std::collections::HashMap::new(),
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
@@ -674,6 +679,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            competing_msg1_counts: std::collections::HashMap::new(),
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
@@ -814,6 +820,47 @@ impl Node {
                 tracing::warn!(
                     "BLE transport configured but 'ble' feature not enabled at compile time"
                 );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let ble_instances: Vec<_> = self
+                .config
+                .transports
+                .ble
+                .iter()
+                .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
+                .collect();
+
+            #[cfg(all(feature = "ble-macos", not(test)))]
+            for (name, ble_config) in ble_instances {
+                let transport_id = self.allocate_transport_id();
+                let adapter = ble_config.adapter().to_string();
+                let mtu = ble_config.mtu();
+                match crate::transport::ble::io::BluestIo::new(&adapter, mtu).await {
+                    Ok(io) => {
+                        let mut ble = crate::transport::ble::BleTransport::new(
+                            transport_id,
+                            name,
+                            ble_config,
+                            io,
+                            packet_tx.clone(),
+                        );
+                        ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
+                        transports.push(TransportHandle::Ble(ble));
+                    }
+                    Err(e) => {
+                        tracing::warn!(adapter = %adapter, error = %e, "failed to initialize BLE adapter (macOS/bluest)");
+                    }
+                }
+            }
+
+            #[cfg(any(not(feature = "ble-macos"), test))]
+            if !ble_instances.is_empty() {
+                #[cfg(not(test))]
+                tracing::warn!("BLE transport configured but 'ble-macos' feature not enabled at compile time");
             }
         }
 

@@ -1,0 +1,22 @@
+# FIPS macOS BLE Central (Scan Mode)
+
+node:
+  identity:
+    persistent: true
+
+tun:
+  enabled: false
+
+dns:
+  enabled: false
+
+transports:
+  ble:
+    enabled: true
+    scan: true
+    auto_connect: true
+    disable_tiebreaker: true
+
+logging:
+  level: debug
+  format: pretty

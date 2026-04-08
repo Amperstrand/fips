@@ -6,7 +6,7 @@
 
 use crate::transport::TransportError;
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleDeviceAddr};
 
 // ============================================================================
 // BLE I/O Traits
@@ -107,11 +107,7 @@ pub trait BleIo: Send + Sync + 'static {
     fn adapter_name(&self) -> &str;
 }
 
-// ============================================================================
-// BluerIo — Production BLE I/O via BlueZ D-Bus
-// ============================================================================
-
-#[cfg(feature = "ble")]
+#[cfg(all(feature = "ble", target_os = "linux"))]
 mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
@@ -489,12 +485,19 @@ mod bluer_impl {
     }
 }
 
-#[cfg(feature = "ble")]
+#[cfg(all(feature = "ble", target_os = "linux"))]
 pub use bluer_impl::{BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SERVICE_UUID};
 
 // ============================================================================
 // Mock BLE I/O (for testing without hardware)
 // ============================================================================
+
+#[cfg(feature = "ble-macos")]
+#[path = "bluest.rs"]
+mod bluest;
+
+#[cfg(feature = "ble-macos")]
+pub use bluest::{BluestAcceptor, BluestIo, BluestScanner, BluestStream, FIPS_SERVICE_UUID};
 
 /// Mock BLE stream backed by tokio channels.
 pub struct MockBleStream {
@@ -706,7 +709,7 @@ mod tests {
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
-            device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            device: BleDeviceAddr::Mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n]),
         }
     }
 

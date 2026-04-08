@@ -1,0 +1,29 @@
+# FIPS Node Configuration — BLE + UDP
+
+node:
+  identity:
+    persistent: true
+
+tun:
+  enabled: true
+  name: fips0
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  udp:
+    bind_addr: "0.0.0.0:2121"
+
+  ble:
+    adapter: "hci0"
+    mtu: 2048
+    advertise: true
+    scan: true
+    auto_connect: true
+    accept_connections: true
+
+peers: []

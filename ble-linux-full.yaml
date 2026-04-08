@@ -1,0 +1,25 @@
+node:
+  identity:
+    persistent: true
+  log_level: debug
+  control:
+    socket_path: "/tmp/fips-linux-control.sock"
+
+tun:
+  enabled: true
+  name: fips0
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    advertise: true
+    scan: false
+    auto_connect: false
+    accept_connections: true
+    adapter: "hci0"
+    psm: 133

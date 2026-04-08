@@ -1,0 +1,10 @@
+# Test config for BLE relay testing - DO NOT USE IN PRODUCTION
+[identity]
+nsec = "96aaaac63fbd11660a2a988a4bcf3d14ebfde6918516f9f44c501a2f9b0537ba"
+
+[[transports.tcp]]
+bind_addr = "127.0.0.1:4443"
+
+[[peers]]
+npub = "npub175053xup9hefenvj6al5dnvrrv6u87lt407xlqfzwmw2yxuduh0sy8x7va"
+connect_policy = "accept"
