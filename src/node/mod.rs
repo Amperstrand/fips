@@ -28,7 +28,8 @@ use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
 use self::rate_limit::HandshakeRateLimiter;
 use self::routing_error_rate_limit::RoutingErrorRateLimiter;
 use crate::transport::{
-    Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError, TransportHandle, TransportId,
+    DisconnectRx, DisconnectTx, Link, LinkId, PacketRx, PacketTx, TransportAddr,
+    TransportError, TransportHandle, TransportId,
 };
 use crate::transport::udp::UdpTransport;
 use crate::transport::tcp::TcpTransport;
@@ -302,6 +303,8 @@ pub struct Node {
     packet_tx: Option<PacketTx>,
     /// Packet receiver (for event loop).
     packet_rx: Option<PacketRx>,
+    /// Disconnect receiver for connection-oriented transports.
+    disconnect_rx: Option<DisconnectRx>,
 
     // === Connections (Handshake Phase) ===
     /// Pending connections (handshake in progress).
@@ -512,6 +515,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -622,6 +626,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -675,7 +680,11 @@ impl Node {
     /// Create transport instances from configuration.
     ///
     /// Returns a vector of TransportHandles for all configured transports.
-    async fn create_transports(&mut self, packet_tx: &PacketTx) -> Vec<TransportHandle> {
+    async fn create_transports(
+        &mut self,
+        packet_tx: &PacketTx,
+        disconnect_tx: &DisconnectTx,
+    ) -> Vec<TransportHandle> {
         let mut transports = Vec::new();
 
         // Collect UDP configs with optional names to avoid borrow conflicts
@@ -725,7 +734,8 @@ impl Node {
 
         for (name, tcp_config) in tcp_instances {
             let transport_id = self.allocate_transport_id();
-            let tcp = TcpTransport::new(transport_id, name, tcp_config, packet_tx.clone());
+            let mut tcp = TcpTransport::new(transport_id, name, tcp_config, packet_tx.clone());
+            tcp.set_disconnect_tx(disconnect_tx.clone());
             transports.push(TransportHandle::Tcp(tcp));
         }
 
@@ -740,7 +750,8 @@ impl Node {
 
         for (name, tor_config) in tor_instances {
             let transport_id = self.allocate_transport_id();
-            let tor = TorTransport::new(transport_id, name, tor_config, packet_tx.clone());
+            let mut tor = TorTransport::new(transport_id, name, tor_config, packet_tx.clone());
+            tor.set_disconnect_tx(disconnect_tx.clone());
             transports.push(TransportHandle::Tor(tor));
         }
 
@@ -769,6 +780,7 @@ impl Node {
                             io,
                             packet_tx.clone(),
                         );
+                        ble.set_disconnect_tx(disconnect_tx.clone());
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
                         transports.push(TransportHandle::Ble(ble));
                     }
@@ -778,7 +790,37 @@ impl Node {
                 }
             }
 
-            #[cfg(any(not(feature = "ble"), test))]
+            #[cfg(all(feature = "ble-macos", not(test)))]
+            for (name, ble_config) in ble_instances {
+                let transport_id = self.allocate_transport_id();
+                let adapter = ble_config.adapter().to_string();
+                let mtu = ble_config.mtu();
+                match crate::transport::ble::io::BluestIo::new(&adapter, mtu).await {
+                    Ok(io) => {
+                        let mut ble = crate::transport::ble::BleTransport::new(
+                            transport_id,
+                            name,
+                            ble_config,
+                            io,
+                            packet_tx.clone(),
+                        );
+                        ble.set_disconnect_tx(disconnect_tx.clone());
+                        ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        transports.push(TransportHandle::Ble(ble));
+                    }
+                    Err(e) => {
+                        tracing::warn!(adapter = %adapter, error = %e, "failed to initialize BLE adapter");
+                    }
+                }
+            }
+
+            #[cfg(any(
+                not(any(
+                    all(feature = "ble", target_os = "linux"),
+                    feature = "ble-macos",
+                )),
+                test,
+            ))]
             if !ble_instances.is_empty() {
                 #[cfg(not(test))]
                 tracing::warn!("BLE transport configured but 'ble' feature not enabled at compile time");

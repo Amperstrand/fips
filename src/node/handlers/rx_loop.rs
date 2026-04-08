@@ -31,6 +31,13 @@ impl Node {
     pub async fn run_rx_loop(&mut self) -> Result<(), NodeError> {
         let mut packet_rx = self.packet_rx.take()
             .ok_or(NodeError::NotStarted)?;
+        let (mut disconnect_rx, _disconnect_guard) = match self.disconnect_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
 
         // Take the TUN outbound receiver, or create a dummy channel that never
         // produces messages (when TUN is disabled). Holding the sender prevents
@@ -85,6 +92,12 @@ impl Node {
                     match packet {
                         Some(p) => self.process_packet(p).await,
                         None => break, // channel closed
+                    }
+                }
+                disconnect = disconnect_rx.recv() => {
+                    match disconnect {
+                        Some(d) => self.handle_transport_disconnect(d),
+                        None => break,
                     }
                 }
                 Some(ipv6_packet) = tun_outbound_rx.recv() => {
