@@ -37,8 +37,9 @@ pub use bloom::{BloomError, BloomFilter, BloomState};
 
 // Re-export transport types
 pub use transport::{
-    packet_channel, DiscoveredPeer, Link, LinkDirection, LinkId, LinkState, LinkStats, PacketRx,
-    PacketTx, ReceivedPacket, Transport, TransportAddr, TransportError, TransportHandle,
+    disconnect_channel, packet_channel, DisconnectRx, DisconnectTx, DiscoveredPeer, Link,
+    LinkDirection, LinkId, LinkState, LinkStats, PacketRx, PacketTx, ReceivedPacket,
+    Transport, TransportAddr, TransportDisconnect, TransportError, TransportHandle,
     TransportId, TransportState, TransportType,
 };
 pub use transport::udp::UdpTransport;
@@ -61,4 +62,3 @@ pub use peer::{
 
 // Re-export node types
 pub use node::{Node, NodeError, NodeState};
-
