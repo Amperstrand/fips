@@ -17,6 +17,7 @@ mod run_loop {
 
     static RUN_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+    #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFRunLoopRun();
         fn CFRunLoopStop(rl: *mut c_void);
