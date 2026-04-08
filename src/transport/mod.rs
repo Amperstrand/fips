@@ -86,6 +86,26 @@ pub fn packet_channel(buffer: usize) -> (PacketTx, PacketRx) {
     tokio::sync::mpsc::channel(buffer)
 }
 
+/// Notification emitted by a transport when a connection-oriented link drops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportDisconnect {
+    /// Which transport observed the disconnect.
+    pub transport_id: TransportId,
+    /// Remote address of the dropped connection.
+    pub remote_addr: TransportAddr,
+}
+
+/// Channel sender for transport disconnect notifications.
+pub type DisconnectTx = tokio::sync::mpsc::Sender<TransportDisconnect>;
+
+/// Channel receiver for transport disconnect notifications.
+pub type DisconnectRx = tokio::sync::mpsc::Receiver<TransportDisconnect>;
+
+/// Create a disconnect notification channel with the given buffer size.
+pub fn disconnect_channel(buffer: usize) -> (DisconnectTx, DisconnectRx) {
+    tokio::sync::mpsc::channel(buffer)
+}
+
 // ============================================================================
 // Transport Identifiers
 // ============================================================================
@@ -1500,6 +1520,20 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.data, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_channel() {
+        let (tx, mut rx) = disconnect_channel(4);
+        let disconnect = TransportDisconnect {
+            transport_id: TransportId::new(9),
+            remote_addr: TransportAddr::from_string("test"),
+        };
+
+        tx.send(disconnect.clone()).await.unwrap();
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received, disconnect);
     }
 
     // ========================================================================
