@@ -808,6 +808,9 @@ impl Node {
                         );
                         ble.set_disconnect_tx(disconnect_tx.clone());
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_local_capabilities(
+                            crate::transport::ble::PeerCapabilities::central_only(),
+                        );
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
