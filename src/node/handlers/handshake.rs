@@ -1,11 +1,13 @@
 //! Handshake handlers and connection promotion.
 
-use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
-use crate::node::wire::{Msg1Header, Msg2Header, build_msg2};
+use crate::node::wire::{build_msg2, Msg1Header, Msg2Header};
 use crate::node::{Node, NodeError};
-use crate::peer::{ActivePeer, PeerConnection, PromotionResult, cross_connection_winner};
+use crate::peer::{
+    cross_connection_winner, ActivePeer, PeerConnection, PromotionResult,
+};
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
+use crate::PeerIdentity;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -62,7 +64,8 @@ impl Node {
         {
             if link.direction() == LinkDirection::Inbound {
                 // Check if this link belongs to an already-promoted active peer
-                let is_active_peer = self.peers.values().any(|p| p.link_id() == existing_link_id);
+                let is_active_peer = self.peers.values()
+                    .any(|p| p.link_id() == existing_link_id);
 
                 if is_active_peer {
                     // Possible restart — fall through to decrypt and check epoch
@@ -98,7 +101,8 @@ impl Node {
                 // peer, this may be a rekey msg1 (same epoch) or a
                 // restart (different epoch). Set possible_restart to enable
                 // the epoch/rekey check below.
-                let is_active_peer = self.peers.values().any(|p| p.link_id() == existing_link_id);
+                let is_active_peer = self.peers.values()
+                    .any(|p| p.link_id() == existing_link_id);
                 if is_active_peer {
                     possible_restart = true;
                 } else {
@@ -123,12 +127,7 @@ impl Node {
 
         let our_keypair = self.identity.keypair();
         let noise_msg1 = &packet.data[header.noise_msg1_offset..];
-        let msg2_response = match conn.receive_handshake_init(
-            our_keypair,
-            self.startup_epoch,
-            noise_msg1,
-            packet.timestamp_ms,
-        ) {
+        let msg2_response = match conn.receive_handshake_init(our_keypair, self.startup_epoch, noise_msg1, packet.timestamp_ms) {
             Ok(m) => m,
             Err(e) => {
                 self.msg1_rate_limiter.complete_handshake();
@@ -164,7 +163,9 @@ impl Node {
         // If we fell through from the addr_to_link check above with
         // possible_restart=true, we now have the decrypted epoch from msg1.
         // Compare it against the stored epoch for this peer.
-        if possible_restart && let Some(existing_peer) = self.peers.get(&peer_node_addr) {
+        if possible_restart
+            && let Some(existing_peer) = self.peers.get(&peer_node_addr)
+        {
             let new_epoch = conn.remote_epoch();
             let existing_epoch = existing_peer.remote_epoch();
 
@@ -192,8 +193,10 @@ impl Node {
                     // During simultaneous connection, both sides promote
                     // within the same tick and the peer's msg1 arrives
                     // immediately — a genuine rekey can't fire that fast.
-                    let session_age_secs =
-                        existing_peer.session_established_at().elapsed().as_secs();
+                    let session_age_secs = existing_peer
+                        .session_established_at()
+                        .elapsed()
+                        .as_secs();
                     if self.config.node.rekey.enabled
                         && existing_peer.has_session()
                         && existing_peer.is_healthy()
@@ -270,8 +273,7 @@ impl Node {
                         };
 
                         // Send msg2 response using the new handshake
-                        let wire_msg2 =
-                            build_msg2(our_new_index, header.sender_idx, &msg2_response);
+                        let wire_msg2 = build_msg2(our_new_index, header.sender_idx, &msg2_response);
                         if let Some(transport) = self.transports.get(&packet.transport_id) {
                             match transport.send(&packet.remote_addr, &wire_msg2).await {
                                 Ok(_) => {
@@ -415,8 +417,7 @@ impl Node {
                     // Clean up on failure
                     self.connections.remove(&link_id);
                     self.links.remove(&link_id);
-                    self.addr_to_link
-                        .remove(&(packet.transport_id, packet.remote_addr));
+                    self.addr_to_link.remove(&(packet.transport_id, packet.remote_addr));
                     let _ = self.index_allocator.free(our_index);
                     self.msg1_rate_limiter.complete_handshake();
                     return;
@@ -449,10 +450,7 @@ impl Node {
                         self.bloom_state.mark_update_needed(node_addr);
                         self.reset_discovery_backoff();
                     }
-                    PromotionResult::CrossConnectionWon {
-                        loser_link_id,
-                        node_addr,
-                    } => {
+                    PromotionResult::CrossConnectionWon { loser_link_id, node_addr } => {
                         // Store msg2 on peer for resend on duplicate msg1
                         if let Some(peer) = self.peers.get_mut(&node_addr) {
                             peer.set_handshake_msg2(wire_msg2.clone());
@@ -570,7 +568,9 @@ impl Node {
 
             // Find peer with rekey in progress for this index
             let peer_addr = self.peers.iter().find_map(|(addr, peer)| {
-                if peer.rekey_in_progress() && peer.rekey_our_index() == Some(header.receiver_idx) {
+                if peer.rekey_in_progress()
+                    && peer.rekey_our_index() == Some(header.receiver_idx)
+                {
                     Some(*addr)
                 } else {
                     None
@@ -584,12 +584,15 @@ impl Node {
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                     match peer.complete_rekey_msg2(noise_msg2) {
                         Ok(session) => {
-                            let our_index = peer.rekey_our_index().unwrap_or(header.receiver_idx);
+                            let our_index = peer.rekey_our_index()
+                                .unwrap_or(header.receiver_idx);
                             peer.set_pending_session(session, our_index, header.sender_idx);
 
                             if let Some(transport_id) = peer.transport_id() {
-                                self.peers_by_index
-                                    .insert((transport_id, our_index.as_u32()), peer_node_addr);
+                                self.peers_by_index.insert(
+                                    (transport_id, our_index.as_u32()),
+                                    peer_node_addr,
+                                );
                             }
 
                             debug!(
@@ -722,17 +725,15 @@ impl Node {
                 let outbound_our_index = conn.our_index();
                 let outbound_session = conn.take_session();
 
-                let (outbound_session, outbound_our_index) = match (
-                    outbound_session,
-                    outbound_our_index,
-                ) {
+                let (outbound_session, outbound_our_index) =
+                    match (outbound_session, outbound_our_index) {
                     (Some(s), Some(idx)) => (s, idx),
                     _ => {
                         warn!(peer = %self.peer_display_name(&peer_node_addr), "Incomplete outbound connection");
                         self.pending_outbound.remove(&key);
                         return;
                     }
-                };
+                    };
 
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                     let suppressed = peer.replay_suppressed_count();
@@ -745,12 +746,13 @@ impl Node {
                     // Update peers_by_index: remove old inbound index, add outbound
                     let transport_id = peer.transport_id().unwrap();
                     if let Some(old_idx) = old_our_index {
-                        self.peers_by_index
-                            .remove(&(transport_id, old_idx.as_u32()));
+                        self.peers_by_index.remove(&(transport_id, old_idx.as_u32()));
                         let _ = self.index_allocator.free(old_idx);
                     }
-                    self.peers_by_index
-                        .insert((transport_id, outbound_our_index.as_u32()), peer_node_addr);
+                    self.peers_by_index.insert(
+                        (transport_id, outbound_our_index.as_u32()),
+                        peer_node_addr,
+                    );
 
                     if suppressed > 0 {
                         debug!(
@@ -835,10 +837,7 @@ impl Node {
                         self.bloom_state.mark_update_needed(node_addr);
                         self.reset_discovery_backoff();
                     }
-                    PromotionResult::CrossConnectionWon {
-                        loser_link_id,
-                        node_addr,
-                    } => {
+                    PromotionResult::CrossConnectionWon { loser_link_id, node_addr } => {
                         // Close the losing TCP connection (no-op for connectionless)
                         if let Some(loser_link) = self.links.get(&loser_link_id) {
                             let loser_tid = loser_link.transport_id();
@@ -850,8 +849,10 @@ impl Node {
                         // Clean up the losing connection's link
                         self.remove_link(&loser_link_id);
                         // Ensure addr_to_link points to the winning link
-                        self.addr_to_link
-                            .insert((packet.transport_id, packet.remote_addr.clone()), link_id);
+                        self.addr_to_link.insert(
+                            (packet.transport_id, packet.remote_addr.clone()),
+                            link_id,
+                        );
                         debug!(
                             peer = %self.peer_display_name(&node_addr),
                             loser_link_id = %loser_link_id,
@@ -918,31 +919,30 @@ impl Node {
             .take_session()
             .ok_or(NodeError::NoSession(link_id))?;
 
-        let our_index = connection
-            .our_index()
-            .ok_or_else(|| NodeError::PromotionFailed {
+        let our_index = connection.our_index().ok_or_else(|| {
+            NodeError::PromotionFailed {
                 link_id,
                 reason: "missing our_index".into(),
-            })?;
-        let their_index = connection
-            .their_index()
-            .ok_or_else(|| NodeError::PromotionFailed {
+            }
+        })?;
+        let their_index = connection.their_index().ok_or_else(|| {
+            NodeError::PromotionFailed {
                 link_id,
                 reason: "missing their_index".into(),
-            })?;
-        let transport_id = connection
-            .transport_id()
-            .ok_or_else(|| NodeError::PromotionFailed {
+            }
+        })?;
+        let transport_id = connection.transport_id().ok_or_else(|| {
+            NodeError::PromotionFailed {
                 link_id,
                 reason: "missing transport_id".into(),
-            })?;
-        let current_addr = connection
-            .source_addr()
-            .ok_or_else(|| NodeError::PromotionFailed {
+            }
+        })?;
+        let current_addr = connection.source_addr().ok_or_else(|| {
+            NodeError::PromotionFailed {
                 link_id,
                 reason: "missing source_addr".into(),
-            })?
-            .clone();
+            }
+        })?.clone();
         let link_stats = connection.link_stats().clone();
         let remote_epoch = connection.remote_epoch();
 
@@ -954,8 +954,11 @@ impl Node {
             let existing_link_id = existing_peer.link_id();
 
             // Determine which connection wins
-            let this_wins =
-                cross_connection_winner(self.identity.node_addr(), &peer_node_addr, is_outbound);
+            let this_wins = cross_connection_winner(
+                self.identity.node_addr(),
+                &peer_node_addr,
+                is_outbound,
+            );
 
             if this_wins {
                 // This connection wins, replace the existing peer
@@ -984,9 +987,7 @@ impl Node {
                     &self.config.node.mmp,
                     remote_epoch,
                 );
-                new_peer.set_tree_announce_min_interval_ms(
-                    self.config.node.tree.announce_min_interval_ms,
-                );
+                new_peer.set_tree_announce_min_interval_ms(self.config.node.tree.announce_min_interval_ms);
 
                 self.peers.insert(peer_node_addr, new_peer);
                 self.peers_by_index
@@ -1052,17 +1053,13 @@ impl Node {
             // Normal promotion
             if self.max_peers > 0 && self.peers.len() >= self.max_peers {
                 let _ = self.index_allocator.free(our_index);
-                return Err(NodeError::MaxPeersExceeded {
-                    max: self.max_peers,
-                });
+                return Err(NodeError::MaxPeersExceeded { max: self.max_peers });
             }
 
             // Preserve tree announce rate-limit state from old peer (if reconnecting).
             // Without this, reconnection resets the rate limit window to zero,
             // allowing an immediate announce that can feed an announce loop.
-            let old_announce_ts = self
-                .peers
-                .get(&peer_node_addr)
+            let old_announce_ts = self.peers.get(&peer_node_addr)
                 .map(|p| p.last_tree_announce_sent_ms());
 
             let mut new_peer = ActivePeer::with_session(
@@ -1079,8 +1076,7 @@ impl Node {
                 &self.config.node.mmp,
                 remote_epoch,
             );
-            new_peer
-                .set_tree_announce_min_interval_ms(self.config.node.tree.announce_min_interval_ms);
+            new_peer.set_tree_announce_min_interval_ms(self.config.node.tree.announce_min_interval_ms);
             if let Some(ts) = old_announce_ts {
                 new_peer.set_last_tree_announce_sent_ms(ts);
             }

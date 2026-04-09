@@ -1,13 +1,13 @@
 use super::*;
 use crate::PeerIdentity;
-use crate::transport::{LinkDirection, TransportAddr, packet_channel};
+use crate::transport::{packet_channel, LinkDirection, TransportAddr};
 use crate::utils::index::SessionIndex;
 use std::time::Duration;
 
+mod bloom;
 mod acl;
 #[cfg(target_os = "linux")]
 mod ble;
-mod bloom;
 mod disconnect;
 mod discovery;
 #[cfg(target_os = "linux")]
@@ -56,9 +56,7 @@ pub(super) fn make_completed_connection(
 
     // Run initiator side of handshake
     let our_keypair = node.identity.keypair();
-    let msg1 = conn
-        .start_handshake(our_keypair, node.startup_epoch, current_time_ms)
-        .unwrap();
+    let msg1 = conn.start_handshake(our_keypair, node.startup_epoch, current_time_ms).unwrap();
 
     // Run responder side to generate msg2
     let mut resp_conn = PeerConnection::inbound(LinkId::new(999), current_time_ms);

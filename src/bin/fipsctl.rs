@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use fips::config::{write_key_file, write_pub_file};
 use fips::upper::hosts::HostMap;
 use fips::version;
-use fips::{Identity, encode_nsec};
+use fips::{encode_nsec, Identity};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
