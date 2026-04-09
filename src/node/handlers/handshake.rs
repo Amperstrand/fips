@@ -354,6 +354,8 @@ impl Node {
             )
             .is_err()
         {
+            // Intentionally drop denied peers without sending msg2 or a
+            // disconnect so we do not reveal ACL policy to unauthorized nodes.
             self.msg1_rate_limiter.complete_handshake();
             return;
         }
@@ -666,6 +668,8 @@ impl Node {
                 let tid = link.transport_id();
                 let addr = link.remote_addr().clone();
                 if let Some(transport) = self.transports.get(&tid) {
+                    // Close the transport quietly instead of sending a
+                    // disconnect so ACL policy is not signaled in-band.
                     transport.close_connection(&addr).await;
                 }
             }

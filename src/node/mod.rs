@@ -20,7 +20,7 @@ mod tests;
 mod tree;
 pub(crate) mod wire;
 
-use self::acl::{PeerAclContext, PeerAclReloader};
+use self::acl::{PeerAclContext, PeerAclReloader, PeerAclStatus};
 use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
 use self::rate_limit::HandshakeRateLimiter;
 use self::routing_error_rate_limit::RoutingErrorRateLimiter;
@@ -954,9 +954,9 @@ impl Node {
             return Ok(());
         }
 
-        tracing::warn!(
+        tracing::debug!(
             peer = %self.peer_display_name(peer.node_addr()),
-            npub = %peer.npub(),
+            rejected_npub = %peer.npub(),
             context = %context,
             transport_id = %transport_id,
             remote_addr = %remote_addr,
@@ -973,6 +973,11 @@ impl Node {
     /// Reload ACL files if they changed.
     pub(crate) fn reload_peer_acl(&mut self) -> bool {
         self.peer_acl.check_reload()
+    }
+
+    /// Return the currently loaded ACL state for observability.
+    pub fn peer_acl_status(&self) -> PeerAclStatus {
+        self.peer_acl.status()
     }
 
     // === Configuration ===
