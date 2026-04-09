@@ -44,11 +44,11 @@ impl<S> BleConnection<S> {
 
 impl<S> Drop for BleConnection<S> {
     fn drop(&mut self) {
-        if let Some(task) = self.recv_task.take() {
-            task.abort();
-        }
         if let Some(on_drop) = self.on_drop.take() {
             on_drop();
+        }
+        if let Some(task) = self.recv_task.take() {
+            task.abort();
         }
     }
 }
