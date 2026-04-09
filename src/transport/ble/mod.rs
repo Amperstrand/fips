@@ -964,14 +964,29 @@ async fn receive_loop<S: BleStream>(
     stats: Arc<BleStats>,
     recv_mtu: u16,
 ) {
+    /// Maximum time to wait for a single recv() before declaring the link dead.
+    ///
+    /// On macOS, bluest's internal L2CAP read loop can die with "Sender is
+    /// closed" without propagating the error to our recv() call, leaving the
+    /// future pending forever. This timeout ensures the receive_loop exits,
+    /// cleans up the pool, and emits a disconnect event so that scan_probe_loop
+    /// can reconnect.
+    const RECV_TIMEOUT_SECS: u64 = 45;
+
     let mut buf = vec![0u8; recv_mtu as usize];
     loop {
-        match stream.recv(&mut buf).await {
-            Ok(0) => {
+        let recv_result = tokio::time::timeout(
+            std::time::Duration::from_secs(RECV_TIMEOUT_SECS),
+            stream.recv(&mut buf),
+        )
+        .await;
+
+        match recv_result {
+            Ok(Ok(0)) => {
                 debug!(addr = %addr, "BLE connection closed by peer");
                 break;
             }
-            Ok(n) => {
+            Ok(Ok(n)) => {
                 stats.record_recv(n);
                 let packet = ReceivedPacket::new(transport_id, addr.clone(), buf[..n].to_vec());
                 if packet_tx.send(packet).await.is_err() {
@@ -979,8 +994,17 @@ async fn receive_loop<S: BleStream>(
                     break;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!(addr = %addr, error = %e, "BLE receive error");
+                stats.record_recv_error();
+                break;
+            }
+            Err(_) => {
+                debug!(
+                    addr = %addr,
+                    timeout_secs = RECV_TIMEOUT_SECS,
+                    "BLE recv timeout — link may be silently dead (bluest L2CAP stall)"
+                );
                 stats.record_recv_error();
                 break;
             }
