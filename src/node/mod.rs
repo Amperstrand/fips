@@ -502,13 +502,20 @@ impl Node {
         let backoff_max_secs = config.node.discovery.backoff_max_secs;
         let forward_min_interval_secs = config.node.discovery.forward_min_interval_secs;
 
-        let mut host_map = HostMap::from_peer_configs(config.peers());
+        let base_host_map = HostMap::from_peer_configs(config.peers());
+        let mut host_map = base_host_map.clone();
+        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
         let hosts_file = HostMap::load_hosts_file(std::path::Path::new(
             crate::upper::hosts::DEFAULT_HOSTS_PATH,
         ));
         host_map.merge(hosts_file);
         let host_map = Arc::new(host_map);
-        let peer_acl = PeerAclReloader::new();
+        let peer_acl = PeerAclReloader::with_alias_sources(
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_ALLOW_PATH),
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_DENY_PATH),
+            base_host_map,
+            hosts_path,
+        );
 
         Ok(Self {
             identity,
@@ -616,8 +623,14 @@ impl Node {
         let max_links = config.node.limits.max_links;
         let coords_response_interval_ms = config.node.session.coords_response_interval_ms;
 
-        let host_map = Arc::new(HostMap::new());
-        let peer_acl = PeerAclReloader::new();
+        let base_host_map = HostMap::from_peer_configs(config.peers());
+        let host_map = Arc::new(base_host_map.clone());
+        let peer_acl = PeerAclReloader::with_alias_sources(
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_ALLOW_PATH),
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_DENY_PATH),
+            base_host_map,
+            std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH),
+        );
 
         Self {
             identity,
