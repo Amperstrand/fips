@@ -293,16 +293,25 @@ impl BleIo for BluestIo {
             };
 
             futures::pin_mut!(scan_stream);
-            let mut seen = std::collections::HashSet::new();
+            // Time-based dedup: allow re-discovery after REDISCOVERY_COOLDOWN_SECS.
+            // This ensures devices that disconnect and resume advertising are
+            // found again, unlike a permanent HashSet which would suppress them
+            // for the entire scan session.
+            const REDISCOVERY_COOLDOWN_SECS: u64 = 60;
+            let mut last_seen: std::collections::HashMap<[u8; 6], tokio::time::Instant> =
+                std::collections::HashMap::new();
             while let Some(discovered) = scan_stream.next().await {
                 let device = discovered.device;
                 let id = device.id();
                 let bytes = device_id_to_bytes(&id);
 
-                // Deduplicate within this scan session
-                if !seen.insert(bytes) {
-                    continue;
+                // Suppress duplicates within the cooldown window
+                if let Some(last) = last_seen.get(&bytes) {
+                    if last.elapsed().as_secs() < REDISCOVERY_COOLDOWN_SECS {
+                        continue;
+                    }
                 }
+                last_seen.insert(bytes, tokio::time::Instant::now());
 
                 let name = discovered.adv_data.local_name.as_deref().unwrap_or("unknown");
                 debug!(
