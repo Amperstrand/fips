@@ -149,11 +149,20 @@ mod bluer_impl {
     // ----------------------------------------------------------------
 
     /// BLE stream wrapping a bluer L2CAP SeqPacket connection.
+    ///
+    /// While SeqPacket nominally preserves message boundaries, some BLE
+    /// controllers and the macOS CoreBluetooth byte-stream layer may split
+    /// a single send() across multiple recv() calls. This stream buffers
+    /// incoming data and extracts complete length-prefixed frames, matching
+    /// the macOS BluestStream implementation.
     pub struct BluerStream {
         conn: SeqPacket,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
+        /// Reassembly buffer for length-prefixed frames that may be split
+        /// across multiple SeqPacket recv() calls.
+        recv_buf: Mutex<Vec<u8>>,
     }
 
     impl BluerStream {
@@ -172,7 +181,7 @@ mod bluer_impl {
                 Err(_) => debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)"),
             }
 
-            Ok(Self { conn, remote, send_mtu, recv_mtu })
+            Ok(Self { conn, remote, send_mtu, recv_mtu, recv_buf: Mutex::new(Vec::new()) })
         }
     }
 
@@ -191,23 +200,41 @@ mod bluer_impl {
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            // SeqPacket preserves message boundaries, so each recv is one
-            // framed message: [len:2 BE][payload]. Strip the 2-byte prefix.
-            let mut raw = vec![0u8; buf.len() + 2];
-            let n = self.conn
-                .recv(&mut raw)
-                .await
-                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
-            if n < 2 {
-                return Err(TransportError::RecvFailed(
-                    format!("BLE frame too short: {n} bytes"),
-                ));
+            loop {
+                // Check if we have a complete frame in the buffer
+                {
+                    let mut recv_buf = self.recv_buf.lock().await;
+                    if recv_buf.len() >= 2 {
+                        let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+                        if recv_buf.len() >= 2 + payload_len {
+                            let copy_len = payload_len.min(buf.len());
+                            buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
+                            recv_buf.drain(..2 + payload_len);
+                            trace!(
+                                len = copy_len,
+                                buf_remaining = recv_buf.len(),
+                                addr = %self.remote,
+                                "BLE recv frame"
+                            );
+                            return Ok(copy_len);
+                        }
+                    }
+                } // drop recv_buf lock
+
+                // Read more bytes from the SeqPacket connection
+                let mut raw = vec![0u8; self.recv_mtu as usize + 2];
+                let n = self.conn
+                    .recv(&mut raw)
+                    .await
+                    .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+                if n == 0 {
+                    return Ok(0);
+                }
+                trace!(raw_bytes = n, addr = %self.remote, "BLE recv raw");
+
+                // Append to buffer
+                self.recv_buf.lock().await.extend_from_slice(&raw[..n]);
             }
-            let payload_len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-            let available = n - 2;
-            let copy_len = payload_len.min(available).min(buf.len());
-            buf[..copy_len].copy_from_slice(&raw[2..2 + copy_len]);
-            Ok(copy_len)
         }
 
         fn send_mtu(&self) -> u16 {
