@@ -275,6 +275,19 @@ impl BleIo for BluestIo {
         Ok(())
     }
 
+    async fn disconnect_device(&self, addr: &BleAddr) {
+        let device = {
+            let devices = self.devices.lock().await;
+            devices.get(&addr.device).cloned()
+        };
+        if let Some(device) = device {
+            match self.adapter.disconnect_device(&device).await {
+                Ok(()) => debug!(addr = %addr, "Disconnected CoreBluetooth peripheral"),
+                Err(e) => debug!(addr = %addr, error = %e, "Failed to disconnect peripheral"),
+            }
+        }
+    }
+
     async fn start_scanning(&self) -> Result<BluestScanner, TransportError> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let devices = self.devices.clone();

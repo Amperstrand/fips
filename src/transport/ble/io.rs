@@ -95,6 +95,17 @@ pub trait BleIo: Send + Sync + 'static {
         &self,
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
+    /// Disconnect the underlying BLE device at the given address.
+    ///
+    /// On macOS, this calls `cancelPeripheralConnection:` so CoreBluetooth
+    /// transitions the peripheral to Disconnected and resumes reporting it
+    /// in scan results. On Linux this is a no-op (bluez manages connections
+    /// via socket lifecycle).
+    fn disconnect_device(
+        &self,
+        addr: &BleAddr,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
     /// Start passive scanning for FIPS service UUID advertisements.
     fn start_scanning(
         &self,
@@ -438,6 +449,8 @@ mod bluer_impl {
             Ok(())
         }
 
+        async fn disconnect_device(&self, _addr: &BleAddr) {}
+
         async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
             // Clear cached devices so BlueZ fires DeviceAdded for every
             // advertisement. Without this, already-known devices only
@@ -714,6 +727,8 @@ impl BleIo for MockBleIo {
     async fn stop_advertising(&self) -> Result<(), TransportError> {
         Ok(())
     }
+
+    async fn disconnect_device(&self, _addr: &BleAddr) {}
 
     async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
         let rx = self

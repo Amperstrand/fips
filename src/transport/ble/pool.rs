@@ -28,6 +28,11 @@ pub struct BleConnection<S> {
     pub is_static: bool,
     /// Parsed remote address.
     pub addr: BleAddr,
+    /// Optional callback to disconnect the underlying BLE device when this
+    /// connection is dropped. Used on macOS to call
+    /// `CBCentralManager.cancelPeripheralConnection:` so CoreBluetooth
+    /// resumes reporting the device in scan results.
+    pub on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<S> BleConnection<S> {
@@ -41,6 +46,9 @@ impl<S> Drop for BleConnection<S> {
     fn drop(&mut self) {
         if let Some(task) = self.recv_task.take() {
             task.abort();
+        }
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
         }
     }
 }
@@ -151,9 +159,7 @@ impl<S> ConnectionPool<S> {
                 .min_by_key(|(_, c)| c.established_at)
                 .map(|(addr, _)| addr.clone())
                 .ok_or_else(|| {
-                    TransportError::NotSupported(
-                        "BLE pool full: all connections are static".into(),
-                    )
+                    TransportError::NotSupported("BLE pool full: all connections are static".into())
                 })
         } else {
             // Non-static peer evicts oldest non-static
@@ -163,9 +169,7 @@ impl<S> ConnectionPool<S> {
                 .min_by_key(|(_, c)| c.established_at)
                 .map(|(addr, _)| addr.clone())
                 .ok_or_else(|| {
-                    TransportError::NotSupported(
-                        "BLE pool full: all connections are static".into(),
-                    )
+                    TransportError::NotSupported("BLE pool full: all connections are static".into())
                 })
         }
     }
@@ -199,6 +203,7 @@ mod tests {
             established_at: tokio::time::Instant::now(),
             is_static,
             addr: test_ble_addr(n),
+            on_drop: None,
         }
     }
 

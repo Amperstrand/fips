@@ -446,6 +446,16 @@ impl<I: BleIo> BleTransport<I> {
             recv_mtu,
         ));
 
+        let io = Arc::clone(&self.io);
+        let drop_addr = ble_addr.clone();
+        let on_drop: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let io = io.clone();
+            let addr = drop_addr;
+            tokio::spawn(async move {
+                io.disconnect_device(&addr).await;
+            });
+        }));
+
         let conn = BleConnection {
             stream,
             recv_task: Some(recv_task),
@@ -454,6 +464,7 @@ impl<I: BleIo> BleTransport<I> {
             established_at: tokio::time::Instant::now(),
             is_static: false,
             addr: ble_addr.clone(),
+            on_drop,
         };
 
         let mut pool = self.pool.lock().await;
@@ -568,6 +579,7 @@ impl<I: BleIo> BleTransport<I> {
                         established_at: tokio::time::Instant::now(),
                         is_static: false,
                         addr: ble_addr,
+                        on_drop: None,
                     };
 
                     let mut pool = pool.lock().await;
@@ -926,6 +938,7 @@ async fn accept_loop<A>(
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr,
+                    on_drop: None,
                 };
 
                 let mut pool_guard = pool.lock().await;
@@ -1192,18 +1205,19 @@ async fn scan_probe_loop<I: io::BleIo>(
                     recv_mtu,
                 ));
 
-                let conn = BleConnection {
-                    stream,
-                    recv_task: Some(recv_task),
-                    send_mtu,
-                    recv_mtu,
-                    established_at: tokio::time::Instant::now(),
-                    is_static: false,
-                    addr: addr.clone(),
-                };
+                 let conn = BleConnection {
+                     stream,
+                     recv_task: Some(recv_task),
+                     send_mtu,
+                     recv_mtu,
+                     established_at: tokio::time::Instant::now(),
+                     is_static: false,
+                     addr: addr.clone(),
+                     on_drop: None,
+                 };
 
-                let mut pool_guard = pool.lock().await;
-                match pool_guard.insert(ta.clone(), conn) {
+                 let mut pool_guard = pool.lock().await;
+                 match pool_guard.insert(ta.clone(), conn) {
                     Ok(Some(evicted)) => {
                         stats.record_pool_eviction();
                         debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
