@@ -22,6 +22,7 @@ pub mod addr;
 pub mod discovery;
 pub mod io;
 pub mod pool;
+pub mod rate_limit;
 pub mod stats;
 
 use super::{
@@ -333,37 +334,39 @@ impl<I: BleIo> BleTransport<I> {
         addr: &TransportAddr,
         data: &[u8],
     ) -> Result<usize, TransportError> {
-        let pool = self.pool.lock().await;
-        let conn = match pool.get(addr) {
-            Some(c) => c,
-            None => {
-                // Drop pool lock before triggering background connect
-                drop(pool);
-                // Fire-and-forget: connect_async spawns a background task
-                let _ = self.connect_async(addr).await;
-                return Err(TransportError::SendFailed("not connected".into()));
+        // Clone stream Arc and drop pool lock BEFORE the send (which may
+        // sleep for rate limiting). Holding the pool lock during send blocks
+        // all other BLE operations for the sleep duration.
+        let stream = {
+            let pool = self.pool.lock().await;
+            let conn = match pool.get(addr) {
+                Some(c) => c,
+                None => {
+                    drop(pool);
+                    let _ = self.connect_async(addr).await;
+                    return Err(TransportError::SendFailed("not connected".into()));
+                }
+            };
+
+            let mtu = conn.effective_mtu() as usize;
+            if data.len() > mtu {
+                self.stats.record_mtu_exceeded();
+                return Err(TransportError::MtuExceeded {
+                    packet_size: data.len(),
+                    mtu: mtu as u16,
+                });
             }
-        };
 
-        // MTU check
-        let mtu = conn.effective_mtu() as usize;
-        if data.len() > mtu {
-            self.stats.record_mtu_exceeded();
-            return Err(TransportError::MtuExceeded {
-                packet_size: data.len(),
-                mtu: mtu as u16,
-            });
-        }
+            Arc::clone(&conn.stream)
+        }; // pool lock dropped here
 
-        match conn.stream.send(data).await {
+        match stream.send(data).await {
             Ok(()) => {
                 self.stats.record_send(data.len());
                 Ok(data.len())
             }
             Err(e) => {
                 self.stats.record_send_error();
-                // Drop pool lock before removing to avoid deadlock
-                drop(pool);
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 warn!(addr = %addr, error = %e, "BLE send failed, connection removed");

@@ -9,10 +9,12 @@
 
 use super::*;
 use crate::transport::ble::addr::BleAddr;
+use crate::transport::ble::rate_limit::SendRateLimiter;
 use crate::transport::TransportError;
 
 use bluest::{Adapter, Device, DeviceId};
 use futures::StreamExt;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,21 +46,28 @@ pub struct BluestStream {
     /// Byte buffer for reassembling length-prefixed frames from the
     /// underlying byte stream.
     recv_buf: Mutex<Vec<u8>>,
+    /// Send rate limiter. None = unlimited (for mock/test streams).
+    rate_limiter: Option<Mutex<SendRateLimiter>>,
 }
 
 impl BleStream for BluestStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        // Length-prefix framing: [len:2 BE][payload]
-        let mut framed = Vec::with_capacity(2 + data.len());
+        let framed_len = 2 + data.len();
+        if let Some(ref limiter) = self.rate_limiter {
+            limiter.lock().await.acquire(framed_len).await;
+        }
+
+        let mut framed = Vec::with_capacity(framed_len);
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send");
         self.writer
             .lock()
             .await
-            .write(&framed)
+            .write_all(&framed)
             .await
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE send: {e}"))))
+            .map_err(|e| TransportError::Io(e))?;
+        Ok(())
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -90,7 +99,7 @@ impl BleStream for BluestStream {
                 .await
                 .read(&mut tmp)
                 .await
-                .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE recv: {e}"))))?;
+                .map_err(|e| TransportError::Io(e))?;
             if n == 0 {
                 return Ok(0);
             }
@@ -160,6 +169,8 @@ pub struct BluestIo {
     /// Cache of discovered devices, keyed by the 6-byte pseudo-address
     /// derived from CoreBluetooth's DeviceId.
     devices: Arc<Mutex<HashMap<[u8; 6], Device>>>,
+    send_rate_bps: u64,
+    send_burst_bytes: u32,
 }
 
 impl BluestIo {
@@ -169,10 +180,10 @@ impl BluestIo {
     /// binary handles this when built with the `ble-macos` feature by
     /// dedicating the main thread to the NSRunLoop and running tokio on
     /// a background thread.
-    pub async fn new(_adapter_name: &str, mtu: u16) -> Result<Self, TransportError> {
+    pub async fn new(_adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
         let adapter = Adapter::default()
             .await
-            .ok_or_else(|| TransportError::StartFailed("CoreBluetooth adapter not found".into()))?;
+            .map_err(|e| TransportError::StartFailed(format!("CoreBluetooth adapter not found: {e}")))?;
 
         adapter
             .wait_available()
@@ -185,6 +196,8 @@ impl BluestIo {
             adapter,
             mtu,
             devices: Arc::new(Mutex::new(HashMap::new())),
+            send_rate_bps,
+            send_burst_bytes,
         })
     }
 }
@@ -262,6 +275,11 @@ impl BleIo for BluestIo {
             remote: addr.clone(),
             mtu: self.mtu,
             recv_buf: Mutex::new(Vec::new()),
+            rate_limiter: if self.send_rate_bps > 0 {
+                Some(Mutex::new(SendRateLimiter::new(self.send_rate_bps, self.send_burst_bytes)))
+            } else {
+                None
+            },
         })
     }
 

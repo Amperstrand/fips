@@ -773,7 +773,7 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
-                match crate::transport::ble::io::BluerIo::new(&adapter, mtu).await {
+                match crate::transport::ble::io::BluerIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes()).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,
@@ -797,7 +797,7 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
-                match crate::transport::ble::io::BluestIo::new(&adapter, mtu).await {
+                match crate::transport::ble::io::BluestIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes()).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,

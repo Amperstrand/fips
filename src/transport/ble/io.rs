@@ -165,11 +165,12 @@ mod bluer_impl {
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
+        rate_limiter: Option<tokio::sync::Mutex<crate::transport::ble::rate_limit::SendRateLimiter>>,
     }
 
     impl BluerStream {
         /// Construct from a connected SeqPacket, querying MTU values.
-        pub fn new(conn: SeqPacket, remote: BleAddr) -> Result<Self, TransportError> {
+        pub fn new(conn: SeqPacket, remote: BleAddr, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
             let send_mtu = conn
                 .send_mtu()
                 .map_err(|e| map_io_err("send_mtu", e))? as u16;
@@ -183,15 +184,33 @@ mod bluer_impl {
                 Err(_) => debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)"),
             }
 
-            Ok(Self { conn, remote, send_mtu, recv_mtu })
+            Ok(Self {
+                conn,
+                remote,
+                send_mtu,
+                recv_mtu,
+                rate_limiter: if send_rate_bps > 0 {
+                    Some(tokio::sync::Mutex::new(
+                        crate::transport::ble::rate_limit::SendRateLimiter::new(send_rate_bps, send_burst_bytes)
+                    ))
+                } else {
+                    None
+                },
+            })
         }
     }
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+            // Rate limit before writing
+            let framed_len = 2 + data.len();
+            if let Some(ref limiter) = self.rate_limiter {
+                limiter.lock().await.acquire(framed_len).await;
+            }
+
             // Length-prefix framing: [len:2 BE][payload]
             // Required for interop with macOS (CoreBluetooth byte-stream L2CAP).
-            let mut framed = Vec::with_capacity(2 + data.len());
+            let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
             self.conn
@@ -242,6 +261,8 @@ mod bluer_impl {
     pub struct BluerAcceptor {
         listener: SeqPacketListener,
         adapter_name: String,
+        send_rate_bps: u64,
+        send_burst_bytes: u32,
     }
 
     impl BleAcceptor for BluerAcceptor {
@@ -255,7 +276,7 @@ mod bluer_impl {
                 .map_err(|e| map_io_err("accept", e))?;
 
             let remote = BleAddr::from_bluer(peer_sa.addr, &self.adapter_name);
-            BluerStream::new(conn, remote)
+            BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
         }
     }
 
@@ -312,13 +333,15 @@ mod bluer_impl {
         adapter_name: String,
         adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
         mtu: u16,
+        send_rate_bps: u64,
+        send_burst_bytes: u32,
     }
 
     impl BluerIo {
         /// Create a new BluerIo for the given adapter.
         ///
         /// Connects to BlueZ via D-Bus and powers on the adapter.
-        pub async fn new(adapter_name: &str, mtu: u16) -> Result<Self, TransportError> {
+        pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
             let session = bluer::Session::new()
                 .await
                 .map_err(|e| map_err("Session::new", e))?;
@@ -348,6 +371,8 @@ mod bluer_impl {
                 adapter_name: name,
                 adv_handle: Mutex::new(None),
                 mtu,
+                send_rate_bps,
+                send_burst_bytes,
             })
         }
     }
@@ -385,6 +410,8 @@ mod bluer_impl {
             Ok(BluerAcceptor {
                 listener,
                 adapter_name: self.adapter_name.clone(),
+                send_rate_bps: self.send_rate_bps,
+                send_burst_bytes: self.send_burst_bytes,
             })
         }
 
@@ -415,7 +442,7 @@ mod bluer_impl {
                 .map_err(|e| map_io_err("connect", e))?;
 
             let remote = addr.clone();
-            BluerStream::new(conn, remote)
+            BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {
