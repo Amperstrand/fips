@@ -51,7 +51,13 @@ impl Node {
         // Local delivery: dispatch to session layer handlers
         if self.is_local_endpoint(&datagram.dest_addr) {
             self.stats_mut().forwarding.record_delivered(payload.len());
-            self.handle_session_payload(&datagram.src_addr, &datagram.payload, datagram.path_mtu, incoming_ce)
+            self.handle_session_payload(
+                &datagram.dest_addr,
+                &datagram.src_addr,
+                &datagram.payload,
+                datagram.path_mtu,
+                incoming_ce,
+            )
                 .await;
             return;
         }

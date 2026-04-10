@@ -304,10 +304,9 @@ impl Node {
     pub(in crate::node) async fn check_session_mmp_reports(&mut self) {
         let now = Instant::now();
 
-        // Collect reports to send: (dest_addr, msg_type, encoded_body)
-        let mut reports: Vec<(NodeAddr, u8, Vec<u8>)> = Vec::new();
+        let mut reports: Vec<(NodeAddr, NodeAddr, u8, Vec<u8>)> = Vec::new();
 
-        for ((_, dest_addr), entry) in self.sessions.iter_mut() {
+        for ((local_addr, dest_addr), entry) in self.sessions.iter_mut() {
             // Compute display name before taking mutable MMP borrow
             let session_name = self.peer_aliases.get(dest_addr)
                 .cloned()
@@ -329,6 +328,7 @@ impl Node {
             {
                 let session_sr: SessionSenderReport = SessionSenderReport::from(&sr);
                 reports.push((
+                    *local_addr,
                     *dest_addr,
                     SessionMessageType::SenderReport.to_byte(),
                     session_sr.encode(),
@@ -342,6 +342,7 @@ impl Node {
             {
                 let session_rr: SessionReceiverReport = SessionReceiverReport::from(&rr);
                 reports.push((
+                    *local_addr,
                     *dest_addr,
                     SessionMessageType::ReceiverReport.to_byte(),
                     session_rr.encode(),
@@ -354,6 +355,7 @@ impl Node {
             {
                 let notif = PathMtuNotification::new(mtu_value);
                 reports.push((
+                    *local_addr,
                     *dest_addr,
                     SessionMessageType::PathMtuNotification.to_byte(),
                     notif.encode(),
@@ -369,15 +371,15 @@ impl Node {
 
         // Send collected reports via session-layer encryption.
         // Track per-destination success/failure for backoff and log suppression.
-        let mut send_results: Vec<(NodeAddr, bool)> = Vec::new();
-        for (dest_addr, msg_type, body) in reports {
-            match self.send_session_msg(&dest_addr, msg_type, &body).await {
+        let mut send_results: Vec<((NodeAddr, NodeAddr), bool)> = Vec::new();
+        for (local_addr, dest_addr, msg_type, body) in reports {
+            match self.send_session_msg(&local_addr, &dest_addr, msg_type, &body).await {
                 Ok(()) => {
-                    send_results.push((dest_addr, true));
+                    send_results.push(((local_addr, dest_addr), true));
                 }
                 Err(e) => {
                     // Peek at current failure count for log suppression
-                    let failures = self.sessions.get(&(*self.node_addr(), dest_addr))
+                    let failures = self.sessions.get(&(local_addr, dest_addr))
                         .and_then(|entry| entry.mmp())
                         .map(|mmp| mmp.sender.consecutive_send_failures())
                         .unwrap_or(0);
@@ -397,7 +399,7 @@ impl Node {
                     }
                     // failures > 3: silently suppressed
 
-                    send_results.push((dest_addr, false));
+                    send_results.push(((local_addr, dest_addr), false));
                 }
             }
         }
@@ -405,16 +407,16 @@ impl Node {
         // Update backoff state from send results.
         // Deduplicate: a destination counts as success if ANY report succeeded,
         // failure only if ALL reports for that destination failed.
-        let mut dest_success: std::collections::HashMap<NodeAddr, bool> =
+        let mut dest_success: std::collections::HashMap<(NodeAddr, NodeAddr), bool> =
             std::collections::HashMap::new();
-        for (dest, ok) in &send_results {
-            let entry = dest_success.entry(*dest).or_insert(false);
+        for (session_key, ok) in &send_results {
+            let entry = dest_success.entry(*session_key).or_insert(false);
             if *ok {
                 *entry = true;
             }
         }
-        for (dest_addr, success) in dest_success {
-            if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), dest_addr))
+        for ((local_addr, dest_addr), success) in dest_success {
+            if let Some(entry) = self.sessions.get_mut(&(local_addr, dest_addr))
                 && let Some(mmp) = entry.mmp_mut()
             {
                 if success {

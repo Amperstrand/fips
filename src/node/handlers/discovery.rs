@@ -565,7 +565,8 @@ impl Node {
             );
             if let Some(packets) = queued {
                 for pkt in &packets {
-                    self.send_icmpv6_dest_unreachable(pkt);
+                    let local_endpoint = self.local_endpoint_for_tun_source(pkt).clone();
+                    self.send_icmpv6_dest_unreachable(&local_endpoint, pkt);
                 }
             }
         }

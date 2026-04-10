@@ -976,6 +976,15 @@ impl Node {
         self.local_endpoints.iter().find(|ep| &ep.node_addr == addr)
     }
 
+    pub fn get_local_endpoint_by_fips_addr(
+        &self,
+        fips_addr: &[u8; 16],
+    ) -> Option<&local_endpoint::LocalEndpoint> {
+        self.local_endpoints
+            .iter()
+            .find(|ep| ep.fips_address.as_bytes() == fips_addr)
+    }
+
     /// Get the primary (own identity) endpoint.
     ///
     /// There is always exactly one primary endpoint.
@@ -1407,10 +1416,6 @@ impl Node {
     }
 
     // === End-to-End Sessions ===
-
-    pub fn find_sessions_for_local<'a>(&'a self, local_addr: &NodeAddr) -> impl Iterator<Item = (&'a (NodeAddr, NodeAddr), &'a SessionEntry)> {
-        self.sessions.iter().filter(move |((l, _), _)| l == local_addr)
-    }
 
     /// Get a session by remote NodeAddr.
     /// Disable the discovery forward rate limiter (for tests).
