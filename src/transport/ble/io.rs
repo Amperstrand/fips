@@ -150,6 +150,7 @@ mod bluer_impl {
     use std::collections::{BTreeSet, HashSet};
     use std::pin::Pin;
     use tokio::sync::Mutex;
+    use tokio::time::{Duration, timeout};
     use tracing::{debug, trace};
 
     /// FIPS BLE service UUID.
@@ -410,6 +411,68 @@ mod bluer_impl {
                 send_burst_bytes,
             })
         }
+
+        async fn resolve_addr_type(&self, addr: &BleAddr) -> AddressType {
+            let bluer_addr = addr.to_bluer_address();
+
+            match self.adapter.device(bluer_addr) {
+                Ok(device) => device.address_type().await.unwrap_or(AddressType::LeRandom),
+                Err(_) => {
+                    debug!(addr = %addr, "BLE connect: device not in cache, starting discovery scan");
+
+                    let filter = DiscoveryFilter {
+                        transport: DiscoveryTransport::Le,
+                        ..Default::default()
+                    };
+
+                    if let Err(e) = self.adapter.set_discovery_filter(filter).await {
+                        debug!(addr = %addr, error = %e, "BLE connect: failed to set discovery filter");
+                        return AddressType::LeRandom;
+                    }
+
+                    match self.adapter.discover_devices().await {
+                        Ok(mut events) => {
+                            let scan_result = timeout(Duration::from_secs(5), async {
+                                while let Some(event) = events.next().await {
+                                    if let AdapterEvent::DeviceAdded(found_addr) = event {
+                                        if found_addr == bluer_addr {
+                                            let addr_type = match self.adapter.device(found_addr) {
+                                                Ok(device) => {
+                                                    device.address_type().await.unwrap_or(AddressType::LeRandom)
+                                                }
+                                                Err(_) => AddressType::LeRandom,
+                                            };
+                                            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
+                                            return Some(addr_type);
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .await;
+
+                            drop(events);
+
+                            match scan_result {
+                                Ok(Some(addr_type)) => addr_type,
+                                Ok(None) | Err(_) => match self.adapter.device(bluer_addr) {
+                                    Ok(device) => {
+                                        let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
+                                        debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
+                                        addr_type
+                                    }
+                                    Err(_) => AddressType::LeRandom,
+                                },
+                            }
+                        }
+                        Err(e) => {
+                            debug!(addr = %addr, error = %e, "BLE connect: failed to start discovery scan");
+                            AddressType::LeRandom
+                        }
+                    }
+                }
+            }
+        }
     }
 
     impl BleIo for BluerIo {
@@ -455,10 +518,7 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
-            let addr_type = match self.adapter.device(addr.to_bluer_address()) {
-                Ok(device) => device.address_type().await.unwrap_or(AddressType::LePublic),
-                Err(_) => AddressType::LePublic,
-            };
+            let addr_type = self.resolve_addr_type(addr).await;
             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
 
             let target_sa = SocketAddr::new(addr.to_bluer_address(), addr_type, psm);
