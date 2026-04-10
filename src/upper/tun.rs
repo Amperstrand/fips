@@ -182,6 +182,18 @@ impl TunDevice {
         platform::delete_interface(&self.name).await
     }
 
+    /// Add a secondary IPv6 /128 address to this TUN device.
+    /// Used for proxied leaf endpoints (ESP32 devices).
+    pub async fn add_secondary_address(&self, addr: Ipv6Addr) -> Result<(), TunError> {
+        platform::add_address(&self.name, addr).await
+    }
+
+    /// Remove a secondary IPv6 /128 address from this TUN device.
+    /// Used during leaf proxy teardown.
+    pub async fn remove_secondary_address(&self, addr: Ipv6Addr) -> Result<(), TunError> {
+        platform::remove_address(&self.name, addr).await
+    }
+
     /// Create a TunWriter for this device.
     ///
     /// This duplicates the underlying file descriptor so that reads and writes
@@ -647,6 +659,53 @@ mod platform {
         Ok(())
     }
 
+    /// Add a secondary IPv6 /128 address to a network interface.
+    /// Used for proxied leaf endpoints (ESP32 devices).
+    pub async fn add_address(name: &str, addr: Ipv6Addr) -> Result<(), TunError> {
+        let (connection, handle, _) = new_connection()
+            .map_err(|e| TunError::Configure(format!("netlink connection failed: {}", e)))?;
+        tokio::spawn(connection);
+
+        let index = get_interface_index(&handle, name).await?;
+
+        handle
+            .address()
+            .add(index, std::net::IpAddr::V6(addr), 128)
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Remove a secondary IPv6 /128 address from a network interface.
+    /// Silently succeeds if the address is not found.
+    pub async fn remove_address(name: &str, addr: Ipv6Addr) -> Result<(), TunError> {
+        let (connection, handle, _) = new_connection()
+            .map_err(|e| TunError::Configure(format!("netlink connection failed: {}", e)))?;
+        tokio::spawn(connection);
+
+        let index = get_interface_index(&handle, name).await?;
+
+        let mut addr_iter = handle.address().get().set_link_index_filter(index).execute();
+
+        while let Some(addr_msg) = addr_iter.try_next().await? {
+            if addr_msg.header.prefix_len == 128 {
+                for attr in &addr_msg.attributes {
+                    if let rtnetlink::packet_route::address::AddressAttribute::Address(ip) = attr {
+                        if let std::net::IpAddr::V6(found_addr) = ip {
+                            if *found_addr == addr {
+                                handle.address().del(addr_msg).execute().await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the interface index by name.
     async fn get_interface_index(handle: &Handle, name: &str) -> Result<u32, TunError> {
         let mut links = handle.link().get().match_name(name.to_string()).execute();
@@ -710,6 +769,16 @@ mod platform {
         // Add route for fd00::/8 (FIPS address space) via this interface
         run_cmd("route", &["add", "-inet6", "-prefixlen", "8", "fd00::", "-interface", name]).await?;
 
+        Ok(())
+    }
+
+    /// Add a secondary IPv6 /128 address to a network interface (no-op on macOS).
+    pub async fn add_address(_name: &str, _addr: Ipv6Addr) -> Result<(), TunError> {
+        Ok(())
+    }
+
+    /// Remove a secondary IPv6 /128 address from a network interface (no-op on macOS).
+    pub async fn remove_address(_name: &str, _addr: Ipv6Addr) -> Result<(), TunError> {
         Ok(())
     }
 
