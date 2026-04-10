@@ -455,7 +455,13 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
-            let target_sa = addr.to_socket_addr(psm);
+            let addr_type = match self.adapter.device(addr.to_bluer_address()) {
+                Ok(device) => device.address_type().await.unwrap_or(AddressType::LePublic),
+                Err(_) => AddressType::LePublic,
+            };
+            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
+
+            let target_sa = SocketAddr::new(addr.to_bluer_address(), addr_type, psm);
 
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
