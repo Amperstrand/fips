@@ -11,5 +11,6 @@ pub mod hosts;
 pub mod icmp;
 pub mod icmp_rate_limit;
 pub mod ipv6_shim;
+pub mod tcp_proxy;
 pub mod tcp_mss;
 pub mod tun;

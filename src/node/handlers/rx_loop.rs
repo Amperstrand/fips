@@ -60,6 +60,22 @@ impl Node {
             }
         };
 
+        let (mut tcp_proxy_outbound_rx, _tcp_proxy_guard) = match self.tcp_proxy_outbound_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
+        let (mut leaf_tcp_proxy_outbound_rx, _leaf_tcp_proxy_guard) = match self.leaf_tcp_proxy_outbound_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
         let mut tick = tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
 
         // Set up control socket channel
@@ -109,6 +125,24 @@ impl Node {
                         "Registering identity from DNS resolution"
                     );
                     self.register_identity(identity.node_addr, identity.pubkey);
+                }
+                Some(data) = tcp_proxy_outbound_rx.recv() => {
+                    if let Some(target) = self.tcp_proxy_target {
+                        let mut msg = Vec::with_capacity(1 + data.len());
+                        msg.push(0x60);
+                        msg.extend_from_slice(&data);
+                        if let Err(e) = self.send_encrypted_link_message(&target, &msg).await {
+                            warn!(error = %e, "TCP proxy: failed to send to peer");
+                        }
+                    }
+                }
+                Some((leaf_addr, data)) = leaf_tcp_proxy_outbound_rx.recv() => {
+                    let mut msg = Vec::with_capacity(1 + data.len());
+                    msg.push(0x60);
+                    msg.extend_from_slice(&data);
+                    if let Err(e) = self.send_encrypted_link_message(&leaf_addr, &msg).await {
+                        warn!(leaf = %self.peer_display_name(&leaf_addr), error = %e, "Leaf TCP proxy: failed to send to BLE peer");
+                    }
                 }
                 Some((request, response_tx)) = control_rx.recv() => {
                     let response = if request.command.starts_with("show_") {

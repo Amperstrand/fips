@@ -385,6 +385,10 @@ pub struct Node {
     tcp_proxy_task: Option<tokio::task::JoinHandle<()>>,
     tcp_proxy_target: Option<NodeAddr>,
 
+    leaf_tcp_proxy_inbound_tx: HashMap<NodeAddr, tokio::sync::mpsc::Sender<Vec<u8>>>,
+    leaf_tcp_proxy_outbound_rx: Option<tokio::sync::mpsc::Receiver<(NodeAddr, Vec<u8>)>>,
+    leaf_tcp_proxy_handles: Vec<crate::upper::tcp_proxy::LeafTcpProxyHandle>,
+
     // === Index-Based Session Dispatch ===
     /// Allocator for session indices.
     index_allocator: IndexAllocator,
@@ -556,6 +560,9 @@ impl Node {
             tcp_proxy_inbound_tx: None,
             tcp_proxy_task: None,
             tcp_proxy_target: None,
+            leaf_tcp_proxy_inbound_tx: HashMap::new(),
+            leaf_tcp_proxy_outbound_rx: None,
+            leaf_tcp_proxy_handles: Vec::new(),
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
@@ -676,6 +683,9 @@ impl Node {
             tcp_proxy_inbound_tx: None,
             tcp_proxy_task: None,
             tcp_proxy_target: None,
+            leaf_tcp_proxy_inbound_tx: HashMap::new(),
+            leaf_tcp_proxy_outbound_rx: None,
+            leaf_tcp_proxy_handles: Vec::new(),
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
