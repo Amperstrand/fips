@@ -49,7 +49,7 @@ impl Node {
         self.try_warm_coord_cache(&datagram);
 
         // Local delivery: dispatch to session layer handlers
-        if datagram.dest_addr == *self.node_addr() {
+        if self.is_local_endpoint(&datagram.dest_addr) {
             self.stats_mut().forwarding.record_delivered(payload.len());
             self.handle_session_payload(&datagram.src_addr, &datagram.payload, datagram.path_mtu, incoming_ce)
                 .await;
