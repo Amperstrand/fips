@@ -581,9 +581,6 @@ impl<I: BleIo> BleTransport<I> {
             )
             .await;
 
-            // Remove from connecting pool
-            connecting.lock().await.remove(&addr_clone);
-
             match result {
                 Ok(Ok(stream)) => {
                     // Pre-handshake pubkey exchange (temporary, pre-XX)
@@ -599,6 +596,7 @@ impl<I: BleIo> BleTransport<I> {
                                     addr = %addr_clone, error = %e,
                                     "BLE outbound pubkey exchange failed"
                                 );
+                                connecting.lock().await.remove(&addr_clone);
                                 return;
                             }
                         }
@@ -642,16 +640,20 @@ impl<I: BleIo> BleTransport<I> {
                         Err(e) => {
                             warn!(addr = %addr_clone, error = %e, "BLE pool full, connection dropped");
                             stats.record_connection_rejected();
+                            connecting.lock().await.remove(&addr_clone);
                             return;
                         }
                     }
+                    connecting.lock().await.remove(&addr_clone);
                     stats.record_connection_established();
                 }
                 Ok(Err(e)) => {
+                    connecting.lock().await.remove(&addr_clone);
                     debug!(addr = %addr_clone, error = %e, "BLE connect failed");
                 }
                 Err(_) => {
                     stats.record_connect_timeout();
+                    connecting.lock().await.remove(&addr_clone);
                     debug!(addr = %addr_clone, "BLE connect timeout");
                 }
             }
