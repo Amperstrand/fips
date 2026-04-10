@@ -336,7 +336,7 @@ impl Node {
 
         // Send the wire format handshake message
         if let Some(transport) = self.transports.get(&transport_id) {
-            match transport.send(&remote_addr, &wire_msg1).await {
+            match transport.send_urgent(&remote_addr, &wire_msg1).await {
                 Ok(bytes) => {
                     debug!(
                         link_id = %link_id,

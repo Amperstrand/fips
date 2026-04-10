@@ -10,6 +10,7 @@ use crate::node::wire::build_msg1;
 use crate::noise::HandshakeState;
 use crate::protocol::{SessionDatagram, SessionSetup};
 use crate::NodeAddr;
+use std::time::Duration;
 use tracing::{debug, trace, warn};
 
 /// Keep previous session alive for this long after cutover.
@@ -18,6 +19,11 @@ const DRAIN_WINDOW_SECS: u64 = 10;
 /// Suppress local rekey initiation for this long after receiving
 /// a peer's rekey msg1.
 const REKEY_DAMPENING_SECS: u64 = 30;
+
+/// Maximum random jitter added to the rekey timer (milliseconds).
+/// Matches WireGuard's REKEY_TIMEOUT_JITTER_MAX_MS to prevent dual rekey.
+#[allow(dead_code)]
+const REKEY_JITTER_MAX_MS: u32 = 334;
 
 /// Delay FSP initiator cutover after handshake completion to allow
 /// XK msg3 to reach the responder before K-bit-flipped data arrives.
@@ -68,12 +74,14 @@ impl Node {
                 continue;
             }
 
-            let elapsed = peer.session_established_at().elapsed().as_secs();
+            let elapsed = peer.session_established_at().elapsed();
+            let jittered_threshold = Duration::from_secs(rekey_after_secs)
+                + Duration::from_millis(peer.rekey_jitter_ms() as u64);
             let counter = peer.noise_session()
                 .map(|s| s.current_send_counter())
                 .unwrap_or(0);
 
-            if elapsed >= rekey_after_secs || counter >= rekey_after_messages {
+            if elapsed >= jittered_threshold || counter >= rekey_after_messages {
                 peers_to_rekey.push(*node_addr);
             }
         }
@@ -180,7 +188,7 @@ impl Node {
 
         // Send msg1 on the existing link (same transport + address)
         if let Some(transport) = self.transports.get(&transport_id) {
-            match transport.send(&remote_addr, &wire_msg1).await {
+            match transport.send_urgent(&remote_addr, &wire_msg1).await {
                 Ok(_) => {
                     debug!(
                         peer = %self.peer_display_name(node_addr),
@@ -244,7 +252,7 @@ impl Node {
             };
 
             let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                transport.send(&remote_addr, &msg1_bytes).await.is_ok()
+                transport.send_urgent(&remote_addr, &msg1_bytes).await.is_ok()
             } else {
                 false
             };
@@ -316,10 +324,11 @@ impl Node {
                 continue;
             }
 
-            let elapsed_secs = now_ms.saturating_sub(entry.session_start_ms()) / 1000;
+            let elapsed_ms = now_ms.saturating_sub(entry.session_start_ms());
+            let jittered_threshold_ms = (rekey_after_secs * 1000) + entry.rekey_jitter_ms() as u64;
             let counter = entry.send_counter();
 
-            if elapsed_secs >= rekey_after_secs || counter >= rekey_after_messages {
+            if elapsed_ms >= jittered_threshold_ms || counter >= rekey_after_messages {
                 sessions_to_rekey.push(*node_addr);
             }
         }

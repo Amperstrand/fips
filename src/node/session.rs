@@ -10,7 +10,9 @@ use std::time::Instant;
 use crate::config::SessionMmpConfig;
 use crate::mmp::MmpSessionState;
 use crate::noise::{HandshakeState, NoiseSession};
+use crate::peer::REKEY_JITTER_MAX_MS;
 use crate::NodeAddr;
+use rand::RngExt;
 use secp256k1::PublicKey;
 
 /// State machine for an end-to-end session.
@@ -112,6 +114,9 @@ pub(crate) struct SessionEntry {
     /// When the FSP rekey handshake completed (initiator sent msg3, Unix ms).
     /// Used to defer cutover until msg3 has time to reach the responder.
     rekey_completed_ms: u64,
+    /// Per-session random jitter (0..REKEY_JITTER_MAX_MS ms) added to rekey
+    /// timer to prevent simultaneous rekey by both peers ("dual rekey").
+    rekey_jitter_ms: u32,
 }
 
 impl SessionEntry {
@@ -148,6 +153,7 @@ impl SessionEntry {
             rekey_initiator: false,
             last_peer_rekey_ms: 0,
             rekey_completed_ms: 0,
+            rekey_jitter_ms: rand::rng().random_range(0..REKEY_JITTER_MAX_MS),
         }
     }
 
@@ -159,12 +165,16 @@ impl SessionEntry {
     /// Get the current session state.
     #[cfg(test)]
     pub(crate) fn state(&self) -> &EndToEndState {
-        self.state.as_ref().expect("session state taken but not restored")
+        self.state
+            .as_ref()
+            .expect("session state taken but not restored")
     }
 
     /// Get mutable access to the session state.
     pub(crate) fn state_mut(&mut self) -> &mut EndToEndState {
-        self.state.as_mut().expect("session state taken but not restored")
+        self.state
+            .as_mut()
+            .expect("session state taken but not restored")
     }
 
     /// Replace the session state.
@@ -278,7 +288,12 @@ impl SessionEntry {
 
     /// Get traffic counters: (packets_sent, packets_recv, bytes_sent, bytes_recv).
     pub(crate) fn traffic_counters(&self) -> (u64, u64, u64, u64) {
-        (self.packets_sent, self.packets_recv, self.bytes_sent, self.bytes_recv)
+        (
+            self.packets_sent,
+            self.packets_recv,
+            self.bytes_sent,
+            self.bytes_recv,
+        )
     }
 
     // === Handshake Resend ===
@@ -365,6 +380,11 @@ impl SessionEntry {
     /// When the session transitioned to Established (for rekey timer).
     pub(crate) fn session_start_ms(&self) -> u64 {
         self.session_start_ms
+    }
+
+    /// Per-session random jitter added to rekey timer (milliseconds).
+    pub(crate) fn rekey_jitter_ms(&self) -> u32 {
+        self.rekey_jitter_ms
     }
 
     /// Get the current send counter from the established NoiseSession.

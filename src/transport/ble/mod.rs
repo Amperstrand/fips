@@ -375,6 +375,46 @@ impl<I: BleIo> BleTransport<I> {
         }
     }
 
+    /// Send data with priority (bypasses rate limiter) to a remote BLE address.
+    ///
+    /// For control plane packets: handshakes, rekey, heartbeats, MMP reports.
+    pub async fn send_urgent_async(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        let stream = {
+            let pool = self.pool.lock().await;
+            let conn = match pool.get(addr) {
+                Some(c) => c,
+                None => return Err(TransportError::SendFailed("not connected".into())),
+            };
+
+            let mtu = conn.effective_mtu() as usize;
+            if data.len() > mtu {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: data.len(),
+                    mtu: mtu as u16,
+                });
+            }
+
+            Arc::clone(&conn.stream)
+        };
+
+        match stream.send_urgent(data).await {
+            Ok(()) => {
+                self.stats.record_send(data.len());
+                Ok(data.len())
+            }
+            Err(e) => {
+                self.stats.record_send_error();
+                let mut pool = self.pool.lock().await;
+                pool.remove(addr);
+                Err(e)
+            }
+        }
+    }
+
     /// Connect to a remote BLE device inline (blocking the caller).
     ///
     /// Not used in normal operation (send_async fails fast instead).
@@ -645,6 +685,18 @@ impl<I: BleIo> BleTransport<I> {
         if let Some(conn) = pool.remove(addr) {
             debug!(addr = %addr, "BLE connection closed");
             drop(conn); // recv_task aborted via Drop
+        }
+    }
+
+    /// Query transport-local congestion indicators.
+    pub fn congestion(&self) -> super::TransportCongestion {
+        let snap = self.stats.snapshot();
+        super::TransportCongestion {
+            recv_drops: if snap.recv_errors > 0 {
+                Some(snap.recv_errors)
+            } else {
+                None
+            },
         }
     }
 

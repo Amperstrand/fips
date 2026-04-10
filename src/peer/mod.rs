@@ -10,7 +10,7 @@
 mod active;
 mod connection;
 
-pub use active::{ActivePeer, ConnectivityState};
+pub use active::{ActivePeer, ConnectivityState, REKEY_JITTER_MAX_MS};
 pub use connection::{HandshakeState, PeerConnection};
 
 use crate::transport::LinkId;
@@ -44,7 +44,10 @@ pub enum PeerError {
     HandshakeTimeout,
 
     #[error("identity mismatch: expected {expected:?}, got {actual:?}")]
-    IdentityMismatch { expected: NodeAddr, actual: NodeAddr },
+    IdentityMismatch {
+        expected: NodeAddr,
+        actual: NodeAddr,
+    },
 
     #[error("peer disconnected")]
     Disconnected,
@@ -240,10 +243,20 @@ impl fmt::Display for PeerSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PeerSlot::Connecting(conn) => {
-                write!(f, "connecting(link={}, state={})", conn.link_id(), conn.handshake_state())
+                write!(
+                    f,
+                    "connecting(link={}, state={})",
+                    conn.link_id(),
+                    conn.handshake_state()
+                )
             }
             PeerSlot::Active(peer) => {
-                write!(f, "active(node={:?}, link={})", peer.node_addr(), peer.link_id())
+                write!(
+                    f,
+                    "active(node={:?}, link={})",
+                    peer.node_addr(),
+                    peer.link_id()
+                )
             }
         }
     }

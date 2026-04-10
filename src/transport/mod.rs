@@ -917,6 +917,17 @@ impl TransportHandle {
         }
     }
 
+    /// Send data with priority (bypasses rate limiter for BLE).
+    ///
+    /// Non-BLE transports fall through to normal [`send`](Self::send).
+    pub async fn send_urgent(&self, addr: &TransportAddr, data: &[u8]) -> Result<usize, TransportError> {
+        match self {
+            #[cfg(any(all(feature = "ble", target_os = "linux"), feature = "ble-macos"))]
+            TransportHandle::Ble(t) => t.send_urgent_async(addr, data).await,
+            _ => self.send(addr, data).await,
+        }
+    }
+
     /// Get the transport ID.
     pub fn transport_id(&self) -> TransportId {
         match self {
@@ -1142,7 +1153,7 @@ impl TransportHandle {
             TransportHandle::Tcp(_) => TransportCongestion::default(),
             TransportHandle::Tor(_) => TransportCongestion::default(),
             #[cfg(any(all(feature = "ble", target_os = "linux"), feature = "ble-macos"))]
-            TransportHandle::Ble(_) => TransportCongestion::default(),
+            TransportHandle::Ble(t) => t.congestion(),
         }
     }
 

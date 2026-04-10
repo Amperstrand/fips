@@ -121,7 +121,7 @@ impl Node {
 
             // Send the stored msg1
             let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                match transport.send(&remote_addr, &msg1_bytes).await {
+                match transport.send_urgent(&remote_addr, &msg1_bytes).await {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(

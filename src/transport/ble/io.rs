@@ -20,6 +20,16 @@ pub trait BleStream: Send + Sync {
         data: &[u8],
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
+    /// Send data with priority (bypasses rate limiting).
+    ///
+    /// For control plane packets: handshakes, rekey, heartbeats, MMP reports.
+    /// Default implementation falls through to [`send`](Self::send), which is
+    /// correct for streams without rate limiting (e.g., mock streams).
+    fn send_urgent(
+        &self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+
     /// Receive data from the L2CAP connection.
     ///
     /// Returns the number of bytes read into `buf`.
@@ -211,6 +221,18 @@ mod bluer_impl {
             // Length-prefix framing: [len:2 BE][payload]
             // Required for interop with macOS (CoreBluetooth byte-stream L2CAP).
             let mut framed = Vec::with_capacity(framed_len);
+            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            framed.extend_from_slice(data);
+            self.conn
+                .send(&framed)
+                .await
+                .map(|_| ())
+                .map_err(|e| TransportError::SendFailed(format!("{}", e)))
+        }
+
+        async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
+            // Skip rate limiter entirely for urgent/control plane traffic
+            let mut framed = Vec::with_capacity(2 + data.len());
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
             self.conn
@@ -611,6 +633,10 @@ impl BleStream for MockBleStream {
             .send(framed)
             .await
             .map_err(|_| TransportError::SendFailed("channel closed".into()))
+    }
+
+    async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
+        self.send(data).await
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {

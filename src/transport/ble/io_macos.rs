@@ -70,6 +70,20 @@ impl BleStream for BluestStream {
         Ok(())
     }
 
+    async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
+        let mut framed = Vec::with_capacity(2 + data.len());
+        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        framed.extend_from_slice(data);
+        trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent");
+        self.writer
+            .lock()
+            .await
+            .write_all(&framed)
+            .await
+            .map_err(|e| TransportError::Io(e))?;
+        Ok(())
+    }
+
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
         loop {
             // Check if we have a complete frame in the buffer

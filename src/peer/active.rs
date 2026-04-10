@@ -5,14 +5,19 @@
 
 use crate::bloom::BloomFilter;
 use crate::mmp::{MmpConfig, MmpPeerState};
-use crate::utils::index::SessionIndex;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
 use crate::tree::{ParentDeclaration, TreeCoordinate};
+use crate::utils::index::SessionIndex;
 use crate::{FipsAddress, NodeAddr, PeerIdentity};
+use rand::RngExt;
 use secp256k1::XOnlyPublicKey;
 use std::fmt;
 use std::time::Instant;
+
+/// Maximum random jitter added to the rekey timer (milliseconds).
+/// Matches WireGuard's REKEY_TIMEOUT_JITTER_MAX_MS to prevent dual rekey.
+pub const REKEY_JITTER_MAX_MS: u32 = 334;
 
 /// Connectivity state for an active peer.
 ///
@@ -32,7 +37,10 @@ pub enum ConnectivityState {
 impl ConnectivityState {
     /// Check if the peer is usable for sending traffic.
     pub fn can_send(&self) -> bool {
-        matches!(self, ConnectivityState::Connected | ConnectivityState::Stale)
+        matches!(
+            self,
+            ConnectivityState::Connected | ConnectivityState::Stale
+        )
     }
 
     /// Check if this is a terminal state requiring cleanup.
@@ -179,6 +187,10 @@ pub struct ActivePeer {
     rekey_msg1: Option<Vec<u8>>,
     /// In-progress rekey: next resend timestamp (Unix ms).
     rekey_msg1_next_resend: u64,
+
+    /// Per-session random jitter (0..REKEY_JITTER_MAX_MS ms) added to rekey
+    /// timer to prevent simultaneous rekey by both peers ("dual rekey").
+    rekey_jitter_ms: u32,
 }
 
 impl ActivePeer {
@@ -230,6 +242,7 @@ impl ActivePeer {
             rekey_our_index: None,
             rekey_msg1: None,
             rekey_msg1_next_resend: 0,
+            rekey_jitter_ms: rand::rng().random_range(0..REKEY_JITTER_MAX_MS),
         }
     }
 
@@ -310,6 +323,7 @@ impl ActivePeer {
             rekey_our_index: None,
             rekey_msg1: None,
             rekey_msg1_next_resend: 0,
+            rekey_jitter_ms: rand::rng().random_range(0..REKEY_JITTER_MAX_MS),
         }
     }
 
@@ -744,12 +758,7 @@ impl ActivePeer {
     // === Filter Updates ===
 
     /// Update peer's inbound filter.
-    pub fn update_filter(
-        &mut self,
-        filter: BloomFilter,
-        sequence: u64,
-        current_time_ms: u64,
-    ) {
+    pub fn update_filter(&mut self, filter: BloomFilter, sequence: u64, current_time_ms: u64) {
         self.inbound_filter = Some(filter);
         self.filter_sequence = sequence;
         self.filter_received_at = current_time_ms;
@@ -778,6 +787,11 @@ impl ActivePeer {
     /// When the current Noise session was established.
     pub fn session_established_at(&self) -> Instant {
         self.session_established_at
+    }
+
+    /// Per-session random jitter added to rekey timer (milliseconds).
+    pub fn rekey_jitter_ms(&self) -> u32 {
+        self.rekey_jitter_ms
     }
 
     /// Shift the session establishment time backwards for tests.
@@ -970,12 +984,11 @@ impl ActivePeer {
         self.rekey_msg1_next_resend = 0;
         self.rekey_in_progress = false;
         // Return whichever index needs freeing
-        self.rekey_our_index.take()
-            .or_else(|| {
-                self.pending_new_session = None;
-                self.pending_their_index = None;
-                self.pending_our_index.take()
-            })
+        self.rekey_our_index.take().or_else(|| {
+            self.pending_new_session = None;
+            self.pending_their_index = None;
+            self.pending_our_index.take()
+        })
     }
 
     // === Rekey Handshake State (Initiator) ===
@@ -1005,11 +1018,9 @@ impl ActivePeer {
     /// Takes the stored handshake state, reads msg2, and returns the
     /// completed NoiseSession. Clears the handshake-related fields but
     /// leaves rekey_our_index for set_pending_session to use.
-    pub fn complete_rekey_msg2(
-        &mut self,
-        msg2_bytes: &[u8],
-    ) -> Result<NoiseSession, NoiseError> {
-        let mut hs = self.rekey_handshake
+    pub fn complete_rekey_msg2(&mut self, msg2_bytes: &[u8]) -> Result<NoiseSession, NoiseError> {
+        let mut hs = self
+            .rekey_handshake
             .take()
             .ok_or_else(|| NoiseError::WrongState {
                 expected: "rekey handshake in progress".to_string(),
@@ -1028,9 +1039,7 @@ impl ActivePeer {
 
     /// Check if msg1 needs resending.
     pub fn needs_msg1_resend(&self, now_ms: u64) -> bool {
-        self.rekey_in_progress
-            && self.rekey_msg1.is_some()
-            && now_ms >= self.rekey_msg1_next_resend
+        self.rekey_in_progress && self.rekey_msg1.is_some() && now_ms >= self.rekey_msg1_next_resend
     }
 
     /// Get msg1 bytes for resend (without consuming).
