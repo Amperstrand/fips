@@ -1157,6 +1157,19 @@ impl TransportHandle {
         }
     }
 
+    /// Feed SRTT measurement back to the transport for adaptive rate control.
+    ///
+    /// BLE uses this for AIMD rate adaptation. Other transports ignore it.
+    pub async fn update_rate_from_srtt(&self, addr: &TransportAddr, srtt_ms: f64) {
+        match self {
+            #[cfg(any(all(feature = "ble", target_os = "linux"), feature = "ble-macos"))]
+            TransportHandle::Ble(t) => {
+                t.update_rate_from_srtt(addr, srtt_ms).await;
+            }
+            _ => {}
+        }
+    }
+
     /// Get transport-specific stats as a JSON value.
     ///
     /// Returns a snapshot of counters for the specific transport type.

@@ -36,6 +36,7 @@ use addr::BleAddr;
 use discovery::DiscoveryBuffer;
 use io::{BleIo, BleScanner, BleStream};
 use pool::{BleConnection, ConnectionPool};
+use rate_limit::BleRateAdapter;
 use stats::BleStats;
 
 use std::collections::HashMap;
@@ -119,6 +120,8 @@ pub struct BleTransport<I: BleIo> {
     /// Set to `PeerCapabilities::central_only()` on macOS where
     /// CoreBluetooth cannot accept inbound connections.
     local_capabilities: PeerCapabilities,
+    /// Adaptive rate controller using MMP SRTT feedback.
+    rate_adapter: Arc<Mutex<BleRateAdapter>>,
 }
 
 /// A pending background connection attempt.
@@ -136,6 +139,7 @@ impl<I: BleIo> BleTransport<I> {
         packet_tx: PacketTx,
     ) -> Self {
         let max_conns = config.max_connections();
+        let initial_rate_bps = config.send_rate_bps();
         Self {
             transport_id,
             name,
@@ -152,6 +156,7 @@ impl<I: BleIo> BleTransport<I> {
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
             local_capabilities: PeerCapabilities::none(),
+            rate_adapter: Arc::new(Mutex::new(BleRateAdapter::new(initial_rate_bps))),
         }
     }
 
@@ -698,6 +703,21 @@ impl<I: BleIo> BleTransport<I> {
                 None
             },
         }
+    }
+
+    /// Feed MMP SRTT measurement to the adaptive rate controller.
+    ///
+    /// Returns the new rate in bps after AIMD adjustment.
+    /// Updates the rate limiter on the specific connection's stream.
+    pub async fn update_rate_from_srtt(&self, addr: &TransportAddr, srtt_ms: f64) -> u64 {
+        let new_rate = self.rate_adapter.lock().await.update(srtt_ms);
+
+        let pool = self.pool.lock().await;
+        if let Some(conn) = pool.get(addr) {
+            conn.stream.set_rate_bps(new_rate).await;
+        }
+
+        new_rate
     }
 
     /// Get the link MTU for a specific address.

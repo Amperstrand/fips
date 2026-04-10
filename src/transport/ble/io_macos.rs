@@ -135,6 +135,12 @@ impl BleStream for BluestStream {
     fn remote_addr(&self) -> &BleAddr {
         &self.remote
     }
+
+    async fn set_rate_bps(&self, rate_bps: u64) {
+        if let Some(ref limiter) = self.rate_limiter {
+            limiter.lock().await.set_rate_bps(rate_bps);
+        }
+    }
 }
 
 // ============================================================================

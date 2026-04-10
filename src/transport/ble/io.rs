@@ -46,6 +46,13 @@ pub trait BleStream: Send + Sync {
 
     /// Get the remote device address.
     fn remote_addr(&self) -> &BleAddr;
+
+    /// Update the send rate limiter's throughput ceiling.
+    /// No-op if rate limiting is disabled (rate_bps = 0).
+    fn set_rate_bps(
+        &self,
+        rate_bps: u64,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// An acceptor that yields inbound L2CAP connections.
@@ -272,6 +279,12 @@ mod bluer_impl {
 
         fn remote_addr(&self) -> &BleAddr {
             &self.remote
+        }
+
+        async fn set_rate_bps(&self, rate_bps: u64) {
+            if let Some(ref limiter) = self.rate_limiter {
+                limiter.lock().await.set_rate_bps(rate_bps);
+            }
         }
     }
 
@@ -668,6 +681,8 @@ impl BleStream for MockBleStream {
     fn remote_addr(&self) -> &BleAddr {
         &self.addr
     }
+
+    async fn set_rate_bps(&self, _rate_bps: u64) {}
 }
 
 /// Mock BLE acceptor backed by a channel of pre-connected streams.

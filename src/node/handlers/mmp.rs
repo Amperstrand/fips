@@ -93,6 +93,8 @@ impl Node {
 
         // Get session timestamp before taking mutable borrow on MMP
         let our_timestamp_ms = peer.session_elapsed_ms();
+        let peer_transport_id = peer.transport_id();
+        let peer_transport_addr = peer.current_addr().cloned();
 
         let Some(mmp) = peer.mmp_mut() else {
             return;
@@ -104,11 +106,14 @@ impl Node {
         let first_rtt = mmp.metrics.process_receiver_report(&rr, our_timestamp_ms, now);
 
         // Feed SRTT back to sender/receiver report interval tuning
-        if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
+        let ble_srtt_ms = if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
             let srtt_us = (srtt_ms * 1000.0) as i64;
             mmp.sender.update_report_interval_from_srtt(srtt_us);
             mmp.receiver.update_report_interval_from_srtt(srtt_us);
-        }
+            Some(srtt_ms)
+        } else {
+            None
+        };
 
         // Update reverse delivery ratio from our own receiver state
         // (what fraction of peer's frames we received), using per-interval deltas.
@@ -123,6 +128,16 @@ impl Node {
             etx = format_args!("{:.2}", mmp.metrics.etx),
             "Processed ReceiverReport"
         );
+
+        if let Some(srtt_ms) = ble_srtt_ms {
+            if let Some(tid) = peer_transport_id {
+                if let Some(taddr) = peer_transport_addr {
+                    if let Some(transport) = self.transports.get(&tid) {
+                        transport.update_rate_from_srtt(&taddr, srtt_ms).await;
+                    }
+                }
+            }
+        }
 
         // First RTT sample — peer is now eligible for parent selection.
         // Trigger re-evaluation so the node doesn't wait for the next
