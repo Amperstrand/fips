@@ -10,6 +10,7 @@ use crate::transport::{
 use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState};
 use crate::node::wire::build_msg1;
 use crate::{NodeAddr, PeerIdentity};
+use tokio::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -672,6 +673,97 @@ impl Node {
             }
         }
 
+        info!(
+            tcp_proxy_enabled = self.config.tcp_proxy.enabled,
+            leaf_proxy_count = self.config.leaf_proxies.len(),
+            "Proxy startup config"
+        );
+
+        if self.config.tcp_proxy.enabled {
+            match &self.config.tcp_proxy.target_npub {
+                Some(target_npub) => {
+                    match PeerIdentity::from_npub(target_npub) {
+                        Ok(identity) => {
+                            let listen_addr = self.config.tcp_proxy.listen_addr().to_string();
+                            match TcpListener::bind(&listen_addr).await {
+                                Ok(listener) => {
+                                    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                                    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                                    let task = tokio::spawn(crate::upper::tcp_proxy::run_tcp_proxy(
+                                        listener,
+                                        target_npub.clone(),
+                                        outbound_tx,
+                                        inbound_rx,
+                                    ));
+                                    self.tcp_proxy_outbound_rx = Some(outbound_rx);
+                                    self.tcp_proxy_inbound_tx = Some(inbound_tx);
+                                    self.tcp_proxy_task = Some(task);
+                                    self.tcp_proxy_target = Some(*identity.node_addr());
+                                    info!(listen = %listen_addr, target = %target_npub, "TCP proxy listener started");
+                                }
+                                Err(e) => {
+                                    warn!(listen = %listen_addr, error = %e, "Failed to start TCP proxy listener");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(npub = %target_npub, error = %e, "Failed to parse TCP proxy target npub");
+                        }
+                    }
+                }
+                None => {
+                    warn!("TCP proxy enabled but target_npub is not configured");
+                }
+            }
+        }
+
+        if !self.config.leaf_proxies.is_empty() {
+            let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<(crate::node::NodeAddr, Vec<u8>)>(256);
+            self.leaf_tcp_proxy_outbound_rx = Some(outbound_rx);
+
+            for leaf_cfg in &self.config.leaf_proxies {
+                match leaf_cfg.derived_identity() {
+                    Ok(leaf_id) => {
+                        let leaf_node_addr = leaf_id.node_addr;
+                        let fips_addr = leaf_id.fips_address.to_ipv6();
+
+                        for service in &leaf_cfg.services {
+                            if service.protocol != "tcp" {
+                                warn!(
+                                    seed = %leaf_cfg.identity_seed,
+                                    protocol = %service.protocol,
+                                    port = service.port,
+                                    "Skipping unsupported leaf proxy service protocol"
+                                );
+                                continue;
+                            }
+
+                            let handle = crate::upper::tcp_proxy::start_leaf_tcp_proxy(
+                                fips_addr,
+                                service.port,
+                                leaf_node_addr,
+                                outbound_tx.clone(),
+                            );
+                            let leaf_addr = handle.leaf_node_addr;
+                            let inbound_tx = handle.inbound_tx.clone();
+
+                            info!(
+                                listen = %format!("[{}]:{}", fips_addr, service.port),
+                                leaf = %leaf_node_addr,
+                                "Leaf TCP proxy listener started"
+                            );
+
+                            self.leaf_tcp_proxy_handles.push(handle);
+                            self.leaf_tcp_proxy_inbound_tx.insert(leaf_addr, inbound_tx);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(seed = %leaf_cfg.identity_seed, error = %e, "Failed to derive leaf proxy identity");
+                    }
+                }
+            }
+        }
+
         self.state = NodeState::Running;
         info!("Node started:");
         info!("       state: {}", self.state);
@@ -696,6 +788,20 @@ impl Node {
             handle.abort();
             debug!("DNS responder stopped");
         }
+
+        if let Some(handle) = self.tcp_proxy_task.take() {
+            handle.abort();
+        }
+        self.tcp_proxy_inbound_tx.take();
+        self.tcp_proxy_outbound_rx.take();
+        self.tcp_proxy_target.take();
+
+        for handle in self.leaf_tcp_proxy_handles.drain(..) {
+            handle.task_handle.abort();
+        }
+        self.leaf_tcp_proxy_inbound_tx.clear();
+        self.leaf_tcp_proxy_outbound_rx.take();
+        debug!("Leaf TCP proxy listeners stopped");
 
         // Send disconnect notifications to all active peers before closing transports
         self.send_disconnect_to_all_peers(DisconnectReason::Shutdown).await;
