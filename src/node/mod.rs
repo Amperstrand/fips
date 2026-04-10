@@ -321,8 +321,7 @@ pub struct Node {
 
     // === End-to-End Sessions ===
     /// Session table for end-to-end encrypted sessions.
-    /// Keyed by remote NodeAddr.
-    sessions: HashMap<NodeAddr, SessionEntry>,
+    sessions: HashMap<(NodeAddr, NodeAddr), SessionEntry>,
 
     // === Identity Cache ===
     /// Maps FipsAddress prefix bytes (bytes 1-15) to (NodeAddr, PublicKey).
@@ -1005,7 +1004,7 @@ impl Node {
         if let Some(peer) = self.peers.get(addr) {
             return peer.identity().short_npub();
         }
-        if let Some(entry) = self.sessions.get(addr) {
+        if let Some((_, entry)) = self.sessions.iter().find(|((_, remote), _)| remote == addr) {
             let (xonly, _) = entry.remote_pubkey().x_only_public_key();
             return PeerIdentity::from_pubkey(xonly).short_npub();
         }
@@ -1409,6 +1408,10 @@ impl Node {
 
     // === End-to-End Sessions ===
 
+    pub fn find_sessions_for_local<'a>(&'a self, local_addr: &NodeAddr) -> impl Iterator<Item = (&'a (NodeAddr, NodeAddr), &'a SessionEntry)> {
+        self.sessions.iter().filter(move |((l, _), _)| l == local_addr)
+    }
+
     /// Get a session by remote NodeAddr.
     /// Disable the discovery forward rate limiter (for tests).
     #[cfg(test)]
@@ -1419,19 +1422,19 @@ impl Node {
 
     #[cfg(test)]
     pub(crate) fn get_session(&self, remote: &NodeAddr) -> Option<&SessionEntry> {
-        self.sessions.get(remote)
+        self.sessions.get(&(*self.node_addr(), *remote))
     }
 
     /// Get a mutable session by remote NodeAddr.
     #[cfg(test)]
     pub(crate) fn get_session_mut(&mut self, remote: &NodeAddr) -> Option<&mut SessionEntry> {
-        self.sessions.get_mut(remote)
+        self.sessions.get_mut(&(*self.node_addr(), *remote))
     }
 
     /// Remove a session.
     #[cfg(test)]
     pub(crate) fn remove_session(&mut self, remote: &NodeAddr) -> Option<SessionEntry> {
-        self.sessions.remove(remote)
+        self.sessions.remove(&(*self.node_addr(), *remote))
     }
 
     /// Number of end-to-end sessions.
@@ -1440,7 +1443,7 @@ impl Node {
     }
 
     /// Iterate over all session entries (for control queries).
-    pub(crate) fn session_entries(&self) -> impl Iterator<Item = (&NodeAddr, &SessionEntry)> {
+    pub(crate) fn session_entries(&self) -> impl Iterator<Item = (&(NodeAddr, NodeAddr), &SessionEntry)> {
         self.sessions.iter()
     }
 

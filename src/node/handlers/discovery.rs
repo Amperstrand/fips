@@ -231,7 +231,7 @@ impl Node {
             self.pending_lookups.remove(&target);
 
             // If an established session exists, reset the warmup counter.
-            if let Some(entry) = self.sessions.get_mut(&target)
+            if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), target))
                 && entry.is_established()
             {
                 let n = self.config.node.session.coords_warmup_packets;

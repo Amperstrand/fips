@@ -54,6 +54,13 @@ impl Node {
                 // Heartbeat — no-op, last_recv_time already updated by record_recv()
                 trace!(peer = %self.peer_display_name(from), "Received heartbeat");
             }
+            0x60 => {
+                if let Some(tx) = &self.tcp_proxy_inbound_tx {
+                    if let Err(e) = tx.try_send(payload.to_vec()) {
+                        debug!(error = %e, "TCP proxy: inbound channel full or closed, dropping data");
+                    }
+                }
+            }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");
             }
@@ -170,7 +177,7 @@ impl Node {
         //   2. initiate_session() finds is_established() == true on the stale entry
         //      and silently returns Ok(()), preventing a new session from being
         //      established even after the link layer reconnects successfully.
-        if let Some(session_entry) = self.sessions.remove(node_addr)
+        if let Some(session_entry) = self.sessions.remove(&(*self.node_addr(), *node_addr))
             && let Some(mmp) = session_entry.mmp()
         {
             Self::log_session_mmp_teardown(&peer_name, mmp);

@@ -116,7 +116,7 @@ fn test_session_table_operations() {
         true,
     );
 
-    node.sessions.insert(dest_addr, entry);
+    node.sessions.insert((*node.node_addr(), dest_addr), entry);
     assert_eq!(node.session_count(), 1);
     assert!(node.get_session(&dest_addr).is_some());
     assert!(node.get_session(&make_node_addr(0xFF)).is_none());
@@ -1235,7 +1235,7 @@ fn test_purge_idle_sessions_removes_expired() {
         true,
     );
 
-    node.sessions.insert(remote_addr, entry);
+    node.sessions.insert((*node.node_addr(), remote_addr), entry);
     assert_eq!(node.session_count(), 1);
     assert!(node.get_session(&remote_addr).unwrap().is_established());
 
@@ -1264,7 +1264,7 @@ fn test_purge_idle_sessions_keeps_active() {
     // Touch at t=80s — recent activity
     entry.touch(81_000);
 
-    node.sessions.insert(remote_addr, entry);
+    node.sessions.insert((*node.node_addr(), remote_addr), entry);
 
     // Purge at t=92s — only 11s since last activity, well within 90s timeout
     let now_ms = 92_000;
@@ -1293,7 +1293,7 @@ fn test_purge_idle_sessions_ignores_initiating() {
         true,
     );
 
-    node.sessions.insert(remote_addr, entry);
+    node.sessions.insert((*node.node_addr(), remote_addr), entry);
 
     // Purge well past the idle timeout — Initiating sessions should not be touched
     let now_ms = 1000 + 200_000;
@@ -1317,7 +1317,7 @@ fn test_purge_idle_sessions_cleans_pending_packets() {
         true,
     );
 
-    node.sessions.insert(remote_addr, entry);
+    node.sessions.insert((*node.node_addr(), remote_addr), entry);
 
     // Insert some pending packets for this destination
     let mut queue = std::collections::VecDeque::new();
@@ -1351,7 +1351,7 @@ fn test_purge_idle_sessions_disabled_when_zero() {
         true,
     );
 
-    node.sessions.insert(remote_addr, entry);
+    node.sessions.insert((*node.node_addr(), remote_addr), entry);
 
     // Even way past any timeout, sessions should survive when disabled
     let now_ms = 1000 + 1_000_000;
@@ -1378,7 +1378,7 @@ fn test_purge_idle_sessions_mmp_activity_does_not_prevent_purge() {
     // Do NOT call entry.touch() — simulates a session where only MMP
     // reports have flowed (MMP no longer calls touch). last_activity
     // remains at creation time (1000ms).
-    node.sessions.insert(remote_addr, entry);
+    node.sessions.insert((*node.node_addr(), remote_addr), entry);
 
     // Purge at t=92s — 91s since creation, exceeds 90s idle timeout.
     // Even though MMP reports would have been flowing, they no longer
@@ -1664,20 +1664,20 @@ async fn test_session_handshake_timeout() {
         1000,
         true,
     );
-    node.sessions.insert(dest_addr, entry);
+    node.sessions.insert((*node.node_addr(), dest_addr), entry);
 
-    assert!(node.sessions.contains_key(&dest_addr));
+    assert!(node.sessions.contains_key(&(*node.node_addr(), dest_addr)));
 
     // Before timeout: session should remain
     let timeout_secs = node.config.node.rate_limit.handshake_timeout_secs;
     let before_timeout = 1000 + timeout_secs * 1000 - 1;
     node.resend_pending_session_handshakes(before_timeout).await;
-    assert!(node.sessions.contains_key(&dest_addr), "Session should survive before timeout");
+    assert!(node.sessions.contains_key(&(*node.node_addr(), dest_addr)), "Session should survive before timeout");
 
     // After timeout: session should be removed
     let after_timeout = 1000 + timeout_secs * 1000 + 1;
     node.resend_pending_session_handshakes(after_timeout).await;
-    assert!(!node.sessions.contains_key(&dest_addr), "Timed-out session should be removed");
+    assert!(!node.sessions.contains_key(&(*node.node_addr(), dest_addr)), "Timed-out session should be removed");
 }
 
 /// Test that session handshake timeout removes stale AwaitingMsg3 sessions.
@@ -1704,15 +1704,15 @@ async fn test_session_awaiting_msg3_timeout() {
         1000,
         false,
     );
-    node.sessions.insert(src_addr, entry);
+    node.sessions.insert((*node.node_addr(), src_addr), entry);
 
-    assert!(node.sessions.contains_key(&src_addr));
+    assert!(node.sessions.contains_key(&(*node.node_addr(), src_addr)));
 
     // After timeout: session should be removed
     let timeout_secs = node.config.node.rate_limit.handshake_timeout_secs;
     let after_timeout = 1000 + timeout_secs * 1000 + 1;
     node.resend_pending_session_handshakes(after_timeout).await;
-    assert!(!node.sessions.contains_key(&src_addr), "Timed-out AwaitingMsg3 session should be removed");
+    assert!(!node.sessions.contains_key(&(*node.node_addr(), src_addr)), "Timed-out AwaitingMsg3 session should be removed");
 }
 
 #[tokio::test]

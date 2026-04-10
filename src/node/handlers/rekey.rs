@@ -290,7 +290,7 @@ impl Node {
         let mut sessions_to_drain: Vec<NodeAddr> = Vec::new();
         let mut sessions_to_rekey: Vec<NodeAddr> = Vec::new();
 
-        for (node_addr, entry) in &self.sessions {
+        for ((_, node_addr), entry) in &self.sessions {
             if !entry.is_established() {
                 continue;
             }
@@ -335,7 +335,7 @@ impl Node {
 
         // Execute cutover for initiator side
         for node_addr in sessions_to_cutover {
-            if let Some(entry) = self.sessions.get_mut(&node_addr)
+            if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), node_addr))
                 && entry.cutover_to_new_session(now_ms)
             {
                 debug!(
@@ -347,7 +347,7 @@ impl Node {
 
         // Execute drain completion
         for node_addr in sessions_to_drain {
-            if let Some(entry) = self.sessions.get_mut(&node_addr) {
+            if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), node_addr)) {
                 entry.complete_drain();
                 trace!(
                     peer = %self.peer_display_name(&node_addr),
@@ -376,7 +376,7 @@ impl Node {
             return;
         }
 
-        let entry = match self.sessions.get(dest_addr) {
+        let entry = match self.sessions.get(&(*self.node_addr(), *dest_addr)) {
             Some(e) => e,
             None => return,
         };
@@ -420,7 +420,7 @@ impl Node {
         }
 
         // Store rekey state on the existing session entry
-        if let Some(entry) = self.sessions.get_mut(dest_addr) {
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *dest_addr)) {
             entry.set_rekey_state(handshake, true);
         }
 

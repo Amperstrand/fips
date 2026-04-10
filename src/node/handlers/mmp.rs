@@ -307,7 +307,7 @@ impl Node {
         // Collect reports to send: (dest_addr, msg_type, encoded_body)
         let mut reports: Vec<(NodeAddr, u8, Vec<u8>)> = Vec::new();
 
-        for (dest_addr, entry) in self.sessions.iter_mut() {
+        for ((_, dest_addr), entry) in self.sessions.iter_mut() {
             // Compute display name before taking mutable MMP borrow
             let session_name = self.peer_aliases.get(dest_addr)
                 .cloned()
@@ -377,7 +377,7 @@ impl Node {
                 }
                 Err(e) => {
                     // Peek at current failure count for log suppression
-                    let failures = self.sessions.get(&dest_addr)
+                    let failures = self.sessions.get(&(*self.node_addr(), dest_addr))
                         .and_then(|entry| entry.mmp())
                         .map(|mmp| mmp.sender.consecutive_send_failures())
                         .unwrap_or(0);
@@ -414,7 +414,7 @@ impl Node {
             }
         }
         for (dest_addr, success) in dest_success {
-            if let Some(entry) = self.sessions.get_mut(&dest_addr)
+            if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), dest_addr))
                 && let Some(mmp) = entry.mmp_mut()
             {
                 if success {

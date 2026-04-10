@@ -144,7 +144,7 @@ impl Node {
 
         // Look up session entry — must be Established to decrypt
         {
-            let entry = match self.sessions.get(src_addr) {
+            let entry = match self.sessions.get(&(*self.node_addr(), *src_addr)) {
                 Some(e) => e,
                 None => {
                     debug!(src = %self.peer_display_name(src_addr), "Encrypted session message for unknown session");
@@ -165,7 +165,7 @@ impl Node {
         // K-bit flip detection: peer has cut over to the new session.
         let received_k_bit = header.flags & FSP_FLAG_K != 0;
         {
-            let entry = self.sessions.get(src_addr).unwrap();
+            let entry = self.sessions.get(&(*self.node_addr(), *src_addr)).unwrap();
             let k_bit_flipped = received_k_bit != entry.current_k_bit()
                 && entry.pending_new_session().is_some();
 
@@ -176,12 +176,12 @@ impl Node {
                     "Peer FSP K-bit flip detected, promoting new session"
                 );
                 let now_ms = Self::now_ms();
-                let entry = self.sessions.get_mut(src_addr).unwrap();
+                let entry = self.sessions.get_mut(&(*self.node_addr(), *src_addr)).unwrap();
                 entry.handle_peer_kbit_flip(now_ms);
             }
         }
 
-        let mut entry = match self.sessions.remove(src_addr) {
+        let mut entry = match self.sessions.remove(&(*self.node_addr(), *src_addr)) {
             Some(e) => e,
             None => return,
         };
@@ -191,7 +191,7 @@ impl Node {
             EndToEndState::Established(s) => s,
             _ => {
                 debug!(src = %self.peer_display_name(src_addr), "Encrypted message but session not established");
-                self.sessions.insert(*src_addr, entry);
+                self.sessions.insert((*self.node_addr(), *src_addr), entry);
                 return;
             }
         };
@@ -216,7 +216,7 @@ impl Node {
                                 error = %e, src = %self.peer_display_name(src_addr), counter = header.counter,
                                 "Session AEAD decryption failed (current and previous)"
                             );
-                            self.sessions.insert(*src_addr, entry);
+                            self.sessions.insert((*self.node_addr(), *src_addr), entry);
                             return;
                         }
                     }
@@ -225,13 +225,13 @@ impl Node {
                         error = %e, src = %self.peer_display_name(src_addr), counter = header.counter,
                         "Session AEAD decryption failed"
                     );
-                    self.sessions.insert(*src_addr, entry);
+                    self.sessions.insert((*self.node_addr(), *src_addr), entry);
                     return;
                 }
             }
         };
 
-        self.sessions.insert(*src_addr, entry);
+        self.sessions.insert((*self.node_addr(), *src_addr), entry);
 
         // Strip FSP inner header (6 bytes)
         let (timestamp, msg_type, inner_flags_byte, rest) = match fsp_strip_inner_header(&plaintext) {
@@ -243,7 +243,7 @@ impl Node {
         };
 
         // MMP per-message recording on RX path
-        if let Some(entry) = self.sessions.get_mut(src_addr)
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *src_addr))
             && let Some(mmp) = entry.mmp_mut()
         {
             let now = std::time::Instant::now();
@@ -262,7 +262,7 @@ impl Node {
         // Feed path_mtu from datagram envelope to MMP path MTU tracking.
         // Done for ALL session messages, not just DataPackets, so the
         // destination learns the path MTU even when only reports flow.
-        if let Some(entry) = self.sessions.get_mut(src_addr)
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *src_addr))
             && let Some(mmp) = entry.mmp_mut()
         {
             mmp.path_mtu.observe_incoming_mtu(path_mtu);
@@ -342,7 +342,7 @@ impl Node {
         // Only application data resets the idle timer and traffic counters —
         // MMP reports (SenderReport, ReceiverReport, PathMtuNotification) do not.
         if msg_type == SessionMessageType::DataPacket.to_byte()
-            && let Some(entry) = self.sessions.get_mut(src_addr)
+            && let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *src_addr))
         {
             entry.record_recv(rest.len());
             entry.touch(Self::now_ms());
@@ -377,7 +377,7 @@ impl Node {
         }
 
         // Check for existing session with this remote
-        if let Some(existing) = self.sessions.get(src_addr) {
+        if let Some(existing) = self.sessions.get(&(*self.node_addr(), *src_addr)) {
             if existing.is_initiating() {
                 // Simultaneous initiation: smaller NodeAddr wins as initiator
                 if self.identity.node_addr() < src_addr {
@@ -431,7 +431,7 @@ impl Node {
                             src = %self.peer_display_name(src_addr),
                             "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
                         );
-                        let entry = self.sessions.get_mut(src_addr).unwrap();
+                        let entry = self.sessions.get_mut(&(*self.node_addr(), *src_addr)).unwrap();
                         entry.abandon_rekey();
                     } else if has_pending {
                         // Guard: already have a pending session waiting for K-bit cutover
@@ -474,7 +474,7 @@ impl Node {
 
                     // Store rekey state on the existing entry
                     let now_ms = Self::now_ms();
-                    let entry = self.sessions.get_mut(src_addr).unwrap();
+                    let entry = self.sessions.get_mut(&(*self.node_addr(), *src_addr)).unwrap();
                     entry.set_rekey_state(handshake, false);
                     entry.record_peer_rekey(now_ms);
 
@@ -535,7 +535,7 @@ impl Node {
         let resend_interval = self.config.node.rate_limit.handshake_resend_interval_ms;
         let mut entry = SessionEntry::new(*src_addr, placeholder_pubkey, EndToEndState::AwaitingMsg3(handshake), now_ms, false);
         entry.set_handshake_payload(ack_payload, now_ms + resend_interval);
-        self.sessions.insert(*src_addr, entry);
+        self.sessions.insert((*self.node_addr(), *src_addr), entry);
 
         debug!(src = %self.peer_display_name(src_addr), "SessionSetup processed (XK), SessionAck sent, awaiting msg3");
     }
@@ -562,7 +562,7 @@ impl Node {
         }
 
         // Remove the entry to take ownership of the handshake state
-        let mut entry = match self.sessions.remove(src_addr) {
+        let mut entry = match self.sessions.remove(&(*self.node_addr(), *src_addr)) {
             Some(e) => e,
             None => {
                 debug!(src = %self.peer_display_name(src_addr), "SessionAck for unknown session");
@@ -575,7 +575,7 @@ impl Node {
             let mut handshake = match entry.take_rekey_state() {
                 Some(hs) => hs,
                 None => {
-                    self.sessions.insert(*src_addr, entry);
+                    self.sessions.insert((*self.node_addr(), *src_addr), entry);
                     return;
                 }
             };
@@ -584,7 +584,7 @@ impl Node {
             if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
                 debug!(error = %e, "Failed to process rekey XK msg2");
                 entry.abandon_rekey();
-                self.sessions.insert(*src_addr, entry);
+                self.sessions.insert((*self.node_addr(), *src_addr), entry);
                 return;
             }
 
@@ -594,7 +594,7 @@ impl Node {
                 Err(e) => {
                     debug!(error = %e, "Failed to generate rekey XK msg3");
                     entry.abandon_rekey();
-                    self.sessions.insert(*src_addr, entry);
+                    self.sessions.insert((*self.node_addr(), *src_addr), entry);
                     return;
                 }
             };
@@ -609,7 +609,7 @@ impl Node {
             if let Err(e) = self.send_session_datagram(&mut datagram).await {
                 debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionMsg3");
                 entry.abandon_rekey();
-                self.sessions.insert(*src_addr, entry);
+                self.sessions.insert((*self.node_addr(), *src_addr), entry);
                 return;
             }
 
@@ -619,14 +619,14 @@ impl Node {
                 Err(e) => {
                     debug!(error = %e, "Failed to create session from rekey XK");
                     entry.abandon_rekey();
-                    self.sessions.insert(*src_addr, entry);
+                    self.sessions.insert((*self.node_addr(), *src_addr), entry);
                     return;
                 }
             };
 
             entry.set_pending_session(session);
             entry.set_rekey_completed_ms(Self::now_ms());
-            self.sessions.insert(*src_addr, entry);
+            self.sessions.insert((*self.node_addr(), *src_addr), entry);
 
             debug!(
                 src = %self.peer_display_name(src_addr),
@@ -638,7 +638,7 @@ impl Node {
         // Must be in Initiating state — check before take to avoid poisoning
         if !entry.is_initiating() {
             debug!(src = %self.peer_display_name(src_addr), "SessionAck but session not in Initiating state");
-            self.sessions.insert(*src_addr, entry);
+            self.sessions.insert((*self.node_addr(), *src_addr), entry);
             return;
         }
         let mut handshake = match entry.take_state() {
@@ -689,7 +689,7 @@ impl Node {
         entry.init_mmp(&self.config.node.session_mmp);
         entry.clear_handshake_payload();
         entry.touch(now_ms);
-        self.sessions.insert(*src_addr, entry);
+        self.sessions.insert((*self.node_addr(), *src_addr), entry);
         self.coord_cache.insert(*src_addr, ack.src_coords, now_ms);
 
         // Flush any queued outbound packets for this destination
@@ -722,7 +722,7 @@ impl Node {
         }
 
         // Remove the entry to take ownership of the handshake state
-        let mut entry = match self.sessions.remove(src_addr) {
+        let mut entry = match self.sessions.remove(&(*self.node_addr(), *src_addr)) {
             Some(e) => e,
             None => {
                 debug!(src = %self.peer_display_name(src_addr), "SessionMsg3 for unknown session");
@@ -735,7 +735,7 @@ impl Node {
             let mut handshake = match entry.take_rekey_state() {
                 Some(hs) => hs,
                 None => {
-                    self.sessions.insert(*src_addr, entry);
+                    self.sessions.insert((*self.node_addr(), *src_addr), entry);
                     return;
                 }
             };
@@ -744,7 +744,7 @@ impl Node {
             if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
                 debug!(error = %e, "Failed to process rekey XK msg3");
                 entry.abandon_rekey();
-                self.sessions.insert(*src_addr, entry);
+                self.sessions.insert((*self.node_addr(), *src_addr), entry);
                 return;
             }
 
@@ -754,13 +754,13 @@ impl Node {
                 Err(e) => {
                     debug!(error = %e, "Failed to create session from rekey XK msg3");
                     entry.abandon_rekey();
-                    self.sessions.insert(*src_addr, entry);
+                    self.sessions.insert((*self.node_addr(), *src_addr), entry);
                     return;
                 }
             };
 
             entry.set_pending_session(session);
-            self.sessions.insert(*src_addr, entry);
+            self.sessions.insert((*self.node_addr(), *src_addr), entry);
 
             debug!(
                 src = %self.peer_display_name(src_addr),
@@ -772,7 +772,7 @@ impl Node {
         // Must be in AwaitingMsg3 state
         if !entry.is_awaiting_msg3() {
             debug!(src = %self.peer_display_name(src_addr), "SessionMsg3 but session not in AwaitingMsg3 state");
-            self.sessions.insert(*src_addr, entry);
+            self.sessions.insert((*self.node_addr(), *src_addr), entry);
             return;
         }
         let mut handshake = match entry.take_state() {
@@ -814,7 +814,7 @@ impl Node {
         new_entry.mark_established(now_ms);
         new_entry.init_mmp(&self.config.node.session_mmp);
         new_entry.touch(now_ms);
-        self.sessions.insert(*src_addr, new_entry);
+        self.sessions.insert((*self.node_addr(), *src_addr), new_entry);
 
         // Flush any pending packets
         self.flush_pending_packets(src_addr).await;
@@ -863,7 +863,7 @@ impl Node {
 
         let now_ms = Self::now_ms();
         let peer_name = self.peer_display_name(src_addr);
-        let entry = match self.sessions.get_mut(src_addr) {
+        let entry = match self.sessions.get_mut(&(*self.node_addr(), *src_addr)) {
             Some(e) => e,
             None => {
                 debug!(src = %peer_name, "SessionReceiverReport for unknown session");
@@ -924,7 +924,7 @@ impl Node {
         };
 
         let peer_name = self.peer_display_name(src_addr);
-        let entry = match self.sessions.get_mut(src_addr) {
+        let entry = match self.sessions.get_mut(&(*self.node_addr(), *src_addr)) {
             Some(e) => e,
             None => {
                 debug!(src = %peer_name, "PathMtuNotification for unknown session");
@@ -976,7 +976,7 @@ impl Node {
 
         // Send standalone CoordsWarmup immediately (rate-limited)
         if self.coords_response_rate_limiter.should_send(&msg.dest_addr) {
-            if let Some(entry) = self.sessions.get(&msg.dest_addr)
+            if let Some(entry) = self.sessions.get(&(*self.node_addr(), msg.dest_addr))
                 && entry.is_established()
                 && let Err(e) = self.send_coords_warmup(&msg.dest_addr).await
             {
@@ -999,7 +999,7 @@ impl Node {
 
         // Reset coords warmup counter so the next N packets also include
         // COORDS_PRESENT, re-warming transit caches along the path.
-        if let Some(entry) = self.sessions.get_mut(&msg.dest_addr) {
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), msg.dest_addr)) {
             let n = self.config.node.session.coords_warmup_packets;
             entry.set_coords_warmup_remaining(n);
             debug!(
@@ -1034,7 +1034,7 @@ impl Node {
 
         // Send standalone CoordsWarmup immediately (rate-limited)
         if self.coords_response_rate_limiter.should_send(&msg.dest_addr) {
-            if let Some(entry) = self.sessions.get(&msg.dest_addr)
+            if let Some(entry) = self.sessions.get(&(*self.node_addr(), msg.dest_addr))
                 && entry.is_established()
                 && let Err(e) = self.send_coords_warmup(&msg.dest_addr).await
             {
@@ -1062,7 +1062,7 @@ impl Node {
 
         // Reset coords warmup counter so the next N packets include
         // COORDS_PRESENT, re-warming transit caches along the new path.
-        if let Some(entry) = self.sessions.get_mut(&msg.dest_addr) {
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), msg.dest_addr)) {
             let n = self.config.node.session.coords_warmup_packets;
             entry.set_coords_warmup_remaining(n);
             debug!(
@@ -1098,7 +1098,7 @@ impl Node {
         );
 
         // Apply to PathMtuState: immediate decrease via apply_notification()
-        if let Some(entry) = self.sessions.get_mut(&msg.dest_addr)
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), msg.dest_addr))
             && let Some(mmp) = entry.mmp_mut()
         {
             let old_mtu = mmp.path_mtu.current_mtu();
@@ -1129,7 +1129,7 @@ impl Node {
         dest_pubkey: PublicKey,
     ) -> Result<(), NodeError> {
         // Check for existing session
-        if let Some(existing) = self.sessions.get(&dest_addr)
+        if let Some(existing) = self.sessions.get(&(*self.node_addr(), dest_addr))
             && (existing.is_established() || existing.is_initiating())
         {
             return Ok(());
@@ -1167,7 +1167,7 @@ impl Node {
         let resend_interval = self.config.node.rate_limit.handshake_resend_interval_ms;
         let mut entry = SessionEntry::new(dest_addr, dest_pubkey, EndToEndState::Initiating(handshake), now_ms, true);
         entry.set_handshake_payload(setup_payload, now_ms + resend_interval);
-        self.sessions.insert(dest_addr, entry);
+        self.sessions.insert((*self.node_addr(), dest_addr), entry);
 
         debug!(dest = %self.peer_display_name(&dest_addr), "Session initiation started");
         Ok(())
@@ -1192,7 +1192,7 @@ impl Node {
         let now_ms = Self::now_ms();
 
         // First borrow: read session metadata (NLL releases before coord decision)
-        let entry = self.sessions.get(dest_addr).ok_or_else(|| NodeError::SendFailed {
+        let entry = self.sessions.get(&(*self.node_addr(), *dest_addr)).ok_or_else(|| NodeError::SendFailed {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
@@ -1240,21 +1240,21 @@ impl Node {
 
         // Decrement warmup counter if we sent coords (piggybacked or standalone)
         if wants_coords
-            && let Some(entry) = self.sessions.get_mut(dest_addr)
+            && let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *dest_addr))
         {
             entry.set_coords_warmup_remaining(entry.coords_warmup_remaining() - 1);
         }
 
         // Build FSP flags (CP flag if coords, K-bit for key epoch)
         let mut flags = if include_coords { FSP_FLAG_CP } else { 0 };
-        if let Some(entry) = self.sessions.get(dest_addr)
+        if let Some(entry) = self.sessions.get(&(*self.node_addr(), *dest_addr))
             && entry.current_k_bit()
         {
             flags |= FSP_FLAG_K;
         }
 
         // Borrow session for counter + encryption (after potential standalone send)
-        let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
+        let entry = self.sessions.get_mut(&(*self.node_addr(), *dest_addr)).ok_or_else(|| NodeError::SendFailed {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
@@ -1297,7 +1297,7 @@ impl Node {
         self.send_session_datagram(&mut datagram).await?;
 
         // Re-borrow after send (which borrowed &mut self)
-        if let Some(entry) = self.sessions.get_mut(dest_addr) {
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *dest_addr)) {
             entry.record_sent(payload.len());
             if let Some(mmp) = entry.mmp_mut() {
                 mmp.sender.record_sent(counter, timestamp, ciphertext.len());
@@ -1342,7 +1342,7 @@ impl Node {
         let now_ms = Self::now_ms();
 
         // Read spin bit and session timestamp from entry
-        let entry = self.sessions.get(dest_addr).ok_or_else(|| NodeError::SendFailed {
+        let entry = self.sessions.get(&(*self.node_addr(), *dest_addr)).ok_or_else(|| NodeError::SendFailed {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
@@ -1353,7 +1353,7 @@ impl Node {
         let inner_flags = FspInnerFlags { spin_bit }.to_byte();
 
         // Get mutable access for encryption
-        let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
+        let entry = self.sessions.get_mut(&(*self.node_addr(), *dest_addr)).ok_or_else(|| NodeError::SendFailed {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
@@ -1400,7 +1400,7 @@ impl Node {
         self.send_session_datagram(&mut datagram).await?;
 
         // Record in MMP sender state (no touch — MMP reports don't reset idle timer)
-        if let Some(entry) = self.sessions.get_mut(dest_addr)
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *dest_addr))
             && let Some(mmp) = entry.mmp_mut()
         {
             mmp.sender.record_sent(counter, timestamp, ciphertext.len());
@@ -1426,7 +1426,7 @@ impl Node {
         let dest_coords = self.get_dest_coords(dest_addr);
 
         // Read session metadata
-        let entry = self.sessions.get(dest_addr).ok_or_else(|| NodeError::SendFailed {
+        let entry = self.sessions.get(&(*self.node_addr(), *dest_addr)).ok_or_else(|| NodeError::SendFailed {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
@@ -1434,7 +1434,7 @@ impl Node {
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
         // Get mutable access for encryption
-        let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
+        let entry = self.sessions.get_mut(&(*self.node_addr(), *dest_addr)).ok_or_else(|| NodeError::SendFailed {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
@@ -1482,7 +1482,7 @@ impl Node {
         self.send_session_datagram(&mut datagram).await?;
 
         // Record in MMP (infrastructure traffic — no idle timer touch)
-        if let Some(entry) = self.sessions.get_mut(dest_addr)
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), *dest_addr))
             && let Some(mmp) = entry.mmp_mut()
         {
             mmp.sender.record_sent(counter, timestamp, ciphertext.len());
@@ -1525,7 +1525,7 @@ impl Node {
         // Source-side: seed our PathMtuState.current_mtu from the outbound
         // transport MTU so it doesn't stay at u16::MAX until the destination
         // sends a PathMtuNotification back.
-        if let Some(entry) = self.sessions.get_mut(&datagram.dest_addr)
+        if let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), datagram.dest_addr))
             && let Some(mmp) = entry.mmp_mut()
         {
             mmp.path_mtu.seed_source_mtu(datagram.path_mtu);
@@ -1601,7 +1601,7 @@ impl Node {
         };
 
         // Check for established session
-        if let Some(entry) = self.sessions.get(&dest_addr) {
+        if let Some(entry) = self.sessions.get(&(*self.node_addr(), dest_addr)) {
             if entry.is_established() {
                 // Check per-destination path MTU learned from MtuExceeded signals.
                 // The first oversized packet is forwarded normally and triggers
@@ -1750,7 +1750,7 @@ impl Node {
         };
 
         // Skip if a session already exists
-        if let Some(existing) = self.sessions.get(&dest_addr)
+        if let Some(existing) = self.sessions.get(&(*self.node_addr(), dest_addr))
             && (existing.is_established() || existing.is_initiating())
         {
             return;

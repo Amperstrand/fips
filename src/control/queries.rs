@@ -237,7 +237,7 @@ pub fn show_tree(node: &Node) -> Value {
 
 /// `show_sessions` — End-to-end sessions.
 pub fn show_sessions(node: &Node) -> Value {
-    let sessions: Vec<Value> = node.session_entries().map(|(addr, entry)| {
+    let sessions: Vec<Value> = node.session_entries().map(|((local_addr, remote_addr), entry)| {
         let state_str = if entry.is_established() {
             "established"
         } else if entry.is_initiating() {
@@ -249,8 +249,9 @@ pub fn show_sessions(node: &Node) -> Value {
         };
 
         let mut session_json = json!({
-            "remote_addr": hex::encode(addr.as_bytes()),
-            "display_name": node.peer_display_name(addr),
+            "local_addr": hex::encode(local_addr.as_bytes()),
+            "remote_addr": hex::encode(remote_addr.as_bytes()),
+            "display_name": node.peer_display_name(remote_addr),
             "state": state_str,
             "is_initiator": entry.is_initiator(),
             "last_activity_ms": entry.last_activity(),
@@ -397,7 +398,7 @@ pub fn show_mmp(node: &Node) -> Value {
     }).collect();
 
     // Session-layer MMP
-    let sessions: Vec<Value> = node.session_entries().filter_map(|(addr, entry)| {
+    let sessions: Vec<Value> = node.session_entries().filter_map(|((local_addr, remote_addr), entry)| {
         let mmp = entry.mmp()?;
         let metrics = &mmp.metrics;
 
@@ -421,8 +422,9 @@ pub fn show_mmp(node: &Node) -> Value {
         }
 
         Some(json!({
-            "remote": hex::encode(addr.as_bytes()),
-            "display_name": node.peer_display_name(addr),
+            "local": hex::encode(local_addr.as_bytes()),
+            "remote": hex::encode(remote_addr.as_bytes()),
+            "display_name": node.peer_display_name(remote_addr),
             "mode": format!("{}", mmp.mode()),
             "session_layer": session_layer,
         }))

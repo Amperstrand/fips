@@ -283,7 +283,8 @@ async fn test_disconnect_clears_session() {
             1_000,
             true,
         );
-        nodes[1].node.sessions.insert(node0_addr, entry);
+        let local_addr = *nodes[1].node.node_addr();
+        nodes[1].node.sessions.insert((local_addr, node0_addr), entry);
     }
 
     assert_eq!(nodes[1].node.session_count(), 1, "Session should exist before disconnect");
@@ -359,7 +360,8 @@ async fn test_transport_disconnect_clears_session() {
             1_000,
             true,
         );
-        nodes[1].node.sessions.insert(node0_addr, entry);
+        let local_addr = *nodes[1].node.node_addr();
+        nodes[1].node.sessions.insert((local_addr, node0_addr), entry);
     }
 
     assert_eq!(nodes[1].node.session_count(), 1);

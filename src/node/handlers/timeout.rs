@@ -174,13 +174,13 @@ impl Node {
                 !entry.is_established()
                     && now_ms.saturating_sub(entry.last_activity()) > timeout_ms
             })
-            .map(|(addr, _)| *addr)
+            .map(|((_, addr), _)| *addr)
             .collect();
 
         for addr in &timed_out {
             let name = self.peer_display_name(addr);
             info!(dest = %name, "Session handshake timed out, removing");
-            self.sessions.remove(addr);
+            self.sessions.remove(&(*self.node_addr(), *addr));
             self.pending_tun_packets.remove(addr);
         }
 
@@ -194,7 +194,7 @@ impl Node {
                     && entry.next_resend_at_ms() > 0
                     && now_ms >= entry.next_resend_at_ms()
             })
-            .map(|(addr, entry)| (*addr, entry.handshake_payload().unwrap().to_vec()))
+            .map(|((_, addr), entry)| (*addr, entry.handshake_payload().unwrap().to_vec()))
             .collect();
 
         for (dest_addr, payload) in candidates {
@@ -215,7 +215,7 @@ impl Node {
             };
 
             if sent
-                && let Some(entry) = self.sessions.get_mut(&dest_addr)
+                && let Some(entry) = self.sessions.get_mut(&(*self.node_addr(), dest_addr))
             {
                 let count = entry.resend_count() + 1;
                 let next = now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
@@ -244,7 +244,7 @@ impl Node {
                 entry.is_established()
                     && now_ms.saturating_sub(entry.last_activity()) > timeout_ms
             })
-            .map(|(addr, _)| *addr)
+            .map(|((_, addr), _)| *addr)
             .collect();
 
         for addr in idle {
@@ -252,12 +252,12 @@ impl Node {
             let name = self.peer_display_name(&addr);
 
             // Log MMP teardown metrics before removing the session
-            if let Some(entry) = self.sessions.get(&addr)
+            if let Some(entry) = self.sessions.get(&(*self.node_addr(), addr))
                 && let Some(mmp) = entry.mmp()
             {
                 Self::log_session_mmp_teardown(&name, mmp);
             }
-            self.sessions.remove(&addr);
+            self.sessions.remove(&(*self.node_addr(), addr));
             self.pending_tun_packets.remove(&addr);
             debug!(
                 dest = %name,
