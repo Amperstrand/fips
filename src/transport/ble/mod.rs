@@ -1034,12 +1034,15 @@ async fn receive_loop<S: BleStream>(
 ) {
     /// Maximum time to wait for a single recv() before declaring the link dead.
     ///
-    /// On macOS, bluest's internal L2CAP read loop can die with "Sender is
-    /// closed" without propagating the error to our recv() call, leaving the
-    /// future pending forever. This timeout ensures the receive_loop exits,
-    /// cleans up the pool, and emits a disconnect event so that scan_probe_loop
-    /// can reconnect.
-    const RECV_TIMEOUT_SECS: u64 = 45;
+    /// On macOS, bluest's internal L2CAP read loop can stall silently
+    /// (CoreBluetooth stops delivering HasBytesAvailable events). This timeout
+    /// ensures the receive_loop exits, cleans up the pool, and emits a
+    /// disconnect event so that scan_probe_loop can reconnect.
+    ///
+    /// 15s is a balance: short enough to recover quickly from a stall, long
+    /// enough to avoid false positives on quiet links (MMP heartbeats arrive
+    /// every ~1-2s on an established link).
+    const RECV_TIMEOUT_SECS: u64 = 15;
 
     let mut buf = vec![0u8; recv_mtu as usize];
     loop {
