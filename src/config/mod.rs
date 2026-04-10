@@ -22,7 +22,7 @@ mod node;
 mod peer;
 mod transport;
 
-use crate::upper::config::{DnsConfig, TunConfig};
+use crate::upper::config::{DnsConfig, LeafProxyConfig, TcpProxyConfig, TunConfig};
 use crate::{Identity, IdentityError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -34,7 +34,10 @@ pub use node::{
     TreeConfig,
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
-pub use transport::{BleConfig, DirectoryServiceConfig, EthernetConfig, TcpConfig, TorConfig, TransportInstances, TransportsConfig, UdpConfig};
+pub use transport::{
+    BleConfig, DirectoryServiceConfig, EthernetConfig, TcpConfig, TorConfig, TransportInstances,
+    TransportsConfig, UdpConfig,
+};
 
 /// Default config filename.
 const CONFIG_FILENAME: &str = "fips.yaml";
@@ -277,6 +280,9 @@ pub enum ConfigError {
 
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+
+    #[error("validation error: field '{field}': {message}")]
+    Validation { field: String, message: String },
 }
 
 /// Identity configuration (`node.identity.*`).
@@ -309,6 +315,9 @@ pub struct Config {
     #[serde(default)]
     pub dns: DnsConfig,
 
+    #[serde(default)]
+    pub tcp_proxy: TcpProxyConfig,
+
     /// Transport instances (`transports.*`).
     #[serde(default, skip_serializing_if = "TransportsConfig::is_empty")]
     pub transports: TransportsConfig,
@@ -316,6 +325,10 @@ pub struct Config {
     /// Static peers to connect to (`peers`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerConfig>,
+
+    /// Leaf proxy configurations (`leaf_proxies`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaf_proxies: Vec<LeafProxyConfig>,
 }
 
 impl Config {
@@ -428,11 +441,23 @@ impl Config {
         if other.dns.ttl.is_some() {
             self.dns.ttl = other.dns.ttl;
         }
+        if other.tcp_proxy.enabled {
+            self.tcp_proxy.enabled = true;
+        }
+        if other.tcp_proxy.listen_addr.is_some() {
+            self.tcp_proxy.listen_addr = other.tcp_proxy.listen_addr;
+        }
+        if other.tcp_proxy.target_npub.is_some() {
+            self.tcp_proxy.target_npub = other.tcp_proxy.target_npub;
+        }
         // Merge transports section
         self.transports.merge(other.transports);
         // Merge peers (replace if non-empty)
         if !other.peers.is_empty() {
             self.peers = other.peers;
+        }
+        if !other.leaf_proxies.is_empty() {
+            self.leaf_proxies = other.leaf_proxies;
         }
     }
 
@@ -467,6 +492,54 @@ impl Config {
         self.peers.iter().filter(|p| p.is_auto_connect())
     }
 
+    /// Validate leaf proxies configuration.
+    ///
+    /// Checks for duplicate identity seeds and NodeAddr collisions with primary identity.
+    pub fn validate_leaf_proxies(&self) -> Result<(), ConfigError> {
+        use std::collections::HashSet;
+
+        let mut seen_seeds = HashSet::new();
+        let mut seen_node_addrs = HashSet::new();
+
+        for (i, proxy) in self.leaf_proxies.iter().enumerate() {
+            if proxy.identity_seed.is_empty() {
+                return Err(ConfigError::Validation {
+                    field: format!("leaf_proxies[{}].identity_seed", i),
+                    message: "identity_seed cannot be empty".to_string(),
+                });
+            }
+
+            if !seen_seeds.insert(&proxy.identity_seed) {
+                return Err(ConfigError::Validation {
+                    field: format!("leaf_proxies[{}].identity_seed", i),
+                    message: format!("duplicate identity_seed '{}'", proxy.identity_seed),
+                });
+            }
+
+            let identity = proxy.derived_identity()?;
+            let node_addr = identity.node_addr;
+
+            if !seen_node_addrs.insert(node_addr) {
+                return Err(ConfigError::Validation {
+                    field: format!("leaf_proxies[{}]", i),
+                    message: format!("NodeAddr collision: {}", node_addr),
+                });
+            }
+
+            let primary_identity = self.create_identity()?;
+            let primary_node_addr = primary_identity.node_addr();
+
+            if &node_addr == primary_node_addr {
+                return Err(ConfigError::Validation {
+                    field: format!("leaf_proxies[{}]", i),
+                    message: format!("NodeAddr collision with primary identity: {}", node_addr),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Serialize this configuration to YAML.
     pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
         serde_yaml::to_string(self)
@@ -476,6 +549,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upper::config::LeafServiceConfig;
     use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
@@ -539,10 +613,7 @@ node:
         override_config.node.identity.nsec = Some("override_nsec".to_string());
 
         base.merge(override_config);
-        assert_eq!(
-            base.node.identity.nsec,
-            Some("override_nsec".to_string())
-        );
+        assert_eq!(base.node.identity.nsec, Some("override_nsec".to_string()));
     }
 
     #[test]
@@ -559,9 +630,8 @@ node:
     #[test]
     fn test_create_identity_from_nsec() {
         let mut config = Config::new();
-        config.node.identity.nsec = Some(
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_string(),
-        );
+        config.node.identity.nsec =
+            Some("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_string());
 
         let identity = config.create_identity().unwrap();
         assert!(!identity.npub().is_empty());
@@ -747,16 +817,21 @@ node:
     #[test]
     fn test_key_file_path_derivation() {
         let config_path = PathBuf::from("/etc/fips/fips.yaml");
-        assert_eq!(key_file_path(&config_path), PathBuf::from("/etc/fips/fips.key"));
-        assert_eq!(pub_file_path(&config_path), PathBuf::from("/etc/fips/fips.pub"));
+        assert_eq!(
+            key_file_path(&config_path),
+            PathBuf::from("/etc/fips/fips.key")
+        );
+        assert_eq!(
+            pub_file_path(&config_path),
+            PathBuf::from("/etc/fips/fips.pub")
+        );
     }
 
     #[test]
     fn test_resolve_identity_from_config() {
         let mut config = Config::new();
-        config.node.identity.nsec = Some(
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_string(),
-        );
+        config.node.identity.nsec =
+            Some("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_string());
 
         let resolved = resolve_identity(&config, &[]).unwrap();
         assert!(matches!(resolved.source, IdentitySource::Config));
@@ -803,11 +878,7 @@ node:
         let config_path = temp_dir.path().join("fips.yaml");
         let key_path = temp_dir.path().join("fips.key");
 
-        fs::write(
-            &config_path,
-            "node:\n  identity:\n    persistent: true\n",
-        )
-        .unwrap();
+        fs::write(&config_path, "node:\n  identity:\n    persistent: true\n").unwrap();
 
         // Write a key file
         let identity = crate::Identity::generate();
@@ -827,11 +898,7 @@ node:
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("fips.yaml");
 
-        fs::write(
-            &config_path,
-            "node:\n  identity:\n    persistent: true\n",
-        )
-        .unwrap();
+        fs::write(&config_path, "node:\n  identity:\n    persistent: true\n").unwrap();
 
         let config = Config::load_file(&config_path).unwrap();
         let resolved = resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap();
@@ -892,8 +959,7 @@ transports:
 
         assert_eq!(config.transports.udp.len(), 2);
 
-        let instances: std::collections::HashMap<_, _> =
-            config.transports.udp.iter().collect();
+        let instances: std::collections::HashMap<_, _> = config.transports.udp.iter().collect();
 
         // Named instances have Some(name)
         assert!(instances.contains_key(&Some("main")));
@@ -1019,5 +1085,138 @@ peers:
         assert_eq!(peer.alias, Some("test-peer".to_string()));
         assert_eq!(peer.addresses.len(), 2);
         assert!(peer.is_auto_connect());
+    }
+
+    #[test]
+    fn test_parse_leaf_proxies_empty() {
+        let yaml = r#"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.leaf_proxies.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_leaf_proxies_single() {
+        let yaml = r#"
+leaf_proxies:
+  - identity_seed: "fips-esp32s3"
+    services:
+      - port: 6053
+        protocol: "tcp"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.leaf_proxies.len(), 1);
+        let proxy = &config.leaf_proxies[0];
+        assert_eq!(proxy.identity_seed, "fips-esp32s3");
+        assert_eq!(proxy.services.len(), 1);
+        assert_eq!(proxy.services[0].port, 6053);
+        assert_eq!(proxy.services[0].protocol, "tcp");
+    }
+
+    #[test]
+    fn test_parse_leaf_proxies_multiple() {
+        let yaml = r#"
+leaf_proxies:
+  - identity_seed: "device1"
+    services:
+      - port: 6053
+        protocol: "tcp"
+  - identity_seed: "device2"
+    services:
+      - port: 8080
+        protocol: "tcp"
+      - port: 8443
+        protocol: "tcp"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.leaf_proxies.len(), 2);
+        assert_eq!(config.leaf_proxies[0].identity_seed, "device1");
+        assert_eq!(config.leaf_proxies[1].identity_seed, "device2");
+        assert_eq!(config.leaf_proxies[1].services.len(), 2);
+    }
+
+    #[test]
+    fn test_leaf_proxies_merge() {
+        let mut base = Config::new();
+        base.leaf_proxies = vec![LeafProxyConfig {
+            identity_seed: "base".to_string(),
+            services: vec![LeafServiceConfig {
+                port: 8080,
+                protocol: "tcp".to_string(),
+            }],
+        }];
+
+        let mut override_config = Config::new();
+        override_config.leaf_proxies = vec![LeafProxyConfig {
+            identity_seed: "override".to_string(),
+            services: vec![LeafServiceConfig {
+                port: 6053,
+                protocol: "tcp".to_string(),
+            }],
+        }];
+
+        base.merge(override_config);
+        assert_eq!(base.leaf_proxies.len(), 1);
+        assert_eq!(base.leaf_proxies[0].identity_seed, "override");
+    }
+
+    #[test]
+    fn test_validate_leaf_proxies_duplicate_seed() {
+        let mut config = Config::new();
+        config.leaf_proxies = vec![
+            LeafProxyConfig {
+                identity_seed: "device1".to_string(),
+                services: vec![LeafServiceConfig::default()],
+            },
+            LeafProxyConfig {
+                identity_seed: "device1".to_string(),
+                services: vec![LeafServiceConfig::default()],
+            },
+        ];
+
+        let result = config.validate_leaf_proxies();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("duplicate identity_seed"));
+        assert!(err.to_string().contains("device1"));
+    }
+
+    #[test]
+    fn test_validate_leaf_proxies_empty_seed() {
+        let mut config = Config::new();
+        config.leaf_proxies = vec![LeafProxyConfig {
+            identity_seed: String::new(),
+            services: vec![LeafServiceConfig::default()],
+        }];
+
+        let result = config.validate_leaf_proxies();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_leaf_proxies_nodeaddr_collision() {
+        let mut config_with_collision = Config::new();
+        config_with_collision.leaf_proxies = vec![
+            LeafProxyConfig {
+                identity_seed: "collision1".to_string(),
+                services: vec![LeafServiceConfig::default()],
+            },
+            LeafProxyConfig {
+                identity_seed: "collision1".to_string(),
+                services: vec![LeafServiceConfig::default()],
+            },
+        ];
+
+        let result = config_with_collision.validate_leaf_proxies();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate identity_seed"));
     }
 }
