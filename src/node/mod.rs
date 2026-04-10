@@ -7,6 +7,7 @@
 mod bloom;
 mod handlers;
 mod lifecycle;
+mod local_endpoint;
 mod retry;
 mod discovery_rate_limit;
 mod rate_limit;
@@ -258,6 +259,9 @@ pub struct Node {
     /// Exchanged inside Noise handshake messages so peers can detect restarts.
     startup_epoch: [u8; 8],
 
+    /// Local endpoints: this node's own identity (primary) plus proxied leaf identities.
+    local_endpoints: Vec<local_endpoint::LocalEndpoint>,
+
     /// Instant when the node was created, for uptime reporting.
     started_at: std::time::Instant,
 
@@ -376,6 +380,11 @@ pub struct Node {
     dns_identity_rx: Option<crate::upper::dns::DnsIdentityRx>,
     /// DNS responder task handle.
     dns_task: Option<tokio::task::JoinHandle<()>>,
+
+    tcp_proxy_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    tcp_proxy_inbound_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    tcp_proxy_task: Option<tokio::task::JoinHandle<()>>,
+    tcp_proxy_target: Option<NodeAddr>,
 
     // === Index-Based Session Dispatch ===
     /// Allocator for session indices.
@@ -501,9 +510,12 @@ impl Node {
         host_map.merge(hosts_file);
         let host_map = Arc::new(host_map);
 
+        let primary_endpoint = local_endpoint::LocalEndpoint::primary(identity.keypair(), startup_epoch);
+
         Ok(Self {
             identity,
             startup_epoch,
+            local_endpoints: vec![primary_endpoint],
             started_at: std::time::Instant::now(),
             config,
             state: NodeState::Created,
@@ -541,6 +553,10 @@ impl Node {
             tun_shutdown_fd: None,
             dns_identity_rx: None,
             dns_task: None,
+            tcp_proxy_outbound_rx: None,
+            tcp_proxy_inbound_tx: None,
+            tcp_proxy_task: None,
+            tcp_proxy_target: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
@@ -614,9 +630,12 @@ impl Node {
 
         let host_map = Arc::new(HostMap::new());
 
+        let primary_endpoint = local_endpoint::LocalEndpoint::primary(identity.keypair(), startup_epoch);
+
         Self {
             identity,
             startup_epoch,
+            local_endpoints: vec![primary_endpoint],
             started_at: std::time::Instant::now(),
             config,
             state: NodeState::Created,
@@ -654,6 +673,10 @@ impl Node {
             tun_shutdown_fd: None,
             dns_identity_rx: None,
             dns_task: None,
+            tcp_proxy_outbound_rx: None,
+            tcp_proxy_inbound_tx: None,
+            tcp_proxy_task: None,
+            tcp_proxy_target: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
@@ -940,6 +963,28 @@ impl Node {
     /// Get this node's npub.
     pub fn npub(&self) -> String {
         self.identity.npub()
+    }
+
+    // === Local Endpoints ===
+
+    /// Check if a NodeAddr belongs to any local endpoint (primary or proxied leaf).
+    pub fn is_local_endpoint(&self, addr: &NodeAddr) -> bool {
+        self.local_endpoints.iter().any(|ep| &ep.node_addr == addr)
+    }
+
+    /// Look up a local endpoint by NodeAddr.
+    pub fn get_local_endpoint(&self, addr: &NodeAddr) -> Option<&local_endpoint::LocalEndpoint> {
+        self.local_endpoints.iter().find(|ep| &ep.node_addr == addr)
+    }
+
+    /// Get the primary (own identity) endpoint.
+    ///
+    /// There is always exactly one primary endpoint.
+    pub fn primary_endpoint(&self) -> &local_endpoint::LocalEndpoint {
+        self.local_endpoints
+            .iter()
+            .find(|ep| ep.is_primary)
+            .expect("primary endpoint always exists")
     }
 
     /// Return a human-readable display name for a NodeAddr.

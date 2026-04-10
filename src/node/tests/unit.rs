@@ -943,3 +943,85 @@ fn test_transport_disconnect_ignores_unknown_address() {
     assert_eq!(node.connection_count(), 0);
     assert!(node.retry_pending.is_empty());
 }
+
+#[test]
+fn test_local_endpoint_primary_exists() {
+    let node = make_node();
+
+    let primary = node.primary_endpoint();
+    assert!(primary.is_primary);
+    assert_eq!(&primary.node_addr, node.node_addr());
+    assert_eq!(primary.fips_address, *node.identity().address());
+}
+
+#[test]
+fn test_local_endpoint_is_local_own_addr() {
+    let node = make_node();
+
+    assert!(node.is_local_endpoint(node.node_addr()));
+}
+
+#[test]
+fn test_local_endpoint_is_local_unknown_addr() {
+    let node = make_node();
+    let unknown = make_node_addr(0xAA);
+
+    assert!(!node.is_local_endpoint(&unknown));
+}
+
+#[test]
+fn test_local_endpoint_get_found() {
+    let node = make_node();
+
+    let ep = node.get_local_endpoint(node.node_addr());
+    assert!(ep.is_some());
+    assert_eq!(ep.unwrap().node_addr, *node.node_addr());
+}
+
+#[test]
+fn test_local_endpoint_get_not_found() {
+    let node = make_node();
+    let unknown = make_node_addr(0xBB);
+
+    assert!(node.get_local_endpoint(&unknown).is_none());
+}
+
+#[test]
+fn test_local_endpoint_with_identity() {
+    let identity = Identity::generate();
+    let expected_addr = *identity.node_addr();
+    let config = Config::new();
+    let node = Node::with_identity(identity, config);
+
+    let primary = node.primary_endpoint();
+    assert!(primary.is_primary);
+    assert_eq!(&primary.node_addr, &expected_addr);
+    assert!(node.is_local_endpoint(&expected_addr));
+}
+
+#[test]
+fn test_local_endpoint_known_seed_esp32s3() {
+    use sha2::{Digest, Sha256};
+
+    let seed = "fips-esp32s3";
+    let prefix = format!("esphome:fips_ble:{}", seed);
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    let secret_bytes = hasher.finalize();
+
+    let secret_key = secp256k1::SecretKey::from_slice(&secret_bytes).unwrap();
+    let identity = Identity::from_secret_key(secret_key);
+    let config = Config::new();
+    let node = Node::with_identity(identity, config);
+
+    let primary = node.primary_endpoint();
+    assert_eq!(
+        primary.node_addr.to_string(),
+        "91132891ed6ef5c0ff983fd4c1e9c970"
+    );
+    assert_eq!(
+        primary.fips_address.to_string(),
+        "fd91:1328:91ed:6ef5:c0ff:983f:d4c1:e9c9"
+    );
+    assert!(node.is_local_endpoint(&primary.node_addr));
+}
