@@ -7,7 +7,7 @@ use crate::transport::{
     disconnect_channel, packet_channel, Link, LinkDirection, LinkId, TransportAddr,
     TransportId,
 };
-use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState};
+use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState, add_tun_address};
 use crate::node::wire::build_msg1;
 use crate::{NodeAddr, PeerIdentity};
 use tokio::net::TcpListener;
@@ -726,6 +726,18 @@ impl Node {
                     Ok(leaf_id) => {
                         let leaf_node_addr = leaf_id.node_addr;
                         let fips_addr = leaf_id.fips_address.to_ipv6();
+
+                        if let Some(ref tun_name) = self.tun_name {
+                            if let Err(e) = add_tun_address(tun_name, fips_addr).await {
+                                warn!(
+                                    addr = %fips_addr,
+                                    error = %e,
+                                    "Failed to add leaf proxy address to TUN interface"
+                                );
+                            } else {
+                                debug!(addr = %fips_addr, tun = %tun_name, "Added leaf proxy address to TUN");
+                            }
+                        }
 
                         for service in &leaf_cfg.services {
                             if service.protocol != "tcp" {

@@ -554,6 +554,12 @@ pub async fn shutdown_tun_interface(name: &str) -> Result<(), TunError> {
     Ok(())
 }
 
+/// Add a secondary IPv6 /128 address to a named TUN interface.
+/// Called from lifecycle when binding per-leaf TCP proxy listeners.
+pub async fn add_tun_address(name: &str, addr: Ipv6Addr) -> Result<(), TunError> {
+    platform::add_address(name, addr).await
+}
+
 impl std::fmt::Debug for TunDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TunDevice")
