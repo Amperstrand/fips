@@ -722,6 +722,8 @@ impl Node {
             let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<(crate::node::NodeAddr, Vec<u8>)>(256);
             self.leaf_tcp_proxy_outbound_rx = Some(outbound_rx);
 
+            let mut leaf_addrs_to_advertise = Vec::new();
+
             for leaf_cfg in &self.config.leaf_proxies {
                 match leaf_cfg.derived_identity() {
                     Ok(leaf_id) => {
@@ -745,6 +747,7 @@ impl Node {
                             leaf_id.keypair,
                             leaf_startup_epoch,
                         ));
+                        leaf_addrs_to_advertise.push(leaf_node_addr);
 
                         for service in &leaf_cfg.services {
                             if service.protocol != "tcp" {
@@ -780,6 +783,10 @@ impl Node {
                         warn!(seed = %leaf_cfg.identity_seed, error = %e, "Failed to derive leaf proxy identity");
                     }
                 }
+            }
+
+            for addr in leaf_addrs_to_advertise {
+                self.bloom_state_mut().add_leaf_dependent(addr);
             }
         }
 
