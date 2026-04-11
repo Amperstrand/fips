@@ -1,5 +1,15 @@
 # BLE L2CAP Framing: Byte-Stream Coalescing and the Length-Prefix Solution
 
+> **IMPORTANT**: This document describes the 2-byte BE length-prefix framing
+> approach implemented on the `linux-ble-stability-v2` branch (commit `42d9adb`).
+> **Upstream (`jmcorgan/master`) does NOT use any framing.** Linux uses raw
+> SeqPacket reads, macOS uses channel-based delivery — both preserve message
+> boundaries without a length prefix. The 2-byte prefix is a **wire protocol
+> change** that makes this branch incompatible with upstream peers.
+>
+> See `.sisyphus/notepad/ble-framing-architecture.md` for the full architectural
+> analysis and the recommended long-term solution.
+
 ## The Problem
 
 BLE L2CAP Connection-Oriented Channels (CoC) are specified as message-oriented

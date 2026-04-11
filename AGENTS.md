@@ -2,39 +2,39 @@
 
 Notes for LLM agents working on this codebase. Not user documentation.
 
-## BLE Framing Architecture
+## BLE Framing Architecture — RESOLVED
 
-**WARNING**: Multiple sessions have introduced bugs by putting frame reassembly
-logic in the wrong layer. Read `.sisyphus/notepad/ble-framing-architecture.md`
-before touching any BLE receive path code.
+The framing issues that caused bugs across multiple sessions have been fixed.
+See `.sisyphus/notepad/ble-framing-architecture.md` for the full history.
 
-### Quick Reference
+### Current State
 
-The framing stack has two layers. Each has its own responsibility:
+| Platform | Framing | Wire-compatible with upstream? |
+|----------|---------|-------------------------------|
+| Linux (`io.rs`) | **None** — raw SeqPacket pass-through | ✅ Yes |
+| macOS (`io_macos.rs`) | 2-byte BE length prefix (byte streams need it) | ❌ No |
+| Mock (`io.rs`) | **None** — raw channel pass-through | ✅ Yes |
 
-```
-FMP frame: [4-byte prefix] [payload] [16-byte AEAD tag]
-  ↓ wrapped in BLE framing
-BLE frame: [2-byte BE length prefix] [FMP frame]
-  ↓ sent over L2CAP SeqPacket
-```
+### What Was Fixed
 
-| Layer | Boundary marker | Reassembly owner | File |
-|-------|----------------|-----------------|------|
-| BLE framing | 2-byte BE length prefix | `BluerStream::recv()` | `io.rs` / `io_macos.rs` |
-| FMP framing | 4-byte FMP prefix | Node layer (after recv) | `mod.rs` receive_loop |
+- Removed FMP-level coalescing from `receive_loop` (was `e81d688` + `daa76f1`)
+- Removed 2-byte BE length prefix from Linux `BluerStream` (was unnecessary for SeqPacket)
+- Removed 2-byte prefix from `MockBleStream` (tests should match production Linux behavior)
+- macOS `Bluestream` keeps its 2-byte prefix (CoreBluetooth byte streams require framing)
 
 ### Rules
 
-1. Frame reassembly belongs in `BluerStream` / `Bluestream` (`io.rs` / `io_macos.rs`),
-   NOT in `receive_loop` in `mod.rs`.
+1. **NEVER put transport framing logic in `receive_loop` (mod.rs).** It should
+   receive one complete FMP frame per `stream.recv()` call and deliver it.
 
-2. `receive_loop` should receive one complete FMP frame per `stream.recv()` call.
-   If it needs to split coalesced frames, the bug is in the stream layer.
+2. **Frame reassembly (if needed) belongs in the BleStream implementation**
+   (`io.rs` for Linux, `io_macos.rs` for macOS).
 
-3. The `e81d688` and `daa76f1` commits on `linux-ble-stability-v2` put coalescing
-   logic in the wrong layer (FMP receive_loop instead of BLE stream). Do NOT
-   extend or depend on this pattern.
+3. **Linux SeqPacket preserves message boundaries.** No framing needed. Do not add
+   length-prefix framing to `BluerStream`.
+
+4. **macOS byte streams need framing.** The 2-byte prefix in `io_macos.rs` is correct
+   and necessary.
 
 ## Branch: linux-ble-stability-v2
 
@@ -42,14 +42,15 @@ Based on `jmcorgan/master` with BLE stability fixes and experimental features.
 
 ### Known Issues on This Branch
 
-- `e81d688` + `daa76f1`: Coalescing logic in wrong layer (see above)
 - `BleConnection.is_static`: Always set to `false` — unimplemented
 - Leaf proxy commits (15+): Experimental feature, separate from BLE fixes
+- macOS framing: Wire-incompatible with upstream (macOS uses channels upstream,
+  we use 2-byte prefix). Acceptable since BLE transport was not in production.
 
 ### PR Planning
 
 See GitHub issue #39 for the recommended PR split. Key point: BLE fixes should
-be separate from leaf proxy feature. Coalescing commits need rework before upstream.
+be separate from leaf proxy feature. Framing cleanup is done.
 
 ## ESP32-S3 Known Limitations
 

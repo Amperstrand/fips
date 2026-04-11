@@ -111,11 +111,13 @@ This can be determined by whether the peer advertises the FIPS GATT service
 L2CAP CoC, the underlying transport preserves message boundaries at the
 controller level, but CoreBluetooth's NSStream abstraction may coalesce reads.
 
-Options:
-- **Length-prefix framing**: prepend a 2-byte length header to each message.
-  Simple, reliable, adds 2 bytes overhead per packet.
-- **Rely on MTU-sized reads**: if each write is ≤ MTU and reads always return
-  exactly one L2CAP SDU, no framing is needed. Needs validation with `bluest`.
+**Resolved**: The `linux-ble-stability-v2` branch implements length-prefix framing
+(2-byte BE prefix) in `io_macos.rs`. Note that upstream (`jmcorgan/macos-support`)
+uses a channel-based approach (`tokio::sync::mpsc`) that avoids needing framing
+entirely — each CoreBluetooth delegate callback maps to one channel message,
+preserving boundaries naturally. The length-prefix approach is a **wire protocol
+change** that makes this branch incompatible with upstream. See
+`.sisyphus/notepad/ble-framing-architecture.md` for the full analysis.
 
 ### Feature gating
 
@@ -176,8 +178,10 @@ With cfg guards on `target_os` + dependency availability throughout the BLE code
 1. **`bluest` maturity**: the L2CAP implementation is ~1 year old. Should we
    vendor/fork it, or depend on crates.io and pin the version?
 
-2. **Stream framing**: does `bluest`'s `L2capChannel::read()` preserve L2CAP
-   SDU boundaries, or do we need length-prefix framing? Requires testing.
+2. **Stream framing** (RESOLVED): `bluest`'s `L2capChannel::read()` does NOT
+   preserve L2CAP SDU boundaries — it's a byte stream. Our branch uses 2-byte
+   BE length-prefix framing to handle this. Upstream avoids the problem entirely
+   by using a channel-based approach. See `.sisyphus/notepad/ble-framing-architecture.md`.
 
 3. **Linux → macOS interop**: should the Linux `BluerIo::connect()` be extended
    to read PSM from GATT as part of this work, or deferred?
