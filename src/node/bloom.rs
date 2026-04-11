@@ -81,17 +81,14 @@ impl Node {
                     // Estimate wire size: plaintext + inner_header + tag + outer_header
                     let estimated_wire = 1035 + INNER_HEADER_SIZE + TAG_SIZE + ESTABLISHED_HEADER_SIZE;
                     if link_mtu > 0 && estimated_wire > link_mtu {
-                        debug!(
-                            peer = %self.peer_display_name(peer_addr),
-                            estimated_wire,
-                            link_mtu,
-                            "Skipping FilterAnnounce: transport MTU too small"
-                        );
+                        // Record the filter as "sent" so mark_changed_peers won't
+                        // re-add this peer to pending_updates on every tick.
+                        let skipped_filter = self
+                            .bloom_state
+                            .compute_outgoing_filter(peer_addr, &self.peer_inbound_filters());
+                        self.bloom_state.record_sent_filter(*peer_addr, skipped_filter);
+                        self.bloom_state.record_update_sent(*peer_addr, now_ms);
                         self.stats_mut().bloom.mtu_skipped += 1;
-                        // Clear the pending flag so we don't retry every tick
-                        if let Some(peer) = self.peers.get_mut(peer_addr) {
-                            peer.clear_filter_update_needed();
-                        }
                         return Ok(());
                     }
                 }
