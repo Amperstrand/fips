@@ -1115,7 +1115,7 @@ async fn receive_loop<S: BleStream>(
                 debug!(addr = %addr, "BLE connection closed by peer");
                 break;
             }
-            Ok(n) => {
+            Ok(Ok(n)) => {
                 let mut remaining = &buf[..n];
                 let mut frame_count = 0u32;
                 while !remaining.is_empty() {
@@ -1156,8 +1156,6 @@ async fn receive_loop<S: BleStream>(
                 }
                 if frame_count > 1 {
                     debug!(addr = %addr, frames = frame_count, "BLE receive: split coalesced frames");
-                }
-            }
                 }
             }
             Ok(Err(e)) => {
