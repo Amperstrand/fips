@@ -127,6 +127,13 @@ async fn async_main(args: Args) {
     // Create node with resolved identity
     let mut config = config;
     config.node.identity.nsec = Some(resolved.nsec);
+
+    debug!("Validating leaf_proxies config");
+    if let Err(e) = config.validate_leaf_proxies() {
+        error!("Invalid leaf_proxies configuration: {}", e);
+        std::process::exit(1);
+    }
+
     debug!("Creating node");
     let mut node = match Node::new(config) {
         Ok(node) => node,
