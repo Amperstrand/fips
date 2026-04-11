@@ -123,11 +123,6 @@ pub struct BleTransport<I: BleIo> {
     /// so the node layer can initiate the IK handshake.
     /// Temporary — removed when FMP switches to XX.
     local_pubkey: Option<[u8; 32]>,
-    /// Our BLE capability flags for pubkey exchange.
-    ///
-    /// Defaults to `PeerCapabilities::none()` (full capability).
-    /// Set to `PeerCapabilities::central_only()` on macOS where
-    /// CoreBluetooth cannot accept inbound connections.
     local_capabilities: PeerCapabilities,
     /// Adaptive rate controller using MMP SRTT feedback.
     rate_adapter: Arc<Mutex<BleRateAdapter>>,
@@ -164,7 +159,7 @@ impl<I: BleIo> BleTransport<I> {
             discovery_buffer: Arc::new(DiscoveryBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
-            local_capabilities: PeerCapabilities::none(),
+            local_capabilities: PeerCapabilities::linux_default(),
             rate_adapter: Arc::new(Mutex::new(BleRateAdapter::new(initial_rate_bps))),
         }
     }
@@ -198,11 +193,6 @@ impl<I: BleIo> BleTransport<I> {
         self.disconnect_tx = Some(tx);
     }
 
-    /// Set BLE capability flags for pubkey exchange.
-    ///
-    /// Must be called before `start_async()`. Defaults to `none()`
-    /// (full capability). On macOS, call with `PeerCapabilities::central_only()`
-    /// to signal that this node cannot accept inbound BLE connections.
     pub fn set_local_capabilities(&mut self, caps: PeerCapabilities) {
         self.local_capabilities = caps;
     }
@@ -827,26 +817,62 @@ const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
 pub struct PeerCapabilities(u8);
 
 impl PeerCapabilities {
-    /// Cannot accept inbound BLE connections (e.g., macOS CoreBluetooth).
-    ///
-    /// When set, the peer MUST use outbound connections only.
-    /// The other side should always let this peer's outbound win
-    /// the tie-breaker, regardless of NodeAddr comparison.
-    const CENTRAL_ONLY: u8 = 0x01;
+    const LEGACY_CENTRAL_ONLY: u8 = 0x01;
+    const PREFER_OUTBOUND: u8 = 0x02;
+    const PREFER_L2CAP: u8 = 0x04;
+    const CAN_CENTRAL: u8 = 0x08;
+    const CAN_PERIPHERAL: u8 = 0x10;
+    const L2CAP_SUPPORTED: u8 = 0x20;
+    const GATT_SUPPORTED: u8 = 0x40;
 
-    /// Create empty capabilities (full capability, no restrictions).
     pub fn none() -> Self {
         Self(0)
     }
 
-    /// Create capabilities with CENTRAL_ONLY set.
+    pub fn linux_default() -> Self {
+        Self(
+            Self::L2CAP_SUPPORTED
+                | Self::CAN_CENTRAL
+                | Self::CAN_PERIPHERAL
+                | Self::PREFER_L2CAP,
+        )
+    }
+
     pub fn central_only() -> Self {
-        Self(Self::CENTRAL_ONLY)
+        Self(Self::L2CAP_SUPPORTED | Self::CAN_CENTRAL | Self::PREFER_OUTBOUND)
+    }
+
+    pub fn macos_default() -> Self {
+        Self::central_only()
     }
 
     /// Whether the peer can only act as BLE central (cannot accept inbound).
     pub fn is_central_only(&self) -> bool {
-        self.0 & Self::CENTRAL_ONLY != 0
+        self.can_initiate_outbound() && !self.can_accept_inbound()
+    }
+
+    pub fn can_accept_inbound(&self) -> bool {
+        self.is_legacy_unrestricted() || (self.0 & Self::CAN_PERIPHERAL != 0)
+    }
+
+    pub fn can_initiate_outbound(&self) -> bool {
+        self.is_legacy_unrestricted() || (self.0 & Self::CAN_CENTRAL != 0)
+    }
+
+    pub fn supports_l2cap(&self) -> bool {
+        self.is_legacy_unrestricted() || (self.0 & Self::L2CAP_SUPPORTED != 0)
+    }
+
+    pub fn supports_gatt(&self) -> bool {
+        self.0 & Self::GATT_SUPPORTED != 0
+    }
+
+    pub fn prefers_l2cap(&self) -> bool {
+        self.0 & Self::PREFER_L2CAP != 0
+    }
+
+    pub fn prefers_outbound(&self) -> bool {
+        self.0 & Self::PREFER_OUTBOUND != 0
     }
 
     /// Encode as a single byte.
@@ -856,7 +882,14 @@ impl PeerCapabilities {
 
     /// Decode from a single byte.
     pub fn from_byte(byte: u8) -> Self {
+        if byte == Self::LEGACY_CENTRAL_ONLY {
+            return Self::central_only();
+        }
         Self(byte)
+    }
+
+    fn is_legacy_unrestricted(&self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -972,13 +1005,17 @@ async fn accept_loop<A>(
                             debug!(addr = %ta, "BLE inbound pubkey exchange complete");
                             discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
 
-                            // If the peer is CENTRAL_ONLY, they cannot accept
-                            // inbound connections. They initiated this outbound
-                            // to us, so we must keep it — never drop.
-                            if peer_capabilities.is_central_only() {
+                            if !peer_capabilities.can_accept_inbound() {
                                 debug!(
                                     addr = %ta,
-                                    "BLE inbound: peer is CENTRAL_ONLY, keeping connection"
+                                    "BLE inbound: peer cannot accept inbound, keeping connection"
+                                );
+                            } else if peer_capabilities.prefers_outbound()
+                                && !local_capabilities.prefers_outbound()
+                            {
+                                debug!(
+                                    addr = %ta,
+                                    "BLE inbound: peer prefers outbound, keeping connection"
                                 );
                                 // Skip tie-breaker — keep this inbound
                             } else if let Some(ref our_addr) = local_node_addr {
@@ -1258,12 +1295,19 @@ async fn scan_probe_loop<I: io::BleIo>(
                 let peer_capabilities = result.peer_capabilities;
                 debug!(addr = %addr, "BLE probe complete");
 
-                // If the peer is CENTRAL_ONLY, they cannot accept inbound
-                // connections. Their outbound must win — yield ours.
-                if peer_capabilities.is_central_only() {
+                if !peer_capabilities.can_accept_inbound() {
                     debug!(
                         addr = %addr,
-                        "BLE probe: peer is CENTRAL_ONLY, yielding to peer's outbound"
+                        "BLE probe: peer cannot accept inbound, yielding to peer's outbound"
+                    );
+                    buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                    continue;
+                }
+
+                if peer_capabilities.prefers_outbound() && !local_capabilities.prefers_outbound() {
+                    debug!(
+                        addr = %addr,
+                        "BLE probe: peer prefers outbound, yielding to peer's outbound"
                     );
                     buffer.add_peer_with_pubkey(&addr, peer_pubkey);
                     continue;
@@ -1383,6 +1427,53 @@ mod tests {
         let io = MockBleIo::new("hci0", test_addr(1));
         let (transport, _rx) = make_transport(io);
         assert_eq!(transport.state(), TransportState::Configured);
+    }
+
+    #[test]
+    fn test_peer_capabilities_defaults_and_queries() {
+        let linux = PeerCapabilities::linux_default();
+        assert_eq!(linux.to_byte(), 0x3c);
+        assert!(linux.supports_l2cap());
+        assert!(!linux.supports_gatt());
+        assert!(linux.can_accept_inbound());
+        assert!(linux.can_initiate_outbound());
+        assert!(linux.prefers_l2cap());
+        assert!(!linux.prefers_outbound());
+
+        let mac = PeerCapabilities::macos_default();
+        assert_eq!(mac.to_byte(), 0x2a);
+        assert!(mac.supports_l2cap());
+        assert!(!mac.supports_gatt());
+        assert!(!mac.can_accept_inbound());
+        assert!(mac.can_initiate_outbound());
+        assert!(mac.prefers_outbound());
+        assert!(mac.is_central_only());
+    }
+
+    #[test]
+    fn test_peer_capabilities_legacy_compatibility() {
+        let legacy_none = PeerCapabilities::none();
+        assert_eq!(legacy_none.to_byte(), 0x00);
+        assert!(legacy_none.supports_l2cap());
+        assert!(legacy_none.can_accept_inbound());
+        assert!(legacy_none.can_initiate_outbound());
+        assert!(!legacy_none.prefers_outbound());
+
+        let legacy_central_only = PeerCapabilities::from_byte(0x01);
+        assert_eq!(legacy_central_only.to_byte(), 0x2a);
+        assert!(legacy_central_only.supports_l2cap());
+        assert!(!legacy_central_only.can_accept_inbound());
+        assert!(legacy_central_only.can_initiate_outbound());
+        assert!(legacy_central_only.prefers_outbound());
+    }
+
+    #[test]
+    fn test_peer_outbound_preference() {
+        let linux = PeerCapabilities::linux_default();
+        let mac = PeerCapabilities::macos_default();
+
+        assert!(mac.prefers_outbound() && !linux.prefers_outbound());
+        assert!(!(linux.prefers_outbound() && !mac.prefers_outbound()));
     }
 
     #[test]
