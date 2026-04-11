@@ -26,6 +26,16 @@ env:
 # Builds on Linux x86_64, Linux aarch64, and macOS.
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -63,11 +73,11 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --release ${{ runner.os == 'macOS' && '--no-default-features --features tui,ble-macos' || '' }}
+        run: cargo build --release ${{ runner.os == 'macOS' && '--no-default-features --features tui' || '--features gateway' }}
 
       - name: SHA-256 hashes (Linux)
         if: runner.os == 'Linux'
-        run: sha256sum target/release/fips target/release/fipsctl target/release/fipstop
+        run: sha256sum target/release/fips target/release/fipsctl target/release/fipstop target/release/fips-gateway
 
       - name: SHA-256 hashes (macOS)
         if: runner.os == 'macOS'
@@ -83,6 +93,7 @@ jobs:
             target/release/fips
             target/release/fipsctl
             target/release/fipstop
+            target/release/fips-gateway
           retention-days: 1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +133,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run unit tests
-        run: cargo nextest run --all --profile ci
+        run: cargo nextest run --all --profile ci --features gateway
 
       - name: Publish test report (Checks tab)
         uses: dorny/test-reporter@v2
@@ -172,7 +183,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run unit tests
-        run: cargo nextest run --all --profile ci --no-default-features --features tui,ble-macos
+        run: cargo nextest run --all --profile ci --no-default-features --features tui
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 3 – Integration tests (static mesh + chaos simulation)
@@ -261,9 +272,11 @@ jobs:
         run: |
           chmod +x _bin/fips _bin/fipsctl
           [ -f _bin/fipstop ] && chmod +x _bin/fipstop || true
+          [ -f _bin/fips-gateway ] && chmod +x _bin/fips-gateway || true
           cp _bin/fips    testing/docker/fips
           cp _bin/fipsctl testing/docker/fipsctl
           [ -f _bin/fipstop ] && cp _bin/fipstop testing/docker/fipstop || true
+          [ -f _bin/fips-gateway ] && cp _bin/fips-gateway testing/docker/fips-gateway || true
           docker build -t fips-test:latest testing/docker
           docker build -t fips-test-app:latest -f testing/docker/Dockerfile.app testing/docker
 

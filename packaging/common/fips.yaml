@@ -46,6 +46,24 @@ transports:
   #   auto_connect: true
   #   accept_connections: true
 
+# Outbound LAN gateway. Allows non-FIPS hosts on the LAN to reach
+# mesh destinations via DNS-allocated virtual IPs and kernel NAT.
+# Requires: IPv6 forwarding enabled, fips daemon running with DNS.
+# gateway:
+#   enabled: true
+#   pool: "fd01::/112"
+#   lan_interface: "eth0"
+#   dns:
+#     listen: "[::]:53"
+#     upstream: "127.0.0.1:5354"
+#     ttl: 60
+#   pool_grace_period: 60
+#   conntrack:
+#     tcp_established: 432000
+#     udp_timeout: 30
+#     udp_assured: 180
+#     icmp_timeout: 30
+
 peers: []
   # Static peers for bootstrapping (UDP or TCP):
   # - npub: "npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98"

@@ -18,18 +18,24 @@ Usage: packaging/macos/build-pkg.sh [options]
 
 Options:
   --version <version> Override package version
+  --target <triple>   Rust target triple (e.g. x86_64-apple-darwin)
   --no-build          Package existing binaries without running cargo build
   -h, --help          Show this help
 EOF
 }
 
 VERSION_OVERRIDE=""
+TARGET_TRIPLE=""
 NO_BUILD=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)
             VERSION_OVERRIDE="${2:?missing value for --version}"
+            shift 2
+            ;;
+        --target)
+            TARGET_TRIPLE="${2:?missing value for --target}"
             shift 2
             ;;
         --no-build)
@@ -56,13 +62,19 @@ STAGING_DIR="$(mktemp -d)"
 SCRIPTS_DIR="$(mktemp -d)"
 trap 'rm -rf "${STAGING_DIR}" "${SCRIPTS_DIR}"' EXIT
 
-BINARY_DIR="${PROJECT_ROOT}/target/release"
+if [[ -n "${TARGET_TRIPLE}" ]]; then
+    BINARY_DIR="${PROJECT_ROOT}/target/${TARGET_TRIPLE}/release"
+else
+    BINARY_DIR="${PROJECT_ROOT}/target/release"
+fi
 
 echo "Building FIPS v${VERSION} for macOS ${ARCH}..."
 
 # Build release binaries
 if [[ "${NO_BUILD}" -eq 0 ]]; then
-    cargo build --release --manifest-path="${PROJECT_ROOT}/Cargo.toml" --no-default-features --features tui,ble-macos
+    cargo_args=(build --release --manifest-path="${PROJECT_ROOT}/Cargo.toml" --no-default-features --features tui)
+    [[ -n "${TARGET_TRIPLE}" ]] && cargo_args+=(--target "${TARGET_TRIPLE}")
+    cargo "${cargo_args[@]}"
 fi
 
 # Verify binaries exist
@@ -104,12 +116,18 @@ cat > "${SCRIPTS_DIR}/postinstall" <<'POSTINSTALL'
 #!/bin/sh
 set -e
 
+LOG="/var/log/fips-install.log"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; logger -t fips-install "$*"; }
+
+log "postinstall started"
+
 CONFDIR="/usr/local/etc/fips"
 
 # Install default config only if none exists (preserve on upgrade)
 if [ ! -f "$CONFDIR/fips.yaml" ]; then
     cp "$CONFDIR/fips.yaml.default" "$CONFDIR/fips.yaml"
     chmod 600 "$CONFDIR/fips.yaml"
+    log "installed default config"
 fi
 if [ ! -f "$CONFDIR/hosts" ]; then
     cp "$CONFDIR/hosts.default" "$CONFDIR/hosts"
@@ -118,11 +136,34 @@ fi
 # Flush DNS cache so macOS picks up the new /etc/resolver/fips file
 dscacheutil -flushcache
 killall -HUP mDNSResponder 2>/dev/null || true
+log "flushed DNS cache"
+
+# Create fips group if it doesn't exist
+if ! dscl . -read /Groups/fips > /dev/null 2>&1; then
+    dscl . -create /Groups/fips RecordName fips
+    dscl . -create /Groups/fips PrimaryGroupID 999
+    log "created group fips"
+fi
+
+# stat /dev/console gives the user logged into the GUI session —
+# logname/SUDO_USER are not set in pkg postinstall context
+REAL_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+log "console user: ${REAL_USER:-unknown}"
+if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+    if ! dscl . -read /Groups/fips GroupMembership 2>/dev/null | grep -qw "$REAL_USER"; then
+        dscl . -append /Groups/fips GroupMembership "$REAL_USER"
+        log "added $REAL_USER to group fips"
+    else
+        log "$REAL_USER already in group fips"
+    fi
+fi
 
 # Load the launchd service
 launchctl bootout system /Library/LaunchDaemons/com.fips.daemon.plist 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.fips.daemon.plist 2>/dev/null || true
+log "launchd service loaded"
 
+log "postinstall complete"
 exit 0
 POSTINSTALL
 chmod +x "${SCRIPTS_DIR}/postinstall"

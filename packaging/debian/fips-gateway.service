@@ -1,0 +1,23 @@
+# Gateway is not enabled by default. Enable with: systemctl enable --now fips-gateway
+[Unit]
+Description=FIPS Outbound LAN Gateway
+After=fips.service
+Requires=fips.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fips-gateway --config /etc/fips/fips.yaml
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=15
+
+# Security hardening (needs CAP_NET_ADMIN for nftables and proxy NDP)
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=no
+
+[Install]
+WantedBy=multi-user.target

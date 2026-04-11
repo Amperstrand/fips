@@ -34,26 +34,26 @@ transports:
   # Use physical port names, NOT bridge names (e.g. eth1, not br-lan).
   # Run 'ip link show' on the router to identify port names.
   # See: https://github.com/jmcorgan/fips/blob/master/deploy/native/README.md
-  #
-  # ethernet:
-  #   wan:
-  #     interface: "eth0" # WAN
-  #     discovery: true
-  #     announce: true
-  #     auto_connect: true
-  #     accept_connections: true
-  #   wwan:
-  #     interface: "phy0-sta0" # WWAN
-  #     discovery: true
-  #     announce: true
-  #     auto_connect: true
-  #     accept_connections: true
-  #   lan:
-  #     interface: "br-lan"       # LAN
-  #     discovery: true
-  #     announce: true
-  #     auto_connect: true
-  #     accept_connections: true
+  
+  ethernet:
+    wan:
+      interface: "eth0" # WAN
+      discovery: true
+      announce: true
+      auto_connect: true
+      accept_connections: true
+    wwan:
+      interface: "phy0-sta0" # WWAN
+      discovery: true
+      announce: true
+      auto_connect: true
+      accept_connections: true
+    lan:
+      interface: "br-lan"       # LAN
+      discovery: true
+      announce: true
+      auto_connect: true
+      accept_connections: true
 
 peers: []
   # Static peers for bootstrapping (add at least one if using UDP-only):
@@ -62,3 +62,22 @@ peers: []
   #   addresses:
   #     - transport: udp
   #       addr: "1.2.3.4:2121"  # IP or hostname
+
+# --- Outbound LAN gateway ---
+#
+# Allows unmodified LAN hosts to reach FIPS mesh destinations via
+# DNS-allocated virtual IPs and kernel nftables NAT.
+#
+# The gateway DNS listens on port 5353 by default so it does not conflict
+# with dnsmasq on port 53.  The init script configures dnsmasq to forward
+# .fips queries to the gateway automatically.
+
+gateway:
+  enabled: true
+  pool: "fd01::/112"            # virtual IP range (up to 65535 addresses)
+  lan_interface: "br-lan"       # LAN-facing interface for proxy NDP
+  dns:
+    listen: "[::1]:5353"        # gateway DNS listener (dnsmasq forwards here)
+    upstream: "127.0.0.1:5354"  # FIPS daemon DNS resolver
+    ttl: 60                     # DNS TTL and mapping lifetime (seconds)
+  pool_grace_period: 60         # seconds after last session before reclaiming

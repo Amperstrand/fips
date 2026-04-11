@@ -110,16 +110,17 @@ cargo zigbuild \
     --release \
     --target "$RUST_TARGET" \
     --no-default-features \
-    --features tui \
+    --features tui,gateway \
     --bin fips \
     --bin fipsctl \
-    --bin fipstop
+    --bin fipstop \
+    --bin fips-gateway
 
 RELEASE_DIR="$PROJECT_ROOT/target/$RUST_TARGET/release"
 
 echo "==> Stripping binaries..."
 STRIP="${LLVM_STRIP:-strip}"
-for bin in fips fipsctl fipstop; do
+for bin in fips fipsctl fipstop fips-gateway; do
     "$STRIP" "$RELEASE_DIR/$bin" 2>/dev/null || true
 done
 
@@ -147,9 +148,11 @@ install -d "$DATA_DIR/usr/bin"
 install -m 0755 "$RELEASE_DIR/fips"    "$DATA_DIR/usr/bin/fips"
 install -m 0755 "$RELEASE_DIR/fipsctl" "$DATA_DIR/usr/bin/fipsctl"
 install -m 0755 "$RELEASE_DIR/fipstop" "$DATA_DIR/usr/bin/fipstop"
+install -m 0755 "$RELEASE_DIR/fips-gateway" "$DATA_DIR/usr/bin/fips-gateway"
 
 install -d "$DATA_DIR/etc/init.d"
 install -m 0755 "$FILES_DIR/etc/init.d/fips" "$DATA_DIR/etc/init.d/fips"
+install -m 0755 "$FILES_DIR/etc/init.d/fips-gateway" "$DATA_DIR/etc/init.d/fips-gateway"
 
 install -d "$DATA_DIR/etc/fips"
 install -m 0600 "$FILES_DIR/etc/fips/fips.yaml"   "$DATA_DIR/etc/fips/fips.yaml"
@@ -160,6 +163,7 @@ install -m 0644 "$FILES_DIR/etc/dnsmasq.d/fips.conf" "$DATA_DIR/etc/dnsmasq.d/fi
 
 install -d "$DATA_DIR/etc/sysctl.d"
 install -m 0644 "$FILES_DIR/etc/sysctl.d/fips-bridge.conf" "$DATA_DIR/etc/sysctl.d/fips-bridge.conf"
+install -m 0644 "$FILES_DIR/etc/sysctl.d/fips-gateway.conf" "$DATA_DIR/etc/sysctl.d/fips-gateway.conf"
 
 install -d "$DATA_DIR/etc/hotplug.d/net"
 install -m 0755 "$FILES_DIR/etc/hotplug.d/net/99-fips" "$DATA_DIR/etc/hotplug.d/net/99-fips"
@@ -181,7 +185,7 @@ Architecture: $OPENWRT_ARCH
 Maintainer: FIPS Network
 Section: net
 Priority: optional
-Depends: kmod-tun, kmod-br-netfilter
+Depends: kmod-tun, kmod-br-netfilter, kmod-nft-nat, kmod-nf-conntrack, ip-full
 Description: FIPS Mesh Network Daemon
  Distributed, decentralized mesh networking over UDP, TCP, and raw Ethernet.
  Provides a TUN interface (fips0) with ULA IPv6 addressing and a DNS
@@ -203,14 +207,18 @@ fi
 
 /etc/init.d/fips enable
 /etc/init.d/fips start
+/etc/init.d/fips-gateway enable
+/etc/init.d/fips-gateway start
 exit 0
 EOF
 chmod 0755 "$CONTROL_DIR/postinst"
 
 cat > "$CONTROL_DIR/prerm" <<'EOF'
 #!/bin/sh
-/etc/init.d/fips stop    2>/dev/null || true
-/etc/init.d/fips disable 2>/dev/null || true
+/etc/init.d/fips-gateway stop    2>/dev/null || true
+/etc/init.d/fips-gateway disable 2>/dev/null || true
+/etc/init.d/fips stop            2>/dev/null || true
+/etc/init.d/fips disable         2>/dev/null || true
 exit 0
 EOF
 chmod 0755 "$CONTROL_DIR/prerm"

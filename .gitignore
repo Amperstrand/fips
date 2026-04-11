@@ -11,8 +11,11 @@
 .vscode/
 .idea/
 
-# Claude Code
+# AI Agents
 .claude/
+AGENTS.md
+CLAUDE.md
+agents/
 
 deploy/
 vps.env
@@ -29,3 +32,4 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
+

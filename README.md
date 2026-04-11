@@ -143,6 +143,19 @@ sudo launchctl load -w /Library/LaunchDaemons/com.fips.daemon.plist
 
 Remove with `sudo packaging/macos/uninstall.sh` (preserves config).
 
+To restart the node after making configuration changes:
+
+```bash
+sudo launchctl unload -w /Library/LaunchDaemons/com.fips.daemon.plist
+sudo launchctl load -w /Library/LaunchDaemons/com.fips.daemon.plist
+```
+
+Check logs for troubleshooting:
+
+```bash
+sudo tail -f /usr/local/var/log/fips/fips.log
+```
+
 > **Note:** On macOS, the TUN device is named `utun<N>` (kernel-assigned)
 > rather than `fips0`.
 
@@ -268,6 +281,16 @@ sudo journalctl -u fips -f
 
 See [testing/](testing/) for Docker-based integration test harnesses
 including static topology tests and stochastic chaos simulation.
+
+## Examples
+
+- [examples/wireguard-sidecar-macos/](examples/wireguard-sidecar-macos/) -
+  Run a local WireGuard sidecar on macOS so `.fips` traffic can reach the mesh
+  through Docker.
+
+The macOS WireGuard sidecar only forwards FIPS IPv6 traffic destined for
+`fd00::/8` from `wg0` to `fips0`. Regular internet traffic does not transit the
+sidecar and continues to use the host network normally.
 
 ## Documentation
 

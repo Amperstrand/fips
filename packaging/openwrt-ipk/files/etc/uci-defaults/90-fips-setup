@@ -64,9 +64,24 @@ uci commit firewall
 # regeneration (e.g. after a firmware upgrade that rebuilds dnsmasq.conf).
 
 uci -q del_list dhcp.@dnsmasq[0].server="/fips/127.0.0.1#5354" 2>/dev/null || true
-uci add_list dhcp.@dnsmasq[0].server="/fips/127.0.0.1#5354"
+uci -q del_list dhcp.@dnsmasq[0].server="/fips/::1#5354" 2>/dev/null || true
+uci add_list dhcp.@dnsmasq[0].server="/fips/::1#5354"
 uci -q del_list dhcp.@dnsmasq[0].rebind_domain="fips" 2>/dev/null || true
 uci add_list dhcp.@dnsmasq[0].rebind_domain="fips"
 uci commit dhcp
+
+# ---------------------------------------------------------------------------
+# 4. Gateway prerequisites
+# ---------------------------------------------------------------------------
+# Load conntrack module (needed for /proc/net/nf_conntrack session counting).
+modprobe nf_conntrack 2>/dev/null || true
+grep -qxF 'nf_conntrack' /etc/modules.d/nf-conntrack 2>/dev/null || \
+	echo "nf_conntrack" > /etc/modules.d/nf-conntrack
+
+# Apply gateway sysctls (proxy_ndp + IPv6 forwarding).
+# These are harmless even if the gateway is not enabled — forwarding is
+# typically already on for a router, and proxy_ndp has no effect until
+# proxy NDP entries are actually added.
+sysctl -p /etc/sysctl.d/fips-gateway.conf 2>/dev/null || true
 
 exit 0

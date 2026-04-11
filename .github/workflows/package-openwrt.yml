@@ -1,6 +1,13 @@
 name: OpenWrt Package
 on:
   push:
+    branches:
+      - master
+      - maint
+      - next
+    tags:
+      - "v*"
+  pull_request:
   workflow_dispatch:
     inputs:
       arch:

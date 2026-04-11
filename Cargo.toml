@@ -13,6 +13,7 @@ default = ["tui", "ble"]
 tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
 ble-macos = ["dep:bluest"]
+gateway = ["dep:rustables"]
 
 [dependencies]
 ratatui = { version = "0.30", optional = true }
@@ -41,6 +42,7 @@ tokio-socks = "0.5"
 uuid = "1"
 bluest = { git = "https://github.com/Amperstrand/bluest.git", branch = "main", features = ["l2cap", "unstable"], optional = true }
 futures-lite = "2"
+rustables = { version = "0.8.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.20.0"
@@ -70,6 +72,8 @@ assets = [
     ["packaging/debian/fips.service", "/lib/systemd/system/fips.service", "644"],
     ["packaging/debian/fips-dns.service", "/lib/systemd/system/fips-dns.service", "644"],
     ["packaging/debian/fips.tmpfiles", "/usr/lib/tmpfiles.d/fips.conf", "644"],
+    ["target/release/fips-gateway", "/usr/bin/", "755"],
+    ["packaging/debian/fips-gateway.service", "/lib/systemd/system/fips-gateway.service", "644"],
 ]
 conf-files = ["/etc/fips/fips.yaml", "/etc/fips/hosts"]
 
@@ -81,6 +85,11 @@ tokio = { version = "1", features = ["test-util"] }
 [[bin]]
 name = "fipsctl"
 path = "src/bin/fipsctl.rs"
+
+[[bin]]
+name = "fips-gateway"
+path = "src/bin/fips-gateway.rs"
+required-features = ["gateway"]
 
 [[bin]]
 name = "fipstop"

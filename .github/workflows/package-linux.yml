@@ -1,8 +1,13 @@
 name: Linux Package
 on:
   push:
+    branches:
+      - master
+      - maint
+      - next
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -85,7 +90,7 @@ jobs:
         run: cargo install cargo-deb --version 3.6.3 --locked
 
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --release --features gateway
 
       - name: Build systemd tarball
         env:

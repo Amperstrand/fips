@@ -49,7 +49,8 @@ define Package/fips
   CATEGORY:=Network
   TITLE:=FIPS Mesh Network Daemon
   URL:=https://github.com/jmcorgan/fips
-  DEPENDS:=+kmod-tun +kmod-br-netfilter
+  DEPENDS:=+kmod-tun +kmod-br-netfilter +kmod-nft-nat \
+	+kmod-nf-conntrack +ip-full
 endef
 
 define Package/fips/description
@@ -58,10 +59,11 @@ define Package/fips/description
   0x2121). Provides a TUN interface (fips0) with ULA IPv6 mesh addressing
   and a local DNS responder for .fips name resolution.
 
-  Three binaries are installed:
-    fips     — mesh daemon
-    fipsctl  — CLI control and inspection tool
-    fipstop  — live TUI dashboard (requires a terminal)
+  Four binaries are installed:
+    fips         — mesh daemon
+    fipsctl      — CLI control and inspection tool
+    fipstop      — live TUI dashboard (requires a terminal)
+    fips-gateway — outbound LAN gateway (not started by default)
 endef
 
 # ---------------------------------------------------------------------------
@@ -80,9 +82,11 @@ define Build/Compile
 	cargo build \
 		--release \
 		--target $(RUST_TARGET) \
+		--features gateway \
 		--bin fips \
 		--bin fipsctl \
-		--bin fipstop
+		--bin fipstop \
+		--bin fips-gateway
 endef
 
 define Package/fips/install
@@ -91,10 +95,12 @@ define Package/fips/install
 	$(INSTALL_BIN) $(RUST_RELEASE_DIR)/fips    $(1)/usr/bin/fips
 	$(INSTALL_BIN) $(RUST_RELEASE_DIR)/fipsctl $(1)/usr/bin/fipsctl
 	$(INSTALL_BIN) $(RUST_RELEASE_DIR)/fipstop $(1)/usr/bin/fipstop
+	$(INSTALL_BIN) $(RUST_RELEASE_DIR)/fips-gateway $(1)/usr/bin/fips-gateway
 
 	# procd init script
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/fips $(1)/etc/init.d/fips
+	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/fips-gateway $(1)/etc/init.d/fips-gateway
 
 	# Default config — installed as CONF so opkg will not overwrite it on upgrade
 	$(INSTALL_DIR) $(1)/etc/fips
@@ -110,6 +116,7 @@ define Package/fips/install
 	# sysctl: enable br_netfilter so AF_PACKET sees frames on bridge member ports
 	$(INSTALL_DIR) $(1)/etc/sysctl.d
 	$(INSTALL_DATA) $(CURDIR)/files/etc/sysctl.d/fips-bridge.conf $(1)/etc/sysctl.d/fips-bridge.conf
+	$(INSTALL_DATA) $(CURDIR)/files/etc/sysctl.d/fips-gateway.conf $(1)/etc/sysctl.d/fips-gateway.conf
 
 	# Hotplug: apply firewall rules when the FIPS TUN interface comes up
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/net

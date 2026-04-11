@@ -1,8 +1,13 @@
 name: macOS Package
 on:
   push:
+    branches:
+      - master
+      - maint
+      - next
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -50,8 +55,10 @@ jobs:
         include:
           - os: macos-latest
             arch: arm64
-          - os: macos-13
+            target: aarch64-apple-darwin
+          - os: macos-latest
             arch: x86_64
+            target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +70,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Add cross-compile target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache Cargo registry + build
         uses: actions/cache@v4
@@ -76,12 +86,13 @@ jobs:
             macos-release-${{ matrix.arch }}-
 
       - name: Build release binaries
-        run: cargo build --release --no-default-features --features tui,ble-macos
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features tui
 
       - name: Build macOS package
         run: |
           packaging/macos/build-pkg.sh \
             --version "${{ needs.determine-versioning.outputs.macos_package_version }}" \
+            --target ${{ matrix.target }} \
             --no-build
 
       - name: Resolve macOS asset path
