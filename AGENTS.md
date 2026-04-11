@@ -38,7 +38,10 @@ See `.sisyphus/notepad/ble-framing-architecture.md` for the full history.
 
 ## Branch: linux-ble-stability-v2
 
-Based on `jmcorgan/master` with BLE stability fixes and experimental features.
+Based on `jmcorgan/master` (merged at `0442117`) with BLE stability fixes and
+experimental features. Upstream features now included: LAN gateway, macOS
+packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
+1.94.1.
 
 ### Known Issues on This Branch
 
