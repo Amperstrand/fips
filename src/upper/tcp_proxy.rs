@@ -135,8 +135,8 @@ pub async fn run_leaf_tcp_proxy(
             inbound = inbound_rx.recv() => {
                 match inbound {
                     Some(data) => {
-                        if let Some(writer) = client_writer.as_mut() {
-                            if let Err(e) = writer.write_all(&data).await {
+                        if let Some(writer) = client_writer.as_mut()
+                            && let Err(e) = writer.write_all(&data).await {
                                 if let Some(addr) = client_addr.take() {
                                     info!(client = %addr, error = %e, leaf = %leaf_node_addr, "Leaf TCP proxy client disconnected during write");
                                 } else {
@@ -145,7 +145,6 @@ pub async fn run_leaf_tcp_proxy(
                                 client_reader.take();
                                 client_writer.take();
                             }
-                        }
                     }
                     None => {
                         debug!(leaf = %leaf_node_addr, "Leaf TCP proxy inbound channel closed");
@@ -267,8 +266,8 @@ pub async fn run_tcp_proxy(
             inbound = inbound_rx.recv() => {
                 match inbound {
                     Some(data) => {
-                        if let Some(writer) = client_writer.as_mut() {
-                            if let Err(e) = writer.write_all(&data).await {
+                        if let Some(writer) = client_writer.as_mut()
+                            && let Err(e) = writer.write_all(&data).await {
                                 if let Some(addr) = client_addr.take() {
                                     info!(client = %addr, error = %e, target = %target_npub, "TCP proxy client disconnected during write");
                                 } else {
@@ -277,7 +276,6 @@ pub async fn run_tcp_proxy(
                                 client_reader.take();
                                 client_writer.take();
                             }
-                        }
                     }
                     None => {
                         debug!(target = %target_npub, "TCP proxy inbound channel closed");

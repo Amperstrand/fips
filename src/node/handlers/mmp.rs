@@ -129,15 +129,12 @@ impl Node {
             "Processed ReceiverReport"
         );
 
-        if let Some(srtt_ms) = ble_srtt_ms {
-            if let Some(tid) = peer_transport_id {
-                if let Some(taddr) = peer_transport_addr {
-                    if let Some(transport) = self.transports.get(&tid) {
+        if let Some(srtt_ms) = ble_srtt_ms
+            && let Some(tid) = peer_transport_id
+                && let Some(taddr) = peer_transport_addr
+                    && let Some(transport) = self.transports.get(&tid) {
                         transport.update_rate_from_srtt(&taddr, srtt_ms).await;
                     }
-                }
-            }
-        }
 
         // First RTT sample — peer is now eligible for parent selection.
         // Trigger re-evaluation so the node doesn't wait for the next

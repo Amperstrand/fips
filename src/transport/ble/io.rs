@@ -462,8 +462,8 @@ mod bluer_impl {
                         Ok(mut events) => {
                             let scan_result = timeout(Duration::from_secs(5), async {
                                 while let Some(event) = events.next().await {
-                                    if let AdapterEvent::DeviceAdded(found_addr) = event {
-                                        if found_addr == bluer_addr {
+                                    if let AdapterEvent::DeviceAdded(found_addr) = event
+                                        && found_addr == bluer_addr {
                                             let addr_type = match self.adapter.device(found_addr) {
                                                 Ok(device) => {
                                                     device.address_type().await.unwrap_or(AddressType::LeRandom)
@@ -473,7 +473,6 @@ mod bluer_impl {
                                             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
                                             return Some(addr_type);
                                         }
-                                    }
                                 }
                                 None
                             })

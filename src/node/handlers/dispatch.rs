@@ -63,13 +63,11 @@ impl Node {
                         routed = true;
                     }
                 }
-                if !routed {
-                    if let Some(tx) = &self.tcp_proxy_inbound_tx {
-                        if let Err(e) = tx.try_send(payload.to_vec()) {
+                if !routed
+                    && let Some(tx) = &self.tcp_proxy_inbound_tx
+                        && let Err(e) = tx.try_send(payload.to_vec()) {
                             debug!(error = %e, "TCP proxy: inbound channel full or closed, dropping data");
                         }
-                    }
-                }
             }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");

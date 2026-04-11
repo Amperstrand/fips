@@ -697,14 +697,12 @@ mod platform {
         while let Some(addr_msg) = addr_iter.try_next().await? {
             if addr_msg.header.prefix_len == 128 {
                 for attr in &addr_msg.attributes {
-                    if let rtnetlink::packet_route::address::AddressAttribute::Address(ip) = attr {
-                        if let std::net::IpAddr::V6(found_addr) = ip {
-                            if *found_addr == addr {
+                    if let rtnetlink::packet_route::address::AddressAttribute::Address(ip) = attr
+                        && let std::net::IpAddr::V6(found_addr) = ip
+                            && *found_addr == addr {
                                 handle.address().del(addr_msg).execute().await?;
                                 return Ok(());
                             }
-                        }
-                    }
                 }
             }
         }

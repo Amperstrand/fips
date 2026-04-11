@@ -910,7 +910,7 @@ async fn pubkey_exchange<S: BleStream>(
         .map_err(|e| TransportError::RecvFailed(format!("pubkey exchange: invalid key: {}", e)))?;
 
     // If peer sent 34+ bytes, read capability flags; otherwise assume full capability
-    let peer_capabilities = if n >= PUBKEY_EXCHANGE_SIZE + 1 {
+    let peer_capabilities = if n > PUBKEY_EXCHANGE_SIZE {
         PeerCapabilities::from_byte(buf[33])
     } else {
         PeerCapabilities::none()

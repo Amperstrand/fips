@@ -68,9 +68,9 @@ impl Node {
         // Wire overhead: inner header (4) + AEAD tag (16) + outer header (16) = 36 bytes.
         // For v1 (1024-byte filter), the plaintext is 1035 bytes → 1071 bytes on wire.
         // BLE L2CAP MTU is typically 512 bytes, so this will never fit.
-        if let Some(peer) = self.peers.get(peer_addr) {
-            if let Some(transport_id) = peer.transport_id() {
-                if let Some(transport) = self.transports.get(&transport_id) {
+        if let Some(peer) = self.peers.get(peer_addr)
+            && let Some(transport_id) = peer.transport_id()
+                && let Some(transport) = self.transports.get(&transport_id) {
                     let addr = peer.current_addr();
                     let link_mtu = if let Some(addr) = addr {
                         transport.link_mtu(addr)
@@ -92,8 +92,6 @@ impl Node {
                         return Ok(());
                     }
                 }
-            }
-        }
 
         // Build and encode
         let announce = self.build_filter_announce(peer_addr);

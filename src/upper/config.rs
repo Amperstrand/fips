@@ -80,6 +80,7 @@ impl DnsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct TcpProxyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -91,15 +92,6 @@ pub struct TcpProxyConfig {
     pub target_npub: Option<String>,
 }
 
-impl Default for TcpProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            listen_addr: None,
-            target_npub: None,
-        }
-    }
-}
 
 impl TcpProxyConfig {
     pub fn listen_addr(&self) -> &str {
