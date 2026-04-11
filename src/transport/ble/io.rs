@@ -220,17 +220,23 @@ mod bluer_impl {
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-            // Rate limit before writing
-            let framed_len = 2 + data.len();
             if let Some(ref limiter) = self.rate_limiter {
-                limiter.lock().await.acquire(framed_len).await;
+                limiter.lock().await.acquire(data.len() + 2).await;
             }
 
-            // Length-prefix framing: [len:2 BE][payload]
-            // Required for interop with macOS (CoreBluetooth byte-stream L2CAP).
+            let framed_len = data.len() + 2;
+            if framed_len > self.send_mtu as usize {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: framed_len,
+                    mtu: self.send_mtu,
+                });
+            }
+
             let mut framed = Vec::with_capacity(framed_len);
-            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            framed.push((data.len() >> 8) as u8);
+            framed.push(data.len() as u8);
             framed.extend_from_slice(data);
+
             self.conn
                 .send(&framed)
                 .await
@@ -239,10 +245,19 @@ mod bluer_impl {
         }
 
         async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-            // Skip rate limiter entirely for urgent/control plane traffic
-            let mut framed = Vec::with_capacity(2 + data.len());
-            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            let framed_len = data.len() + 2;
+            if framed_len > self.send_mtu as usize {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: framed_len,
+                    mtu: self.send_mtu,
+                });
+            }
+
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.push((data.len() >> 8) as u8);
+            framed.push(data.len() as u8);
             framed.extend_from_slice(data);
+
             self.conn
                 .send(&framed)
                 .await
@@ -251,23 +266,33 @@ mod bluer_impl {
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            // SeqPacket preserves message boundaries, so each recv is one
-            // framed message: [len:2 BE][payload]. Strip the 2-byte prefix.
-            let mut raw = vec![0u8; buf.len() + 2];
             let n = self.conn
-                .recv(&mut raw)
+                .recv(buf)
                 .await
                 .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+
             if n < 2 {
                 return Err(TransportError::RecvFailed(
-                    format!("BLE frame too short: {n} bytes"),
+                    "frame too short for length prefix".into(),
                 ));
             }
-            let payload_len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-            let available = n - 2;
-            let copy_len = payload_len.min(available).min(buf.len());
-            buf[..copy_len].copy_from_slice(&raw[2..2 + copy_len]);
-            Ok(copy_len)
+
+            let payload_len = ((buf[0] as usize) << 8) | (buf[1] as usize);
+            if 2 + payload_len != n {
+                return Err(TransportError::RecvFailed(format!(
+                    "length prefix mismatch: header says {} but received {}",
+                    payload_len, n - 2,
+                )));
+            }
+
+            if payload_len > buf.len() - 2 {
+                return Err(TransportError::RecvFailed(format!(
+                    "payload {} exceeds buffer {}", payload_len, buf.len() - 2,
+                )));
+            }
+
+            buf.copy_within(2..n, 0);
+            Ok(payload_len)
         }
 
         fn send_mtu(&self) -> u16 {
@@ -704,12 +729,8 @@ impl MockBleStream {
 
 impl BleStream for MockBleStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        // Length-prefix framing to match real BLE streams.
-        let mut framed = Vec::with_capacity(2 + data.len());
-        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        framed.extend_from_slice(data);
         self.tx
-            .send(framed)
+            .send(data.to_vec())
             .await
             .map_err(|_| TransportError::SendFailed("channel closed".into()))
     }
@@ -722,17 +743,11 @@ impl BleStream for MockBleStream {
         let mut rx = self.rx.lock().await;
         match rx.recv().await {
             Some(data) => {
-                // Strip 2-byte length prefix (channel preserves boundaries).
-                if data.len() < 2 {
-                    return Err(TransportError::RecvFailed("frame too short".into()));
-                }
-                let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-                let payload = &data[2..];
-                let len = payload_len.min(payload.len()).min(buf.len());
-                buf[..len].copy_from_slice(&payload[..len]);
+                let len = data.len().min(buf.len());
+                buf[..len].copy_from_slice(&data[..len]);
                 Ok(len)
             }
-            None => Ok(0), // channel closed = connection closed = zero-length read
+            None => Ok(0),
         }
     }
 
