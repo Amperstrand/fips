@@ -9,6 +9,7 @@ use crate::transport::{
 };
 use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState, add_tun_address};
 use crate::node::wire::build_msg1;
+use crate::node::local_endpoint::LocalEndpoint;
 use crate::{NodeAddr, PeerIdentity};
 use tokio::net::TcpListener;
 use std::thread;
@@ -738,6 +739,12 @@ impl Node {
                                 debug!(addr = %fips_addr, tun = %tun_name, "Added leaf proxy address to TUN");
                             }
                         }
+
+                        let leaf_startup_epoch = rand::random::<u64>();
+                        self.local_endpoints.push(LocalEndpoint::leaf(
+                            leaf_id.keypair,
+                            leaf_startup_epoch,
+                        ));
 
                         for service in &leaf_cfg.services {
                             if service.protocol != "tcp" {
