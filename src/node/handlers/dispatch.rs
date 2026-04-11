@@ -55,13 +55,19 @@ impl Node {
                 trace!(peer = %self.peer_display_name(from), "Received heartbeat");
             }
             0x60 => {
+                let mut routed = false;
                 if let Some(tx) = self.leaf_tcp_proxy_inbound_tx.get(from) {
                     if let Err(e) = tx.try_send(payload.to_vec()) {
                         debug!(leaf = %self.peer_display_name(from), error = %e, "Leaf TCP proxy: inbound channel full or closed, dropping data");
+                    } else {
+                        routed = true;
                     }
-                } else if let Some(tx) = &self.tcp_proxy_inbound_tx {
-                    if let Err(e) = tx.try_send(payload.to_vec()) {
-                        debug!(error = %e, "TCP proxy: inbound channel full or closed, dropping data");
+                }
+                if !routed {
+                    if let Some(tx) = &self.tcp_proxy_inbound_tx {
+                        if let Err(e) = tx.try_send(payload.to_vec()) {
+                            debug!(error = %e, "TCP proxy: inbound channel full or closed, dropping data");
+                        }
                     }
                 }
             }

@@ -177,13 +177,20 @@ mod bluer_impl {
     // BluerStream
     // ----------------------------------------------------------------
 
-    /// BLE stream wrapping a bluer L2CAP SeqPacket connection.
+    /// BLE stream wrapping a bluer L2CAP SeqPacket connection with length-prefix framing.
+    ///
+    /// The ESP32 firmware adds a 2-byte big-endian length prefix to every L2CAP
+    /// frame. The macOS `BluestStream` does the same for CoreBluetooth
+    /// compatibility. This stream matches that framing so the daemon and ESP32
+    /// can communicate.
     pub struct BluerStream {
         conn: SeqPacket,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
         rate_limiter: Option<tokio::sync::Mutex<crate::transport::ble::rate_limit::SendRateLimiter>>,
+        /// Internal buffer for stripping the 2-byte BE length prefix on recv.
+        recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
 
     impl BluerStream {
@@ -214,50 +221,81 @@ mod bluer_impl {
                 } else {
                     None
                 },
+                recv_buf: tokio::sync::Mutex::new(vec![0u8; recv_mtu as usize]),
             })
         }
     }
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+            let framed_len = 2 + data.len();
             if let Some(ref limiter) = self.rate_limiter {
-                limiter.lock().await.acquire(data.len()).await;
+                limiter.lock().await.acquire(framed_len).await;
             }
 
-            if data.len() > self.send_mtu as usize {
+            if framed_len > self.send_mtu as usize {
                 return Err(TransportError::MtuExceeded {
-                    packet_size: data.len(),
+                    packet_size: framed_len,
                     mtu: self.send_mtu,
                 });
             }
 
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            framed.extend_from_slice(data);
             self.conn
-                .send(data)
+                .send(&framed)
                 .await
                 .map(|_| ())
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-            if data.len() > self.send_mtu as usize {
+            let framed_len = 2 + data.len();
+            if framed_len > self.send_mtu as usize {
                 return Err(TransportError::MtuExceeded {
-                    packet_size: data.len(),
+                    packet_size: framed_len,
                     mtu: self.send_mtu,
                 });
             }
 
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            framed.extend_from_slice(data);
             self.conn
-                .send(data)
+                .send(&framed)
                 .await
                 .map(|_| ())
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            self.conn
-                .recv(buf)
+            let mut internal = self.recv_buf.lock().await;
+            let n = self
+                .conn
+                .recv(&mut internal[..])
                 .await
-                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))
+                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+
+            if n < 2 {
+                return Err(TransportError::RecvFailed(format!(
+                    "BLE recv: framed message too short ({} bytes)",
+                    n
+                )));
+            }
+
+            let payload_len = u16::from_be_bytes([internal[0], internal[1]]) as usize;
+            if n < 2 + payload_len {
+                return Err(TransportError::RecvFailed(format!(
+                    "BLE recv: frame header says {} bytes but only {} available",
+                    payload_len,
+                    n - 2
+                )));
+            }
+
+            let copy_len = payload_len.min(buf.len());
+            buf[..copy_len].copy_from_slice(&internal[2..2 + copy_len]);
+            Ok(copy_len)
         }
 
         fn send_mtu(&self) -> u16 {
