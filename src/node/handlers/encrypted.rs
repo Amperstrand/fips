@@ -21,25 +21,40 @@ impl Node {
     /// session to previous for a drain window. During drain, we try the
     /// current session first, then fall back to the previous session.
     pub(in crate::node) async fn handle_encrypted_frame(&mut self, packet: ReceivedPacket) {
-        // Parse header (fail fast)
+        if packet.data.len() >= 8 {
+            let ver = packet.data[0] >> 4;
+            let phase = packet.data[0] & 0x0F;
+            let recv_idx = u32::from_le_bytes([packet.data[4], packet.data[5], packet.data[6], packet.data[7]]);
+            warn!(
+                ver, phase, recv_idx,
+                transport_id = %packet.transport_id,
+                data_len = packet.data.len(),
+                "[fips-ble-dbg] encrypted frame arrived"
+            );
+        }
+
         let header = match EncryptedHeader::parse(&packet.data) {
             Some(h) => h,
-            None => return, // Malformed, drop silently
-        };
-
-        // O(1) session lookup by our receiver index
-        let key = (packet.transport_id, header.receiver_idx.as_u32());
-        let node_addr = match self.peers_by_index.get(&key) {
-            Some(id) => *id,
             None => {
-                trace!(
-                    receiver_idx = %header.receiver_idx,
-                    transport_id = %packet.transport_id,
-                    "Unknown session index, dropping"
+                warn!(
+                    data_len = packet.data.len(),
+                    first_bytes = ?&packet.data[..packet.data.len().min(8)],
+                    "[fips-ble-dbg] header parse FAILED"
                 );
                 return;
             }
         };
+
+        let key = (packet.transport_id, header.receiver_idx.as_u32());
+        if !self.peers_by_index.contains_key(&key) {
+            warn!(
+                receiver_idx = header.receiver_idx.as_u32(),
+                transport_id = %packet.transport_id,
+                "[fips-ble-dbg] Unknown session index, dropping"
+            );
+            return;
+        }
+        let node_addr = *self.peers_by_index.get(&key).unwrap();
 
         if !self.peers.contains_key(&node_addr) {
             self.peers_by_index.remove(&key);
@@ -81,15 +96,13 @@ impl Node {
 
         // Decrypt: try current session first, then previous (drain fallback)
         let ciphertext = &packet.data[header.ciphertext_offset()..];
+        let peer_display = self.peer_display_name(&node_addr);
         let plaintext = {
             let peer = self.peers.get_mut(&node_addr).unwrap();
             let session = match peer.noise_session_mut() {
                 Some(s) => s,
                 None => {
-                    warn!(
-                        peer = %self.peer_display_name(&node_addr),
-                        "Peer in index map has no session"
-                    );
+                    warn!(peer = %peer_display, "Peer in index map has no session");
                     return;
                 }
             };
@@ -100,11 +113,22 @@ impl Node {
                 &header.header_bytes,
             ) {
                 Ok(p) => {
+                    warn!(
+                        peer = %peer_display,
+                        counter = header.counter,
+                        pt_len = p.len(),
+                        "[fips-ble-dbg] decryption SUCCESS"
+                    );
                     peer.reset_decrypt_failures();
                     p
                 }
                 Err(e) => {
-                    // Current session failed — try previous session (drain window)
+                    warn!(
+                        peer = %peer_display,
+                        counter = header.counter,
+                        error = %e,
+                        "[fips-ble-dbg] decryption FAILED"
+                    );
                     if let Some(prev_session) = peer.previous_session_mut() {
                         match prev_session.decrypt_with_replay_check_and_aad(
                             ciphertext,
