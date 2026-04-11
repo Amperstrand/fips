@@ -2,39 +2,40 @@
 
 Notes for LLM agents working on this codebase. Not user documentation.
 
-## BLE Framing Architecture — RESOLVED
+## BLE Framing Architecture
 
-The framing issues that caused bugs across multiple sessions have been fixed.
+All platforms on this branch use 2-byte BE length-prefix framing.
 See `.sisyphus/notepad/ble-framing-architecture.md` for the full history.
 
 ### Current State
 
 | Platform | Framing | Wire-compatible with upstream? |
 |----------|---------|-------------------------------|
-| Linux (`io.rs`) | **None** — raw SeqPacket pass-through | ✅ Yes |
-| macOS (`io_macos.rs`) | 2-byte BE length prefix (byte streams need it) | ❌ No |
-| Mock (`io.rs`) | **None** — raw channel pass-through | ✅ Yes |
+| Linux (`io.rs`) | 2-byte BE length prefix | ❌ No |
+| macOS (`io_macos.rs`) | 2-byte BE length prefix | ❌ No |
+| Mock (`io.rs`) | 2-byte BE length prefix | ❌ No |
 
-### What Was Fixed
+### Why All Platforms Use 2-byte Prefix
 
-- Removed FMP-level coalescing from `receive_loop` (was `e81d688` + `daa76f1`)
-- Removed 2-byte BE length prefix from Linux `BluerStream` (was unnecessary for SeqPacket)
-- Removed 2-byte prefix from `MockBleStream` (tests should match production Linux behavior)
-- macOS `Bluestream` keeps its 2-byte prefix (CoreBluetooth byte streams require framing)
+- **macOS**: CoreBluetooth byte streams may coalesce/fragment SDUs. Framing is required.
+- **Linux**: SeqPacket preserves boundaries, so framing is technically unnecessary.
+  However, the ESP32 firmware **expects** 2-byte prefix framing. Since we need
+  Linux↔ESP32 interop, Linux must also use the prefix.
+- **Mock**: Tests must match production wire format (all platforms use prefix).
 
 ### Rules
 
 1. **NEVER put transport framing logic in `receive_loop` (mod.rs).** It should
    receive one complete FMP frame per `stream.recv()` call and deliver it.
 
-2. **Frame reassembly (if needed) belongs in the BleStream implementation**
+2. **Frame reassembly belongs in the BleStream implementation**
    (`io.rs` for Linux, `io_macos.rs` for macOS).
 
-3. **Linux SeqPacket preserves message boundaries.** No framing needed. Do not add
-   length-prefix framing to `BluerStream`.
+3. **All platforms use 2-byte prefix.** Do NOT remove it from Linux or Mock.
+   The ESP32 firmware depends on it.
 
-4. **macOS byte streams need framing.** The 2-byte prefix in `io_macos.rs` is correct
-   and necessary.
+4. **Upstream (`jmcorgan/master`) does NOT use framing.** This branch is
+   wire-incompatible with upstream. Acceptable — upstream BLE was not in production.
 
 ## Branch: linux-ble-stability-v2
 
@@ -47,13 +48,12 @@ packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
 
 - `BleConnection.is_static`: Always set to `false` — unimplemented
 - Leaf proxy commits (15+): Experimental feature, separate from BLE fixes
-- macOS framing: Wire-incompatible with upstream (macOS uses channels upstream,
-  we use 2-byte prefix). Acceptable since BLE transport was not in production.
+- Wire-incompatible with upstream (we use 2-byte prefix, upstream doesn't)
 
 ### PR Planning
 
 See GitHub issue #39 for the recommended PR split. Key point: BLE fixes should
-be separate from leaf proxy feature. Framing cleanup is done.
+be separate from leaf proxy feature.
 
 ## ESP32-S3 Known Limitations
 

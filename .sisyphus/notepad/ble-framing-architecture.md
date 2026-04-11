@@ -150,12 +150,11 @@ incompatible with upstream.
 
 | File | What it does | Correct? |
 |------|-------------|----------|
-| `io.rs` BluerStream::send() | Prepends 2-byte BE length prefix | Unnecessary for SeqPacket, but harmless |
-| `io.rs` BluerStream::recv() | Strips 2-byte prefix, no buffering | Works IF SeqPacket preserves boundaries (it does) |
+| `io.rs` BluerStream::send() | Prepends 2-byte BE length prefix | Required for ESP32 interop |
+| `io.rs` BluerStream::recv() | Has recv_buf, strips 2-byte prefix | Correct — handles potential coalescing |
 | `io_macos.rs` Bluestream::send() | Prepends 2-byte BE length prefix | Correct for byte streams |
 | `io_macos.rs` Bluestream::recv() | Buffers and reassembles on 2-byte prefix | Correct for byte streams |
-| `mod.rs` receive_loop | Has FMP-level coalescing via calculate_frame_len() | **WRONG LAYER** |
-| `mod.rs` module doc | Claims "ESP32 may coalesce" | **UNVERIFIED** — no evidence this actually happens |
+| `mod.rs` receive_loop | Simple pass-through (one recv = one frame) | ✅ Correct — FMP-level coalescing removed |
 
 ---
 
@@ -213,20 +212,33 @@ keep the send/recv framing but move ALL framing logic to the stream layer.
 
 ## Resolution (2026-04-11)
 
-The framing cleanup has been applied:
+### What was done
 
-1. **Removed `calculate_frame_len()` and FMP-level coalescing** from `receive_loop`
-   (mod.rs). Reverted commits `e81d688` and `daa76f1`.
-2. **Removed 2-byte BE length prefix** from Linux `BluerStream` send/recv (io.rs).
-   SeqPacket preserves boundaries — no framing needed.
-3. **Removed 2-byte prefix from `MockBleStream`** (io.rs). Tests now match
-   production Linux behavior (no framing).
-4. **Kept 2-byte prefix on macOS `Bluestream`** (io_macos.rs). Byte streams need
-   framing — this is correct.
+1. **Removed FMP-level coalescing** from `receive_loop` (mod.rs). Commits `e81d688`
+   and `daa76f1` put frame-splitting logic in the wrong layer. This was removed and
+   receive_loop now does simple pass-through (one recv = one delivered frame).
+2. **Restored 2-byte BE length prefix on all platforms** (commit `349ad15`).
+   Linux was briefly switched to no-prefix, but the ESP32 firmware requires it.
+3. **Added recv_buf to Linux BluerStream** for safety — handles potential coalescing
+   from BLE controllers.
 
-**Result**: Linux and Mock are wire-compatible with upstream. macOS is not
-(wire-incompatible due to 2-byte prefix), but this is acceptable since BLE
-transport was not in production and macOS CoreBluetooth byte streams require
-some form of framing.
+### Why the 2-byte prefix was kept on Linux
 
-**Tests**: 973 pass, 0 failures.
+The original plan was to remove it (SeqPacket preserves boundaries, so it's
+unnecessary). But the ESP32 firmware **always** expects and sends 2-byte prefix
+framing on all L2CAP data (pubkey exchange, handshake, FMP frames). Without
+framing on the Linux side, ESP32 can never parse incoming data.
+
+Since Linux↔ESP32 interop is a primary use case, all platforms now use the prefix.
+This makes the branch wire-incompatible with upstream, but that's acceptable:
+- Upstream BLE was not in production
+- The ESP32 firmware can't be changed to remove the prefix easily
+- macOS needs it anyway (byte streams)
+
+### Decision: Modified Option B
+
+Original Option B was "keep prefix but fix layering." That's what we did:
+- ✅ 2-byte prefix on all platforms (Linux, macOS, Mock)
+- ✅ FMP-level coalescing removed from receive_loop
+- ✅ recv_buf added to Linux BluerStream for safety
+- ❌ Wire-incompatible with upstream (accepted tradeoff)

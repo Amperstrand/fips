@@ -1,14 +1,13 @@
 # BLE L2CAP Framing: Byte-Stream Coalescing and the Length-Prefix Solution
 
-> **IMPORTANT**: This document describes the 2-byte BE length-prefix framing
-> approach implemented on the `linux-ble-stability-v2` branch (commit `42d9adb`).
-> **Upstream (`jmcorgan/master`) does NOT use any framing.** Linux uses raw
-> SeqPacket reads, macOS uses channel-based delivery — both preserve message
-> boundaries without a length prefix. The 2-byte prefix is a **wire protocol
-> change** that makes this branch incompatible with upstream peers.
+> **NOTE**: The 2-byte BE length-prefix framing described below is used on ALL
+> platforms in this branch (`linux-ble-stability-v2`). Upstream
+> (`jmcorgan/master`) does NOT use any framing — this is a wire protocol change.
+> The prefix is kept because: (1) macOS CoreBluetooth byte streams require it,
+> and (2) the ESP32 firmware expects it. Linux SeqPacket doesn't need it, but
+> uses it for cross-platform consistency.
 >
-> See `.sisyphus/notepad/ble-framing-architecture.md` for the full architectural
-> analysis and the recommended long-term solution.
+> See `.sisyphus/notepad/ble-framing-architecture.md` for the full history.
 
 ## The Problem
 
