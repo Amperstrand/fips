@@ -4,9 +4,11 @@
 //! including debounced propagation to peers.
 
 use crate::bloom::BloomFilter;
+use crate::noise::TAG_SIZE;
 use crate::protocol::FilterAnnounce;
 use crate::NodeAddr;
 
+use super::wire::{ESTABLISHED_HEADER_SIZE, INNER_HEADER_SIZE};
 use super::{Node, NodeError};
 use std::collections::HashMap;
 use tracing::debug;
@@ -60,6 +62,40 @@ impl Node {
             self.stats_mut().bloom.debounce_suppressed += 1;
             // Either not pending or rate-limited; will retry on tick
             return Ok(());
+        }
+
+        // Check if the peer's transport can fit a FilterAnnounce.
+        // Wire overhead: inner header (4) + AEAD tag (16) + outer header (16) = 36 bytes.
+        // For v1 (1024-byte filter), the plaintext is 1035 bytes → 1071 bytes on wire.
+        // BLE L2CAP MTU is typically 512 bytes, so this will never fit.
+        if let Some(peer) = self.peers.get(peer_addr) {
+            if let Some(transport_id) = peer.transport_id() {
+                if let Some(transport) = self.transports.get(&transport_id) {
+                    let addr = peer.current_addr();
+                    let link_mtu = if let Some(addr) = addr {
+                        transport.link_mtu(addr)
+                    } else {
+                        transport.mtu()
+                    } as usize;
+
+                    // Estimate wire size: plaintext + inner_header + tag + outer_header
+                    let estimated_wire = 1035 + INNER_HEADER_SIZE + TAG_SIZE + ESTABLISHED_HEADER_SIZE;
+                    if link_mtu > 0 && estimated_wire > link_mtu {
+                        debug!(
+                            peer = %self.peer_display_name(peer_addr),
+                            estimated_wire,
+                            link_mtu,
+                            "Skipping FilterAnnounce: transport MTU too small"
+                        );
+                        self.stats_mut().bloom.mtu_skipped += 1;
+                        // Clear the pending flag so we don't retry every tick
+                        if let Some(peer) = self.peers.get_mut(peer_addr) {
+                            peer.clear_filter_update_needed();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         // Build and encode

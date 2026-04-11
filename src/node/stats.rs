@@ -216,6 +216,7 @@ pub struct BloomStats {
     pub sent: u64,
     pub debounce_suppressed: u64,
     pub send_failed: u64,
+    pub mtu_skipped: u64,
 }
 
 impl BloomStats {
@@ -231,6 +232,7 @@ impl BloomStats {
             sent: self.sent,
             debounce_suppressed: self.debounce_suppressed,
             send_failed: self.send_failed,
+            mtu_skipped: self.mtu_skipped,
         }
     }
 }
@@ -401,6 +403,7 @@ pub struct BloomStatsSnapshot {
     pub sent: u64,
     pub debounce_suppressed: u64,
     pub send_failed: u64,
+    pub mtu_skipped: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
