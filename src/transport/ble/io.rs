@@ -221,43 +221,79 @@ mod bluer_impl {
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
             if let Some(ref limiter) = self.rate_limiter {
-                limiter.lock().await.acquire(data.len()).await;
+                limiter.lock().await.acquire(data.len() + 2).await;
             }
 
-            if data.len() > self.send_mtu as usize {
+            let framed_len = data.len() + 2;
+            if framed_len > self.send_mtu as usize {
                 return Err(TransportError::MtuExceeded {
-                    packet_size: data.len(),
+                    packet_size: framed_len,
                     mtu: self.send_mtu,
                 });
             }
 
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.push((data.len() >> 8) as u8);
+            framed.push(data.len() as u8);
+            framed.extend_from_slice(data);
+
             self.conn
-                .send(data)
+                .send(&framed)
                 .await
                 .map(|_| ())
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-            if data.len() > self.send_mtu as usize {
+            let framed_len = data.len() + 2;
+            if framed_len > self.send_mtu as usize {
                 return Err(TransportError::MtuExceeded {
-                    packet_size: data.len(),
+                    packet_size: framed_len,
                     mtu: self.send_mtu,
                 });
             }
 
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.push((data.len() >> 8) as u8);
+            framed.push(data.len() as u8);
+            framed.extend_from_slice(data);
+
             self.conn
-                .send(data)
+                .send(&framed)
                 .await
                 .map(|_| ())
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            self.conn
-                .recv(buf)
+            let mut frame_buf = vec![0u8; self.recv_mtu as usize];
+            let n = self.conn
+                .recv(&mut frame_buf)
                 .await
-                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))
+                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+
+            if n < 2 {
+                return Err(TransportError::RecvFailed(
+                    "frame too short for length prefix".into(),
+                ));
+            }
+
+            let payload_len = ((frame_buf[0] as usize) << 8) | (frame_buf[1] as usize);
+            if 2 + payload_len != n {
+                return Err(TransportError::RecvFailed(format!(
+                    "length prefix mismatch: header says {} but received {}",
+                    payload_len, n - 2,
+                )));
+            }
+
+            if payload_len > buf.len() {
+                return Err(TransportError::RecvFailed(format!(
+                    "payload {} exceeds buffer {}", payload_len, buf.len(),
+                )));
+            }
+
+            buf[..payload_len].copy_from_slice(&frame_buf[2..2 + payload_len]);
+            Ok(payload_len)
         }
 
         fn send_mtu(&self) -> u16 {
