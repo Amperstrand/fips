@@ -79,8 +79,13 @@ impl DnsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+/// Legacy single-target TCP proxy configuration.
+///
+/// This compatibility mode exposes one localhost listener (default:
+/// `127.0.0.1:6053`) and forwards all traffic to a single peer selected by
+/// `target_npub`. It should not be combined with `leaf_proxies`, which provide
+/// identity-aware per-leaf listeners on derived FIPS addresses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TcpProxyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -91,7 +96,6 @@ pub struct TcpProxyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_npub: Option<String>,
 }
-
 
 impl TcpProxyConfig {
     pub fn listen_addr(&self) -> &str {

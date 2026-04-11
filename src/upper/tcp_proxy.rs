@@ -194,9 +194,10 @@ pub fn start_leaf_tcp_proxy(
 
 /// Run the legacy (single-target) TCP proxy.
 ///
-/// This is the original proxy that binds on a single address (e.g.,
-/// 127.0.0.1:6053) and bridges to a single BLE peer. Kept for backward
-/// compatibility when `tcp_proxy.target_npub` is configured directly.
+/// This compatibility path binds one local listener (for example,
+/// `127.0.0.1:6053`) and bridges to a single peer selected by
+/// `tcp_proxy.target_npub`. It is intentionally separate from the
+/// identity-aware `leaf_proxies` path.
 pub async fn run_tcp_proxy(
     listener: TcpListener,
     target_npub: String,

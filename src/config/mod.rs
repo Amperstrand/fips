@@ -496,6 +496,13 @@ impl Config {
     ///
     /// Checks for duplicate identity seeds and NodeAddr collisions with primary identity.
     pub fn validate_leaf_proxies(&self) -> Result<(), ConfigError> {
+        if self.tcp_proxy.enabled && !self.leaf_proxies.is_empty() {
+            return Err(ConfigError::Validation {
+                field: "tcp_proxy".to_string(),
+                message: "tcp_proxy is a legacy compatibility mode and cannot be combined with leaf_proxies; use leaf_proxies for identity-aware access".to_string(),
+            });
+        }
+
         use std::collections::HashSet;
 
         let mut seen_seeds = HashSet::new();
@@ -1218,5 +1225,23 @@ leaf_proxies:
             .unwrap_err()
             .to_string()
             .contains("duplicate identity_seed"));
+    }
+
+    #[test]
+    fn test_validate_leaf_proxies_rejects_legacy_tcp_proxy_combo() {
+        let mut config = Config::new();
+        config.tcp_proxy.enabled = true;
+        config.tcp_proxy.target_npub = Some("npub1test".to_string());
+        config.leaf_proxies = vec![LeafProxyConfig {
+            identity_seed: "leaf-device".to_string(),
+            services: vec![LeafServiceConfig::default()],
+        }];
+
+        let result = config.validate_leaf_proxies();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be combined with leaf_proxies"));
     }
 }
