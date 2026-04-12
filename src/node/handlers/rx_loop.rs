@@ -1,10 +1,10 @@
 //! RX event loop and packet dispatch.
 
-use crate::control::{commands, ControlSocket};
 use crate::control::queries;
+use crate::control::{commands, ControlSocket};
+use crate::node::wire::{CommonPrefix, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, FMP_VERSION, COMMON_PREFIX_SIZE};
 use crate::node::{Node, NodeError};
 use crate::transport::ReceivedPacket;
-use crate::node::wire::{CommonPrefix, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2, FMP_VERSION, COMMON_PREFIX_SIZE};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -162,6 +162,7 @@ impl Node {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+                    self.reload_peer_acl();
                     self.poll_pending_connects().await;
                     self.resend_pending_handshakes(now_ms).await;
                     self.resend_pending_rekeys(now_ms).await;

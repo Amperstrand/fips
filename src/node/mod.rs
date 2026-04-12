@@ -4,6 +4,7 @@
 //! holds all state required for mesh routing: identity, tree state,
 //! Bloom filters, coordinate caches, transports, links, and peers.
 
+pub mod acl;
 mod bloom;
 mod handlers;
 mod lifecycle;
@@ -20,14 +21,15 @@ mod tree;
 #[cfg(test)]
 mod tests;
 
+use self::acl::{PeerAclContext, PeerAclReloader, PeerAclStatus};
+use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
+use self::rate_limit::HandshakeRateLimiter;
+use self::routing_error_rate_limit::RoutingErrorRateLimiter;
 use crate::bloom::BloomState;
 use crate::cache::CoordCache;
 use crate::utils::index::IndexAllocator;
 use crate::node::session::SessionEntry;
 use crate::peer::{ActivePeer, PeerConnection};
-use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
-use self::rate_limit::HandshakeRateLimiter;
-use self::routing_error_rate_limit::RoutingErrorRateLimiter;
 use crate::transport::{
     DisconnectRx, DisconnectTx, Link, LinkId, PacketRx, PacketTx, TransportAddr,
     TransportError, TransportHandle, TransportId,
@@ -126,6 +128,9 @@ pub enum NodeError {
 
     #[error("transport error: {0}")]
     TransportError(String),
+
+    #[error("peer denied by ACL: {0}")]
+    AccessDenied(String),
 }
 
 /// Node operational state.
@@ -450,6 +455,8 @@ pub struct Node {
     /// Static hostname → npub mapping for DNS resolution.
     /// Built at construction from peer aliases and /etc/fips/hosts.
     host_map: Arc<HostMap>,
+    /// Reloadable peer allow/deny lists.
+    peer_acl: PeerAclReloader,
 }
 
 impl Node {
@@ -506,12 +513,20 @@ impl Node {
         let backoff_max_secs = config.node.discovery.backoff_max_secs;
         let forward_min_interval_secs = config.node.discovery.forward_min_interval_secs;
 
-        let mut host_map = HostMap::from_peer_configs(config.peers());
+        let base_host_map = HostMap::from_peer_configs(config.peers());
+        let mut host_map = base_host_map.clone();
+        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
         let hosts_file = HostMap::load_hosts_file(std::path::Path::new(
             crate::upper::hosts::DEFAULT_HOSTS_PATH,
         ));
         host_map.merge(hosts_file);
         let host_map = Arc::new(host_map);
+        let peer_acl = PeerAclReloader::with_alias_sources(
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_ALLOW_PATH),
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_DENY_PATH),
+            base_host_map,
+            hosts_path,
+        );
 
         let primary_endpoint = local_endpoint::LocalEndpoint::primary(identity.keypair(), startup_epoch);
 
@@ -587,6 +602,7 @@ impl Node {
             last_mesh_size_log: None,
             peer_aliases: HashMap::new(),
             host_map,
+            peer_acl,
         })
     }
 
@@ -634,7 +650,14 @@ impl Node {
         let max_links = config.node.limits.max_links;
         let coords_response_interval_ms = config.node.session.coords_response_interval_ms;
 
-        let host_map = Arc::new(HostMap::new());
+        let base_host_map = HostMap::from_peer_configs(config.peers());
+        let host_map = Arc::new(base_host_map.clone());
+        let peer_acl = PeerAclReloader::with_alias_sources(
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_ALLOW_PATH),
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_DENY_PATH),
+            base_host_map,
+            std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH),
+        );
 
         let primary_endpoint = local_endpoint::LocalEndpoint::primary(identity.keypair(), startup_epoch);
 
@@ -705,6 +728,7 @@ impl Node {
             last_mesh_size_log: None,
             peer_aliases: HashMap::new(),
             host_map,
+            peer_acl,
         }
     }
 
@@ -1036,6 +1060,45 @@ impl Node {
         addr.short_hex()
     }
 
+    /// Enforce the peer ACL for a newly identified link-layer peer.
+    pub(crate) fn authorize_peer(
+        &self,
+        peer: &PeerIdentity,
+        context: PeerAclContext,
+        transport_id: TransportId,
+        remote_addr: &TransportAddr,
+    ) -> Result<(), NodeError> {
+        let decision = self.peer_acl.acl().check(peer);
+        if decision.allowed() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            peer = %self.peer_display_name(peer.node_addr()),
+            rejected_npub = %peer.npub(),
+            context = %context,
+            transport_id = %transport_id,
+            remote_addr = %remote_addr,
+            decision = %decision,
+            "Rejected peer by ACL"
+        );
+
+        Err(NodeError::AccessDenied(format!(
+            "{} ({decision})",
+            peer.npub()
+        )))
+    }
+
+    /// Reload ACL files if they changed.
+    pub(crate) fn reload_peer_acl(&mut self) -> bool {
+        self.peer_acl.check_reload()
+    }
+
+    /// Return the currently loaded ACL state for observability.
+    pub fn peer_acl_status(&self) -> PeerAclStatus {
+        self.peer_acl.status()
+    }
+
     // === Configuration ===
 
     /// Get the configuration.
@@ -1223,7 +1286,6 @@ impl Node {
     pub fn tun_name(&self) -> Option<&str> {
         self.tun_name.as_deref()
     }
-
 
     // === Resource Limits ===
 
@@ -1526,9 +1588,7 @@ impl Node {
     /// has declared us as their parent (making them our child).
     pub(crate) fn is_tree_peer(&self, peer_addr: &NodeAddr) -> bool {
         // Peer is our parent
-        if !self.tree_state.is_root()
-            && self.tree_state.my_declaration().parent_id() == peer_addr
-        {
+        if !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == peer_addr {
             return true;
         }
         // Peer is our child (their declaration names us as parent)
@@ -1577,7 +1637,10 @@ impl Node {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let dest_coords = self.coord_cache.get_and_touch(dest_node_addr, now_ms)?.clone();
+        let dest_coords = self
+            .coord_cache
+            .get_and_touch(dest_node_addr, now_ms)?
+            .clone();
 
         // 3. Bloom filter candidates — requires dest_coords for loop-free selection.
         //    If no candidate is strictly closer, fall through to tree routing.
@@ -1703,17 +1766,15 @@ impl Node {
             reason: "no transport_id".into(),
         })?;
         let remote_addr = peer.current_addr().cloned().ok_or_else(|| NodeError::SendFailed {
-            node_addr: *node_addr,
-            reason: "no current_addr".into(),
-        })?;
+                node_addr: *node_addr,
+                reason: "no current_addr".into(),
+            })?;
 
         // Prepend 4-byte session-relative timestamp (inner header)
         let timestamp_ms = peer.session_elapsed_ms();
 
         // MMP: read spin bit value before entering session borrow
-        let sp_flag = peer.mmp()
-            .map(|mmp| mmp.spin_bit.tx_bit())
-            .unwrap_or(false);
+        let sp_flag = peer.mmp().map(|mmp| mmp.spin_bit.tx_bit()).unwrap_or(false);
         let mut flags = if sp_flag { FLAG_SP } else { 0 };
         if ce_flag {
             flags |= FLAG_CE;
@@ -1723,9 +1784,9 @@ impl Node {
         }
 
         let session = peer.noise_session_mut().ok_or_else(|| NodeError::SendFailed {
-            node_addr: *node_addr,
-            reason: "no noise session".into(),
-        })?;
+                node_addr: *node_addr,
+                reason: "no noise session".into(),
+            })?;
 
         // Inner plaintext: [timestamp:4 LE][msg_type][payload...]
         let inner_plaintext = prepend_inner_header(timestamp_ms, plaintext);
@@ -1737,9 +1798,9 @@ impl Node {
 
         // Encrypt with AAD binding to the outer header
         let ciphertext = session.encrypt_with_aad(&inner_plaintext, &header).map_err(|e| NodeError::SendFailed {
-            node_addr: *node_addr,
-            reason: format!("encryption failed: {}", e),
-        })?;
+                node_addr: *node_addr,
+                reason: format!("encryption failed: {}", e),
+            })?;
 
         let wire_packet = build_encrypted(&header, &ciphertext);
 

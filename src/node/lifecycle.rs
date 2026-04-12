@@ -1,6 +1,8 @@
 //! Node lifecycle management: start, stop, and peer connection initiation.
 
 use super::{Node, NodeError, NodeState};
+use crate::node::acl::PeerAclContext;
+use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};
 use crate::transport::{
@@ -8,7 +10,6 @@ use crate::transport::{
     TransportId,
 };
 use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState, add_tun_address};
-use crate::node::wire::build_msg1;
 use crate::node::local_endpoint::LocalEndpoint;
 use crate::{NodeAddr, PeerIdentity};
 use tokio::net::TcpListener;
@@ -165,6 +166,7 @@ impl Node {
 
             match self.initiate_connection(transport_id, remote_addr, peer_identity).await {
                 Ok(()) => return Ok(()),
+                Err(e @ NodeError::AccessDenied(_)) => return Err(e),
                 Err(e) => {
                     debug!(
                         npub = %peer_config.npub,
@@ -201,6 +203,12 @@ impl Node {
         peer_identity: PeerIdentity,
     ) -> Result<(), NodeError> {
         let peer_node_addr = *peer_identity.node_addr();
+        self.authorize_peer(
+            &peer_identity,
+            PeerAclContext::OutboundConnect,
+            transport_id,
+            &remote_addr,
+        )?;
 
         let is_connection_oriented = self.transports.get(&transport_id)
             .map(|t| t.transport_type().connection_oriented)
@@ -425,6 +433,9 @@ impl Node {
                 "Auto-connecting to discovered peer"
             );
             if let Err(e) = self.initiate_connection(transport_id, remote_addr, identity).await {
+                if matches!(e, NodeError::AccessDenied(_)) {
+                    continue;
+                }
                 warn!(error = %e, "Failed to auto-connect to discovered peer");
             }
         }
@@ -590,7 +601,7 @@ impl Node {
                     // Calculate max MSS for TCP clamping
                     let effective_mtu = self.effective_ipv6_mtu();
                     let max_mss = effective_mtu.saturating_sub(40).saturating_sub(20); // IPv6 + TCP headers
-                    
+
                     info!("effective MTU: {} bytes", effective_mtu);
                     debug!("   max TCP MSS: {} bytes", max_mss);
 

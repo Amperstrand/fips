@@ -1,11 +1,12 @@
 //! Handshake handlers and connection promotion.
 
+use crate::node::acl::PeerAclContext;
+use crate::node::wire::{build_msg2, Msg1Header, Msg2Header};
 use crate::node::{Node, NodeError};
 use crate::peer::{
     cross_connection_winner, ActivePeer, PeerConnection, PromotionResult,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
-use crate::node::wire::{build_msg2, Msg1Header, Msg2Header};
 use crate::PeerIdentity;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -364,6 +365,21 @@ impl Node {
         // If possible_restart was true but peer is no longer in self.peers
         // (removed by another path), fall through to process as new connection.
 
+        if self
+            .authorize_peer(
+                &peer_identity,
+                PeerAclContext::InboundHandshake,
+                packet.transport_id,
+                &packet.remote_addr,
+            )
+            .is_err()
+        {
+            // Intentionally drop denied peers without sending msg2 or a
+            // disconnect so we do not reveal ACL policy to unauthorized nodes.
+            self.msg1_rate_limiter.complete_handshake();
+            return;
+        }
+
         // Note: we don't early-return if peer is already in self.peers here.
         // promote_connection handles cross-connection resolution via tie-breaker.
 
@@ -629,32 +645,62 @@ impl Node {
             return;
         }
 
-        let conn = self.connections.get_mut(&link_id).unwrap();
+        let (peer_identity, our_index) = {
+            let conn = self.connections.get_mut(&link_id).unwrap();
 
-        // Process Noise msg2
-        let noise_msg2 = &packet.data[header.noise_msg2_offset..];
-        if let Err(e) = conn.complete_handshake(noise_msg2, packet.timestamp_ms) {
-            warn!(
-                link_id = %link_id,
-                error = %e,
-                "Handshake completion failed"
-            );
-            conn.mark_failed();
-            return;
-        }
-
-        // Store their index
-        conn.set_their_index(header.sender_idx);
-        conn.set_source_addr(packet.remote_addr.clone());
-
-        // Get peer identity for promotion
-        let peer_identity = match conn.expected_identity() {
-            Some(id) => *id,
-            None => {
-                warn!(link_id = %link_id, "No identity after handshake");
+            // Process Noise msg2
+            let noise_msg2 = &packet.data[header.noise_msg2_offset..];
+            if let Err(e) = conn.complete_handshake(noise_msg2, packet.timestamp_ms) {
+                warn!(
+                    link_id = %link_id,
+                    error = %e,
+                    "Handshake completion failed"
+                );
+                conn.mark_failed();
                 return;
             }
+
+            // Store their index
+            conn.set_their_index(header.sender_idx);
+            conn.set_source_addr(packet.remote_addr.clone());
+
+            let peer_identity = match conn.expected_identity() {
+                Some(id) => *id,
+                None => {
+                    warn!(link_id = %link_id, "No identity after handshake");
+                    return;
+                }
+            };
+
+            (peer_identity, conn.our_index())
         };
+
+        if self
+            .authorize_peer(
+                &peer_identity,
+                PeerAclContext::OutboundHandshake,
+                packet.transport_id,
+                &packet.remote_addr,
+            )
+            .is_err()
+        {
+            self.pending_outbound.remove(&key);
+            if let Some(link) = self.links.get(&link_id) {
+                let tid = link.transport_id();
+                let addr = link.remote_addr().clone();
+                if let Some(transport) = self.transports.get(&tid) {
+                    // Close the transport quietly instead of sending a
+                    // disconnect so ACL policy is not signaled in-band.
+                    transport.close_connection(&addr).await;
+                }
+            }
+            self.connections.remove(&link_id);
+            self.remove_link(&link_id);
+            if let Some(idx) = our_index {
+                let _ = self.index_allocator.free(idx);
+            }
+            return;
+        }
 
         let peer_node_addr = *peer_identity.node_addr();
 
@@ -699,12 +745,12 @@ impl Node {
 
                 let (outbound_session, outbound_our_index) =
                     match (outbound_session, outbound_our_index) {
-                        (Some(s), Some(idx)) => (s, idx),
-                        _ => {
-                            warn!(peer = %self.peer_display_name(&peer_node_addr), "Incomplete outbound connection");
-                            self.pending_outbound.remove(&key);
-                            return;
-                        }
+                    (Some(s), Some(idx)) => (s, idx),
+                    _ => {
+                        warn!(peer = %self.peer_display_name(&peer_node_addr), "Incomplete outbound connection");
+                        self.pending_outbound.remove(&key);
+                        return;
+                    }
                     };
 
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
@@ -941,8 +987,7 @@ impl Node {
                 if let (Some(old_tid), Some(old_idx)) =
                     (old_peer.transport_id(), old_peer.our_index())
                 {
-                    self.peers_by_index
-                        .remove(&(old_tid, old_idx.as_u32()));
+                    self.peers_by_index.remove(&(old_tid, old_idx.as_u32()));
                     let _ = self.index_allocator.free(old_idx);
                 }
 

@@ -37,6 +37,11 @@ enum Commands {
         #[command(subcommand)]
         what: ShowCommands,
     },
+    /// Show access-control information
+    Acl {
+        #[command(subcommand)]
+        what: AclCommands,
+    },
     /// Generate a new FIPS identity keypair
     Keygen {
         /// Output directory for fips.key and fips.pub
@@ -91,6 +96,12 @@ enum ShowCommands {
     Routing,
 }
 
+#[derive(Subcommand, Debug)]
+enum AclCommands {
+    /// Loaded allow/deny state
+    Show,
+}
+
 impl ShowCommands {
     fn command_name(&self) -> &'static str {
         match self {
@@ -105,6 +116,14 @@ impl ShowCommands {
             ShowCommands::Connections => "show_connections",
             ShowCommands::Transports => "show_transports",
             ShowCommands::Routing => "show_routing",
+        }
+    }
+}
+
+impl AclCommands {
+    fn command_name(&self) -> &'static str {
+        match self {
+            AclCommands::Show => "show_acl",
         }
     }
 }
@@ -223,12 +242,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Commands that don't require a running daemon
-    if let Commands::Keygen {
-        dir,
-        force,
-        stdout,
-    } = &cli.command
-    {
+    if let Commands::Keygen { dir, force, stdout } = &cli.command {
         let identity = Identity::generate();
         let nsec = encode_nsec(&identity.keypair().secret_key());
         let npub = identity.npub();
@@ -275,6 +289,7 @@ fn main() {
 
     let request = match &cli.command {
         Commands::Show { what } => build_query(what.command_name()),
+        Commands::Acl { what } => build_query(what.command_name()),
         Commands::Connect {
             peer,
             address,
