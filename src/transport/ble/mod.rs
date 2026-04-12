@@ -1006,9 +1006,15 @@ async fn accept_loop<A>(
                             discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
 
                             if !peer_capabilities.can_accept_inbound() {
+                                // Peer is central-only but connected to us inbound.
+                                // This means the peer insists on being central as a hard
+                                // constraint (e.g. macOS CoreBluetooth can only initiate
+                                // outbound L2CAP).  Accept the inbound connection and
+                                // proceed to normal handshake — the peer will drive the
+                                // session as initiator on its end.
                                 debug!(
                                     addr = %ta,
-                                    "BLE inbound: peer cannot accept inbound, keeping connection"
+                                    "BLE inbound: peer is central-only, accepting inbound connection anyway"
                                 );
                             } else if peer_capabilities.prefers_outbound()
                                 && !local_capabilities.prefers_outbound()
