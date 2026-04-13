@@ -504,6 +504,7 @@ using the `bluer` crate.
 | `transports.ble.auto_connect` | bool | `false` | Automatically connect to discovered peers |
 | `transports.ble.accept_connections` | bool | `true` | Accept incoming L2CAP connections |
 | `transports.ble.probe_cooldown_secs` | u64 | `30` | Cooldown before re-probing the same BLE address |
+| `transports.ble.debug_ephemeral_key_log_path` | string | *(disabled)* | Debug-only JSONL file for IK ephemeral keys. Intended for lab captures and offline BLE decrypt tooling; enabling it weakens forward secrecy for captured sessions. |
 
 **Address format.** BLE peer addresses use the form
 `"adapter/device_address"` — for example, `"hci0/AA:BB:CC:DD:EE:FF"`.
@@ -521,6 +522,15 @@ one connection is established.
 **Connection pool.** The `max_connections` parameter limits the number of
 concurrent BLE connections. When the pool is full, the least-recently-used
 connection is evicted to make room for new connections.
+
+**Ephemeral key dump (debug-only).** When `debug_ephemeral_key_log_path` is
+set, the node appends one JSON object per IK `msg1`/`msg2` generation. Each
+record includes the local static pubkey, local ephemeral pub/priv key, any
+known remote static/ephemeral pubkeys, epochs, and the current handshake hash.
+This is meant for controlled debugging sessions where you capture BLE traffic
+with `btmon`, then correlate handshake public keys from the capture with the
+logged private ephemeral key to complete offline decryption. Do not enable it
+on normal deployments.
 
 ### BLE Example
 
@@ -543,6 +553,7 @@ transports:
     scan: true
     auto_connect: true
     accept_connections: true
+    # debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral.jsonl"  # debug only
 
 peers:
   - npub: "npub1abc..."

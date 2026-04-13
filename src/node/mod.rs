@@ -824,6 +824,22 @@ impl Node {
                 .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
                 .collect();
 
+            let debug_ephemeral_paths: Vec<_> = ble_instances
+                .iter()
+                .filter_map(|(_, config)| config.debug_ephemeral_key_log_path().map(str::to_string))
+                .collect();
+            if let Some(first_path) = debug_ephemeral_paths.first() {
+                if debug_ephemeral_paths.iter().any(|path| path != first_path) {
+                    tracing::warn!(
+                        paths = ?debug_ephemeral_paths,
+                        "multiple BLE debug_ephemeral_key_log_path values configured; using the first path"
+                    );
+                }
+                crate::noise::set_ik_debug_ephemeral_key_log_path(Some(first_path.into()));
+            } else {
+                crate::noise::set_ik_debug_ephemeral_key_log_path(None);
+            }
+
             #[cfg(all(feature = "ble", target_os = "linux", not(test)))]
             for (name, ble_config) in ble_instances {
                 let transport_id = self.allocate_transport_id();

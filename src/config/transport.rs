@@ -584,6 +584,15 @@ pub struct BleConfig {
     /// Send burst size in bytes. Default: 4096 (2 MTU-sized packets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_burst_bytes: Option<u32>,
+
+    /// Debug-only JSONL output path for IK ephemeral keys used by BLE handshakes.
+    ///
+    /// When set, every IK `msg1`/`msg2` generation appends enough local key
+    /// material to reproduce the handshake later from a BLE capture. This is
+    /// intended only for lab debugging because it weakens forward secrecy for
+    /// any captured sessions whose ephemeral private keys are written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_ephemeral_key_log_path: Option<String>,
 }
 
 impl BleConfig {
@@ -647,6 +656,10 @@ impl BleConfig {
     /// Get the send burst size in bytes. Default: 4096.
     pub fn send_burst_bytes(&self) -> u32 {
         self.send_burst_bytes.unwrap_or(4096)
+    }
+
+    pub fn debug_ephemeral_key_log_path(&self) -> Option<&str> {
+        self.debug_ephemeral_key_log_path.as_deref()
     }
 }
 
@@ -715,5 +728,29 @@ impl TransportsConfig {
         if !other.ble.is_empty() {
             self.ble = other.ble;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BleConfig;
+
+    #[test]
+    fn ble_debug_ephemeral_key_log_path_defaults_to_none() {
+        let config = BleConfig::default();
+        assert_eq!(config.debug_ephemeral_key_log_path(), None);
+    }
+
+    #[test]
+    fn ble_debug_ephemeral_key_log_path_returns_configured_value() {
+        let config = BleConfig {
+            debug_ephemeral_key_log_path: Some("/tmp/fips-ik-ephemeral.jsonl".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.debug_ephemeral_key_log_path(),
+            Some("/tmp/fips-ik-ephemeral.jsonl")
+        );
     }
 }

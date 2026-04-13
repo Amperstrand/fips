@@ -46,7 +46,7 @@ use chacha20poly1305::{
 use std::fmt;
 use thiserror::Error;
 
-pub use handshake::HandshakeState;
+pub use handshake::{set_ik_debug_ephemeral_key_log_path, HandshakeState};
 pub use replay::ReplayWindow;
 pub use session::NoiseSession;
 
@@ -327,7 +327,13 @@ impl CipherState {
 
         let nonce = self.next_nonce()?;
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| NoiseError::EncryptionFailed)?;
 
         Ok(ciphertext)
@@ -360,7 +366,13 @@ impl CipherState {
 
         let nonce = Self::counter_to_nonce(counter);
         let plaintext = cipher
-            .decrypt(&nonce, Payload { msg: ciphertext, aad })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|_| NoiseError::DecryptionFailed)?;
 
         Ok(plaintext)

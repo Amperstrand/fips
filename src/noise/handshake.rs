@@ -1,14 +1,54 @@
 use super::{
     CipherState, HandshakeProgress, HandshakeRole, NoiseError, NoisePattern, NoiseSession,
-    EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE,
-    PROTOCOL_NAME_IK, PROTOCOL_NAME_XK, PUBKEY_SIZE,
-    XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE, XK_HANDSHAKE_MSG3_SIZE,
+    EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, PROTOCOL_NAME_IK,
+    PROTOCOL_NAME_XK, PUBKEY_SIZE, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE,
+    XK_HANDSHAKE_MSG3_SIZE,
 };
 use hkdf::Hkdf;
 use rand::Rng;
 use secp256k1::{ecdh::shared_secret_point, Keypair, PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tracing::warn;
+
+static IK_EPHEMERAL_KEY_LOG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+fn ik_ephemeral_key_log_path() -> &'static Mutex<Option<PathBuf>> {
+    IK_EPHEMERAL_KEY_LOG_PATH.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_ik_debug_ephemeral_key_log_path(path: Option<PathBuf>) {
+    let mut guard = ik_ephemeral_key_log_path()
+        .lock()
+        .expect("ik ephemeral log path mutex poisoned");
+    *guard = path;
+}
+
+fn append_ik_ephemeral_key_record(path: &Path, record: &serde_json::Value) {
+    let serialized = match serde_json::to_string(record) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            warn!(error = %error, "failed to serialize IK debug record");
+            return;
+        }
+    };
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "failed to open IK debug log file");
+            return;
+        }
+    };
+
+    if let Err(error) = writeln!(file, "{serialized}") {
+        warn!(path = %path.display(), error = %error, "failed to append IK debug log record");
+    }
+}
 
 /// Symmetric state during handshake.
 ///
@@ -133,6 +173,43 @@ pub struct HandshakeState {
 }
 
 impl HandshakeState {
+    fn maybe_dump_ik_ephemeral_key(
+        &self,
+        event: &str,
+        local_ephemeral: &Keypair,
+        remote_ephemeral: Option<&PublicKey>,
+    ) {
+        if self.pattern != NoisePattern::Ik {
+            return;
+        }
+
+        let path = ik_ephemeral_key_log_path()
+            .lock()
+            .expect("ik ephemeral log path mutex poisoned")
+            .clone();
+        let Some(path) = path else {
+            return;
+        };
+
+        let local_secret = SecretKey::from_keypair(local_ephemeral);
+        let record = serde_json::json!({
+            "version": 1,
+            "tool": "fips-ik-ephemeral-dump",
+            "event": event,
+            "role": self.role.to_string(),
+            "local_static_pubkey": hex::encode(self.static_keypair.public_key().serialize()),
+            "remote_static_pubkey": self.remote_static.map(|pk| hex::encode(pk.serialize())),
+            "local_ephemeral_pubkey": hex::encode(local_ephemeral.public_key().serialize()),
+            "local_ephemeral_privkey": hex::encode(local_secret.secret_bytes()),
+            "remote_ephemeral_pubkey": remote_ephemeral.map(|pk| hex::encode(pk.serialize())),
+            "local_epoch": self.local_epoch.map(hex::encode),
+            "remote_epoch": self.remote_epoch.map(hex::encode),
+            "handshake_hash": hex::encode(self.symmetric.handshake_hash()),
+        });
+
+        append_ik_ephemeral_key_record(&path, &record);
+    }
+
     /// Normalize a compressed public key to even parity for pre-message hashing.
     ///
     /// Nostr npubs encode x-only keys (no parity). The Noise IK pre-message
@@ -343,8 +420,12 @@ impl HandshakeState {
             });
         }
 
-        let remote_static = self.remote_static.expect("initiator must have remote static");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_message_1");
+        let remote_static = self
+            .remote_static
+            .expect("initiator must have remote static");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_message_1");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -374,6 +455,8 @@ impl HandshakeState {
         let encrypted_epoch = self.symmetric.encrypt_and_hash(&epoch)?;
         debug_assert_eq!(encrypted_epoch.len(), EPOCH_ENCRYPTED_SIZE);
         message.extend_from_slice(&encrypted_epoch);
+
+        self.maybe_dump_ik_ephemeral_key("ik_msg1_write", ephemeral, None);
 
         self.progress = HandshakeProgress::Message1Done;
 
@@ -462,7 +545,9 @@ impl HandshakeState {
         }
 
         let re = self.remote_ephemeral.expect("should have remote ephemeral");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_message_2");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_message_2");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -487,6 +572,8 @@ impl HandshakeState {
         let encrypted_epoch = self.symmetric.encrypt_and_hash(&epoch)?;
         debug_assert_eq!(encrypted_epoch.len(), EPOCH_ENCRYPTED_SIZE);
         message.extend_from_slice(&encrypted_epoch);
+
+        self.maybe_dump_ik_ephemeral_key("ik_msg2_write", ephemeral, Some(&re));
 
         self.progress = HandshakeProgress::Complete;
 
@@ -572,7 +659,9 @@ impl HandshakeState {
             });
         }
 
-        let remote_static = self.remote_static.expect("initiator must have remote static");
+        let remote_static = self
+            .remote_static
+            .expect("initiator must have remote static");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -657,7 +746,9 @@ impl HandshakeState {
         }
 
         let re = self.remote_ephemeral.expect("should have remote ephemeral");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_xk_message_2");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_xk_message_2");
 
         // Generate ephemeral keypair
         self.generate_ephemeral();
@@ -755,8 +846,12 @@ impl HandshakeState {
             });
         }
 
-        let re = self.remote_ephemeral.expect("should have remote ephemeral after msg2");
-        let epoch = self.local_epoch.expect("local epoch must be set before write_xk_message_3");
+        let re = self
+            .remote_ephemeral
+            .expect("should have remote ephemeral after msg2");
+        let epoch = self
+            .local_epoch
+            .expect("local epoch must be set before write_xk_message_3");
 
         let mut message = Vec::with_capacity(XK_HANDSHAKE_MSG3_SIZE);
 
@@ -813,7 +908,10 @@ impl HandshakeState {
 
         // -> se: DH(e, rs), mix into key
         // (responder uses their ephemeral with initiator's now-known static)
-        let ephemeral = self.ephemeral_keypair.as_ref().expect("should have ephemeral after msg2");
+        let ephemeral = self
+            .ephemeral_keypair
+            .as_ref()
+            .expect("should have ephemeral after msg2");
         let se = self.ecdh(&ephemeral.secret_key(), &rs);
         self.symmetric.mix_key(&se);
 
