@@ -11,6 +11,7 @@ use super::*;
 use crate::transport::ble::addr::BleAddr;
 use crate::transport::ble::rate_limit::SendRateLimiter;
 use crate::transport::TransportError;
+use tracing::warn;
 
 use bluest::{Adapter, Device, DeviceId};
 use futures::StreamExt;
@@ -61,12 +62,16 @@ impl BleStream for BluestStream {
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send");
-        self.writer
-            .lock()
-            .await
-            .write_all(&framed)
-            .await
-            .map_err(|e| TransportError::Io(e))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.writer.lock().await.write_all(&framed),
+        )
+        .await
+        .map_err(|_| {
+            warn!(addr = %self.remote, len = framed.len(), "BLE write timeout (3s)");
+            TransportError::Timeout
+        })?
+        .map_err(|e| TransportError::Io(e))?;
         Ok(())
     }
 
@@ -75,12 +80,16 @@ impl BleStream for BluestStream {
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent");
-        self.writer
-            .lock()
-            .await
-            .write_all(&framed)
-            .await
-            .map_err(|e| TransportError::Io(e))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.writer.lock().await.write_all(&framed),
+        )
+        .await
+        .map_err(|_| {
+            warn!(addr = %self.remote, len = framed.len(), "BLE write timeout (3s)");
+            TransportError::Timeout
+        })?
+        .map_err(|e| TransportError::Io(e))?;
         Ok(())
     }
 

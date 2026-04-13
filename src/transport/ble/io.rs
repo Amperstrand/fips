@@ -151,7 +151,7 @@ mod bluer_impl {
     use std::pin::Pin;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
-    use tracing::{debug, trace};
+    use tracing::{debug, trace, warn};
 
     /// FIPS BLE service UUID.
     ///
@@ -243,11 +243,17 @@ mod bluer_impl {
             let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
-            self.conn
-                .send(&framed)
-                .await
-                .map(|_| ())
-                .map_err(|e| TransportError::SendFailed(format!("{}", e)))
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.conn.send(&framed),
+            )
+            .await
+            .map_err(|_| {
+                warn!(len = framed.len(), "BLE write timeout (3s)");
+                TransportError::Timeout
+            })?
+            .map(|_| ())
+            .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
@@ -262,11 +268,17 @@ mod bluer_impl {
             let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
-            self.conn
-                .send(&framed)
-                .await
-                .map(|_| ())
-                .map_err(|e| TransportError::SendFailed(format!("{}", e)))
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.conn.send(&framed),
+            )
+            .await
+            .map_err(|_| {
+                warn!(len = framed.len(), "BLE write timeout (3s)");
+                TransportError::Timeout
+            })?
+            .map(|_| ())
+            .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
