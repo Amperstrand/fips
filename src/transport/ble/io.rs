@@ -746,13 +746,8 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
-            let resolved_addr_type = self.resolve_addr_type(addr).await;
-            // H4: Force LeRandom for LE peripherals — CoreBluetooth advertises with
-            // LeRandom in peripheral role, but BlueZ may cache the address as LePublic
-            // from a previous central-role session.
-            let addr_type = AddressType::LeRandom;
-            debug!(addr = %addr, resolved = ?resolved_addr_type, forced = ?addr_type,
-                   "BLE connect: address type (H4: forced LeRandom)");
+            let addr_type = self.resolve_addr_type(addr).await;
+            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
 
             let target_sa = SocketAddr::new(addr.to_bluer_address(), addr_type, psm);
 
@@ -761,7 +756,6 @@ mod bluer_impl {
             socket
                 .bind(SocketAddr::any_le())
                 .map_err(|e| map_io_err("bind", e))?;
-
             socket
                 .set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
