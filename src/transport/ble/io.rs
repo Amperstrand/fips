@@ -750,18 +750,6 @@ mod bluer_impl {
             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
 
             let bluer_addr = addr.to_bluer_address();
-            if let Ok(device) = self.adapter.device(bluer_addr) {
-                let paired = device.is_paired().await.unwrap_or(false);
-                debug!(addr = %addr, paired, "BLE connect: pairing state");
-                if !paired {
-                    debug!(addr = %addr, "BLE connect: initiating pairing");
-                    match device.pair().await {
-                        Ok(()) => debug!(addr = %addr, "BLE connect: pairing succeeded"),
-                        Err(e) => debug!(addr = %addr, error = %e, "BLE connect: pairing failed, continuing anyway"),
-                    }
-                }
-            }
-
             let target_sa = SocketAddr::new(bluer_addr, addr_type, psm);
 
             let socket = Socket::<SeqPacket>::new_seq_packet()
@@ -773,18 +761,54 @@ mod bluer_impl {
                 .set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
 
-            // Prevent sniff mode to reduce latency during data transfer
             if let Err(e) = socket.set_power_forced_active(true) {
                 debug!(error = %e, "BLE connect: set_power_forced_active not supported");
             }
 
-            let conn = socket
-                .connect(target_sa)
-                .await
-                .map_err(|e| map_io_err("connect", e))?;
+            let conn_result = socket.connect(target_sa).await;
 
-            let remote = addr.clone();
-            BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
+            match conn_result {
+                Ok(conn) => {
+                    let remote = addr.clone();
+                    return BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes);
+                }
+                Err(e) => {
+                    let raw_err = e.raw_os_error().unwrap_or(0);
+                    debug!(addr = %addr, error = %e, errno = raw_err, "BLE connect: L2CAP connect failed");
+
+                    // ECONNRESET (104) or ECONNABORTED (103) may indicate unpaired device.
+                    // btmon showed Mac accepts L2CAP then immediately disconnects unpaired peers.
+                    // Try pairing over the LE ACL link (established by the failed connect attempt)
+                    // then retry the L2CAP connect.
+                    if raw_err == 104 || raw_err == 103 {
+                        if let Ok(device) = self.adapter.device(bluer_addr) {
+                            let paired = device.is_paired().await.unwrap_or(false);
+                            if !paired {
+                                debug!(addr = %addr, "BLE connect: attempting pairing after L2CAP rejection");
+                                match device.pair().await {
+                                    Ok(()) => {
+                                        debug!(addr = %addr, "BLE connect: pairing succeeded, retrying L2CAP");
+                                        let socket2 = Socket::<SeqPacket>::new_seq_packet()
+                                            .map_err(|e| map_io_err("new_seq_packet", e))?;
+                                        socket2.bind(SocketAddr::any_le())
+                                            .map_err(|e| map_io_err("bind", e))?;
+                                        socket2.set_recv_mtu(self.mtu)
+                                            .map_err(|e| map_io_err("set_recv_mtu", e))?;
+                                        let conn2 = socket2.connect(target_sa).await
+                                            .map_err(|e| map_io_err("connect retry", e))?;
+                                        let remote = addr.clone();
+                                        return BluerStream::new(conn2, remote, self.send_rate_bps, self.send_burst_bytes);
+                                    }
+                                    Err(pe) => {
+                                        debug!(addr = %addr, error = %pe, "BLE connect: pairing failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Err(map_io_err("connect", e));
+                }
+            }
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {
