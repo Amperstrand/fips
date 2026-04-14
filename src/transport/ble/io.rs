@@ -685,22 +685,6 @@ mod bluer_impl {
             Ok(psm)
         }
 
-        async fn discover_gatt_psm_for_connect(
-            &self,
-            device: &bluer::Device,
-            addr: &BleAddr,
-        ) -> Result<u16, TransportError> {
-            device.connect().await.map_err(|e| {
-                map_err("gatt_connect", e)
-            })?;
-
-            let psm = self.read_psm_from_gatt(device, addr).await?;
-
-            // Intentionally do NOT disconnect GATT — the ACL must stay
-            // alive for the subsequent L2CAP connect to use.
-            Ok(psm)
-        }
-
         async fn find_service_by_uuid(
             &self,
             services: &[bluer::gatt::remote::Service],
@@ -780,26 +764,14 @@ mod bluer_impl {
 
             let bluer_addr = addr.to_bluer_address();
 
-            // Attempt GATT PSM discovery to get the dynamic PSM and
-            // establish the LE ACL link. CoreBluetooth requires an active
-            // GATT connection before accepting L2CAP CoC channels.
-            // If GATT fails (e.g. ConnectDevice unavailable), fall back
-            // to direct L2CAP connect with the configured PSM.
-            let device = self.adapter.device(bluer_addr)
-                .map_err(|e| map_err("device", e))?;
+            // H13: Skip GATT-first. The BlueZ D-Bus Device1.Connect() sends
+            // BR/EDR Create Connection for LePublic addresses (Mac), which
+            // CoreBluetooth ignores. Instead, go directly to raw L2CAP socket
+            // connect with FlowControl::Le — the kernel should create an LE
+            // ACL via HCI LE Create Connection, regardless of address type.
+            debug!(addr = %addr, psm, "BLE connect: direct L2CAP (skip GATT)");
 
-            let effective_psm = match self.discover_gatt_psm_for_connect(&device, addr).await {
-                Ok(discovered_psm) => {
-                    debug!(addr = %addr, discovered_psm, "BLE connect: PSM from GATT, ACL established");
-                    discovered_psm
-                }
-                Err(e) => {
-                    debug!(addr = %addr, error = %e, psm, "BLE connect: GATT failed, direct L2CAP with configured PSM");
-                    psm
-                }
-            };
-
-            let target_sa = SocketAddr::new(bluer_addr, addr_type, effective_psm);
+            let target_sa = SocketAddr::new(bluer_addr, addr_type, psm);
 
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
