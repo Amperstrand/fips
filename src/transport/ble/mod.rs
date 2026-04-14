@@ -1285,17 +1285,9 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         };
 
-        // Determine PSM: try GATT PSM discovery first, fall back to configured PSM
-        let effective_psm = match io.discover_gatt_psm(&addr).await {
-            Ok(discovered_psm) => {
-                debug!(addr = %addr, psm = discovered_psm, "BLE probe: using GATT-discovered PSM");
-                discovered_psm
-            }
-            Err(_) => {
-                trace!(addr = %addr, psm, "BLE probe: using configured PSM (GATT discovery not available)");
-                psm
-            }
-        };
+        // Use configured PSM directly. GATT PSM discovery causes an
+        // ACL teardown race with CoreBluetooth (issue #68).
+        let effective_psm = psm;
 
         // L2CAP connect
         let stream = match tokio::time::timeout(

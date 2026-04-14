@@ -590,10 +590,12 @@ mod bluer_impl {
                     .read_psm_from_gatt(&device, addr)
                     .await;
 
-                // Do NOT disconnect GATT here — keep the LE ACL alive so
-                // the subsequent L2CAP CoC connect reuses the same link.
-                // Disconnecting here causes CoreBluetooth to close the CoC
-                // channel on the rapid reconnect (see issue #68).
+                if let Err(e) = device.disconnect().await {
+                    debug!(
+                        addr = %addr, error = %e,
+                        "GATT PSM discovery: GATT disconnect failed (non-fatal)"
+                    );
+                }
 
                 result
             };
