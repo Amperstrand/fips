@@ -764,31 +764,21 @@ mod bluer_impl {
 
             let bluer_addr = addr.to_bluer_address();
 
-            // CoreBluetooth requires an active GATT/ACL connection before
-            // it will accept an L2CAP CoC channel. Establish GATT first,
-            // read the dynamic PSM, then open L2CAP without disconnecting.
-            //
-            // Set AddressType on the BlueZ device object to force LE
-            // transport. Without this, device.connect() defaults to BR/EDR
-            // for Public addresses, which Mac rejects.
-            let device = self.adapter.device(bluer_addr).map_err(|e| {
-                map_err("device", e)
-            })?;
+            // Attempt GATT PSM discovery to get the dynamic PSM and
+            // establish the LE ACL link. CoreBluetooth requires an active
+            // GATT connection before accepting L2CAP CoC channels.
+            // If GATT fails (e.g. ConnectDevice unavailable), fall back
+            // to direct L2CAP connect with the configured PSM.
+            let device = self.adapter.device(bluer_addr)
+                .map_err(|e| map_err("device", e))?;
 
-            let _ = device.set_address_type(addr_type).await;
-
-            debug!(addr = %addr, "BLE connect: establishing GATT ACL");
-            device.connect().await.map_err(|e| {
-                map_err("gatt_connect", e)
-            })?;
-
-            let effective_psm = match self.read_psm_from_gatt(&device, addr).await {
+            let effective_psm = match self.discover_gatt_psm_for_connect(&device, addr).await {
                 Ok(discovered_psm) => {
-                    debug!(addr = %addr, discovered_psm, "BLE connect: PSM from GATT");
+                    debug!(addr = %addr, discovered_psm, "BLE connect: PSM from GATT, ACL established");
                     discovered_psm
                 }
                 Err(e) => {
-                    debug!(addr = %addr, error = %e, psm, "BLE connect: GATT PSM read failed, using configured PSM");
+                    debug!(addr = %addr, error = %e, psm, "BLE connect: GATT failed, direct L2CAP with configured PSM");
                     psm
                 }
             };
@@ -821,6 +811,24 @@ mod bluer_impl {
 
             let remote = addr.clone();
             BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
+        }
+
+        /// Attempt GATT PSM discovery while keeping the ACL alive.
+        /// Returns the discovered PSM on success.
+        async fn discover_gatt_psm_for_connect(
+            &self,
+            device: &bluer::Device,
+            addr: &BleAddr,
+        ) -> Result<u16, TransportError> {
+            device.connect().await.map_err(|e| {
+                map_err("gatt_connect", e)
+            })?;
+
+            let psm = self.read_psm_from_gatt(device, addr).await?;
+
+            // Intentionally do NOT disconnect GATT — the ACL must stay
+            // alive for the subsequent L2CAP connect to use.
+            Ok(psm)
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {
