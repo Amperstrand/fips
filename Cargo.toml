@@ -12,7 +12,7 @@ readme = "README.md"
 default = ["tui", "ble"]
 tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
-ble-macos = ["dep:bluest"]
+ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2"]
 gateway = ["dep:rustables"]
 
 [dependencies]
@@ -41,6 +41,10 @@ socket2 = { version = "0.6.2", features = ["all"] }
 tokio-socks = "0.5"
 uuid = "1"
 bluest = { git = "https://github.com/Amperstrand/bluest.git", branch = "main", features = ["l2cap", "unstable"], optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-core-bluetooth = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+dispatch2 = { version = "0.3", optional = true }
 futures-lite = "2"
 rustables = { version = "0.8.7", optional = true }
 

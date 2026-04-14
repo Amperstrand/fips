@@ -834,6 +834,7 @@ impl PeerCapabilities {
             Self::L2CAP_SUPPORTED
                 | Self::CAN_CENTRAL
                 | Self::CAN_PERIPHERAL
+                | Self::GATT_SUPPORTED
                 | Self::PREFER_L2CAP,
         )
     }
@@ -843,7 +844,13 @@ impl PeerCapabilities {
     }
 
     pub fn macos_default() -> Self {
-        Self::central_only()
+        Self(
+            Self::L2CAP_SUPPORTED
+                | Self::CAN_CENTRAL
+                | Self::CAN_PERIPHERAL
+                | Self::GATT_SUPPORTED
+                | Self::PREFER_OUTBOUND,
+        )
     }
 
     /// Whether the peer can only act as BLE central (cannot accept inbound).
@@ -1274,10 +1281,22 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         };
 
+        // Determine PSM: try GATT PSM discovery first, fall back to configured PSM
+        let effective_psm = match io.discover_gatt_psm(&addr).await {
+            Ok(discovered_psm) => {
+                debug!(addr = %addr, psm = discovered_psm, "BLE probe: using GATT-discovered PSM");
+                discovered_psm
+            }
+            Err(_) => {
+                trace!(addr = %addr, psm, "BLE probe: using configured PSM (GATT discovery not available)");
+                psm
+            }
+        };
+
         // L2CAP connect
         let stream = match tokio::time::timeout(
             std::time::Duration::from_millis(connect_timeout_ms),
-            io.connect(&addr, psm),
+            io.connect(&addr, effective_psm),
         )
         .await
         {
@@ -1438,22 +1457,22 @@ mod tests {
     #[test]
     fn test_peer_capabilities_defaults_and_queries() {
         let linux = PeerCapabilities::linux_default();
-        assert_eq!(linux.to_byte(), 0x3c);
+        assert_eq!(linux.to_byte(), 0x7c);
         assert!(linux.supports_l2cap());
-        assert!(!linux.supports_gatt());
+        assert!(linux.supports_gatt());
         assert!(linux.can_accept_inbound());
         assert!(linux.can_initiate_outbound());
         assert!(linux.prefers_l2cap());
         assert!(!linux.prefers_outbound());
 
         let mac = PeerCapabilities::macos_default();
-        assert_eq!(mac.to_byte(), 0x2a);
+        assert_eq!(mac.to_byte(), 0x7a);
         assert!(mac.supports_l2cap());
-        assert!(!mac.supports_gatt());
-        assert!(!mac.can_accept_inbound());
+        assert!(mac.supports_gatt());
+        assert!(mac.can_accept_inbound());
         assert!(mac.can_initiate_outbound());
         assert!(mac.prefers_outbound());
-        assert!(mac.is_central_only());
+        assert!(!mac.is_central_only());
     }
 
     #[test]
@@ -1471,6 +1490,22 @@ mod tests {
         assert!(!legacy_central_only.can_accept_inbound());
         assert!(legacy_central_only.can_initiate_outbound());
         assert!(legacy_central_only.prefers_outbound());
+    }
+
+    #[test]
+    fn test_gatt_supported_flag_encoding() {
+        let linux = PeerCapabilities::linux_default();
+        assert!(linux.supports_gatt());
+        let roundtrip = PeerCapabilities::from_byte(linux.to_byte());
+        assert!(roundtrip.supports_gatt());
+        assert_eq!(roundtrip.to_byte(), linux.to_byte());
+
+        let mac = PeerCapabilities::macos_default();
+        assert!(mac.supports_gatt());
+        assert!(mac.can_accept_inbound());
+        let roundtrip = PeerCapabilities::from_byte(mac.to_byte());
+        assert!(roundtrip.supports_gatt());
+        assert!(roundtrip.can_accept_inbound());
     }
 
     #[test]

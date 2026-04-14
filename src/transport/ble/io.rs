@@ -4,6 +4,8 @@
 //! BlueZ/bluer stack. `BluerIo` (behind `cfg(feature = "ble")`) provides
 //! the real implementation; `MockBleIo` provides an in-memory test double.
 
+use std::collections::HashMap;
+
 use crate::transport::TransportError;
 
 use super::addr::BleAddr;
@@ -133,6 +135,22 @@ pub trait BleIo: Send + Sync + 'static {
 
     /// Get the adapter name (e.g., "hci0").
     fn adapter_name(&self) -> &str;
+
+    /// Discover the L2CAP PSM of a remote peripheral via GATT PSM exchange.
+    ///
+    /// Returns the dynamically-assigned PSM if the peer supports GATT PSM
+    /// exchange, or an error if the service is not found or unsupported.
+    /// The default implementation always returns an error (GATT not supported).
+    fn discover_gatt_psm(
+        &self,
+        _addr: &BleAddr,
+    ) -> impl std::future::Future<Output = Result<u16, TransportError>> + Send {
+        async {
+            Err(TransportError::Io(std::io::Error::other(
+                "GATT PSM discovery not supported",
+            )))
+        }
+    }
 }
 
 // ============================================================================
@@ -147,7 +165,7 @@ mod bluer_impl {
     use bluer::l2cap::{SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{adv::Advertisement, AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport};
     use futures::StreamExt;
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::pin::Pin;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
@@ -159,6 +177,21 @@ mod bluer_impl {
     /// version/variant bits applied.
     pub const FIPS_SERVICE_UUID: bluer::Uuid =
         bluer::Uuid::from_u128(0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c);
+
+    /// GATT PSM Exchange Service UUID.
+    ///
+    /// Derived from SHA-256("FIPS GATT PSM Exchange Service") with UUID v4
+    /// version/variant bits applied. Central reads this to decide whether
+    /// to discover the peer's L2CAP PSM via GATT.
+    pub const FIPS_GATT_PSM_SERVICE_UUID: bluer::Uuid =
+        bluer::Uuid::from_u128(0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b);
+
+    /// GATT PSM Exchange Characteristic UUID.
+    ///
+    /// Derived from SHA-256("FIPS GATT PSM Exchange Characteristic") with UUID v4
+    /// version/variant bits applied. Contains the 2-byte LE PSM value.
+    pub const FIPS_GATT_PSM_CHAR_UUID: bluer::Uuid =
+        bluer::Uuid::from_u128(0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc);
 
     /// Map a bluer error to a TransportError.
     fn map_err(context: &str, e: bluer::Error) -> TransportError {
@@ -512,6 +545,162 @@ mod bluer_impl {
                 }
             }
         }
+
+        /// Discover the L2CAP PSM of a remote peripheral via GATT.
+        ///
+        /// Connects at GATT level, finds the FIPS GATT PSM Exchange Service,
+        /// reads the PSM characteristic, and returns the 2-byte LE-encoded PSM.
+        /// Disconnects GATT after reading (L2CAP connection is independent).
+        ///
+        /// Returns an error if the service or characteristic is not found,
+        /// or if the PSM value is invalid.
+        pub async fn discover_gatt_psm(&self, addr: &BleAddr) -> Result<u16, TransportError> {
+            let discover = async {
+                let bluer_addr = addr.to_bluer_address();
+                let device = self.adapter.device(bluer_addr).map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: device not found for {}: {}",
+                        addr, e
+                    )))
+                })?;
+
+                debug!(addr = %addr, "GATT PSM discovery: connecting GATT");
+
+                device.connect().await.map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: GATT connect failed for {}: {}",
+                        addr, e
+                    )))
+                })?;
+
+                let result = self
+                    .read_psm_from_gatt(&device, addr)
+                    .await;
+
+                if let Err(e) = device.disconnect().await {
+                    debug!(
+                        addr = %addr, error = %e,
+                        "GATT PSM discovery: GATT disconnect failed (non-fatal)"
+                    );
+                }
+
+                result
+            };
+
+            timeout(Duration::from_secs(10), discover)
+                .await
+                .map_err(|_| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: timed out discovering PSM for {}",
+                        addr
+                    )))
+                })?
+        }
+
+        async fn read_psm_from_gatt(
+            &self,
+            device: &bluer::Device,
+            addr: &BleAddr,
+        ) -> Result<u16, TransportError> {
+            let services = device.services().await.map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: failed to enumerate services for {}: {}",
+                    addr, e
+                )))
+            })?;
+
+            debug!(
+                addr = %addr, count = services.len(),
+                "GATT PSM discovery: enumerated services"
+            );
+
+            let psm_service = self.find_service_by_uuid(&services, FIPS_GATT_PSM_SERVICE_UUID).await;
+            let psm_service = match psm_service {
+                Some(s) => s,
+                None => {
+                    return Err(TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: FIPS GATT PSM service not found on {}",
+                        addr
+                    ))));
+                }
+            };
+
+            let characteristics = psm_service.characteristics().await.map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
+                    addr, e
+                )))
+            })?;
+
+            let psm_char = self.find_char_by_uuid(&characteristics, FIPS_GATT_PSM_CHAR_UUID).await;
+            let psm_char = match psm_char {
+                Some(c) => c,
+                None => {
+                    return Err(TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: PSM characteristic not found on {}",
+                        addr
+                    ))));
+                }
+            };
+
+            let value = psm_char.read().await.map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
+                    addr, e
+                )))
+            })?;
+
+            if value.len() != 2 {
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
+                    value.len(),
+                    addr
+                ))));
+            }
+
+            let psm = u16::from_le_bytes([value[0], value[1]]);
+
+            if psm == 0 {
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: invalid PSM value 0 from {}",
+                    addr
+                ))));
+            }
+
+            debug!(addr = %addr, psm, "GATT PSM discovery: discovered PSM");
+
+            Ok(psm)
+        }
+
+        async fn find_service_by_uuid(
+            &self,
+            services: &[bluer::gatt::remote::Service],
+            target: bluer::Uuid,
+        ) -> Option<bluer::gatt::remote::Service> {
+            for svc in services {
+                if let Ok(uuid) = svc.uuid().await {
+                    if uuid == target {
+                        return Some(svc.clone());
+                    }
+                }
+            }
+            None
+        }
+
+        async fn find_char_by_uuid(
+            &self,
+            chars: &[bluer::gatt::remote::Characteristic],
+            target: bluer::Uuid,
+        ) -> Option<bluer::gatt::remote::Characteristic> {
+            for ch in chars {
+                if let Ok(uuid) = ch.uuid().await {
+                    if uuid == target {
+                        return Some(ch.clone());
+                    }
+                }
+            }
+            None
+        }
     }
 
     impl BleIo for BluerIo {
@@ -677,6 +866,13 @@ mod bluer_impl {
         fn adapter_name(&self) -> &str {
             &self.adapter_name
         }
+
+        fn discover_gatt_psm(
+            &self,
+            addr: &BleAddr,
+        ) -> impl std::future::Future<Output = Result<u16, TransportError>> + Send {
+            BluerIo::discover_gatt_psm(self, addr)
+        }
     }
 
     // Compile-time assertion that BluerIo satisfies Send + Sync.
@@ -823,6 +1019,7 @@ pub struct MockBleIo {
     scan_tx: tokio::sync::mpsc::Sender<BleAddr>,
     scan_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<BleAddr>>>,
     connect_handler: std::sync::Mutex<Option<ConnectHandler>>,
+    gatt_psm_map: std::sync::Mutex<HashMap<[u8; 6], u16>>,
 }
 
 impl MockBleIo {
@@ -838,6 +1035,7 @@ impl MockBleIo {
             scan_tx,
             scan_rx: std::sync::Mutex::new(Some(scan_rx)),
             connect_handler: std::sync::Mutex::new(None),
+            gatt_psm_map: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -857,6 +1055,16 @@ impl MockBleIo {
         F: Fn(&BleAddr, u16) -> Result<MockBleStream, TransportError> + Send + Sync + 'static,
     {
         *self.connect_handler.lock().unwrap() = Some(Box::new(handler));
+    }
+
+    /// Set the GATT PSM for a remote device address.
+    pub fn set_gatt_psm(&self, addr: &BleAddr, psm: u16) {
+        self.gatt_psm_map.lock().unwrap().insert(addr.device, psm);
+    }
+
+    /// Remove GATT PSM mapping for a remote device address.
+    pub fn set_no_gatt(&self, addr: &BleAddr) {
+        self.gatt_psm_map.lock().unwrap().remove(&addr.device);
     }
 }
 
@@ -909,6 +1117,21 @@ impl BleIo for MockBleIo {
 
     fn adapter_name(&self) -> &str {
         &self.adapter
+    }
+
+    fn discover_gatt_psm(
+        &self,
+        addr: &BleAddr,
+    ) -> impl std::future::Future<Output = Result<u16, TransportError>> + Send {
+        let device = addr.device;
+        let map = self.gatt_psm_map.lock().unwrap();
+        let result = map.get(&device).copied().ok_or_else(|| {
+            TransportError::Io(std::io::Error::other(format!(
+                "discover_gatt_psm: GATT PSM service not found on {}",
+                addr
+            )))
+        });
+        async move { result }
     }
 }
 
@@ -1021,5 +1244,63 @@ mod tests {
         let io = MockBleIo::new("hci0", test_addr(1));
         let _acceptor = io.listen(0x0085).await.unwrap();
         assert!(io.listen(0x0085).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gatt_psm_discovery_success() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let peer = test_addr(2);
+        io.set_gatt_psm(&peer, 0x0099);
+
+        let psm = io.discover_gatt_psm(&peer).await.unwrap();
+        assert_eq!(psm, 0x0099);
+    }
+
+    #[tokio::test]
+    async fn test_gatt_psm_discovery_not_found() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let peer = test_addr(2);
+
+        let result = io.discover_gatt_psm(&peer).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gatt_psm_discovery_fallback_fixed() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let peer = test_addr(2);
+        assert!(io.discover_gatt_psm(&peer).await.is_err());
+
+        io.set_connect_handler(move |addr, psm| {
+            assert_eq!(psm, 0x0085);
+            let (stream, _) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            Ok(stream)
+        });
+        let stream = io.connect(&peer, 0x0085).await.unwrap();
+        assert_eq!(stream.remote_addr(), &peer);
+    }
+
+    #[tokio::test]
+    async fn test_gatt_psm_discovery_override() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let peer = test_addr(2);
+
+        io.set_gatt_psm(&peer, 0x0099);
+        assert_eq!(io.discover_gatt_psm(&peer).await.unwrap(), 0x0099);
+
+        io.set_gatt_psm(&peer, 0x00AA);
+        assert_eq!(io.discover_gatt_psm(&peer).await.unwrap(), 0x00AA);
+    }
+
+    #[tokio::test]
+    async fn test_gatt_psm_set_and_clear() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let peer = test_addr(2);
+
+        io.set_gatt_psm(&peer, 0x0099);
+        assert!(io.discover_gatt_psm(&peer).await.is_ok());
+
+        io.set_no_gatt(&peer);
+        assert!(io.discover_gatt_psm(&peer).await.is_err());
     }
 }
