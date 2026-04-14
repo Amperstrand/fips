@@ -55,6 +55,29 @@ packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
 See GitHub issue #39 for the recommended PR split. Key point: BLE fixes should
 be separate from leaf proxy feature.
 
+## Linux Node Operations
+
+- **SSH**: `ssh -i ~/.ssh/id_ed25519_gitlab ubuntu@192.168.13.218`
+- **ALWAYS run FIPS as a systemd service**, never as a background process:
+  ```bash
+  sudo chattr -i /etc/fips/fips.yaml   # unlock config
+  # edit config...
+  sudo chattr +i /etc/fips/fips.yaml   # lock config
+  sudo systemctl restart fips           # restart service
+  sudo journalctl -u fips -f           # follow logs
+  ```
+- **Build**: `source ~/.cargo/env && CARGO_TARGET_DIR=/tmp/fips-target cargo build --release --features ble`
+- **Install**: `sudo cp /tmp/fips-target/release/fips /usr/local/bin/fips && sudo cp /tmp/fips-target/release/fipsctl /usr/local/bin/fipsctl`
+- **Config file**: `/etc/fips/fips.yaml` (often has `chattr +i` — unlock before editing)
+- **Control socket**: `/run/fips/control.sock` (via `fipsctl`)
+- **Ephemeral key log**: `/var/log/fips/fips-ik-ephemeral.jsonl`
+- **Bluetooth adapter**: `hci0`, BD Address `14:5A:FC:49:C2:24`
+
+## macOS Node Operations
+
+- macOS FIPS is managed by the user (launchd or manual). Do not attempt to start/stop remotely.
+- macOS BLE is central-only (CoreBluetooth limitation) — cannot accept inbound L2CAP.
+
 ## ESP32-S3 Known Limitations
 
 - BLE L2CAP MTU: 512 bytes (hardware constraint)

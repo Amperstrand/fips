@@ -844,13 +844,14 @@ impl PeerCapabilities {
     }
 
     pub fn macos_default() -> Self {
-        // macOS CoreBluetooth can only act as BLE central — it cannot accept
-        // inbound L2CAP connections (no peripheral role for CoC).
-        // Do NOT claim CAN_PERIPHERAL or the tie-breaker will expect this
-        // node to accept inbound connections it can never handle.
+        // macOS CoreBluetooth supports both central and peripheral BLE roles.
+        // When `accept_connections` is true, the peripheral role is activated via
+        // CBPeripheralManager (publishL2CAPChannel + GATT service). When false,
+        // only the central role is used.
         Self(
             Self::L2CAP_SUPPORTED
                 | Self::CAN_CENTRAL
+                | Self::CAN_PERIPHERAL
                 | Self::GATT_SUPPORTED
                 | Self::PREFER_OUTBOUND,
         )
@@ -1469,13 +1470,13 @@ mod tests {
         assert!(!linux.prefers_outbound());
 
         let mac = PeerCapabilities::macos_default();
-        assert_eq!(mac.to_byte(), 0x6a);
+        assert_eq!(mac.to_byte(), 0x7a);
         assert!(mac.supports_l2cap());
         assert!(mac.supports_gatt());
-        assert!(!mac.can_accept_inbound());
+        assert!(mac.can_accept_inbound());
         assert!(mac.can_initiate_outbound());
         assert!(mac.prefers_outbound());
-        assert!(mac.is_central_only());
+        assert!(!mac.is_central_only());
     }
 
     #[test]
@@ -1505,10 +1506,10 @@ mod tests {
 
         let mac = PeerCapabilities::macos_default();
         assert!(mac.supports_gatt());
-        assert!(!mac.can_accept_inbound());
+        assert!(mac.can_accept_inbound()); // macOS can accept inbound when accept_connections=true
         let roundtrip = PeerCapabilities::from_byte(mac.to_byte());
         assert!(roundtrip.supports_gatt());
-        assert!(!roundtrip.can_accept_inbound());
+        assert!(roundtrip.can_accept_inbound()); // roundtrip preserves CAN_PERIPHERAL bit (0x7a)
     }
 
     #[test]
