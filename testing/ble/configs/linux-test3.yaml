@@ -1,0 +1,29 @@
+# Test 3: Legacy compatibility
+# Linux: linux_default() capabilities
+# Expected: Receives 33-byte frame from Mac; treats as legacy (full capability)
+#
+# Usage: sudo ./target/release/fips -c testing/ble/configs/linux-test3.yaml
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /run/fips/control.sock
+  log_level: debug
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "hci0"
+    mtu: 512
+    debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral-test3.jsonl"
+    probe_cooldown_secs: 10

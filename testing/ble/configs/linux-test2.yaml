@@ -1,0 +1,30 @@
+# Test 2: Linux as central-only
+# Linux: central_only() capabilities (accept_connections=false)
+# Expected: Linux cannot accept inbound; Mac outbound always wins
+#
+# Usage: sudo ./target/release/fips -c testing/ble/configs/linux-test2.yaml
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /run/fips/control.sock
+  log_level: debug
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "hci0"
+    mtu: 512
+    accept_connections: false   # <-- Forces central_only() capabilities
+    debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral-test2.jsonl"
+    probe_cooldown_secs: 10

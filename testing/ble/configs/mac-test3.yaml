@@ -1,0 +1,35 @@
+# Test 3: Legacy compatibility
+# Mac: Old-style 33-byte pubkey exchange (no capability flags)
+# Linux: linux_default() capabilities
+# Expected: Old wire format works; Linux assumes legacy = full capability
+#
+# NOTE: This test requires a special build that sends 33-byte frames.
+# Either:
+#   a) Run an older fips binary on Mac (pre-capability-signaling)
+#   b) Temporarily patch pubkey_exchange to send PUBKEY_EXCHANGE_SIZE bytes
+#
+# Usage: sudo ./target/release/fips -c testing/ble/configs/mac-test3.yaml
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /tmp/fips-control.sock
+  log_level: debug
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "hci0"
+    mtu: 512
+    debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral-test3.jsonl"
+    probe_cooldown_secs: 10
