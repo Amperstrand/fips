@@ -749,7 +749,20 @@ mod bluer_impl {
             let addr_type = self.resolve_addr_type(addr).await;
             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
 
-            let target_sa = SocketAddr::new(addr.to_bluer_address(), addr_type, psm);
+            let bluer_addr = addr.to_bluer_address();
+            if let Ok(device) = self.adapter.device(bluer_addr) {
+                let paired = device.is_paired().await.unwrap_or(false);
+                debug!(addr = %addr, paired, "BLE connect: pairing state");
+                if !paired {
+                    debug!(addr = %addr, "BLE connect: initiating pairing");
+                    match device.pair().await {
+                        Ok(()) => debug!(addr = %addr, "BLE connect: pairing succeeded"),
+                        Err(e) => debug!(addr = %addr, error = %e, "BLE connect: pairing failed, continuing anyway"),
+                    }
+                }
+            }
+
+            let target_sa = SocketAddr::new(bluer_addr, addr_type, psm);
 
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
