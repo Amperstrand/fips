@@ -455,7 +455,7 @@ impl<I: BleIo> BleTransport<I> {
         if let Some(ref our_pubkey) = self.local_pubkey {
             match pubkey_exchange(&stream, our_pubkey, self.local_capabilities).await {
                 Ok(result) => {
-                    debug!(addr = %addr, "BLE outbound pubkey exchange complete");
+                    debug!(addr = %addr, peer_caps = format!("0x{:02x}", result.peer_capabilities.to_byte()), local_caps = format!("0x{:02x}", self.local_capabilities.to_byte()), "BLE outbound pubkey exchange complete");
                     self.discovery_buffer
                         .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
                 }
@@ -586,7 +586,7 @@ impl<I: BleIo> BleTransport<I> {
                     if let Some(ref our_pubkey) = local_pubkey {
                         match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
                             Ok(result) => {
-                                debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
+                                debug!(addr = %addr_clone, peer_caps = format!("0x{:02x}", result.peer_capabilities.to_byte()), local_caps = format!("0x{:02x}", local_capabilities.to_byte()), "BLE outbound pubkey exchange complete");
                                 discovery_buffer
                                     .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
                             }
@@ -1012,7 +1012,7 @@ async fn accept_loop<A>(
                         Ok(result) => {
                             let peer_pubkey = result.peer_pubkey;
                             let peer_capabilities = result.peer_capabilities;
-                            debug!(addr = %ta, "BLE inbound pubkey exchange complete");
+                            debug!(addr = %ta, peer_caps = format!("0x{:02x}", peer_capabilities.to_byte()), local_caps = format!("0x{:02x}", local_capabilities.to_byte()), "BLE inbound pubkey exchange complete");
                             discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
 
                             if !peer_capabilities.can_accept_inbound() {
