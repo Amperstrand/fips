@@ -685,6 +685,22 @@ mod bluer_impl {
             Ok(psm)
         }
 
+        async fn discover_gatt_psm_for_connect(
+            &self,
+            device: &bluer::Device,
+            addr: &BleAddr,
+        ) -> Result<u16, TransportError> {
+            device.connect().await.map_err(|e| {
+                map_err("gatt_connect", e)
+            })?;
+
+            let psm = self.read_psm_from_gatt(device, addr).await?;
+
+            // Intentionally do NOT disconnect GATT — the ACL must stay
+            // alive for the subsequent L2CAP connect to use.
+            Ok(psm)
+        }
+
         async fn find_service_by_uuid(
             &self,
             services: &[bluer::gatt::remote::Service],
@@ -811,24 +827,6 @@ mod bluer_impl {
 
             let remote = addr.clone();
             BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
-        }
-
-        /// Attempt GATT PSM discovery while keeping the ACL alive.
-        /// Returns the discovered PSM on success.
-        async fn discover_gatt_psm_for_connect(
-            &self,
-            device: &bluer::Device,
-            addr: &BleAddr,
-        ) -> Result<u16, TransportError> {
-            device.connect().await.map_err(|e| {
-                map_err("gatt_connect", e)
-            })?;
-
-            let psm = self.read_psm_from_gatt(device, addr).await?;
-
-            // Intentionally do NOT disconnect GATT — the ACL must stay
-            // alive for the subsequent L2CAP connect to use.
-            Ok(psm)
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {
