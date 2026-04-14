@@ -767,14 +767,15 @@ mod bluer_impl {
             // CoreBluetooth requires an active GATT/ACL connection before
             // it will accept an L2CAP CoC channel. Establish GATT first,
             // read the dynamic PSM, then open L2CAP without disconnecting.
-            let device = self.adapter.device(bluer_addr).map_err(|e| {
-                map_err("device", e)
-            })?;
-
-            debug!(addr = %addr, "BLE connect: establishing GATT ACL");
-            device.connect().await.map_err(|e| {
-                map_err("gatt_connect", e)
-            })?;
+            //
+            // Use adapter.connect_device() with explicit address type to
+            // force LE transport. device.connect() defaults to BR/EDR for
+            // Public addresses, which Mac rejects.
+            debug!(addr = %addr, ?addr_type, "BLE connect: establishing GATT ACL");
+            let device = self.adapter
+                .connect_device(bluer_addr, addr_type)
+                .await
+                .map_err(|e| map_err("connect_device", e))?;
 
             let effective_psm = match self.read_psm_from_gatt(&device, addr).await {
                 Ok(discovered_psm) => {
