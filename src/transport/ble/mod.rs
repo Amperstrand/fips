@@ -1285,8 +1285,8 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         };
 
-        // Use configured PSM directly. GATT PSM discovery causes an
-        // ACL teardown race with CoreBluetooth (issue #68).
+        // connect() now handles GATT-first for CoreBluetooth peers and
+        // discovers the dynamic PSM. Pass the configured PSM as fallback.
         let effective_psm = psm;
 
         // L2CAP connect

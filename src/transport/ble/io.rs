@@ -763,7 +763,31 @@ mod bluer_impl {
             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
 
             let bluer_addr = addr.to_bluer_address();
-            let target_sa = SocketAddr::new(bluer_addr, addr_type, psm);
+
+            // CoreBluetooth requires an active GATT/ACL connection before
+            // it will accept an L2CAP CoC channel. Establish GATT first,
+            // read the dynamic PSM, then open L2CAP without disconnecting.
+            let device = self.adapter.device(bluer_addr).map_err(|e| {
+                map_err("device", e)
+            })?;
+
+            debug!(addr = %addr, "BLE connect: establishing GATT ACL");
+            device.connect().await.map_err(|e| {
+                map_io_err("gatt_connect", e)
+            })?;
+
+            let effective_psm = match self.read_psm_from_gatt(&device, addr).await {
+                Ok(discovered_psm) => {
+                    debug!(addr = %addr, discovered_psm, "BLE connect: PSM from GATT");
+                    discovered_psm
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, psm, "BLE connect: GATT PSM read failed, using configured PSM");
+                    psm
+                }
+            };
+
+            let target_sa = SocketAddr::new(bluer_addr, addr_type, effective_psm);
 
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
