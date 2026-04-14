@@ -162,7 +162,7 @@ mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
 
-    use bluer::l2cap::{SeqPacket, SeqPacketListener, Socket, SocketAddr};
+    use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{adv::Advertisement, AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport};
     use futures::StreamExt;
     use std::collections::{BTreeSet, HashMap, HashSet};
@@ -746,8 +746,13 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
-            let addr_type = self.resolve_addr_type(addr).await;
-            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
+            let resolved_addr_type = self.resolve_addr_type(addr).await;
+            // H4: Force LeRandom for LE peripherals — CoreBluetooth advertises with
+            // LeRandom in peripheral role, but BlueZ may cache the address as LePublic
+            // from a previous central-role session.
+            let addr_type = AddressType::LeRandom;
+            debug!(addr = %addr, resolved = ?resolved_addr_type, forced = ?addr_type,
+                   "BLE connect: address type (H4: forced LeRandom)");
 
             let target_sa = SocketAddr::new(addr.to_bluer_address(), addr_type, psm);
 
@@ -756,6 +761,17 @@ mod bluer_impl {
             socket
                 .bind(SocketAddr::any_le())
                 .map_err(|e| map_io_err("bind", e))?;
+
+            // H1: Force Extended Flow Control (ECRED, BT 5.2+) instead of the kernel's
+            // default LE_FLOWCTL. The kernel auto-selects LE_FLOWCTL for LE addresses,
+            // but CoreBluetooth likely uses ECRED internally. Setting this BEFORE connect
+            // prevents the kernel from overriding it (it only overrides if mode != EXT_FLOWCTL).
+            if let Err(e) = socket.set_flow_control(FlowControl::Extended) {
+                debug!(error = %e, "BLE connect: set_flow_control(Extended) failed, kernel may not support ECRED");
+            } else {
+                debug!("BLE connect: set ECRED mode (H1: FlowControl::Extended)");
+            }
+
             socket
                 .set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
