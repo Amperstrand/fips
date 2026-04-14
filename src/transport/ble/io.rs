@@ -773,7 +773,7 @@ mod bluer_impl {
 
             debug!(addr = %addr, "BLE connect: establishing GATT ACL");
             device.connect().await.map_err(|e| {
-                map_io_err("gatt_connect", e)
+                map_err("gatt_connect", e)
             })?;
 
             let effective_psm = match self.read_psm_from_gatt(&device, addr).await {
