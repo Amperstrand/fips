@@ -162,7 +162,7 @@ mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
 
-    use bluer::l2cap::{SeqPacket, SeqPacketListener, Socket, SocketAddr};
+    use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{adv::Advertisement, AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport};
     use futures::StreamExt;
     use std::collections::{BTreeSet, HashMap, HashSet};
@@ -729,15 +729,15 @@ mod bluer_impl {
                 .map_err(|e| map_err("address", e))?;
 
             let sa = SocketAddr::new(local_addr, AddressType::LePublic, psm);
-            let listener = SeqPacketListener::bind(sa)
-                .await
-                .map_err(|e| map_io_err("bind", e))?;
-
-            // Request high MTU for accepted connections
-            listener
-                .as_ref()
-                .set_recv_mtu(self.mtu)
+            let socket = Socket::<SeqPacket>::new_seq_packet()
+                .map_err(|e| map_io_err("new_seq_packet", e))?;
+            socket.bind(sa).map_err(|e| map_io_err("bind", e))?;
+            socket.set_flow_control(FlowControl::Le)
+                .map_err(|e| map_io_err("set_flow_control", e))?;
+            socket.set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
+            let listener = socket.listen(1)
+                .map_err(|e| map_io_err("listen", e))?;
 
             // Prevent sniff mode to reduce latency during data transfer
             if let Err(e) = listener.as_ref().set_power_forced_active(true) {
@@ -770,6 +770,14 @@ mod bluer_impl {
             socket
                 .bind(SocketAddr::any_le())
                 .map_err(|e| map_io_err("bind", e))?;
+
+            // SOCK_SEQPACKET defaults to ERTM mode, which is not supported
+            // for LE L2CAP CoC. Must explicitly set LE flow control mode
+            // before connecting or the kernel returns ENOSYS.
+            socket
+                .set_flow_control(FlowControl::Le)
+                .map_err(|e| map_io_err("set_flow_control", e))?;
+
             socket
                 .set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
