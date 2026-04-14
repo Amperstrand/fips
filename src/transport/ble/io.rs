@@ -441,6 +441,8 @@ mod bluer_impl {
         adapter: bluer::Adapter,
         adapter_name: String,
         adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
+        #[allow(dead_code)] // Handle must be kept alive for agent to stay registered.
+        agent_handle: bluer::agent::AgentHandle,
         mtu: u16,
         send_rate_bps: u64,
         send_burst_bytes: u32,
@@ -472,6 +474,16 @@ mod bluer_impl {
                 .map_err(|e| map_err("set_powered", e))?;
 
             let name = adapter.name().to_string();
+
+            let agent = bluer::agent::Agent {
+                request_default: true,
+                ..Default::default()
+            };
+            let agent_handle = session
+                .register_agent(agent)
+                .await
+                .map_err(|e| map_err("register_agent", e))?;
+
             debug!(adapter = %name, "BluerIo initialized");
 
             Ok(Self {
@@ -479,6 +491,7 @@ mod bluer_impl {
                 adapter,
                 adapter_name: name,
                 adv_handle: Mutex::new(None),
+                agent_handle,
                 mtu,
                 send_rate_bps,
                 send_burst_bytes,
@@ -765,50 +778,11 @@ mod bluer_impl {
                 debug!(error = %e, "BLE connect: set_power_forced_active not supported");
             }
 
-            let conn_result = socket.connect(target_sa).await;
+            let conn = socket.connect(target_sa).await
+                .map_err(|e| map_io_err("connect", e))?;
 
-            match conn_result {
-                Ok(conn) => {
-                    let remote = addr.clone();
-                    return BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes);
-                }
-                Err(e) => {
-                    let raw_err = e.raw_os_error().unwrap_or(0);
-                    debug!(addr = %addr, error = %e, errno = raw_err, "BLE connect: L2CAP connect failed");
-
-                    // ECONNRESET (104) or ECONNABORTED (103) may indicate unpaired device.
-                    // btmon showed Mac accepts L2CAP then immediately disconnects unpaired peers.
-                    // Try pairing over the LE ACL link (established by the failed connect attempt)
-                    // then retry the L2CAP connect.
-                    if raw_err == 104 || raw_err == 103 {
-                        if let Ok(device) = self.adapter.device(bluer_addr) {
-                            let paired = device.is_paired().await.unwrap_or(false);
-                            if !paired {
-                                debug!(addr = %addr, "BLE connect: attempting pairing after L2CAP rejection");
-                                match device.pair().await {
-                                    Ok(()) => {
-                                        debug!(addr = %addr, "BLE connect: pairing succeeded, retrying L2CAP");
-                                        let socket2 = Socket::<SeqPacket>::new_seq_packet()
-                                            .map_err(|e| map_io_err("new_seq_packet", e))?;
-                                        socket2.bind(SocketAddr::any_le())
-                                            .map_err(|e| map_io_err("bind", e))?;
-                                        socket2.set_recv_mtu(self.mtu)
-                                            .map_err(|e| map_io_err("set_recv_mtu", e))?;
-                                        let conn2 = socket2.connect(target_sa).await
-                                            .map_err(|e| map_io_err("connect retry", e))?;
-                                        let remote = addr.clone();
-                                        return BluerStream::new(conn2, remote, self.send_rate_bps, self.send_burst_bytes);
-                                    }
-                                    Err(pe) => {
-                                        debug!(addr = %addr, error = %pe, "BLE connect: pairing failed");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return Err(map_io_err("connect", e));
-                }
-            }
+            let remote = addr.clone();
+            BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {

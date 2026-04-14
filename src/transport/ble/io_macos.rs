@@ -902,8 +902,10 @@ impl BleIo for BluestIo {
             }
         }
 
-        // Publish L2CAP channel (no encryption — FIPS uses Noise IK)
-        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
+        // Publish L2CAP channel with encryption — triggers automatic LE SMP pairing
+        // during channel setup, bypassing BlueZ BR/EDR fallback for Public addresses.
+        // FIPS also uses Noise IK on top, so this is defense-in-depth.
+        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(true); });
 
         // Wait for PSM
         loop {
