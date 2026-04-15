@@ -785,17 +785,32 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
-            let addr_type = self.resolve_addr_type(addr).await;
-            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type");
-
             let bluer_addr = addr.to_bluer_address();
 
-            // H13: Skip GATT-first. The BlueZ D-Bus Device1.Connect() sends
-            // BR/EDR Create Connection for LePublic addresses (Mac), which
-            // CoreBluetooth ignores. Instead, go directly to raw L2CAP socket
-            // connect with FlowControl::Le — the kernel should create an LE
-            // ACL via HCI LE Create Connection, regardless of address type.
-            debug!(addr = %addr, psm, "BLE connect: direct L2CAP (skip GATT)");
+            // H15: With BR/EDR disabled (le_only mode), device.connect() uses LE
+            // Create Connection and triggers SMP pairing. After GATT connects
+            // (and SMP/pairing completes), open L2CAP on the encrypted ACL.
+            // Without GATT-first, the L2CAP socket connect goes out unencrypted
+            // and CoreBluetooth refuses the PSM.
+            let device = match self.adapter.device(bluer_addr) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err(map_io_err("device not found", e));
+                }
+            };
+
+            debug!(addr = %addr, "BLE connect: GATT-first for SMP pairing");
+            match device.connect().await {
+                Ok(()) => {
+                    debug!(addr = %addr, "BLE connect: GATT connected, SMP pairing done");
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: GATT connect failed, trying direct L2CAP");
+                }
+            }
+
+            let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
+            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type after GATT");
 
             let target_sa = SocketAddr::new(bluer_addr, addr_type, psm);
 
