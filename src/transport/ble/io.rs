@@ -787,23 +787,19 @@ mod bluer_impl {
         ) -> Result<Self::Stream, TransportError> {
             let bluer_addr = addr.to_bluer_address();
 
-            // H15: With BR/EDR disabled (le_only mode), device.connect() uses LE
-            // Create Connection and triggers SMP pairing. After GATT connects
-            // (and SMP/pairing completes), open L2CAP on the encrypted ACL.
-            // Without GATT-first, the L2CAP socket connect goes out unencrypted
-            // and CoreBluetooth refuses the PSM.
-            let device = self.adapter.device(bluer_addr)
-                .map_err(|e| map_err("device not found", e))?;
+            let initial_addr_type = match self.adapter.device(bluer_addr) {
+                Ok(device) => device.address_type().await.unwrap_or(AddressType::LeRandom),
+                Err(_) => AddressType::LePublic,
+            };
 
-            debug!(addr = %addr, "BLE connect: GATT-first connect");
-            match device.connect().await {
-                Ok(()) => {
-                    debug!(addr = %addr, "BLE connect: GATT connected");
-                }
-                Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE connect: GATT connect failed, trying direct L2CAP");
-                }
-            }
+            debug!(addr = %addr, addr_type = ?initial_addr_type, "BLE connect: adapter.connect_device LE-first");
+            let device = self
+                .adapter
+                .connect_device(bluer_addr, initial_addr_type)
+                .await
+                .map_err(|e| map_err("connect_device", e))?;
+
+            debug!(addr = %addr, "BLE connect: physical LE connection established");
 
             match device.is_paired().await {
                 Ok(true) => {
