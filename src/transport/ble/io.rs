@@ -792,12 +792,8 @@ mod bluer_impl {
             // (and SMP/pairing completes), open L2CAP on the encrypted ACL.
             // Without GATT-first, the L2CAP socket connect goes out unencrypted
             // and CoreBluetooth refuses the PSM.
-            let device = match self.adapter.device(bluer_addr) {
-                Ok(d) => d,
-                Err(e) => {
-                    return Err(map_io_err("device not found", e));
-                }
-            };
+            let device = self.adapter.device(bluer_addr)
+                .map_err(|e| map_err("device not found", e))?;
 
             debug!(addr = %addr, "BLE connect: GATT-first for SMP pairing");
             match device.connect().await {
