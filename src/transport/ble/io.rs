@@ -455,26 +455,6 @@ mod bluer_impl {
         /// When `le_only` is true, disables BR/EDR via btmgmt to prevent
         /// CTKD LinkKey bits in SMP pairing (required for CoreBluetooth).
         pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32, le_only: bool) -> Result<Self, TransportError> {
-            let session = bluer::Session::new()
-                .await
-                .map_err(|e| map_err("Session::new", e))?;
-
-            let adapter = if adapter_name == "default" {
-                session
-                    .default_adapter()
-                    .await
-                    .map_err(|e| map_err("default_adapter", e))?
-            } else {
-                session
-                    .adapter(adapter_name)
-                    .map_err(|e| map_err("adapter", e))?
-            };
-
-            adapter
-                .set_powered(false)
-                .await
-                .map_err(|e| map_err("set_powered off", e))?;
-
             if le_only {
                 let mgmt_adapter = if adapter_name == "default" {
                     "hci0".to_string()
@@ -482,7 +462,7 @@ mod bluer_impl {
                     adapter_name.to_string()
                 };
                 let output = tokio::process::Command::new("btmgmt")
-                    .args(["bredr", "off", &mgmt_adapter])
+                    .args(["bredr", "off"])
                     .output()
                     .await;
                 match output {
@@ -498,6 +478,21 @@ mod bluer_impl {
                     }
                 }
             }
+
+            let session = bluer::Session::new()
+                .await
+                .map_err(|e| map_err("Session::new", e))?;
+
+            let adapter = if adapter_name == "default" {
+                session
+                    .default_adapter()
+                    .await
+                    .map_err(|e| map_err("default_adapter", e))?
+            } else {
+                session
+                    .adapter(adapter_name)
+                    .map_err(|e| map_err("adapter", e))?
+            };
 
             adapter
                 .set_powered(true)
