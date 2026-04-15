@@ -787,19 +787,18 @@ mod bluer_impl {
         ) -> Result<Self::Stream, TransportError> {
             let bluer_addr = addr.to_bluer_address();
 
-            let initial_addr_type = match self.adapter.device(bluer_addr) {
-                Ok(device) => device.address_type().await.unwrap_or(AddressType::LeRandom),
-                Err(_) => AddressType::LePublic,
-            };
+            let device = self.adapter.device(bluer_addr)
+                .map_err(|e| map_err("device not found", e))?;
 
-            debug!(addr = %addr, addr_type = ?initial_addr_type, "BLE connect: adapter.connect_device LE-first");
-            let device = self
-                .adapter
-                .connect_device(bluer_addr, initial_addr_type)
-                .await
-                .map_err(|e| map_err("connect_device", e))?;
-
-            debug!(addr = %addr, "BLE connect: physical LE connection established");
+            debug!(addr = %addr, "BLE connect: GATT-first connect");
+            match device.connect().await {
+                Ok(()) => {
+                    debug!(addr = %addr, "BLE connect: GATT connected");
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: GATT connect failed, trying direct L2CAP");
+                }
+            }
 
             match device.is_paired().await {
                 Ok(true) => {
