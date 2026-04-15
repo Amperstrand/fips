@@ -585,6 +585,19 @@ pub struct BleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_burst_bytes: Option<u32>,
 
+    /// Force LE-only mode on the adapter (disable BR/EDR).
+    ///
+    /// When true, FIPS runs `btmgmt bredr off` on the adapter before powering
+    /// it on. This prevents the BlueZ kernel from adding CTKD LinkKey bits
+    /// to SMP Pairing Requests, which CoreBluetooth (macOS) rejects with
+    /// reason 0x08 (Unspecified) on dual-mode adapters.
+    ///
+    /// Required for reverse-direction BLE (Linux central → Mac peripheral)
+    /// when the Linux adapter is dual-mode (BR/EDR + LE).
+    /// Default: false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub le_only: Option<bool>,
+
     /// Debug-only JSONL output path for IK ephemeral keys used by BLE handshakes.
     ///
     /// When set, every IK `msg1`/`msg2` generation appends enough local key
@@ -660,6 +673,10 @@ impl BleConfig {
 
     pub fn debug_ephemeral_key_log_path(&self) -> Option<&str> {
         self.debug_ephemeral_key_log_path.as_deref()
+    }
+
+    pub fn le_only(&self) -> bool {
+        self.le_only.unwrap_or(false)
     }
 }
 

@@ -452,7 +452,9 @@ mod bluer_impl {
         /// Create a new BluerIo for the given adapter.
         ///
         /// Connects to BlueZ via D-Bus and powers on the adapter.
-        pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
+        /// When `le_only` is true, disables BR/EDR via btmgmt to prevent
+        /// CTKD LinkKey bits in SMP pairing (required for CoreBluetooth).
+        pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32, le_only: bool) -> Result<Self, TransportError> {
             let session = bluer::Session::new()
                 .await
                 .map_err(|e| map_err("Session::new", e))?;
@@ -467,6 +469,35 @@ mod bluer_impl {
                     .adapter(adapter_name)
                     .map_err(|e| map_err("adapter", e))?
             };
+
+            adapter
+                .set_powered(false)
+                .await
+                .map_err(|e| map_err("set_powered off", e))?;
+
+            if le_only {
+                let mgmt_adapter = if adapter_name == "default" {
+                    "hci0".to_string()
+                } else {
+                    adapter_name.to_string()
+                };
+                let output = tokio::process::Command::new("btmgmt")
+                    .args(["bredr", "off", &mgmt_adapter])
+                    .output()
+                    .await;
+                match output {
+                    Ok(out) if out.status.success() => {
+                        debug!(adapter = %mgmt_adapter, "BLE: BR/EDR disabled (le_only mode)");
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        warn!(adapter = %mgmt_adapter, stderr = %stderr, "BLE: btmgmt bredr off failed (non-fatal, SMP pairing may fail)");
+                    }
+                    Err(e) => {
+                        warn!(adapter = %mgmt_adapter, error = %e, "BLE: btmgmt not found (non-fatal, SMP pairing may fail)");
+                    }
+                }
+            }
 
             adapter
                 .set_powered(true)
