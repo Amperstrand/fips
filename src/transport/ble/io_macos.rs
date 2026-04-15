@@ -902,11 +902,7 @@ impl BleIo for BluestIo {
             }
         }
 
-        // H14: Publish L2CAP without encryption. CoreBluetooth rejects SMP
-        // pairing from BlueZ when CTKD LinkKey bits are set (BlueZ adds them
-        // for dual-mode adapters with SSP). FIPS uses Noise IK on top, so
-        // LE encryption is defense-in-depth, not required.
-        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
+        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(true); });
 
         // Wait for PSM
         loop {
