@@ -795,13 +795,47 @@ mod bluer_impl {
             let device = self.adapter.device(bluer_addr)
                 .map_err(|e| map_err("device not found", e))?;
 
-            debug!(addr = %addr, "BLE connect: GATT-first for SMP pairing");
+            debug!(addr = %addr, "BLE connect: GATT-first connect");
             match device.connect().await {
                 Ok(()) => {
-                    debug!(addr = %addr, "BLE connect: GATT connected, SMP pairing done");
+                    debug!(addr = %addr, "BLE connect: GATT connected");
                 }
                 Err(e) => {
                     debug!(addr = %addr, error = %e, "BLE connect: GATT connect failed, trying direct L2CAP");
+                }
+            }
+
+            match device.is_paired().await {
+                Ok(true) => {
+                    debug!(addr = %addr, "BLE connect: device already paired");
+                }
+                Ok(false) => {
+                    debug!(addr = %addr, "BLE connect: explicit pair() starting");
+                    device
+                        .pair()
+                        .await
+                        .map_err(|e| map_err("pair", e))?;
+                    debug!(addr = %addr, "BLE connect: explicit pair() complete");
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: failed to query paired state, attempting pair()");
+                    device
+                        .pair()
+                        .await
+                        .map_err(|e| map_err("pair", e))?;
+                    debug!(addr = %addr, "BLE connect: explicit pair() complete after paired-state query failure");
+                }
+            }
+
+            match device.is_trusted().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(e) = device.set_trusted(true).await {
+                        debug!(addr = %addr, error = %e, "BLE connect: set_trusted(true) failed (non-fatal)");
+                    }
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: failed to query trusted state");
                 }
             }
 
