@@ -550,6 +550,220 @@ fn test_promote_cleans_up_pending_outbound_to_same_peer() {
     assert_eq!(peer.link_id(), completing_link_id);
 }
 
+#[test]
+fn test_promote_cleans_up_losing_pending_outbound_to_same_peer() {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    let peer_b_full = loop {
+        let identity = Identity::generate();
+        let peer_identity = PeerIdentity::from_pubkey_full(identity.pubkey_full());
+        if node.identity.node_addr() > peer_identity.node_addr() {
+            break identity;
+        }
+    };
+    let peer_b_identity = PeerIdentity::from_pubkey_full(peer_b_full.pubkey_full());
+    let peer_b_node_addr = *peer_b_identity.node_addr();
+
+    let pending_link_id = LinkId::new(1);
+    let pending_time_ms = 1000;
+    let mut pending_conn =
+        PeerConnection::outbound(pending_link_id, peer_b_identity, pending_time_ms);
+
+    let our_keypair = node.identity.keypair();
+    let _msg1 = pending_conn
+        .start_handshake(our_keypair, node.startup_epoch, pending_time_ms)
+        .unwrap();
+
+    let pending_index = node.index_allocator.allocate().unwrap();
+    pending_conn.set_our_index(pending_index);
+    pending_conn.set_transport_id(transport_id);
+    let pending_addr = TransportAddr::from_string("10.0.0.2:2121");
+    pending_conn.set_source_addr(pending_addr.clone());
+
+    let pending_link = Link::connectionless(
+        pending_link_id,
+        transport_id,
+        pending_addr.clone(),
+        LinkDirection::Outbound,
+        Duration::from_millis(100),
+    );
+    node.links.insert(pending_link_id, pending_link);
+    node.addr_to_link
+        .insert((transport_id, pending_addr.clone()), pending_link_id);
+    node.connections.insert(pending_link_id, pending_conn);
+    node.pending_outbound
+        .insert((transport_id, pending_index.as_u32()), pending_link_id);
+
+    let completing_link_id = LinkId::new(2);
+    let completing_time_ms = 2000;
+
+    let mut completing_conn = PeerConnection::outbound(
+        completing_link_id,
+        peer_b_identity,
+        completing_time_ms,
+    );
+
+    let our_keypair = node.identity.keypair();
+    let msg1 = completing_conn
+        .start_handshake(our_keypair, node.startup_epoch, completing_time_ms)
+        .unwrap();
+
+    let mut resp_conn = PeerConnection::inbound(LinkId::new(999), completing_time_ms);
+    let peer_keypair = peer_b_full.keypair();
+    let mut resp_epoch = [0u8; 8];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut resp_epoch);
+    let msg2 = resp_conn
+        .receive_handshake_init(peer_keypair, resp_epoch, &msg1, completing_time_ms)
+        .unwrap();
+
+    completing_conn
+        .complete_handshake(&msg2, completing_time_ms)
+        .unwrap();
+
+    let completing_index = node.index_allocator.allocate().unwrap();
+    completing_conn.set_our_index(completing_index);
+    completing_conn.set_their_index(SessionIndex::new(99));
+    completing_conn.set_transport_id(transport_id);
+    completing_conn.set_source_addr(TransportAddr::from_string("10.0.0.2:4001"));
+
+    node.add_connection(completing_conn).unwrap();
+
+    let result = node
+        .promote_connection(completing_link_id, peer_b_identity, completing_time_ms)
+        .unwrap();
+
+    assert!(matches!(result, PromotionResult::Promoted(_)));
+    assert_eq!(node.peer_count(), 1, "Promoted peer should exist");
+    assert_eq!(node.connection_count(), 0, "Losing pending outbound should be removed immediately");
+    assert!(!node.links.contains_key(&pending_link_id), "Losing pending outbound link should be removed");
+    assert!(
+        !node.pending_outbound
+            .contains_key(&(transport_id, pending_index.as_u32())),
+        "pending_outbound entry should be removed for losing outbound"
+    );
+    assert_eq!(node.index_allocator.count(), 1, "Only promoted peer index should remain allocated");
+
+    let peer = node.get_peer(&peer_b_node_addr).unwrap();
+    assert_eq!(peer.link_id(), completing_link_id);
+}
+
+#[test]
+fn test_promote_cleans_up_losing_pending_connect_to_same_peer() {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    let peer_b_full = loop {
+        let identity = Identity::generate();
+        let peer_identity = PeerIdentity::from_pubkey_full(identity.pubkey_full());
+        if node.identity.node_addr() > peer_identity.node_addr() {
+            break identity;
+        }
+    };
+    let peer_b_identity = PeerIdentity::from_pubkey_full(peer_b_full.pubkey_full());
+    let peer_b_node_addr = *peer_b_identity.node_addr();
+
+    let pending_link_id = LinkId::new(1);
+    let pending_addr = TransportAddr::from_string("10.0.0.2:2121");
+    let pending_link = Link::new(
+        pending_link_id,
+        transport_id,
+        pending_addr.clone(),
+        LinkDirection::Outbound,
+        Duration::from_millis(100),
+    );
+    node.links.insert(pending_link_id, pending_link);
+    node.addr_to_link
+        .insert((transport_id, pending_addr.clone()), pending_link_id);
+    node.pending_connects.push(PendingConnect {
+        link_id: pending_link_id,
+        transport_id,
+        remote_addr: pending_addr,
+        peer_identity: peer_b_identity,
+    });
+
+    let completing_link_id = LinkId::new(2);
+    let completing_time_ms = 2000;
+
+    let mut completing_conn = PeerConnection::outbound(
+        completing_link_id,
+        peer_b_identity,
+        completing_time_ms,
+    );
+
+    let our_keypair = node.identity.keypair();
+    let msg1 = completing_conn
+        .start_handshake(our_keypair, node.startup_epoch, completing_time_ms)
+        .unwrap();
+
+    let mut resp_conn = PeerConnection::inbound(LinkId::new(999), completing_time_ms);
+    let peer_keypair = peer_b_full.keypair();
+    let mut resp_epoch = [0u8; 8];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut resp_epoch);
+    let msg2 = resp_conn
+        .receive_handshake_init(peer_keypair, resp_epoch, &msg1, completing_time_ms)
+        .unwrap();
+
+    completing_conn
+        .complete_handshake(&msg2, completing_time_ms)
+        .unwrap();
+
+    let completing_index = node.index_allocator.allocate().unwrap();
+    completing_conn.set_our_index(completing_index);
+    completing_conn.set_their_index(SessionIndex::new(99));
+    completing_conn.set_transport_id(transport_id);
+    completing_conn.set_source_addr(TransportAddr::from_string("10.0.0.2:4001"));
+
+    node.add_connection(completing_conn).unwrap();
+
+    let result = node
+        .promote_connection(completing_link_id, peer_b_identity, completing_time_ms)
+        .unwrap();
+
+    assert!(matches!(result, PromotionResult::Promoted(_)));
+    assert_eq!(node.peer_count(), 1, "Promoted peer should exist");
+    assert!(node.pending_connects.is_empty(), "Losing pending transport connect should be removed");
+    assert!(!node.links.contains_key(&pending_link_id), "Losing pending connect link should be removed");
+
+    let peer = node.get_peer(&peer_b_node_addr).unwrap();
+    assert_eq!(peer.link_id(), completing_link_id);
+}
+
+#[tokio::test]
+async fn test_poll_pending_connects_ignores_pending_connect_resolved_elsewhere() {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+    let peer_identity_full = Identity::generate();
+    let peer_identity = PeerIdentity::from_pubkey_full(peer_identity_full.pubkey_full());
+    let remote_addr = TransportAddr::from_string("127.0.0.1:4001");
+    let link_id = LinkId::new(42);
+
+    let link = Link::new(
+        link_id,
+        transport_id,
+        remote_addr.clone(),
+        LinkDirection::Outbound,
+        Duration::from_millis(50),
+    );
+    node.links.insert(link_id, link);
+    node.addr_to_link
+        .insert((transport_id, remote_addr.clone()), link_id);
+    node.pending_connects.push(PendingConnect {
+        link_id,
+        transport_id,
+        remote_addr: remote_addr.clone(),
+        peer_identity,
+    });
+
+    node.remove_link(&link_id);
+    node.links.remove(&link_id);
+
+    node.poll_pending_connects().await;
+
+    assert!(node.pending_connects.is_empty(), "resolved pending_connect should be dropped silently");
+    assert!(node.retry_pending.is_empty(), "resolved pending_connect should not schedule retry");
+}
+
 /// Test that schedule_retry creates a retry entry for auto-connect peers.
 #[test]
 fn test_schedule_retry_creates_entry() {

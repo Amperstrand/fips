@@ -1,0 +1,33 @@
+# Test C: Both directions, both roles (tie-break enabled)
+#
+# Purpose: Both sides scan + accept. Tie-breaker picks winner.
+#          Proves no duplicate connections and correct role resolution.
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /tmp/fips-control.sock
+  log_level: debug
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "default"
+    mtu: 512
+    accept_connections: true
+    auto_connect: true
+    scan: true
+    advertise: true
+    send_rate_bps: 0
+    debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral-testC.jsonl"
+    probe_cooldown_secs: 10

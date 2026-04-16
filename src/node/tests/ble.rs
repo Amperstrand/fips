@@ -164,6 +164,74 @@ async fn test_ble_two_node_handshake() {
     cleanup_nodes(&mut nodes).await;
 }
 
+#[tokio::test]
+async fn test_ble_initiate_connection_starts_handshake_when_transport_already_connected() {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+    let remote_ble_addr = ble_addr(2);
+    let remote_addr = remote_ble_addr.to_transport_addr();
+
+    let config = BleConfig {
+        adapter: Some("hci0".to_string()),
+        mtu: Some(2048),
+        accept_connections: Some(true),
+        scan: Some(false),
+        advertise: Some(false),
+        auto_connect: Some(false),
+        ..Default::default()
+    };
+
+    let io = MockBleIo::new("hci0", ble_addr(1));
+    let (stream_local, stream_remote) = MockBleStream::pair(remote_ble_addr.clone(), ble_addr(1), 2048);
+    let remote_stream = Arc::new(stream_remote);
+    let stream_bank = Arc::new(StdMutex::new(Some(stream_local)));
+    let handler_addr = remote_ble_addr.clone();
+
+    io.set_connect_handler(move |addr, _psm| {
+        if addr == &handler_addr {
+            stream_bank
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or(crate::transport::TransportError::ConnectionRefused)
+        } else {
+            Err(crate::transport::TransportError::ConnectionRefused)
+        }
+    });
+
+    let (packet_tx, _packet_rx) = packet_channel(256);
+    let mut transport = BleTransport::new(transport_id, None, config, io, packet_tx);
+    transport.start_async().await.unwrap();
+
+    node.transports
+        .insert(transport_id, TransportHandle::Ble(transport));
+
+    let transport = node.transports.get(&transport_id).unwrap();
+    transport.connect(&remote_addr).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(transport.connection_state(&remote_addr), crate::transport::ConnectionState::Connected);
+
+    let peer_identity = PeerIdentity::from_pubkey_full(Identity::generate().pubkey_full());
+    node.initiate_connection(transport_id, remote_addr.clone(), peer_identity)
+        .await
+        .unwrap();
+
+    assert!(node.pending_connects.is_empty(), "already-connected BLE transport should not queue pending_connects");
+    assert_eq!(node.connection_count(), 1, "handshake should start immediately");
+    assert_eq!(node.pending_outbound.len(), 1, "outbound handshake should be tracked immediately");
+
+    let link_id = node.find_link_by_addr(transport_id, &remote_addr).expect("link should exist");
+    let link = node.get_link(&link_id).expect("link should be retrievable");
+    assert_eq!(link.direction(), LinkDirection::Outbound);
+    assert_eq!(link.state(), crate::transport::LinkState::Connected);
+
+    drop(remote_stream);
+
+    if let Some(TransportHandle::Ble(transport)) = node.transports.get_mut(&transport_id) {
+        transport.stop_async().await.unwrap();
+    }
+}
+
 /// Three BLE nodes in a chain converge to a consistent spanning tree.
 #[tokio::test]
 async fn test_ble_three_node_chain() {

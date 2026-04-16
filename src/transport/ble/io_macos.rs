@@ -26,7 +26,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, Message};
 use objc2_core_bluetooth::{
     CBAdvertisementDataServiceUUIDsKey, CBATTError, CBATTRequest, CBAttributePermissions,
-    CBCharacteristic, CBCharacteristicProperties, CBL2CAPChannel, CBL2CAPPSM,
+    CBCharacteristicProperties, CBL2CAPChannel, CBL2CAPPSM,
     CBManagerState, CBMutableCharacteristic, CBMutableService, CBPeripheralManager,
     CBPeripheralManagerDelegate, CBUUID,
 };
@@ -327,6 +327,18 @@ impl PeripheralInputDelegate {
         let this = PeripheralInputDelegate::alloc().set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
     }
+
+    fn take_buffer(&self) -> Vec<u8> {
+        self.ivars()
+            .buffer
+            .lock()
+            .map(|mut buffer| std::mem::take(&mut *buffer))
+            .unwrap_or_default()
+    }
+
+    fn reached_eof(&self) -> bool {
+        self.ivars().eof.lock().map(|eof| *eof).unwrap_or(true)
+    }
 }
 
 // ============================================================================
@@ -572,33 +584,19 @@ impl BleStream for PeripheralStream {
                 }
             }
 
-            let input = self.closer.input_stream.clone();
-            let n = tokio::task::spawn_blocking(move || {
-                input.dispatch(|is| {
-                    let mut tmp = [0u8; 2048];
-                    let res = unsafe {
-                        is.read_maxLength(
-                            NonNull::new_unchecked(tmp.as_mut_ptr()),
-                            tmp.len(),
-                        )
-                    };
-                    trace!("BLE peripheral recv: direct read returned {}", res);
-                    if res > 0 {
-                        Some(tmp[..res as usize].to_vec())
-                    } else {
-                        None
-                    }
-                })
-            }).await.map_err(|_| TransportError::Io(std::io::Error::other("spawn_blocking join failed")))?;
-
-            if let Some(bytes) = n {
-                if !bytes.is_empty() {
-                    self.recv_buf.lock().await.extend_from_slice(&bytes);
-                    continue;
-                }
+            let bytes = self._input_delegate.take_buffer();
+            if !bytes.is_empty() {
+                trace!(raw_bytes = bytes.len(), addr = %self.remote, "BLE peripheral recv raw");
+                self.recv_buf.lock().await.extend_from_slice(&bytes);
+                continue;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if self._input_delegate.reached_eof() {
+                trace!(addr = %self.remote, "BLE peripheral recv EOF");
+                return Ok(0);
+            }
+
+            self.read_notify.notified().await;
         }
     }
 
@@ -1050,12 +1048,22 @@ impl BleIo for BluestIo {
 
         self.adapter.connect_device(&device).await
             .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE connect {addr}: {e}"))))?;
-        debug!(addr = %addr, psm = psm, "Opening L2CAP channel");
+        let effective_psm = match self.discover_gatt_psm(addr).await {
+            Ok(discovered_psm) => {
+                debug!(addr = %addr, configured_psm = psm, discovered_psm, "BLE connect: using GATT-discovered PSM");
+                discovered_psm
+            }
+            Err(e) => {
+                debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery unavailable, using configured PSM");
+                psm
+            }
+        };
+        debug!(addr = %addr, psm = effective_psm, "Opening L2CAP channel");
 
-        let channel = device.open_l2cap_channel(psm, false).await
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("L2CAP open {addr} PSM {psm}: {e}"))))?;
+        let channel = device.open_l2cap_channel(effective_psm, false).await
+            .map_err(|e| TransportError::Io(std::io::Error::other(format!("L2CAP open {addr} PSM {effective_psm}: {e}"))))?;
         let (reader, writer) = channel.split();
-        debug!(addr = %addr, psm = psm, "L2CAP channel open");
+        debug!(addr = %addr, psm = effective_psm, "L2CAP channel open");
 
         Ok(AnyStream::Central(BluestStream {
             reader: Mutex::new(reader), writer: Mutex::new(writer),

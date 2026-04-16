@@ -6,7 +6,7 @@ use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};
 use crate::transport::{
-    disconnect_channel, packet_channel, Link, LinkDirection, LinkId, TransportAddr,
+    disconnect_channel, packet_channel, ConnectionState, Link, LinkDirection, LinkId, TransportAddr,
     TransportId,
 };
 use crate::upper::tun::{run_tun_reader, shutdown_tun_interface, TunDevice, TunState, add_tun_address};
@@ -242,33 +242,59 @@ impl Node {
             .insert((transport_id, remote_addr.clone()), link_id);
 
         if is_connection_oriented {
-            // Connection-oriented: start non-blocking connect, defer handshake
-            if let Some(transport) = self.transports.get(&transport_id) {
+            let connection_state = if let Some(transport) = self.transports.get(&transport_id) {
                 match transport.connect(&remote_addr).await {
-                    Ok(()) => {
-                        debug!(
-                            peer = %self.peer_display_name(&peer_node_addr),
-                            transport_id = %transport_id,
-                            remote_addr = %remote_addr,
-                            link_id = %link_id,
-                            "Transport connect initiated (non-blocking)"
-                        );
-                        self.pending_connects.push(super::PendingConnect {
-                            link_id,
-                            transport_id,
-                            remote_addr,
-                            peer_identity,
-                        });
-                    }
+                    Ok(()) => transport.connection_state(&remote_addr),
                     Err(e) => {
-                        // Clean up link
                         self.links.remove(&link_id);
                         self.addr_to_link.remove(&(transport_id, remote_addr));
                         return Err(NodeError::TransportError(e.to_string()));
                     }
                 }
+            } else {
+                self.links.remove(&link_id);
+                self.addr_to_link.remove(&(transport_id, remote_addr.clone()));
+                return Err(NodeError::TransportNotFound(transport_id));
+            };
+
+            match connection_state {
+                ConnectionState::Connected => {
+                    if let Some(link) = self.links.get_mut(&link_id) {
+                        link.set_connected();
+                    }
+
+                    debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %transport_id,
+                        remote_addr = %remote_addr,
+                        link_id = %link_id,
+                        "Transport already connected, starting handshake immediately"
+                    );
+
+                    self.start_handshake(link_id, transport_id, remote_addr, peer_identity).await
+                }
+                ConnectionState::Connecting | ConnectionState::None => {
+                    debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %transport_id,
+                        remote_addr = %remote_addr,
+                        link_id = %link_id,
+                        "Transport connect initiated (non-blocking)"
+                    );
+                    self.pending_connects.push(super::PendingConnect {
+                        link_id,
+                        transport_id,
+                        remote_addr,
+                        peer_identity,
+                    });
+                    Ok(())
+                }
+                ConnectionState::Failed(reason) => {
+                    self.links.remove(&link_id);
+                    self.addr_to_link.remove(&(transport_id, remote_addr));
+                    Err(NodeError::TransportError(reason))
+                }
             }
-            Ok(())
         } else {
             // Connectionless: proceed with immediate handshake
             self.start_handshake(link_id, transport_id, remote_addr, peer_identity).await
@@ -455,6 +481,16 @@ impl Node {
         let mut completed = Vec::new();
 
         for (i, pending) in self.pending_connects.iter().enumerate() {
+            let link_still_exists = self.links.contains_key(&pending.link_id);
+            let addr_still_maps = self.addr_to_link
+                .get(&(pending.transport_id, pending.remote_addr.clone()))
+                .is_some_and(|link_id| *link_id == pending.link_id);
+
+            if !link_still_exists || !addr_still_maps {
+                completed.push((i, false, None));
+                continue;
+            }
+
             let state = if let Some(transport) = self.transports.get(&pending.transport_id) {
                 transport.connection_state(&pending.remote_addr)
             } else {
@@ -472,8 +508,16 @@ impl Node {
                     // Still in progress, check on next tick
                 }
                 crate::transport::ConnectionState::None => {
-                    // Shouldn't happen — treat as failure
-                    completed.push((i, false, Some("no connection attempt found".into())));
+                    let link_still_exists = self.links.contains_key(&pending.link_id);
+                    let addr_still_maps = self.addr_to_link
+                        .get(&(pending.transport_id, pending.remote_addr.clone()))
+                        .is_some_and(|link_id| *link_id == pending.link_id);
+
+                    if !link_still_exists || !addr_still_maps {
+                        completed.push((i, false, None));
+                    } else {
+                        completed.push((i, false, Some("no connection attempt found".into())));
+                    }
                 }
             }
         }
@@ -512,6 +556,17 @@ impl Node {
                     self.remove_link(&pending.link_id);
                 }
             } else {
+                if reason.is_none() {
+                    debug!(
+                        peer = %self.peer_display_name(pending.peer_identity.node_addr()),
+                        transport_id = %pending.transport_id,
+                        remote_addr = %pending.remote_addr,
+                        link_id = %pending.link_id,
+                        "Pending connect already resolved elsewhere, skipping"
+                    );
+                    continue;
+                }
+
                 let reason = reason.unwrap_or_default();
                 warn!(
                     peer = %self.peer_display_name(pending.peer_identity.node_addr()),

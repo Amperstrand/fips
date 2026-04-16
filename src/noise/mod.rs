@@ -46,7 +46,7 @@ use chacha20poly1305::{
 use std::fmt;
 use thiserror::Error;
 
-pub use handshake::{set_ik_debug_ephemeral_key_log_path, HandshakeState};
+pub use handshake::{set_ik_debug_ephemeral_key_log_path, HandshakeState, IkDebugRecord};
 pub use replay::ReplayWindow;
 pub use session::NoiseSession;
 

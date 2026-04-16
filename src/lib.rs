@@ -62,3 +62,5 @@ pub use peer::{
 
 // Re-export node types
 pub use node::{Node, NodeError, NodeState};
+
+pub use node::wire::{EncryptedHeader as FmpEncryptedHeader, Msg1Header as FmpMsg1Header, Msg2Header as FmpMsg2Header, strip_inner_header as strip_fmp_inner_header};

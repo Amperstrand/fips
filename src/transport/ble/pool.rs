@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use crate::transport::{TransportAddr, TransportError};
 
 use super::addr::BleAddr;
+pub const BLE_FRAME_PREFIX_LEN: u16 = 2;
 
 /// A single BLE connection in the pool.
 pub struct BleConnection<S> {
@@ -36,9 +37,10 @@ pub struct BleConnection<S> {
 }
 
 impl<S> BleConnection<S> {
-    /// Effective MTU for this connection: min(send, recv).
     pub fn effective_mtu(&self) -> u16 {
-        self.send_mtu.min(self.recv_mtu)
+        self.send_mtu
+            .min(self.recv_mtu)
+            .saturating_sub(BLE_FRAME_PREFIX_LEN)
     }
 }
 
@@ -283,7 +285,15 @@ mod tests {
         let mut conn = test_conn(1, false);
         conn.send_mtu = 1024;
         conn.recv_mtu = 2048;
-        assert_eq!(conn.effective_mtu(), 1024);
+        assert_eq!(conn.effective_mtu(), 1022);
+    }
+
+    #[test]
+    fn test_pool_effective_mtu_clamps_framing_overhead() {
+        let mut conn = test_conn(1, false);
+        conn.send_mtu = 1;
+        conn.recv_mtu = 1;
+        assert_eq!(conn.effective_mtu(), 0);
     }
 
     #[test]

@@ -153,6 +153,34 @@ pub trait BleIo: Send + Sync + 'static {
     }
 }
 
+#[cfg(any(test, all(feature = "ble", target_os = "linux")))]
+fn try_take_framed_payload(
+    recv_buf: &mut Vec<u8>,
+    buf: &mut [u8],
+    max_payload_len: usize,
+) -> Result<Option<usize>, TransportError> {
+    if recv_buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+    if payload_len > max_payload_len {
+        return Err(TransportError::RecvFailed(format!(
+            "BLE recv: invalid frame header {} exceeds max payload {}",
+            payload_len, max_payload_len
+        )));
+    }
+
+    if recv_buf.len() < 2 + payload_len {
+        return Ok(None);
+    }
+
+    let copy_len = payload_len.min(buf.len());
+    buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
+    recv_buf.drain(..2 + payload_len);
+    Ok(Some(copy_len))
+}
+
 // ============================================================================
 // BluerIo — Production BLE I/O via BlueZ D-Bus
 // ============================================================================
@@ -170,6 +198,19 @@ mod bluer_impl {
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
     use tracing::{debug, trace, warn};
+
+    const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
+    const STARTUP_RETRY_ATTEMPTS: usize = 3;
+
+    fn is_transient_startup_error(error: &bluer::Error) -> bool {
+        matches!(
+            error.kind,
+            bluer::ErrorKind::AuthenticationFailed
+                | bluer::ErrorKind::Failed
+                | bluer::ErrorKind::InProgress
+                | bluer::ErrorKind::NotReady
+        )
+    }
 
     /// FIPS BLE service UUID.
     ///
@@ -222,7 +263,6 @@ mod bluer_impl {
         send_mtu: u16,
         recv_mtu: u16,
         rate_limiter: Option<tokio::sync::Mutex<crate::transport::ble::rate_limit::SendRateLimiter>>,
-        /// Internal buffer for stripping the 2-byte BE length prefix on recv.
         recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
 
@@ -254,7 +294,7 @@ mod bluer_impl {
                 } else {
                     None
                 },
-                recv_buf: tokio::sync::Mutex::new(vec![0u8; recv_mtu as usize]),
+                recv_buf: tokio::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -315,32 +355,38 @@ mod bluer_impl {
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            let mut internal = self.recv_buf.lock().await;
-            let n = self
-                .conn
-                .recv(&mut internal[..])
-                .await
-                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+            let max_payload_len = self.recv_mtu.saturating_sub(2) as usize;
 
-            if n < 2 {
-                return Err(TransportError::RecvFailed(format!(
-                    "BLE recv: framed message too short ({} bytes)",
-                    n
-                )));
+            loop {
+                {
+                    let mut recv_buf = self.recv_buf.lock().await;
+                    if let Some(copy_len) =
+                        try_take_framed_payload(&mut recv_buf, buf, max_payload_len)?
+                    {
+                        trace!(
+                            len = copy_len,
+                            buf_remaining = recv_buf.len(),
+                            addr = %self.remote,
+                            "BLE linux recv frame"
+                        );
+                        return Ok(copy_len);
+                    }
+                }
+
+                let mut chunk = vec![0u8; self.recv_mtu as usize];
+                let n = self
+                    .conn
+                    .recv(&mut chunk)
+                    .await
+                    .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+
+                if n == 0 {
+                    return Ok(0);
+                }
+
+                trace!(raw_bytes = n, addr = %self.remote, "BLE linux recv raw");
+                self.recv_buf.lock().await.extend_from_slice(&chunk[..n]);
             }
-
-            let payload_len = u16::from_be_bytes([internal[0], internal[1]]) as usize;
-            if n < 2 + payload_len {
-                return Err(TransportError::RecvFailed(format!(
-                    "BLE recv: frame header says {} bytes but only {} available",
-                    payload_len,
-                    n - 2
-                )));
-            }
-
-            let copy_len = payload_len.min(buf.len());
-            buf[..copy_len].copy_from_slice(&internal[2..2 + copy_len]);
-            Ok(copy_len)
         }
 
         fn send_mtu(&self) -> u16 {
@@ -885,28 +931,46 @@ mod bluer_impl {
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {
-            let adv = Advertisement {
-                advertisement_type: bluer::adv::Type::Peripheral,
-                service_uuids: {
-                    let mut s = BTreeSet::new();
-                    s.insert(FIPS_SERVICE_UUID);
-                    s
-                },
-                local_name: Some("fips".to_string()),
-                min_interval: Some(std::time::Duration::from_millis(400)),
-                max_interval: Some(std::time::Duration::from_millis(600)),
-                ..Default::default()
-            };
+            for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
+                let adv = Advertisement {
+                    advertisement_type: bluer::adv::Type::Peripheral,
+                    service_uuids: {
+                        let mut s = BTreeSet::new();
+                        s.insert(FIPS_SERVICE_UUID);
+                        s
+                    },
+                    local_name: Some("fips".to_string()),
+                    min_interval: Some(std::time::Duration::from_millis(400)),
+                    max_interval: Some(std::time::Duration::from_millis(600)),
+                    ..Default::default()
+                };
 
-            let handle = self
-                .adapter
-                .advertise(adv)
-                .await
-                .map_err(|e| map_err("advertise", e))?;
+                match self.adapter.advertise(adv).await {
+                    Ok(handle) => {
+                        *self.adv_handle.lock().await = Some(handle);
+                        debug!(attempt, "BLE advertising started");
+                        return Ok(());
+                    }
+                    Err(error)
+                        if attempt < STARTUP_RETRY_ATTEMPTS
+                            && is_transient_startup_error(&error) =>
+                    {
+                        warn!(
+                            attempt,
+                            retry_in_ms = STARTUP_RETRY_DELAY.as_millis(),
+                            kind = ?error.kind,
+                            message = %error.message,
+                            "BLE advertising start hit transient controller state; retrying"
+                        );
+                        tokio::time::sleep(STARTUP_RETRY_DELAY).await;
+                    }
+                    Err(error) => return Err(map_err("advertise", error)),
+                }
+            }
 
-            *self.adv_handle.lock().await = Some(handle);
-            debug!("BLE advertising started");
-            Ok(())
+            Err(TransportError::Io(std::io::Error::other(
+                "advertise: exhausted retries without returning result",
+            )))
         }
 
         async fn stop_advertising(&self) -> Result<(), TransportError> {
@@ -949,19 +1013,36 @@ mod bluer_impl {
                 .await
                 .map_err(|e| map_err("set_discovery_filter", e))?;
 
-            let events = self
-                .adapter
-                .discover_devices()
-                .await
-                .map_err(|e| map_err("discover_devices", e))?;
+            for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
+                match self.adapter.discover_devices().await {
+                    Ok(events) => {
+                        debug!(attempt, "BLE scanning started");
+                        return Ok(BluerScanner {
+                            events: Box::pin(events),
+                            adapter: self.adapter.clone(),
+                            adapter_name: self.adapter_name.clone(),
+                        });
+                    }
+                    Err(error)
+                        if attempt < STARTUP_RETRY_ATTEMPTS
+                            && is_transient_startup_error(&error) =>
+                    {
+                        warn!(
+                            attempt,
+                            retry_in_ms = STARTUP_RETRY_DELAY.as_millis(),
+                            kind = ?error.kind,
+                            message = %error.message,
+                            "BLE scanning start hit transient controller state; retrying"
+                        );
+                        tokio::time::sleep(STARTUP_RETRY_DELAY).await;
+                    }
+                    Err(error) => return Err(map_err("discover_devices", error)),
+                }
+            }
 
-            debug!("BLE scanning started");
-
-            Ok(BluerScanner {
-                events: Box::pin(events),
-                adapter: self.adapter.clone(),
-                adapter_name: self.adapter_name.clone(),
-            })
+            Err(TransportError::Io(std::io::Error::other(
+                "discover_devices: exhausted retries without returning result",
+            )))
         }
 
         fn local_addr(&self) -> Result<BleAddr, TransportError> {
@@ -1253,6 +1334,13 @@ impl BleIo for MockBleIo {
 mod tests {
     use super::*;
 
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + payload.len());
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
     fn test_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
@@ -1412,5 +1500,54 @@ mod tests {
 
         io.set_no_gatt(&peer);
         assert!(io.discover_gatt_psm(&peer).await.is_err());
+    }
+
+    #[test]
+    fn test_try_take_framed_payload_waits_for_complete_frame() {
+        let payload = b"hello";
+        let frame = framed(payload);
+        let mut recv_buf = frame[..4].to_vec();
+        let mut out = [0u8; 32];
+
+        let result = try_take_framed_payload(&mut recv_buf, &mut out, 510).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(recv_buf, frame[..4]);
+
+        recv_buf.extend_from_slice(&frame[4..]);
+        let result = try_take_framed_payload(&mut recv_buf, &mut out, 510).unwrap();
+        assert_eq!(result, Some(payload.len()));
+        assert_eq!(&out[..payload.len()], payload);
+        assert!(recv_buf.is_empty());
+    }
+
+    #[test]
+    fn test_try_take_framed_payload_leaves_coalesced_frame_buffered() {
+        let first = framed(b"one");
+        let second = framed(b"two");
+        let mut recv_buf = Vec::new();
+        recv_buf.extend_from_slice(&first);
+        recv_buf.extend_from_slice(&second);
+        let mut out = [0u8; 32];
+
+        let result = try_take_framed_payload(&mut recv_buf, &mut out, 510).unwrap();
+        assert_eq!(result, Some(3));
+        assert_eq!(&out[..3], b"one");
+        assert_eq!(recv_buf, second);
+
+        let result = try_take_framed_payload(&mut recv_buf, &mut out, 510).unwrap();
+        assert_eq!(result, Some(3));
+        assert_eq!(&out[..3], b"two");
+        assert!(recv_buf.is_empty());
+    }
+
+    #[test]
+    fn test_try_take_framed_payload_rejects_invalid_header() {
+        let mut recv_buf = vec![0x30, 0xC6, 0xAA, 0xBB];
+        let mut out = [0u8; 32];
+
+        let err = try_take_framed_payload(&mut recv_buf, &mut out, 510).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid frame header 12486 exceeds max payload 510"));
     }
 }

@@ -1,0 +1,39 @@
+# Test A: Linux outbound → macOS inbound (Mac peripheral, Linux central)
+#
+# Purpose: Prove Mac can accept inbound L2CAP connections from Linux.
+#          Mac publishes dynamic PSM via GATT and Linux reads it.
+#
+# Mac: full dual-role with accept_connections
+# Linux: central_only (scan, no accept)
+#
+# Expected: Mac peripheral publishes L2CAP with dynamic PSM, advertises
+#           GATT service with PSM characteristic. Linux discovers and connects.
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /tmp/fips-control.sock
+  log_level: debug
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "default"
+    mtu: 512
+    accept_connections: true
+    auto_connect: true
+    scan: false
+    advertise: true
+    send_rate_bps: 0
+    debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral-testA.jsonl"
+    probe_cooldown_secs: 10

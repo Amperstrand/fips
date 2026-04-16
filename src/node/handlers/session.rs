@@ -1690,7 +1690,21 @@ impl Node {
                     self.send_ipv6_packet_for_local(&local_endpoint, &dest_addr, &ipv6_packet).await
                 };
                 if let Err(e) = send_result {
-                    debug!(dest = %self.peer_display_name(&dest_addr), error = %e, "Failed to send TUN packet via session");
+                    match e {
+                        NodeError::MtuExceeded { mtu, .. } => {
+                            let ipv6_mtu = crate::upper::icmp::effective_ipv6_mtu(mtu) as u32;
+                            self.send_icmpv6_packet_too_big(&ipv6_packet, ipv6_mtu);
+                            debug!(
+                                dest = %self.peer_display_name(&dest_addr),
+                                transport_mtu = mtu,
+                                ipv6_mtu,
+                                "Generated ICMP PTB after transport MTU exceed"
+                            );
+                        }
+                        other => {
+                            debug!(dest = %self.peer_display_name(&dest_addr), error = %other, "Failed to send TUN packet via session");
+                        }
+                    }
                 }
                 return;
             }
