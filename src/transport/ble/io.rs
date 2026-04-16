@@ -165,7 +165,7 @@ mod bluer_impl {
     use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{adv::Advertisement, AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport};
     use futures::StreamExt;
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeSet, HashSet};
     use std::pin::Pin;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
@@ -449,6 +449,36 @@ mod bluer_impl {
     }
 
     impl BluerIo {
+        fn device_handle(&self, addr: &BleAddr) -> Result<bluer::Device, TransportError> {
+            self.adapter
+                .device(addr.to_bluer_address())
+                .map_err(|e| map_err("device", e))
+        }
+
+        async fn run_btmgmt(args: &[&str]) {
+            let mut command = tokio::process::Command::new("btmgmt");
+            command.kill_on_drop(true);
+            command.args(args);
+
+            let output = timeout(Duration::from_secs(3), command.output()).await;
+
+            match output {
+                Ok(Ok(out)) if out.status.success() => {
+                    debug!(args = ?args, "BLE: btmgmt command succeeded");
+                }
+                Ok(Ok(out)) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warn!(args = ?args, stderr = %stderr, "BLE: btmgmt command failed (non-fatal)");
+                }
+                Ok(Err(e)) => {
+                    warn!(args = ?args, error = %e, "BLE: btmgmt command unavailable (non-fatal)");
+                }
+                Err(_) => {
+                    warn!(args = ?args, "BLE: btmgmt command timed out (non-fatal)");
+                }
+            }
+        }
+
         /// Create a new BluerIo for the given adapter.
         ///
         /// Connects to BlueZ via D-Bus and powers on the adapter.
@@ -456,27 +486,7 @@ mod bluer_impl {
         /// CTKD LinkKey bits in SMP pairing (required for CoreBluetooth).
         pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32, le_only: bool) -> Result<Self, TransportError> {
             if le_only {
-                let mgmt_adapter = if adapter_name == "default" {
-                    "hci0".to_string()
-                } else {
-                    adapter_name.to_string()
-                };
-                let output = tokio::process::Command::new("btmgmt")
-                    .args(["bredr", "off"])
-                    .output()
-                    .await;
-                match output {
-                    Ok(out) if out.status.success() => {
-                        debug!(adapter = %mgmt_adapter, "BLE: BR/EDR disabled (le_only mode)");
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        warn!(adapter = %mgmt_adapter, stderr = %stderr, "BLE: btmgmt bredr off failed (non-fatal, SMP pairing may fail)");
-                    }
-                    Err(e) => {
-                        warn!(adapter = %mgmt_adapter, error = %e, "BLE: btmgmt not found (non-fatal, SMP pairing may fail)");
-                    }
-                }
+                Self::run_btmgmt(&["bredr", "off"]).await;
             }
 
             let session = bluer::Session::new()
@@ -498,6 +508,16 @@ mod bluer_impl {
                 .set_powered(true)
                 .await
                 .map_err(|e| map_err("set_powered", e))?;
+
+            if let Err(e) = adapter.set_pairable_timeout(0).await {
+                debug!(error = %e, "BLE: failed to set pairable timeout to 0");
+            }
+
+            if let Err(e) = adapter.set_pairable(true).await {
+                debug!(error = %e, "BLE: failed to set adapter pairable");
+            }
+
+            Self::run_btmgmt(&["bondable", "on"]).await;
 
             let name = adapter.name().to_string();
 
@@ -526,61 +546,57 @@ mod bluer_impl {
 
         async fn resolve_addr_type(&self, addr: &BleAddr) -> AddressType {
             let bluer_addr = addr.to_bluer_address();
+            let device = match self.device_handle(addr) {
+                Ok(device) => device,
+                Err(_) => return AddressType::LeRandom,
+            };
 
-            match self.adapter.device(bluer_addr) {
-                Ok(device) => device.address_type().await.unwrap_or(AddressType::LeRandom),
-                Err(_) => {
-                    debug!(addr = %addr, "BLE connect: device not in cache, starting discovery scan");
+            if let Ok(addr_type) = device.address_type().await {
+                return addr_type;
+            }
 
-                    let filter = DiscoveryFilter {
-                        transport: DiscoveryTransport::Le,
-                        ..Default::default()
-                    };
+            debug!(addr = %addr, "BLE connect: device not in cache, starting discovery scan");
 
-                    if let Err(e) = self.adapter.set_discovery_filter(filter).await {
-                        debug!(addr = %addr, error = %e, "BLE connect: failed to set discovery filter");
-                        return AddressType::LeRandom;
-                    }
+            let filter = DiscoveryFilter {
+                transport: DiscoveryTransport::Le,
+                ..Default::default()
+            };
 
-                    match self.adapter.discover_devices().await {
-                        Ok(mut events) => {
-                            let scan_result = timeout(Duration::from_secs(5), async {
-                                while let Some(event) = events.next().await {
-                                    if let AdapterEvent::DeviceAdded(found_addr) = event
-                                        && found_addr == bluer_addr {
-                                            let addr_type = match self.adapter.device(found_addr) {
-                                                Ok(device) => {
-                                                    device.address_type().await.unwrap_or(AddressType::LeRandom)
-                                                }
-                                                Err(_) => AddressType::LeRandom,
-                                            };
-                                            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
-                                            return Some(addr_type);
-                                        }
-                                }
-                                None
-                            })
-                            .await;
+            if let Err(e) = self.adapter.set_discovery_filter(filter).await {
+                debug!(addr = %addr, error = %e, "BLE connect: failed to set discovery filter");
+                return AddressType::LeRandom;
+            }
 
-                            drop(events);
-
-                            match scan_result {
-                                Ok(Some(addr_type)) => addr_type,
-                                Ok(None) | Err(_) => match self.adapter.device(bluer_addr) {
-                                    Ok(device) => {
-                                        let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
-                                        debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
-                                        addr_type
-                                    }
-                                    Err(_) => AddressType::LeRandom,
-                                },
+            match self.adapter.discover_devices_with_changes().await {
+                Ok(mut events) => {
+                    let scan_result = timeout(Duration::from_secs(5), async {
+                        while let Some(event) = events.next().await {
+                            if let AdapterEvent::DeviceAdded(found_addr) = event
+                                && found_addr == bluer_addr
+                                && let Ok(addr_type) = device.address_type().await
+                            {
+                                debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
+                                return Some(addr_type);
                             }
                         }
-                        Err(e) => {
-                            debug!(addr = %addr, error = %e, "BLE connect: failed to start discovery scan");
-                            AddressType::LeRandom
+                        None
+                    })
+                    .await;
+
+                    drop(events);
+
+                    match scan_result {
+                        Ok(Some(addr_type)) => addr_type,
+                        Ok(None) | Err(_) => {
+                            let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
+                            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
+                            addr_type
                         }
                     }
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: failed to start discovery scan");
+                    AddressType::LeRandom
                 }
             }
         }
@@ -595,13 +611,8 @@ mod bluer_impl {
         /// or if the PSM value is invalid.
         pub async fn discover_gatt_psm(&self, addr: &BleAddr) -> Result<u16, TransportError> {
             let discover = async {
-                let bluer_addr = addr.to_bluer_address();
-                let device = self.adapter.device(bluer_addr).map_err(|e| {
-                    TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: device not found for {}: {}",
-                        addr, e
-                    )))
-                })?;
+                let _ = self.resolve_addr_type(addr).await;
+                let device = self.device_handle(addr)?;
 
                 debug!(addr = %addr, "GATT PSM discovery: connecting GATT");
 
@@ -785,41 +796,36 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
+            let mut effective_psm = psm;
+            let addr_type = self.resolve_addr_type(addr).await;
             let bluer_addr = addr.to_bluer_address();
+            let device = self.device_handle(addr)?;
 
-            let device = self.adapter.device(bluer_addr)
-                .map_err(|e| map_err("device not found", e))?;
-
-            debug!(addr = %addr, "BLE connect: GATT-first connect");
+            debug!(addr = %addr, configured_psm = psm, addr_type = ?addr_type, "BLE connect: GATT-first connect");
             match device.connect().await {
                 Ok(()) => {
                     debug!(addr = %addr, "BLE connect: GATT connected");
+
+                    match timeout(Duration::from_secs(5), self.read_psm_from_gatt(&device, addr)).await {
+                        Ok(Ok(discovered_psm)) => {
+                            effective_psm = discovered_psm;
+                            debug!(addr = %addr, configured_psm = psm, discovered_psm, "BLE connect: using GATT-discovered PSM");
+                        }
+                        Ok(Err(e)) => {
+                            debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery unavailable, using configured PSM");
+                        }
+                        Err(_) => {
+                            debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT PSM discovery timed out, using configured PSM");
+                        }
+                    }
                 }
                 Err(e) => {
                     debug!(addr = %addr, error = %e, "BLE connect: GATT connect failed, trying direct L2CAP");
                 }
             }
 
-            match device.is_paired().await {
-                Ok(true) => {
-                    debug!(addr = %addr, "BLE connect: device already paired");
-                }
-                Ok(false) => {
-                    debug!(addr = %addr, "BLE connect: explicit pair() starting");
-                    device
-                        .pair()
-                        .await
-                        .map_err(|e| map_err("pair", e))?;
-                    debug!(addr = %addr, "BLE connect: explicit pair() complete");
-                }
-                Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE connect: failed to query paired state, attempting pair()");
-                    device
-                        .pair()
-                        .await
-                        .map_err(|e| map_err("pair", e))?;
-                    debug!(addr = %addr, "BLE connect: explicit pair() complete after paired-state query failure");
-                }
+            if let Ok(paired) = device.is_paired().await {
+                debug!(addr = %addr, paired, "BLE connect: pairing state (skipped)");
             }
 
             match device.is_trusted().await {
@@ -834,10 +840,10 @@ mod bluer_impl {
                 }
             }
 
-            let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
+            let addr_type = device.address_type().await.unwrap_or(addr_type);
             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type after GATT");
 
-            let target_sa = SocketAddr::new(bluer_addr, addr_type, psm);
+            let target_sa = SocketAddr::new(bluer_addr, addr_type, effective_psm);
 
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
@@ -845,9 +851,6 @@ mod bluer_impl {
                 .bind(SocketAddr::any_le())
                 .map_err(|e| map_io_err("bind", e))?;
 
-            // SOCK_SEQPACKET defaults to ERTM mode, which is not supported
-            // for LE L2CAP CoC. Must explicitly set LE flow control mode
-            // before connecting or the kernel returns ENOSYS.
             socket
                 .set_flow_control(FlowControl::Le)
                 .map_err(|e| map_io_err("set_flow_control", e))?;
@@ -860,11 +863,25 @@ mod bluer_impl {
                 debug!(error = %e, "BLE connect: set_power_forced_active not supported");
             }
 
-            let conn = socket.connect(target_sa).await
-                .map_err(|e| map_io_err("connect", e))?;
+            debug!(addr = %addr, addr_type = ?addr_type, psm = effective_psm, "BLE connect: opening LE L2CAP socket");
 
-            let remote = addr.clone();
-            BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
+            let conn_result = socket.connect(target_sa).await;
+            match conn_result {
+                Ok(conn) => {
+                    let remote = addr.clone();
+                    BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
+                }
+                Err(e) => {
+                    let err = map_io_err("connect", e);
+                    // Disconnect GATT to release stale L2CAP CIDs on the
+                    // peripheral, otherwise retries get "Source CID already
+                    // allocated" rejections.
+                    if let Err(e) = device.disconnect().await {
+                        debug!(addr = %addr, error = %e, "BLE connect: GATT disconnect after L2CAP failure (non-fatal)");
+                    }
+                    Err(err)
+                }
+            }
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {

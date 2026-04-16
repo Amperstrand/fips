@@ -31,7 +31,7 @@ use objc2_core_bluetooth::{
     CBPeripheralManagerDelegate, CBUUID,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSDictionary, NSError, NSDefaultRunLoopMode, NSInputStream, NSNotificationCenter,
+    NSArray, NSData, NSDate, NSDictionary, NSError, NSDefaultRunLoopMode, NSInputStream, NSNotificationCenter,
     NSNotification, NSObject, NSObjectProtocol, NSOutputStream, NSRunLoop, NSStream, NSStreamDelegate,
     NSStreamEvent, NSString,
 };
@@ -66,6 +66,28 @@ fn peripheral_queue() -> &'static DispatchQueue {
             Some(&utility),
         )
     })
+}
+
+fn ble_runloop() -> &'static NSRunLoop {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    unsafe {
+        let &ptr = PTR.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
+            std::thread::spawn(move || {
+                let rl = NSRunLoop::currentRunLoop();
+                let ptr = (&*rl) as *const NSRunLoop as usize;
+                tx.send(ptr).unwrap();
+                loop {
+                    let ran = rl.runMode_beforeDate(NSDefaultRunLoopMode, &NSDate::dateWithTimeIntervalSinceNow(0.5));
+                    if !ran {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            });
+            rx.recv().unwrap()
+        });
+        &*(ptr as *const NSRunLoop)
+    }
 }
 
 struct Dispatched<T>(UnsafeCell<Retained<T>>);
@@ -265,6 +287,7 @@ define_class!(
     unsafe impl NSStreamDelegate for PeripheralInputDelegate {
         #[unsafe(method(stream:handleEvent:))]
         fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
+            trace!("PeripheralInputDelegate event: {:?}", event_code);
             let input_stream = stream.downcast_ref::<NSInputStream>().unwrap();
             match event_code {
                 NSStreamEvent::HasBytesAvailable => {
@@ -324,6 +347,7 @@ define_class!(
     unsafe impl NSStreamDelegate for PeripheralOutputDelegate {
         #[unsafe(method(stream:handleEvent:))]
         fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
+            trace!("PeripheralOutputDelegate event: {:?}", event_code);
             if event_code != NSStreamEvent::HasSpaceAvailable { return; }
             let output_stream = stream.downcast_ref::<NSOutputStream>().unwrap();
             Self::drain_to_stream(&self.ivars().write_queue, output_stream);
@@ -398,6 +422,7 @@ impl Drop for PeripheralCloser {
 }
 
 pub struct PeripheralStream {
+    _channel: SendableChannel,
     _input_delegate: Retained<PeripheralInputDelegate>,
     output_delegate: Retained<PeripheralOutputDelegate>,
     closer: Arc<PeripheralCloser>,
@@ -410,14 +435,16 @@ pub struct PeripheralStream {
 
 impl PeripheralStream {
     unsafe fn setup_channel(
-        channel: &CBL2CAPChannel,
+        channel: SendableChannel,
         remote: BleAddr,
         mtu: u16,
         send_rate_bps: u64,
         send_burst_bytes: u32,
     ) -> Self {
-        let input_stream = channel.inputStream().expect("CBL2CAPChannel has no input stream");
-        let output_stream = channel.outputStream().expect("CBL2CAPChannel has no output stream");
+        let ble_rl = ble_runloop();
+
+        let input_stream = channel.0.inputStream().expect("CBL2CAPChannel has no input stream");
+        let output_stream = channel.0.outputStream().expect("CBL2CAPChannel has no output stream");
 
         let read_notify = Arc::new(tokio::sync::Notify::new());
         let input_delegate = PeripheralInputDelegate::new(read_notify.clone());
@@ -425,13 +452,15 @@ impl PeripheralStream {
 
         let input_protocol = ProtocolObject::from_retained(input_delegate.clone());
         input_stream.setDelegate(Some(&input_protocol));
-        input_stream.scheduleInRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSDefaultRunLoopMode);
+        input_stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
         input_stream.open();
+        trace!("BLE peripheral: input stream scheduled and opened, status={:?}", input_stream.streamStatus());
 
         let output_protocol = ProtocolObject::from_retained(output_delegate.clone());
         output_stream.setDelegate(Some(&output_protocol));
-        output_stream.scheduleInRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSDefaultRunLoopMode);
+        output_stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
         output_stream.open();
+        trace!("BLE peripheral: output stream scheduled and opened, status={:?}", output_stream.streamStatus());
 
         let center = NSNotificationCenter::defaultCenter();
         let notify_name = NSString::from_str(WRITE_NOTIFY_NAME);
@@ -449,6 +478,7 @@ impl PeripheralStream {
         });
 
         PeripheralStream {
+            _channel: channel,
             _input_delegate: input_delegate,
             output_delegate,
             closer,
@@ -480,26 +510,50 @@ impl BleStream for PeripheralStream {
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
         trace!(len = data.len(), addr = %self.remote, "BLE peripheral send");
-        self.output_delegate.enqueue(framed);
-        self.notify_write();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            async {
-                loop {
-                    if self.output_delegate.queue_len() == 0 { return Ok(()); }
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let output = self.closer.output_stream.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            output.dispatch(|os| {
+                let mut offset = 0;
+                while offset < framed.len() {
+                    let res = unsafe {
+                        os.write_maxLength(
+                            NonNull::new_unchecked(framed.as_ptr().add(offset) as *mut u8),
+                            framed.len() - offset,
+                        )
+                    };
+                    if res < 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write failed"))); }
+                    if res == 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write returned 0"))); }
+                    offset += res as usize;
                 }
-            },
-        ).await.map_err(|_| TransportError::Timeout)?
+                Ok(())
+            })
+        }).await.map_err(|_| TransportError::Io(std::io::Error::other("spawn_blocking join failed")))?;
+        result
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
         let mut framed = Vec::with_capacity(2 + data.len());
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
-        self.output_delegate.enqueue(framed);
-        self.notify_write();
-        Ok(())
+        let output = self.closer.output_stream.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            output.dispatch(|os| {
+                let mut offset = 0;
+                while offset < framed.len() {
+                    let res = unsafe {
+                        os.write_maxLength(
+                            NonNull::new_unchecked(framed.as_ptr().add(offset) as *mut u8),
+                            framed.len() - offset,
+                        )
+                    };
+                    if res < 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write failed"))); }
+                    if res == 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write returned 0"))); }
+                    offset += res as usize;
+                }
+                Ok(())
+            })
+        }).await.map_err(|_| TransportError::Io(std::io::Error::other("spawn_blocking join failed")))?;
+        result
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -512,36 +566,39 @@ impl BleStream for PeripheralStream {
                         let copy_len = payload_len.min(buf.len());
                         buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
                         recv_buf.drain(..2 + payload_len);
+                        trace!("BLE peripheral recv: returned {} bytes from recv_buf", copy_len);
                         return Ok(copy_len);
                     }
                 }
             }
 
-            let delegate = &self._input_delegate;
-            let (bytes, is_eof) = {
-                let mut buffer = delegate.ivars().buffer.lock().map_err(|_| {
-                    TransportError::Io(std::io::Error::other("input delegate lock poisoned"))
-                })?;
-                let eof = delegate.ivars().eof.lock().map(|e| *e).unwrap_or(true);
-                (std::mem::take(&mut *buffer), eof)
-            };
+            let input = self.closer.input_stream.clone();
+            let n = tokio::task::spawn_blocking(move || {
+                input.dispatch(|is| {
+                    let mut tmp = [0u8; 2048];
+                    let res = unsafe {
+                        is.read_maxLength(
+                            NonNull::new_unchecked(tmp.as_mut_ptr()),
+                            tmp.len(),
+                        )
+                    };
+                    trace!("BLE peripheral recv: direct read returned {}", res);
+                    if res > 0 {
+                        Some(tmp[..res as usize].to_vec())
+                    } else {
+                        None
+                    }
+                })
+            }).await.map_err(|_| TransportError::Io(std::io::Error::other("spawn_blocking join failed")))?;
 
-            if !bytes.is_empty() {
-                self.recv_buf.lock().await.extend_from_slice(&bytes);
-                continue;
-            }
-            if is_eof { return Ok(0); }
-
-            tokio::select! {
-                _ = self.read_notify.notified() => continue,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    let is_eof = delegate.ivars().eof.lock().map(|e| *e).unwrap_or(true);
-                    let buffer = delegate.ivars().buffer.lock().map_err(|_| {
-                        TransportError::Io(std::io::Error::other("input delegate lock poisoned"))
-                    })?;
-                    if buffer.is_empty() && is_eof { return Ok(0); }
+            if let Some(bytes) = n {
+                if !bytes.is_empty() {
+                    self.recv_buf.lock().await.extend_from_slice(&bytes);
+                    continue;
                 }
             }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -902,7 +959,7 @@ impl BleIo for BluestIo {
             }
         }
 
-        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(true); });
+        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
 
         // Wait for PSM
         loop {
@@ -966,12 +1023,11 @@ impl BleIo for BluestIo {
                                 std::mem::take(&mut *pending)
                             };
                             for sc in channels {
-                                let channel = &sc.0;
-                                let remote = channel.peer().map(|p| {
+                                let remote = sc.0.peer().map(|p| {
                                     let bytes = nsuuid_to_bytes(&p.identifier());
                                     BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: bytes }
                                 }).unwrap_or_else(|| BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: [0, 0, 0, 0, 0, 0] });
-                                streams.lock().unwrap().push(PeripheralStream::setup_channel(&channel, remote, mtu, send_rate_bps, send_burst_bytes));
+                                streams.lock().unwrap().push(PeripheralStream::setup_channel(sc, remote, mtu, send_rate_bps, send_burst_bytes));
                             }
                         });
                         for stream in streams.into_inner().unwrap() {
