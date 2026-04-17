@@ -250,19 +250,21 @@ impl TunWriter {
     /// to the TUN device. Returns when the channel is closed (all senders dropped).
     #[cfg_attr(target_os = "macos", allow(unused_mut))]
     pub fn run(mut self) {
-        use super::tcp_mss::clamp_tcp_mss;
+        use super::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
         debug!(name = %self.name, max_mss = self.max_mss.load(Ordering::Relaxed), "TUN writer starting");
 
         for mut packet in self.rx {
             let mss = self.max_mss.load(Ordering::Relaxed);
-            // Clamp TCP MSS on inbound SYN-ACK packets
             if clamp_tcp_mss(&mut packet, mss) {
                 trace!(
                     name = %self.name,
                     max_mss = mss,
                     "Clamped TCP MSS in inbound SYN-ACK packet"
                 );
+            }
+            if clamp_tcp_window(&mut packet) {
+                trace!(name = %self.name, "Clamped TCP window in inbound packet");
             }
 
             // On macOS, utun devices require a 4-byte packet information header
@@ -462,7 +464,7 @@ fn handle_tun_packet(
     outbound_tx: &TunOutboundTx,
 ) -> bool {
     use super::icmp::{build_dest_unreachable, should_send_icmp_error, DestUnreachableCode};
-    use super::tcp_mss::clamp_tcp_mss;
+    use super::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
     log_ipv6_packet(packet);
 
@@ -476,6 +478,9 @@ fn handle_tun_packet(
         let mss = max_mss.load(Ordering::Relaxed);
         if clamp_tcp_mss(packet, mss) {
             trace!(name = %name, max_mss = mss, "Clamped TCP MSS in SYN packet");
+        }
+        if clamp_tcp_window(packet) {
+            trace!(name = %name, "Clamped TCP window in outbound packet");
         }
         if outbound_tx.blocking_send(packet.to_vec()).is_err() {
             return false; // Channel closed, shutdown

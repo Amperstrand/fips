@@ -1,7 +1,9 @@
-//! TCP MSS (Maximum Segment Size) clamping for MTU handling.
+//! TCP MSS clamping and receive window clamping for constrained transports.
 //!
-//! Intercepts TCP SYN packets and reduces the MSS option to ensure
-//! TCP segments fit within the FIPS effective MTU after encapsulation.
+//! Intercepts TCP packets to:
+//! - Reduce MSS option in SYN packets to fit FIPS effective MTU
+//! - Strip Window Scale option from SYN/SYN-ACK and clamp receive window
+//!   to a small value appropriate for low-bandwidth links (e.g., BLE)
 
 /// TCP header minimum length (without options).
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -12,11 +14,25 @@ const TCP_OPT_MSS: u8 = 2;
 /// TCP option length for MSS (kind + length + value).
 const TCP_OPT_MSS_LEN: u8 = 4;
 
+/// TCP option kind for Window Scale.
+const TCP_OPT_WSCALE: u8 = 3;
+
+/// TCP option kind for NOP (used as padding when stripping options).
+const TCP_OPT_NOP: u8 = 1;
+
 /// TCP flags offset in header.
 const TCP_FLAGS_OFFSET: usize = 13;
 
+/// TCP window field offset (relative to TCP header start).
+const TCP_WINDOW_OFFSET: usize = 14;
+
 /// TCP SYN flag bit.
 const TCP_FLAG_SYN: u8 = 0x02;
+
+/// Maximum TCP receive window for constrained BLE links (4 × MSS=373).
+/// At ~30kbps and ~300ms RTT, BDP ≈ 1125 bytes. 1460 bytes ≈ 1.3× BDP,
+/// allowing pipelining without excessive queuing.
+const MAX_BLE_TCP_WINDOW: u16 = 1460;
 
 /// Check if a TCP packet is a SYN packet (has SYN flag set).
 fn is_tcp_syn(tcp_header: &[u8]) -> bool {
@@ -74,7 +90,7 @@ pub fn clamp_tcp_mss(ipv6_packet: &mut [u8], max_mss: u16) -> bool {
     // Parse TCP options
     let options_start = tcp_start + TCP_HEADER_MIN_LEN;
     let options_end = tcp_start + tcp_header_len;
-    
+
     if options_end > ipv6_packet.len() {
         return false;
     }
@@ -114,16 +130,109 @@ pub fn clamp_tcp_mss(ipv6_packet: &mut [u8], max_mss: u16) -> bool {
             // Clamp if needed
             if current_mss > max_mss {
                 ipv6_packet[i + 2..i + 4].copy_from_slice(&max_mss.to_be_bytes());
-                
+
                 // Recalculate TCP checksum
                 recalculate_tcp_checksum(ipv6_packet, tcp_start);
-                
+
                 modified = true;
             }
             break; // MSS option found, no need to continue
         }
 
         i += length;
+    }
+
+    modified
+}
+
+/// Clamp TCP receive window and strip Window Scale option on constrained links.
+///
+/// For SYN/SYN-ACK packets: removes the Window Scale option (replaces with NOPs)
+/// so both sides negotiate scale=0, meaning the raw window field = actual window.
+///
+/// For ALL TCP packets: clamps the window field to `min(current, MAX_BLE_TCP_WINDOW)`.
+/// This is necessary because TCP updates its receive window on every ACK — clamping
+/// only SYN-ACK would be bypassed within the first RTT.
+///
+/// Returns true if the packet was modified.
+pub fn clamp_tcp_window(ipv6_packet: &mut [u8]) -> bool {
+    // Validate IPv6 header
+    if ipv6_packet.len() < 40 || ipv6_packet[0] >> 4 != 6 {
+        return false;
+    }
+
+    // Check if next header is TCP (6)
+    if ipv6_packet[6] != 6 {
+        return false;
+    }
+
+    let tcp_start = 40;
+    if ipv6_packet.len() < tcp_start + TCP_HEADER_MIN_LEN {
+        return false;
+    }
+
+    let tcp_header = &ipv6_packet[tcp_start..];
+    let tcp_header_len = get_tcp_data_offset(tcp_header);
+    if tcp_header_len < TCP_HEADER_MIN_LEN || tcp_header_len > tcp_header.len() {
+        return false;
+    }
+
+    let flags = tcp_header[TCP_FLAGS_OFFSET];
+    let is_syn = (flags & TCP_FLAG_SYN) != 0;
+    let mut modified = false;
+
+    // On SYN packets: strip Window Scale option (replace with NOPs)
+    if is_syn {
+        let options_start = tcp_start + TCP_HEADER_MIN_LEN;
+        let options_end = tcp_start + tcp_header_len;
+
+        if options_end <= ipv6_packet.len() {
+            let mut i = options_start;
+            while i < options_end {
+                let kind = ipv6_packet[i];
+                if kind == 0 {
+                    break;
+                }
+                if kind == TCP_OPT_NOP {
+                    i += 1;
+                    continue;
+                }
+                if i + 1 >= options_end {
+                    break;
+                }
+                let length = ipv6_packet[i + 1] as usize;
+                if length < 2 || i + length > options_end {
+                    break;
+                }
+
+                if kind == TCP_OPT_WSCALE && length == 3 {
+                    // Replace 3-byte Window Scale option with 3× NOP
+                    for j in 0..3 {
+                        ipv6_packet[i + j] = TCP_OPT_NOP;
+                    }
+                    modified = true;
+                    break;
+                }
+                i += length;
+            }
+        }
+    }
+
+    // On ALL TCP packets: clamp window field
+    let window_offset = tcp_start + TCP_WINDOW_OFFSET;
+    if window_offset + 2 <= ipv6_packet.len() {
+        let current_window =
+            u16::from_be_bytes([ipv6_packet[window_offset], ipv6_packet[window_offset + 1]]);
+
+        if current_window > MAX_BLE_TCP_WINDOW {
+            ipv6_packet[window_offset..window_offset + 2]
+                .copy_from_slice(&MAX_BLE_TCP_WINDOW.to_be_bytes());
+            modified = true;
+        }
+    }
+
+    if modified {
+        recalculate_tcp_checksum(ipv6_packet, tcp_start);
     }
 
     modified
@@ -258,7 +367,7 @@ mod tests {
         let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
         let mut packet = make_tcp_syn_packet(src, dst, 1460);
-        
+
         // Clear SYN flag
         packet[40 + 13] = 0x10; // ACK only
 
