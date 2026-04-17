@@ -55,6 +55,10 @@ pub trait BleStream: Send + Sync {
         &self,
         rate_bps: u64,
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        true
+    }
 }
 
 /// An acceptor that yields inbound L2CAP connections.
@@ -201,6 +205,7 @@ mod bluer_impl {
 
     const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
     const STARTUP_RETRY_ATTEMPTS: usize = 3;
+    const BLE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
     fn is_transient_startup_error(error: &bluer::Error) -> bool {
         matches!(
@@ -316,13 +321,10 @@ mod bluer_impl {
             let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                self.conn.send(&framed),
-            )
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
             .await
             .map_err(|_| {
-                warn!(len = framed.len(), "BLE write timeout (3s)");
+                warn!(len = framed.len(), timeout_secs = BLE_SEND_TIMEOUT.as_secs(), "BLE write timeout");
                 TransportError::Timeout
             })?
             .map(|_| ())
@@ -341,13 +343,10 @@ mod bluer_impl {
             let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                self.conn.send(&framed),
-            )
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
             .await
             .map_err(|_| {
-                warn!(len = framed.len(), "BLE write timeout (3s)");
+                warn!(len = framed.len(), timeout_secs = BLE_SEND_TIMEOUT.as_secs(), "BLE write timeout");
                 TransportError::Timeout
             })?
             .map(|_| ())

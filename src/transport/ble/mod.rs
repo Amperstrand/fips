@@ -143,7 +143,7 @@ impl<I: BleIo> BleTransport<I> {
         packet_tx: PacketTx,
     ) -> Self {
         let max_conns = config.max_connections();
-        let initial_rate_bps = config.send_rate_bps();
+        let initial_rate_bps = config.effective_send_rate_bps();
         Self {
             transport_id,
             name,
@@ -468,6 +468,8 @@ impl<I: BleIo> BleTransport<I> {
             }
         };
 
+        wait_before_outbound_pubkey_exchange().await;
+
         // Pre-handshake pubkey exchange (temporary, pre-XX)
         if let Some(ref our_pubkey) = self.local_pubkey {
             match pubkey_exchange(&stream, our_pubkey, self.local_capabilities).await {
@@ -602,6 +604,8 @@ impl<I: BleIo> BleTransport<I> {
 
             match result {
                 Ok(Ok(stream)) => {
+                    wait_before_outbound_pubkey_exchange().await;
+
                     // Pre-handshake pubkey exchange (temporary, pre-XX)
                     if let Some(ref our_pubkey) = local_pubkey {
                         match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
@@ -935,6 +939,27 @@ struct PubkeyExchangeResult {
     peer_capabilities: PeerCapabilities,
 }
 
+const OUTBOUND_PUBKEY_EXCHANGE_SETTLE_MS: u64 = 250;
+
+async fn wait_before_outbound_pubkey_exchange() {
+    tokio::time::sleep(std::time::Duration::from_millis(
+        OUTBOUND_PUBKEY_EXCHANGE_SETTLE_MS,
+    ))
+    .await;
+}
+
+async fn send_pubkey_announcement<S: BleStream>(
+    stream: &S,
+    local_pubkey: &[u8; 32],
+    local_capabilities: PeerCapabilities,
+) -> Result<(), TransportError> {
+    let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE + 1];
+    msg[0] = PUBKEY_EXCHANGE_PREFIX;
+    msg[1..33].copy_from_slice(local_pubkey);
+    msg[33] = local_capabilities.to_byte();
+    stream.send(&msg).await
+}
+
 /// Exchange public keys and capabilities over a newly established L2CAP connection.
 ///
 /// Both sides send `[0x00][our_pubkey:32][flags:1]` (34 bytes) and receive
@@ -1035,50 +1060,47 @@ async fn accept_loop<A>(
 
                 // Pre-handshake pubkey exchange (temporary, pre-XX)
                 if let Some(ref our_pubkey) = local_pubkey {
-                    match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
-                        Ok(result) => {
-                            let peer_pubkey = result.peer_pubkey;
-                            let peer_capabilities = result.peer_capabilities;
-                            debug!(addr = %ta, peer_caps = format!("0x{:02x}", peer_capabilities.to_byte()), local_caps = format!("0x{:02x}", local_capabilities.to_byte()), "BLE inbound pubkey exchange complete");
-                            discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                    if stream.supports_bidirectional_pubkey_exchange() {
+                        match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
+                            Ok(result) => {
+                                let peer_pubkey = result.peer_pubkey;
+                                let peer_capabilities = result.peer_capabilities;
+                                debug!(addr = %ta, peer_caps = format!("0x{:02x}", peer_capabilities.to_byte()), local_caps = format!("0x{:02x}", local_capabilities.to_byte()), "BLE inbound pubkey exchange complete");
+                                discovery_buffer.add_peer_with_pubkey(&addr, peer_pubkey);
 
-                            if !peer_capabilities.can_accept_inbound() {
-                                // Peer is central-only but connected to us inbound.
-                                // This means the peer insists on being central as a hard
-                                // constraint (e.g. macOS CoreBluetooth can only initiate
-                                // outbound L2CAP).  Accept the inbound connection and
-                                // proceed to normal handshake — the peer will drive the
-                                // session as initiator on its end.
-                                debug!(
-                                    addr = %ta,
-                                    "BLE inbound: peer is central-only, accepting inbound connection anyway"
-                                );
-                            } else if peer_capabilities.prefers_outbound()
-                                && !local_capabilities.prefers_outbound()
-                            {
-                                debug!(
-                                    addr = %ta,
-                                    "BLE inbound: peer prefers outbound, keeping connection"
-                                );
-                                // Skip tie-breaker — keep this inbound
-                            } else if let Some(ref our_addr) = local_node_addr {
-                                // Cross-probe tie-breaker: smaller NodeAddr's
-                                // outbound wins. If we're smaller, our outbound
-                                // should win — drop this inbound.
-                                let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
-                                if our_addr < &peer_addr {
+                                if !peer_capabilities.can_accept_inbound() {
                                     debug!(
                                         addr = %ta,
-                                        "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
+                                        "BLE inbound: peer is central-only, accepting inbound connection anyway"
                                     );
-                                    continue;
+                                } else if peer_capabilities.prefers_outbound()
+                                    && !local_capabilities.prefers_outbound()
+                                {
+                                    debug!(
+                                        addr = %ta,
+                                        "BLE inbound: peer prefers outbound, keeping connection"
+                                    );
+                                } else if let Some(ref our_addr) = local_node_addr {
+                                    let peer_addr = NodeAddr::from_pubkey(&peer_pubkey);
+                                    if our_addr < &peer_addr {
+                                        debug!(
+                                            addr = %ta,
+                                            "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
+                                        );
+                                        continue;
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                debug!(addr = %ta, error = %e, "BLE inbound pubkey exchange failed");
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            debug!(addr = %ta, error = %e, "BLE inbound pubkey exchange failed");
-                            continue;
-                        }
+                    } else if let Err(e) = send_pubkey_announcement(&stream, our_pubkey, local_capabilities).await {
+                        debug!(addr = %ta, error = %e, "BLE inbound pubkey announcement failed");
+                        continue;
+                    } else {
+                        debug!(addr = %ta, local_caps = format!("0x{:02x}", local_capabilities.to_byte()), "BLE inbound pubkey announcement sent; deferring peer identity to Noise");
                     }
                 }
 
@@ -1324,6 +1346,8 @@ async fn scan_probe_loop<I: io::BleIo>(
                 continue;
             }
         };
+
+        wait_before_outbound_pubkey_exchange().await;
 
         // Pubkey exchange, then promote connection to pool
         let ta = addr.to_transport_addr();

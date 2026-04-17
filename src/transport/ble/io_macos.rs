@@ -31,9 +31,9 @@ use objc2_core_bluetooth::{
     CBPeripheralManagerDelegate, CBUUID,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSDate, NSDictionary, NSError, NSDefaultRunLoopMode, NSInputStream, NSNotificationCenter,
+    NSArray, NSData, NSDictionary, NSError, NSDefaultRunLoopMode, NSInputStream, NSNotificationCenter,
     NSNotification, NSObject, NSObjectProtocol, NSOutputStream, NSRunLoop, NSStream, NSStreamDelegate,
-    NSStreamEvent, NSString,
+    NSStreamEvent, NSStreamStatus, NSString,
 };
 use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, GlobalQueueIdentifier};
 
@@ -49,6 +49,25 @@ const FIPS_GATT_PSM_CHAR_UUID: uuid::Uuid =
 const MACOS_ADAPTER_NAME: &str = "default";
 
 const WRITE_NOTIFY_NAME: &str = "FIPSPeripheralWrite";
+
+/// Bounded queue depth for central-role BLE sends.
+/// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
+const BLE_CENTRAL_QUEUE_DEPTH: usize = 32;
+
+/// Timeout for enqueuing a framed message when the bounded queue is full.
+/// Matches Linux BLE send timeout; 4× safety margin over expected drain time.
+const BLE_CENTRAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bounded queue depth for peripheral-role BLE sends.
+/// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
+const BLE_PERIPHERAL_QUEUE_DEPTH: usize = 32;
+
+/// Maximum total bytes allowed in the peripheral write queue.
+const BLE_PERIPHERAL_QUEUE_BYTE_CAP: usize = 65536;
+
+/// Timeout for enqueuing when the peripheral write queue is full.
+/// 4× safety margin over expected drain time (~3.4s at 150kbps).
+const BLE_PERIPHERAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 // ============================================================================
 // Dispatch helpers
@@ -69,25 +88,21 @@ fn peripheral_queue() -> &'static DispatchQueue {
 }
 
 fn ble_runloop() -> &'static NSRunLoop {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static MAIN_PTR: OnceLock<usize> = OnceLock::new();
     unsafe {
-        let &ptr = PTR.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<usize>();
-            std::thread::spawn(move || {
-                let rl = NSRunLoop::currentRunLoop();
-                let ptr = (&*rl) as *const NSRunLoop as usize;
-                tx.send(ptr).unwrap();
-                loop {
-                    let ran = rl.runMode_beforeDate(NSDefaultRunLoopMode, &NSDate::dateWithTimeIntervalSinceNow(0.5));
-                    if !ran {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
-            });
-            rx.recv().unwrap()
+        let ptr = *MAIN_PTR.get_or_init(|| {
+            let rl = NSRunLoop::mainRunLoop();
+            (&*rl) as *const NSRunLoop as usize
         });
         &*(ptr as *const NSRunLoop)
     }
+}
+
+fn ble_runloop_exec_sync<F, R>(f: F) -> R
+where
+    F: FnOnce(&NSRunLoop) -> R,
+{
+    f(ble_runloop())
 }
 
 struct Dispatched<T>(UnsafeCell<Retained<T>>);
@@ -119,13 +134,40 @@ impl<T: Message> Clone for Dispatched<T> {
     }
 }
 
+struct RunLoopDispatched<T>(UnsafeCell<Retained<T>>);
+
+unsafe impl<T> Send for RunLoopDispatched<T> {}
+unsafe impl<T> Sync for RunLoopDispatched<T> {}
+
+impl<T: Message + 'static> RunLoopDispatched<T> {
+    unsafe fn new(value: Retained<T>) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    fn dispatch<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        ble_runloop_exec_sync(|_| {
+            let value = unsafe { &*self.0.get() };
+            f(value)
+        })
+    }
+}
+
+impl<T: Message + 'static> Clone for RunLoopDispatched<T> {
+    fn clone(&self) -> Self {
+        self.dispatch(|val| Self(UnsafeCell::new(val.retain())))
+    }
+}
+
 // ============================================================================
 // BluestStream — wraps bluest L2capChannel (central role)
 // ============================================================================
 
 pub struct BluestStream {
     reader: Mutex<bluest::L2capChannelReader>,
-    writer: Mutex<bluest::L2capChannelWriter>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     remote: BleAddr,
     mtu: u16,
     recv_buf: Mutex<Vec<u8>>,
@@ -143,17 +185,23 @@ impl BleStream for BluestStream {
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.writer.lock().await.write_all(&framed),
-        )
-        .await
-        .map_err(|_| {
-            warn!(addr = %self.remote, len = framed.len(), "BLE write timeout (3s)");
-            TransportError::Timeout
-        })?
-        .map_err(|e| TransportError::Io(e))?;
-        Ok(())
+
+        match self.tx.try_send(framed) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
+                trace!(addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, waiting with timeout");
+                tokio::time::timeout(BLE_CENTRAL_SEND_TIMEOUT, self.tx.send(framed))
+                    .await
+                    .map_err(|_| {
+                        warn!(addr = %self.remote, timeout_secs = BLE_CENTRAL_SEND_TIMEOUT.as_secs(), "BLE central send timeout (queue full)");
+                        TransportError::Timeout
+                    })?
+                    .map_err(|_| TransportError::Io(std::io::Error::other("BLE central send channel closed")))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(TransportError::Io(std::io::Error::other("BLE central send channel closed")))
+            }
+        }
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
@@ -161,17 +209,23 @@ impl BleStream for BluestStream {
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.writer.lock().await.write_all(&framed),
-        )
-        .await
-        .map_err(|_| {
-            warn!(addr = %self.remote, len = framed.len(), "BLE write timeout (3s)");
-            TransportError::Timeout
-        })?
-        .map_err(|e| TransportError::Io(e))?;
-        Ok(())
+
+        match self.tx.try_send(framed) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
+                trace!(addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full (urgent), waiting with timeout");
+                tokio::time::timeout(BLE_CENTRAL_SEND_TIMEOUT, self.tx.send(framed))
+                    .await
+                    .map_err(|_| {
+                        warn!(addr = %self.remote, timeout_secs = BLE_CENTRAL_SEND_TIMEOUT.as_secs(), "BLE central send_urgent timeout (queue full)");
+                        TransportError::Timeout
+                    })?
+                    .map_err(|_| TransportError::Io(std::io::Error::other("BLE central send channel closed")))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(TransportError::Io(std::io::Error::other("BLE central send channel closed")))
+            }
+        }
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -220,6 +274,8 @@ impl BleStream for BluestStream {
             limiter.lock().await.set_rate_bps(rate_bps);
         }
     }
+
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool { true }
 }
 
 // ============================================================================
@@ -265,6 +321,13 @@ impl BleStream for AnyStream {
             AnyStream::Peripheral(s) => s.set_rate_bps(rate_bps).await,
         }
     }
+
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        match self {
+            AnyStream::Central(s) => s.supports_bidirectional_pubkey_exchange(),
+            AnyStream::Peripheral(s) => s.supports_bidirectional_pubkey_exchange(),
+        }
+    }
 }
 
 // ============================================================================
@@ -277,6 +340,62 @@ struct PeripheralInputDelegateIvars {
     eof: StdMutex<bool>,
 }
 
+struct SendableInputStream(Retained<NSInputStream>);
+unsafe impl Send for SendableInputStream {}
+
+impl Clone for SendableInputStream {
+    fn clone(&self) -> Self {
+        Self(self.0.retain())
+    }
+}
+
+impl SendableInputStream {
+    unsafe fn with<R>(&self, f: impl FnOnce(&NSInputStream) -> R) -> R {
+        f(&self.0)
+    }
+
+    fn retained(&self) -> Retained<NSInputStream> {
+        self.0.retain()
+    }
+}
+
+struct SendableOutputStream(Retained<NSOutputStream>);
+unsafe impl Send for SendableOutputStream {}
+
+impl Clone for SendableOutputStream {
+    fn clone(&self) -> Self {
+        Self(self.0.retain())
+    }
+}
+
+impl SendableOutputStream {
+    unsafe fn with<R>(&self, f: impl FnOnce(&NSOutputStream) -> R) -> R {
+        f(&self.0)
+    }
+
+    fn retained(&self) -> Retained<NSOutputStream> {
+        self.0.retain()
+    }
+}
+
+struct SendableInputDelegate(Retained<PeripheralInputDelegate>);
+unsafe impl Send for SendableInputDelegate {}
+
+impl SendableInputDelegate {
+    fn retained(&self) -> Retained<PeripheralInputDelegate> {
+        self.0.retain()
+    }
+}
+
+struct SendableOutputDelegate(Retained<PeripheralOutputDelegate>);
+unsafe impl Send for SendableOutputDelegate {}
+
+impl SendableOutputDelegate {
+    fn retained(&self) -> Retained<PeripheralOutputDelegate> {
+        self.0.retain()
+    }
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[ivars = PeripheralInputDelegateIvars]
@@ -287,27 +406,10 @@ define_class!(
     unsafe impl NSStreamDelegate for PeripheralInputDelegate {
         #[unsafe(method(stream:handleEvent:))]
         fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
-            trace!("PeripheralInputDelegate event: {:?}", event_code);
-            let input_stream = stream.downcast_ref::<NSInputStream>().unwrap();
+            debug!(?event_code, "PeripheralInputDelegate event");
             match event_code {
-                NSStreamEvent::HasBytesAvailable => {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        let res = unsafe {
-                            input_stream.read_maxLength(
-                                NonNull::new_unchecked(buf.as_mut_ptr()),
-                                buf.len(),
-                            )
-                        };
-                        if res <= 0 { break; }
-                        let n = res as usize;
-                        if let Ok(mut buffer) = self.ivars().buffer.lock() {
-                            buffer.extend_from_slice(&buf[..n]);
-                        }
-                    }
-                    self.ivars().notify.notify_one();
-                }
                 NSStreamEvent::EndEncountered | NSStreamEvent::ErrorOccurred => {
+                    debug!(?event_code, "PeripheralInputDelegate EOF or error");
                     if let Ok(mut eof) = self.ivars().eof.lock() { *eof = true; }
                     self.ivars().notify.notify_one();
                 }
@@ -347,6 +449,8 @@ impl PeripheralInputDelegate {
 
 struct PeripheralOutputDelegateIvars {
     write_queue: StdMutex<VecDeque<Vec<u8>>>,
+    queue_space_notify: Arc<tokio::sync::Notify>,
+    output_stream: StdMutex<Option<SendableOutputStream>>,
 }
 
 define_class!(
@@ -359,34 +463,59 @@ define_class!(
     unsafe impl NSStreamDelegate for PeripheralOutputDelegate {
         #[unsafe(method(stream:handleEvent:))]
         fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
-            trace!("PeripheralOutputDelegate event: {:?}", event_code);
+            debug!(?event_code, "PeripheralOutputDelegate event");
             if event_code != NSStreamEvent::HasSpaceAvailable { return; }
             let output_stream = stream.downcast_ref::<NSOutputStream>().unwrap();
-            Self::drain_to_stream(&self.ivars().write_queue, output_stream);
+            if self.ivars().output_stream.lock().ok().map_or(true, |s| s.is_none()) {
+                let sendable = SendableOutputStream(output_stream.retain());
+                if let Ok(mut guard) = self.ivars().output_stream.lock() {
+                    *guard = Some(sendable);
+                }
+            }
+            self.drain_to_stream(output_stream);
         }
 
         #[unsafe(method(onWriteNotify:))]
-        fn on_write_notify(&self, _notification: &NSNotification) {}
+        fn on_write_notify(&self, _notification: &NSNotification) {
+            if let Ok(guard) = self.ivars().output_stream.lock() {
+                if let Some(ref stream) = *guard {
+                    unsafe { stream.with(|os| self.drain_to_stream(os)) };
+                }
+            }
+        }
     }
 );
 
 impl PeripheralOutputDelegate {
-    fn new() -> Retained<Self> {
+    fn new(queue_space_notify: Arc<tokio::sync::Notify>) -> Retained<Self> {
         let ivars = PeripheralOutputDelegateIvars {
             write_queue: StdMutex::new(VecDeque::new()),
+            queue_space_notify,
+            output_stream: StdMutex::new(None),
         };
         let this = PeripheralOutputDelegate::alloc().set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
     }
 
-    fn enqueue(&self, data: Vec<u8>) {
-        if let Ok(mut queue) = self.ivars().write_queue.lock() {
-            queue.push_back(data);
+    fn try_enqueue(&self, data: &[u8]) -> bool {
+        let mut queue = match self.ivars().write_queue.lock() {
+            Ok(q) => q,
+            Err(_) => return false,
+        };
+        if queue.len() >= BLE_PERIPHERAL_QUEUE_DEPTH {
+            return false;
         }
+        let current_bytes: usize = queue.iter().map(|v| v.len()).sum();
+        if current_bytes + data.len() > BLE_PERIPHERAL_QUEUE_BYTE_CAP {
+            return false;
+        }
+        queue.push_back(data.to_vec());
+        true
     }
 
-    fn drain_to_stream(write_queue: &StdMutex<VecDeque<Vec<u8>>>, output_stream: &NSOutputStream) {
-        let mut queue = match write_queue.lock() { Ok(q) => q, Err(_) => return };
+    fn drain_to_stream(&self, output_stream: &NSOutputStream) {
+        let mut queue = match self.ivars().write_queue.lock() { Ok(q) => q, Err(_) => return };
+        let initial_len = queue.len();
         while let Some(data) = queue.pop_front() {
             let mut offset = 0;
             while offset < data.len() {
@@ -404,6 +533,10 @@ impl PeripheralOutputDelegate {
                 offset += res as usize;
             }
         }
+        drop(queue);
+        if initial_len > 0 {
+            self.ivars().queue_space_notify.notify_waiters();
+        }
     }
 
     fn queue_len(&self) -> usize {
@@ -416,8 +549,8 @@ impl PeripheralOutputDelegate {
 // ============================================================================
 
 struct PeripheralCloser {
-    input_stream: Dispatched<NSInputStream>,
-    output_stream: Dispatched<NSOutputStream>,
+    input_stream: RunLoopDispatched<NSInputStream>,
+    output_stream: RunLoopDispatched<NSOutputStream>,
     _center_observer: Retained<PeripheralOutputDelegate>,
 }
 
@@ -439,6 +572,7 @@ pub struct PeripheralStream {
     output_delegate: Retained<PeripheralOutputDelegate>,
     closer: Arc<PeripheralCloser>,
     read_notify: Arc<tokio::sync::Notify>,
+    queue_space_notify: Arc<tokio::sync::Notify>,
     remote: BleAddr,
     mtu: u16,
     recv_buf: Mutex<Vec<u8>>,
@@ -453,26 +587,38 @@ impl PeripheralStream {
         send_rate_bps: u64,
         send_burst_bytes: u32,
     ) -> Self {
-        let ble_rl = ble_runloop();
-
         let input_stream = channel.0.inputStream().expect("CBL2CAPChannel has no input stream");
         let output_stream = channel.0.outputStream().expect("CBL2CAPChannel has no output stream");
 
         let read_notify = Arc::new(tokio::sync::Notify::new());
         let input_delegate = PeripheralInputDelegate::new(read_notify.clone());
-        let output_delegate = PeripheralOutputDelegate::new();
+        let queue_space_notify = Arc::new(tokio::sync::Notify::new());
+        let output_delegate = PeripheralOutputDelegate::new(queue_space_notify.clone());
 
-        let input_protocol = ProtocolObject::from_retained(input_delegate.clone());
-        input_stream.setDelegate(Some(&input_protocol));
-        input_stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
-        input_stream.open();
-        trace!("BLE peripheral: input stream scheduled and opened, status={:?}", input_stream.streamStatus());
+        let input_stream = SendableInputStream(input_stream.retain());
+        let output_stream = SendableOutputStream(output_stream.retain());
+        let input_stream_for_setup = input_stream.clone();
+        let output_stream_for_setup = output_stream.clone();
+        let input_delegate_for_setup = SendableInputDelegate(input_delegate.clone());
+        let output_delegate_for_setup = SendableOutputDelegate(output_delegate.clone());
 
-        let output_protocol = ProtocolObject::from_retained(output_delegate.clone());
-        output_stream.setDelegate(Some(&output_protocol));
-        output_stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
-        output_stream.open();
-        trace!("BLE peripheral: output stream scheduled and opened, status={:?}", output_stream.streamStatus());
+        ble_runloop_exec_sync(move |ble_rl| unsafe {
+            let input_protocol = ProtocolObject::from_retained(input_delegate_for_setup.retained());
+            input_stream_for_setup.with(|stream| {
+                stream.setDelegate(Some(&input_protocol));
+                stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
+                stream.open();
+                trace!("BLE peripheral: input stream scheduled and opened, status={:?}", stream.streamStatus());
+            });
+
+            let output_protocol = ProtocolObject::from_retained(output_delegate_for_setup.retained());
+            output_stream_for_setup.with(|stream| {
+                stream.setDelegate(Some(&output_protocol));
+                stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
+                stream.open();
+                trace!("BLE peripheral: output stream scheduled and opened, status={:?}", stream.streamStatus());
+            });
+        });
 
         let center = NSNotificationCenter::defaultCenter();
         let notify_name = NSString::from_str(WRITE_NOTIFY_NAME);
@@ -480,8 +626,46 @@ impl PeripheralStream {
             &output_delegate, objc2::sel!(onWriteNotify:), Some(&notify_name), None,
         );
 
-        let input_dispatched = Dispatched::new(input_stream.retain());
-        let output_dispatched = Dispatched::new(output_stream.retain());
+        let input_dispatched = RunLoopDispatched::new(input_stream.retained());
+        let output_dispatched = RunLoopDispatched::new(output_stream.retained());
+
+        let input_stream_for_reader = input_stream.clone();
+        let input_delegate_for_reader = SendableInputDelegate(input_delegate.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let res = unsafe {
+                    input_stream_for_reader.with(|stream| {
+                        stream.read_maxLength(
+                            NonNull::new_unchecked(buf.as_mut_ptr()),
+                            buf.len(),
+                        )
+                    })
+                };
+
+                if res > 0 {
+                    let n = res as usize;
+                    if let Ok(mut buffer) = input_delegate_for_reader.0.ivars().buffer.lock() {
+                        buffer.extend_from_slice(&buf[..n]);
+                    }
+                    debug!(bytes = n, "PeripheralInput reader thread buffered bytes");
+                    input_delegate_for_reader.0.ivars().notify.notify_one();
+                    continue;
+                }
+
+                let status = input_stream_for_reader.with(|stream| stream.streamStatus());
+                if res < 0 || matches!(status, NSStreamStatus::AtEnd | NSStreamStatus::Closed | NSStreamStatus::Error) {
+                    if let Ok(mut eof) = input_delegate_for_reader.0.ivars().eof.lock() {
+                        *eof = true;
+                    }
+                    input_delegate_for_reader.0.ivars().notify.notify_one();
+                    debug!(?status, read_result = res, "PeripheralInput reader thread stopping");
+                    break;
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
 
         let closer = Arc::new(PeripheralCloser {
             input_stream: input_dispatched,
@@ -495,6 +679,7 @@ impl PeripheralStream {
             output_delegate,
             closer,
             read_notify,
+            queue_space_notify,
             remote,
             mtu,
             recv_buf: Mutex::new(Vec::new()),
@@ -510,6 +695,25 @@ impl PeripheralStream {
             NSNotificationCenter::defaultCenter().postNotificationName_object(&name, None);
         }
     }
+
+    async fn enqueue_with_backpressure(&self, framed: &[u8], label: &str) -> Result<(), TransportError> {
+        loop {
+            let notified = self.queue_space_notify.notified();
+            if self.output_delegate.try_enqueue(framed) {
+                self.notify_write();
+                return Ok(());
+            }
+            trace!(addr = %self.remote, %label, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral queue full, waiting for space");
+            match tokio::time::timeout(BLE_PERIPHERAL_SEND_TIMEOUT, notified).await {
+                Ok(()) => continue,
+                Err(_) => {
+                    warn!(addr = %self.remote, %label, timeout_secs = BLE_PERIPHERAL_SEND_TIMEOUT.as_secs(), "BLE peripheral timeout (queue full)");
+                    return Err(TransportError::Timeout);
+                }
+            }
+        }
+    }
+
 }
 
 impl BleStream for PeripheralStream {
@@ -518,54 +722,25 @@ impl BleStream for PeripheralStream {
         if let Some(ref limiter) = self.rate_limiter {
             limiter.lock().await.acquire(framed_len).await;
         }
-        let mut framed = Vec::with_capacity(framed_len);
-        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        framed.extend_from_slice(data);
+        let framed = {
+            let mut f = Vec::with_capacity(framed_len);
+            f.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            f.extend_from_slice(data);
+            f
+        };
         trace!(len = data.len(), addr = %self.remote, "BLE peripheral send");
-        let output = self.closer.output_stream.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            output.dispatch(|os| {
-                let mut offset = 0;
-                while offset < framed.len() {
-                    let res = unsafe {
-                        os.write_maxLength(
-                            NonNull::new_unchecked(framed.as_ptr().add(offset) as *mut u8),
-                            framed.len() - offset,
-                        )
-                    };
-                    if res < 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write failed"))); }
-                    if res == 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write returned 0"))); }
-                    offset += res as usize;
-                }
-                Ok(())
-            })
-        }).await.map_err(|_| TransportError::Io(std::io::Error::other("spawn_blocking join failed")))?;
-        result
+        self.enqueue_with_backpressure(&framed, "send").await
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-        let mut framed = Vec::with_capacity(2 + data.len());
-        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        framed.extend_from_slice(data);
-        let output = self.closer.output_stream.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            output.dispatch(|os| {
-                let mut offset = 0;
-                while offset < framed.len() {
-                    let res = unsafe {
-                        os.write_maxLength(
-                            NonNull::new_unchecked(framed.as_ptr().add(offset) as *mut u8),
-                            framed.len() - offset,
-                        )
-                    };
-                    if res < 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write failed"))); }
-                    if res == 0 { return Err(TransportError::Io(std::io::Error::other("NSOutputStream write returned 0"))); }
-                    offset += res as usize;
-                }
-                Ok(())
-            })
-        }).await.map_err(|_| TransportError::Io(std::io::Error::other("spawn_blocking join failed")))?;
-        result
+        let framed = {
+            let mut f = Vec::with_capacity(2 + data.len());
+            f.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            f.extend_from_slice(data);
+            f
+        };
+        trace!(len = data.len(), addr = %self.remote, "BLE peripheral send_urgent");
+        self.enqueue_with_backpressure(&framed, "send_urgent").await
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -608,6 +783,8 @@ impl BleStream for PeripheralStream {
             limiter.lock().await.set_rate_bps(rate_bps);
         }
     }
+
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool { false }
 }
 
 // ============================================================================
@@ -629,6 +806,10 @@ struct SendableChannel(Retained<CBL2CAPChannel>);
 unsafe impl Send for SendableChannel {}
 unsafe impl Sync for SendableChannel {}
 
+struct SendablePeripheralStream(PeripheralStream);
+unsafe impl Send for SendablePeripheralStream {}
+unsafe impl Sync for SendablePeripheralStream {}
+
 struct SendableDelegate(Retained<FipsPeripheralDelegate>);
 unsafe impl Send for SendableDelegate {}
 unsafe impl Sync for SendableDelegate {}
@@ -636,7 +817,10 @@ unsafe impl Sync for SendableDelegate {}
 struct FipsPeripheralDelegateIvars {
     sender: StdMutex<tokio::sync::mpsc::Sender<PeripheralManagerEvent>>,
     published_psm: Arc<AtomicU16>,
-    pending_channels: StdMutex<Vec<SendableChannel>>,
+    pending_streams: StdMutex<Vec<SendablePeripheralStream>>,
+    mtu: u16,
+    send_rate_bps: u64,
+    send_burst_bytes: u32,
 }
 
 define_class!(
@@ -688,8 +872,22 @@ define_class!(
             if let Some(e) = error { error!("L2CAP channel open failed: {:?}", e); return; }
             if let Some(channel) = channel {
                 debug!("Incoming L2CAP channel opened");
-                if let Ok(mut pending) = self.ivars().pending_channels.lock() {
-                    pending.push(SendableChannel(channel.retain()));
+                let remote = unsafe { channel.peer() }.map(|p| {
+                    let identifier = unsafe { p.identifier() };
+                    let bytes = unsafe { nsuuid_to_bytes(&identifier) };
+                    BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: bytes }
+                }).unwrap_or_else(|| BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: [0, 0, 0, 0, 0, 0] });
+                let stream = unsafe {
+                    PeripheralStream::setup_channel(
+                        SendableChannel(channel.retain()),
+                        remote,
+                        self.ivars().mtu,
+                        self.ivars().send_rate_bps,
+                        self.ivars().send_burst_bytes,
+                    )
+                };
+                if let Ok(mut pending) = self.ivars().pending_streams.lock() {
+                    pending.push(SendablePeripheralStream(stream));
                 }
                 let _ = self.ivars().sender.lock()
                     .map(|s| s.try_send(PeripheralManagerEvent::L2CAPChannelOpened));
@@ -706,11 +904,20 @@ define_class!(
 );
 
 impl FipsPeripheralDelegate {
-    fn new(sender: tokio::sync::mpsc::Sender<PeripheralManagerEvent>, published_psm: Arc<AtomicU16>) -> Retained<Self> {
+    fn new(
+        sender: tokio::sync::mpsc::Sender<PeripheralManagerEvent>,
+        published_psm: Arc<AtomicU16>,
+        mtu: u16,
+        send_rate_bps: u64,
+        send_burst_bytes: u32,
+    ) -> Retained<Self> {
         let ivars = FipsPeripheralDelegateIvars {
             sender: StdMutex::new(sender),
             published_psm,
-            pending_channels: StdMutex::new(Vec::new()),
+            pending_streams: StdMutex::new(Vec::new()),
+            mtu,
+            send_rate_bps,
+            send_burst_bytes,
         };
         let this = FipsPeripheralDelegate::alloc().set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
@@ -918,7 +1125,13 @@ impl BleIo for BluestIo {
         // `ProtocolObject<dyn CBPeripheralManagerDelegate>` drops before
         // any `.await` points below.
         let manager = {
-            let delegate = FipsPeripheralDelegate::new(event_tx, self.published_psm.clone());
+            let delegate = FipsPeripheralDelegate::new(
+                event_tx,
+                self.published_psm.clone(),
+                self.mtu,
+                self.send_rate_bps,
+                self.send_burst_bytes,
+            );
             let protocol = ProtocolObject::from_retained(delegate.clone());
 
             let mgr = unsafe {
@@ -1004,32 +1217,19 @@ impl BleIo for BluestIo {
         // within exec_sync on the dispatch queue where ObjC access is safe.
         let event_rx_bridge = self.event_rx.clone();
         let delegate_arc = self.peripheral_delegate.clone();
-        let mtu = self.mtu;
-        let send_rate_bps = self.send_rate_bps;
-        let send_burst_bytes = self.send_burst_bytes;
         tokio::spawn(async move {
             loop {
                 let mut rx = event_rx_bridge.lock().await;
                 match rx.recv().await {
                     Some(PeripheralManagerEvent::L2CAPChannelOpened) => {
-                        let streams: std::sync::Mutex<Vec<PeripheralStream>> = std::sync::Mutex::new(Vec::new());
-                        peripheral_queue().exec_sync(|| unsafe {
-                            let channels: Vec<SendableChannel> = {
-                                let guard = delegate_arc.lock().unwrap();
-                                let Some(d) = guard.as_ref() else { return };
-                                let mut pending = d.0 .ivars().pending_channels.lock().unwrap();
-                                std::mem::take(&mut *pending)
-                            };
-                            for sc in channels {
-                                let remote = sc.0.peer().map(|p| {
-                                    let bytes = nsuuid_to_bytes(&p.identifier());
-                                    BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: bytes }
-                                }).unwrap_or_else(|| BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: [0, 0, 0, 0, 0, 0] });
-                                streams.lock().unwrap().push(PeripheralStream::setup_channel(sc, remote, mtu, send_rate_bps, send_burst_bytes));
-                            }
-                        });
-                        for stream in streams.into_inner().unwrap() {
-                            if inbound_tx.send(AnyStream::Peripheral(stream)).await.is_err() { return; }
+                        let streams: Vec<SendablePeripheralStream> = {
+                            let guard = delegate_arc.lock().unwrap();
+                            let Some(d) = guard.as_ref() else { return };
+                            let mut pending = d.0.ivars().pending_streams.lock().unwrap();
+                            std::mem::take(&mut *pending)
+                        };
+                        for stream in streams {
+                            if inbound_tx.send(AnyStream::Peripheral(stream.0)).await.is_err() { return; }
                         }
                     }
                     Some(_) => {}
@@ -1065,8 +1265,21 @@ impl BleIo for BluestIo {
         let (reader, writer) = channel.split();
         debug!(addr = %addr, psm = effective_psm, "L2CAP channel open");
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BLE_CENTRAL_QUEUE_DEPTH);
+        let drain_addr = addr.clone();
+        tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some(frame) = rx.recv().await {
+                if let Err(e) = writer.write_all(&frame).await {
+                    warn!(addr = %drain_addr, error = %e, "BLE central drain task write error, stopping");
+                    break;
+                }
+            }
+            debug!(addr = %drain_addr, "BLE central drain task stopped");
+        });
+
         Ok(AnyStream::Central(BluestStream {
-            reader: Mutex::new(reader), writer: Mutex::new(writer),
+            reader: Mutex::new(reader), tx,
             remote: addr.clone(), mtu: self.mtu,
             recv_buf: Mutex::new(Vec::new()),
             rate_limiter: if self.send_rate_bps > 0 {

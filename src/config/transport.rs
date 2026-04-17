@@ -588,11 +588,11 @@ pub struct BleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recv_timeout_secs: Option<u64>,
 
-    /// Send rate limit in bits per second. 0 = unlimited. Default: 150_000 (150 Kbps).
+    /// Send rate limit in bits per second. 0 = unlimited. Default: 100_000 (100 Kbps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_rate_bps: Option<u64>,
 
-    /// Send burst size in bytes. Default: 4096 (2 MTU-sized packets).
+    /// Send burst size in bytes. Default: 2048 (1 MTU-sized packet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_burst_bytes: Option<u32>,
 
@@ -678,14 +678,21 @@ impl BleConfig {
             .unwrap_or(DEFAULT_BLE_RECV_TIMEOUT_SECS)
     }
 
-    /// Get the send rate limit in bits per second. Default: 150_000.
+    /// Get the send rate limit in bits per second. Default: 100_000.
     pub fn send_rate_bps(&self) -> u64 {
-        self.send_rate_bps.unwrap_or(150_000)
+        self.send_rate_bps.unwrap_or(100_000)
     }
 
-    /// Get the send burst size in bytes. Default: 4096.
+    pub fn effective_send_rate_bps(&self) -> u64 {
+        match self.send_rate_bps {
+            Some(0) => 150_000,
+            _ => self.send_rate_bps(),
+        }
+    }
+
+    /// Get the send burst size in bytes. Default: 2048.
     pub fn send_burst_bytes(&self) -> u32 {
-        self.send_burst_bytes.unwrap_or(4096)
+        self.send_burst_bytes.unwrap_or(2048)
     }
 
     pub fn debug_ephemeral_key_log_path(&self) -> Option<&str> {

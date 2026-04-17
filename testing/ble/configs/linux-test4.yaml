@@ -21,8 +21,10 @@ dns:
   bind_addr: "127.0.0.1"
   port: 5354
 
-transports:
-  ble:
-    adapter: "hci0"
-    mtu: 512
-    probe_cooldown_secs: 10
+  transports:
+    ble:
+      adapter: "hci0"
+      mtu: 512
+      send_rate_bps: 100000
+      send_burst_bytes: 2048
+      probe_cooldown_secs: 10

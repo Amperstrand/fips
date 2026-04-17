@@ -847,7 +847,7 @@ impl Node {
                 let mtu = ble_config.mtu();
                 let accept_connections = ble_config.accept_connections();
                 let le_only = ble_config.le_only();
-                match crate::transport::ble::io::BluerIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes(), le_only).await {
+                match crate::transport::ble::io::BluerIo::new(&adapter, mtu, ble_config.effective_send_rate_bps(), ble_config.send_burst_bytes(), le_only).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,
@@ -878,7 +878,7 @@ impl Node {
                 let mtu = ble_config.mtu();
                 let accept_connections = ble_config.accept_connections();
                 let scan_enabled = ble_config.scan();
-                match crate::transport::ble::io::BluestIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes()).await {
+                match crate::transport::ble::io::BluestIo::new(&adapter, mtu, ble_config.effective_send_rate_bps(), ble_config.send_burst_bytes()).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,

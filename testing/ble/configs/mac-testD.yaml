@@ -28,5 +28,5 @@ transports:
     auto_connect: true
     scan: true
     advertise: true
-    send_rate_bps: 0
-    probe_cooldown_secs: 10
+    send_rate_bps: 100000
+    send_burst_bytes: 2048
