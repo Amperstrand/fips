@@ -1,0 +1,89 @@
+BLE Pacing/Config Audit — Stability-First Profile
+===================================================
+Date: 2026-04-17
+Task: Task 3 — Audit pacing/config defaults against stability target
+
+================================================================================
+CURRENT DEFAULTS (from code)
+================================================================================
+
+BleConfig defaults (src/config/transport.rs):
+- send_rate_bps: 150,000 (150 Kbps) — auto-rate when Some(0) or None
+- send_burst_bytes: 4,096 (4 KB)
+- recv_timeout_secs: 45 seconds
+
+effective_send_rate_bps() behavior:
+- Some(0) → 150,000 bps (auto-rate fallback)
+- Some(n) where n > 0 → n
+- None → 150,000 bps
+
+Send timeouts:
+- Linux (io.rs): BLE_SEND_TIMEOUT = 15 seconds (widened from 3s)
+- macOS Central (io_macos.rs): 3 seconds (too short for congestion)
+- macOS Peripheral (io_macos.rs): No timeout (blocks indefinitely)
+
+SendRateLimiter (rate_limit.rs):
+- Token bucket implementation
+- Rate = effective_send_rate_bps() / 8 bytes/sec
+- Burst = send_burst_bytes
+- acquire() blocks until tokens available
+
+BleRateAdapter (rate_limit.rs):
+- AIMD (Additive Increase, Multiplicative Decrease) on MMP SRTT feedback
+- Increases rate on good SRTT, decreases on congestion
+- Target: adaptive pacing based on link conditions
+
+================================================================================
+TEST CONFIG OVERRIDES
+================================================================================
+
+All test configs in testing/ble/configs/ set send_rate_bps: 0, which:
+- Triggers effective_send_rate_bps() → 150,000 bps auto-rate
+- This was added as a fix — previously 0 meant unlimited
+
+Configs examined:
+- testA-*.yaml through testE-*.yaml: all use send_rate_bps: 0
+
+================================================================================
+PROPOSED STABILITY-FIRST PROFILE
+================================================================================
+
+Profile: "Stability-First BLE"
+
+| Parameter          | Current Default | Proposed  | Rationale                        |
+|--------------------|-----------------|-----------|----------------------------------|
+| send_rate_bps      | 150,000         | 100,000   | Conservative start, ~100 Kbps    |
+| send_burst_bytes   | 4,096           | 2,048     | Smaller bursts, less queue pressure |
+| recv_timeout_secs  | 45              | 45        | Keep (already generous)          |
+| send timeout (macOS central) | 3s    | 15s       | Match Linux, tolerate congestion |
+| send timeout (macOS periph)  | ∞     | 15s       | Cap indefinite block             |
+
+Why 100 Kbps:
+- BLE LE CoC typical throughput: 100-250 Kbps
+- Conservative start allows AIMD to ramp up if link is healthy
+- Prevents overwhelming L2CAP credit window
+
+Why 2,048 burst:
+- BLE L2CAP MTU: 512 bytes (ESP32 hardware constraint)
+- 2,048 = ~4 SDUs — smaller burst reduces queue pressure
+- Still large enough to amortize token bucket overhead
+
+================================================================================
+PACING INTERACTION WITH BULK TRANSFER
+================================================================================
+
+Flow: iperf data → TUN → Node → session handler → BleTransport::send()
+  → SendRateLimiter::acquire() [blocks until tokens available]
+  → BleStream::send() [2-byte prefix + FMP frame]
+  → CoreBluetooth/BlueZ L2CAP write
+
+When pacing is bypassed (send_rate_bps: 0 → 150 Kbps auto):
+- Data arrives faster than BLE can transmit
+- Queue fills → backpressure → if backpressure not handled, stall
+
+When pacing is active at 100 Kbps:
+- ~12.5 KB/s max throughput
+- ~50 SDUs/sec at 244 bytes each
+- Manageable for L2CAP credit window
+
+================================================================================

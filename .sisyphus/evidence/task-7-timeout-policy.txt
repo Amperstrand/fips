@@ -1,0 +1,99 @@
+BLE WRITE TIMEOUT POLICY AUDIT
+==============================
+Date: 2026-04-17
+Task: 7 — Cross-path consistency audit of BLE write timeout/backpressure policy
+Status: CONSISTENT — no fixes required
+
+1. SEND TIMEOUT (all production paths)
+=======================================
+
+| Path                    | Timeout  | Constant Name              | Location              |
+|-------------------------|----------|----------------------------|-----------------------|
+| Linux BluerStream       | 15s      | BLE_SEND_TIMEOUT           | io.rs:208             |
+| macOS Central Bluest    | 15s      | BLE_CENTRAL_SEND_TIMEOUT   | io_macos.rs:59        |
+| macOS Peripheral        | 15s      | BLE_PERIPHERAL_SEND_TIMEOUT| io_macos.rs:70        |
+
+Verdict: ALL PATHS USE 15s. Consistent.
+
+
+2. QUEUE DEPTH / BACKPRESSURE
+==============================
+
+| Path                    | Queue Type          | Depth/Size          | Byte Cap | Location          |
+|-------------------------|---------------------|---------------------|----------|-------------------|
+| Linux BluerStream       | Kernel SeqPacket    | Implicit (socket)   | N/A      | io.rs:308-332     |
+| macOS Central Bluest    | mpsc::bounded       | 32 frames           | N/A      | io_macos.rs:55,1268|
+| macOS Peripheral        | VecDeque (StdMutex) | 32 frames           | 65536    | io_macos.rs:63-66 |
+
+Linux: SeqPacket preserves message boundaries. The kernel socket buffer provides
+implicit backpressure — conn.send() blocks when buffer full, and 15s timeout
+ensures bounded wait. No application-level queue needed.
+
+macOS Central: tokio::sync::mpsc::channel(32) + drain task. Drain task reads
+from channel, writes to bluest L2capChannelWriter via write_all(). When channel
+full, try_send falls through to timeout(15s, tx.send()).
+
+macOS Peripheral: StdMutex<VecDeque<Vec<u8>>> with dual caps (count + bytes).
+try_enqueue() checks both limits. On full: Notify-based backpressure with
+15s timeout. Drain triggered by HasSpaceAvailable + NSNotification.
+
+Verdict: All paths bounded. No unbounded queues.
+
+
+3. SEND URGENT POLICY
+======================
+
+| Path                    | Rate Limiter | Queue         | Timeout  |
+|-------------------------|--------------|---------------|----------|
+| Linux BluerStream       | No           | SeqPacket     | 15s      |
+| macOS Central Bluest    | No           | mpsc(32)      | 15s      |
+| macOS Peripheral        | No           | VecDeque(32)  | 15s      |
+
+send_urgent skips rate limiter on all paths. Uses same queue and timeout as send.
+Verdict: Consistent.
+
+
+4. SATURATION BEHAVIOR
+========================
+
+| Path                    | On Queue Full + Timeout  | Error Returned           |
+|-------------------------|--------------------------|--------------------------|
+| Linux BluerStream       | Socket write timeout     | TransportError::Timeout  |
+| macOS Central Bluest    | Channel send timeout     | TransportError::Timeout  |
+| macOS Peripheral        | Notify timeout           | TransportError::Timeout  |
+
+All paths return TransportError::Timeout on saturation. The caller (receive_loop
+in mod.rs) treats Timeout as transient and does NOT disconnect the link.
+
+Verdict: Consistent error handling.
+
+
+5. MOCK BLE STREAM (TEST ONLY)
+===============================
+
+MockBleStream uses mpsc::channel(64) with blocking send().await — no timeout.
+This is acceptable for test code:
+- Test pairs are always consumed by the test's paired receiver
+- Tests that stress the queue read from the other end
+- Production code never uses MockBleStream
+
+
+6. RATE LIMITING
+==================
+
+All three production paths support optional SendRateLimiter:
+- Linux: rate_limiter field on BluerStream, acquired in send() only
+- macOS Central: rate_limiter field on BluestStream, acquired in send() only
+- macOS Peripheral: rate_limiter field on PeripheralStream, acquired in send() only
+
+send_urgent bypasses rate limiter on all paths. Consistent.
+
+
+SUMMARY
+========
+
+No inconsistencies found. The 15s timeout + bounded queue policy is uniform
+across all three production BLE send paths. Tasks 5 and 6 successfully
+hardened the macOS paths to match the Linux timeout value.
+
+NO CODE CHANGES REQUIRED.

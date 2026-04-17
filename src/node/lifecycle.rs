@@ -656,9 +656,10 @@ impl Node {
                     // Calculate max MSS for TCP clamping
                     let effective_mtu = self.effective_ipv6_mtu();
                     let max_mss = effective_mtu.saturating_sub(40).saturating_sub(20); // IPv6 + TCP headers
+                    let max_mss = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(max_mss));
 
                     info!("effective MTU: {} bytes", effective_mtu);
-                    debug!("   max TCP MSS: {} bytes", max_mss);
+                    debug!("   max TCP MSS: {} bytes", max_mss.load(std::sync::atomic::Ordering::Relaxed));
 
                     // On macOS, create a shutdown pipe. Writing to it unblocks the
                     // reader thread's select() loop without closing the TUN fd
@@ -677,7 +678,7 @@ impl Node {
                     };
 
                     // Create writer (dups the fd for independent write access)
-                    let (writer, tun_tx) = device.create_writer(max_mss)?;
+                    let (writer, tun_tx) = device.create_writer(max_mss.clone())?;
 
                     // Spawn writer thread
                     let writer_handle = thread::spawn(move || {
@@ -692,14 +693,14 @@ impl Node {
                     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(tun_channel_size);
 
                     // Spawn reader thread
-                    let transport_mtu = self.transport_mtu();
+                    let reader_max_mss = max_mss.clone();
                     #[cfg(target_os = "macos")]
                     let reader_handle = thread::spawn(move || {
-                        run_tun_reader(device, mtu, our_addr, reader_tun_tx, outbound_tx, transport_mtu, shutdown_read_fd);
+                        run_tun_reader(device, mtu, our_addr, reader_tun_tx, outbound_tx, reader_max_mss, shutdown_read_fd);
                     });
                     #[cfg(not(target_os = "macos"))]
                     let reader_handle = thread::spawn(move || {
-                        run_tun_reader(device, mtu, our_addr, reader_tun_tx, outbound_tx, transport_mtu);
+                        run_tun_reader(device, mtu, our_addr, reader_tun_tx, outbound_tx, reader_max_mss);
                     });
 
                     self.tun_state = TunState::Active;
@@ -710,6 +711,7 @@ impl Node {
                     self.tun_writer_handle = Some(writer_handle);
                     #[cfg(target_os = "macos")]
                     { self.tun_shutdown_fd = Some(shutdown_write_fd); }
+                    self.tun_max_mss = Some(max_mss);
                 }
                 Err(e) => {
                     self.tun_state = TunState::Failed;

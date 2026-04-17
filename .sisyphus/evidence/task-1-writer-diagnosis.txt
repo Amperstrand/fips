@@ -1,0 +1,102 @@
+BLE Writer Failure Diagnosis - TEST D/E
+=======================================
+
+Date: 2026-04-17
+Test: TEST D (Linux->Mac iperf server) and TEST E (Mac->Linux iperf client)
+Status: FAIL - 128KB burst then flatline
+
+================================================================================
+PRIMARY SUSPECTS
+================================================================================
+
+1. macOS Central Writer (bluest::corebluetooth::l2cap_channel)
+   Path: src/transport/ble/io_macos.rs, lines 169-178
+   Evidence:
+   - 3-second timeout on write_all() call
+   - bluest trace: "No data to write" appears after SessionSenderReport
+   - Pattern: SessionSenderReport sent (line 436-440) → 510-byte writes fail → "No data to write"
+   - Rate limiting bypassed (send_rate_bps: 0)
+   - L2CAP credit window exhaustion causes write queue to fill
+   - Tokio timeout fires after 3 seconds, but CoreBluetooth bluest queue never drains
+
+2. macOS Peripheral Writer (objc2-core-bluetooth NSOutputStream)
+   Path: src/transport/ble/io_macos.rs, lines 658-659
+   Evidence:
+   - write_maxLength returning 0 treated as fatal error
+   - Code assumes write_maxLength == 0 means "backpressure", actually means "write failed"
+   - Peripherial output queue: bounded(16) async_channel
+   - Once queue fills, new writes are blocked forever (no tail persistence)
+
+================================================================================
+SECONDARY SUSPECTS
+================================================================================
+
+3. Linux Writer (bluer crate)
+   Path: src/transport/ble/io.rs, lines 324-329
+   Status: NOT THE MAIN BLOOPER
+   - 15-second timeout (BLE_SEND_TIMEOUT)
+   - No evidence of timeout in logs
+   - No "No data to write" messages
+   - Sequence numbers show both sides sending/receiving
+
+================================================================================
+VERIFICATION: Pairing/Auth/PSM Are NOT Current Blockers
+================================================================================
+
+✓ All tests show successful pairing
+✓ GATT PSM exchange succeeded (PSM 200 and 202 confirmed in logs)
+✓ No authentication errors in logs
+✓ No PSM negotiation failures
+✓ All logs show "paired" in connection status
+
+evidence: "Responded to read request with PSM: 200" appears multiple times
+evidence: "paired" appears in connection logs for TEST D
+evidence: PSM negotiation successful for both tests
+
+================================================================================
+FAILURE SIGNATURE: 128KB-Then-Flatline
+================================================================================
+
+Test D (Linux→Mac iperf server):
+- Server receives 0 bytes
+- No data written to client
+- Flatline at 0.00 bits/sec
+
+Test E (Mac→Linux iperf client):
+- Successful SessionSenderReport (cum_pkts=12-26)
+- RTT samples: 409ms, 527ms, 325ms (increasing jitter)
+- SessionReceiverReport with 0% loss (lines 436-596)
+- Multiple "No data to write" after SessionSenderReport (lines 369-425)
+- Last MMP sender report: cum_pkts=38, interval_bytes=1704 (line 585)
+- Goodput metrics degrade as RTT increases to 1213ms
+
+================================================================================
+ROOT CAUSE ANALYSIS
+================================================================================
+
+The "No data to write" pattern confirms bluest L2CAP queue backing up:
+
+1. Initial burst of MMP/SMP traffic succeeds (handshake, TreeAnnounce)
+2. SessionSenderReport triggers 510-byte writes (session payload)
+3. CoreBluetooth bluest queue fills up (bounded(16) without credit monitoring)
+4. Subsequent writes block indefinitely
+5. Tokio timeout fires after 3 seconds, but bluest never drains
+6. TCP window exhaustion cascades - no data can be sent
+7. Receiver (Linux side) sends ReceiverReport, but cannot receive new data
+8. MPPI metrics show increasing RTT jitter, eventual disconnect
+
+macOS Central (bluest): 3s timeout too short, write queue never drains
+macOS Peripheral (objc2): write_maxLength==0 treated as fatal error instead of backpressure
+
+================================================================================
+RECOMMENDATION
+================================================================================
+
+Implement credit-aware flow control in both writer paths:
+
+1. macOS Central: Read L2CAP TX credits, backpressure when credits == 0
+2. macOS Peripheral: Retry write_maxLength==0 with exponential backoff
+3. Both: Add credit recovery mechanism (timeout + re-request credits)
+4. FIPS layer: Add credit monitoring, throttle send rate on credit exhaustion
+
+================================================================================

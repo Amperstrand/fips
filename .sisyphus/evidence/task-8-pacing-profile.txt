@@ -1,0 +1,165 @@
+# Task 8: Pacing Profile for Stability-First BLE Bulk Transfer
+
+Date: 2026-04-17
+Task: Tune pacing defaults for stability-first BLE profile
+
+## Chosen Stability-First Profile
+
+### Rate Limit
+- **Default**: 100,000 bps (100 Kbps)
+- **Effective send rate for `send_rate_bps: 0`**: 150,000 bps (150 Kbps) — backward compatibility preserved
+- **Rationale**: Conservative starting point that prevents overwhelming the BLE link with mesh-speed data. Lower than the previous 150 Kbps default to reduce backpressure risk on writers.
+
+### Burst Size
+- **Default**: 2,048 bytes (2 KB, ~1 MTU-sized packet at BLE L2CAP MTU 512)
+- **Previous**: 4,096 bytes (4 KB, 2 MTU-sized packets)
+- **Rationale**: Smaller bursts reduce the risk of exhausting the bounded writer queues (32 frames / 64 KB) under load. Burst size ≈ 1 MTU aligns with BLE L2CAP SDU patterns and provides smooth incremental pacing.
+
+### Receive Timeout
+- **Default**: 45 seconds
+- **No change**: Already set conservatively with headroom over normal heartbeat cadence
+
+### Adaptive Rate Control (BleRateAdapter)
+- **Preserved**: AIMD (Additive Increase / Multiplicative Decrease) on MMP SRTT feedback
+- **Behavior**:
+  - RTT < 300ms: Increase rate by 5 Kbps (AI_STEP_BPS)
+  - RTT > 500ms: Decrease rate by 30% (MD_FACTOR 0.7)
+  - 300-500ms: Hold steady
+- **Rationale**: Adaptive adjustment allows the link to ramp up when healthy and scale back when congested, preserving stability-first principle without sacrificing bandwidth under good conditions.
+
+## Configuration Changes
+
+### src/config/transport.rs
+
+**Changed constants**:
+- `DEFAULT_BLE_SEND_RATE_BPS`: 150_000 → 100_000
+- `BleConfig::send_rate_bps()` default: 150_000 → 100_000
+- `DEFAULT_BLE_SEND_BURST_BYTES`: 4096 → 2048
+- `BleConfig::send_burst_bytes()` default: 4096 → 2048
+
+**Preserved behavior**:
+- `effective_send_rate_bps()` mapping: 0 → 150_000 (unchanged, backward compatible)
+- Rate limiter implementation: token bucket, no changes to algorithm
+- BleRateAdapter: no changes to AIMD thresholds or factors
+
+### Test Config Updates
+
+**Bulk transfer tests (D/4) updated to explicit stability-first values**:
+
+1. `linux-testD.yaml`:
+   - `send_rate_bps`: 0 → 100000
+   - `send_burst_bytes`: 2048
+
+2. `mac-testD.yaml`:
+   - `send_rate_bps`: 0 → 100000
+   - `send_burst_bytes`: 2048
+
+3. `linux-test4.yaml`:
+   - Added `send_rate_bps: 100000`
+   - Added `send_burst_bytes: 2048`
+
+4. `mac-test4.yaml`:
+   - Added `send_rate_bps: 100000`
+   - Added `send_burst_bytes: 2048`
+
+**Other tests (A/B/C)**:
+- Keep `send_rate_bps: 0` (unlimited) — control-plane discovery tests don't need pacing limits
+- Preserve existing burst size defaults (will use new 2048 default)
+
+## Why This Profile Favors Stability Over Throughput
+
+### Conservative Defaults
+- **100 Kbps start** vs 150 Kbps previous: 33% reduction in starting rate
+- **2 KB burst** vs 4 KB previous: 50% reduction in burst size
+- Effectively halves the initial send pressure on BLE L2CAP queues
+
+### Adaptive Scaling
+- AIMD allows gradual ramp-up when link is healthy (RTT < 300ms)
+- Automatic reduction when congestion detected (RTT > 500ms)
+- Avoids sudden bursts that can exhaust writer queues
+
+### Small, Predictable Bursts
+- Burst size ≈ 1 MTU aligns with BLE SDU patterns
+- Tokens refill at 100 Kbps, allowing ~20ms to accumulate 2 KB
+- Smooth incremental pacing reduces queue backpressure spikes
+
+### Backward Compatibility
+- `send_rate_bps: 0` still maps to 150 Kbps effective rate (existing behavior)
+- Existing configs that use `send_rate_bps: 0` continue to work
+- New configs get stability-first defaults without explicit changes
+
+## Expected Behavior
+
+### Normal Operation (Link Healthy)
+- Initial send rate: 100 Kbps
+- If RTT stays < 300ms: ramps up to ~105 Kbps, 110 Kbps, 115 Kbps, ... (5 Kbps steps)
+- Reaches ~150 Kbps maximum (MIN_RATE_BPS to MAX_RATE_BPS clamping)
+- Burst size: 2 KB per acquisition
+
+### Under Congestion
+- If RTT rises above 500ms: rate decreases by 30% (multiplicative decrease)
+- If RTT drops below 300ms: rate increases by 5 Kbps (additive increase)
+- Bounded between 50 Kbps (MIN_RATE_BPS) and 250 Kbps (MAX_RATE_BPS)
+
+### Bulk Transfer Tests (D/4)
+- Explicit 100 Kbps rate limit with 2 KB burst
+- Allows sustained iperf with minimal queue backpressure
+- Compatible with writer bounded queues (32 frames / 64 KB)
+
+## Trade-offs
+
+### Acceptable Throughput Reduction
+- Starting at 100 Kbps instead of 150 Kbps reduces peak throughput by ~33%
+- AIMD can ramp up to 150 Kbps, but limited by BLE L2CAP practical throughput (~250 Kbps)
+- Acceptable for stability-first target (sub-1s ping under load, no stalls)
+
+### No Removal of Adaptive Adjustment
+- BleRateAdapter provides automatic bandwidth probing
+- Link health feedback loop (RTT-based) enables dynamic scaling
+- Stability-first, not stability-only
+
+### No Changes to Other Pacing Primitives
+- Rate limiter token bucket: unchanged algorithm
+- BleRateAdapter: unchanged AIMD thresholds/factors
+- Just tuned starting defaults to be more conservative
+
+## Verification Criteria
+
+- [x] Code changes applied (transport.rs + test configs)
+- [ ] `cargo build --release --features ble-macos` succeeds
+- [ ] `cargo build --release --features ble` succeeds
+- [ ] Bulk transfer tests (D/4) use new defaults without manual config changes
+- [ ] Control-plane tests (A/B/C) retain `send_rate_bps: 0` behavior
+- [ ] AIMD adaptive rate control remains functional (future testing)
+
+## References
+
+- Task 3 audit: Stability-first BLE pacing profile proposal
+- Task 5/6/7: Writer/backpressure bounded queue design (32 frames / 64 KB)
+- `src/config/transport.rs`: BLE transport configuration types
+- `src/transport/ble/rate_limit.rs`: Token bucket + AIMD implementation
+- `testing/ble/configs/*.yaml`: Test campaign configurations
+
+## Files Modified
+
+1. `src/config/transport.rs`:
+   - DEFAULT_BLE_SEND_RATE_BPS (line ~591)
+   - BleConfig::send_rate_bps() default (line ~681)
+   - DEFAULT_BLE_SEND_BURST_BYTES (line ~595)
+   - BleConfig::send_burst_bytes() default (line ~693)
+
+2. `testing/ble/configs/linux-testD.yaml`:
+   - send_rate_bps: 0 → 100000
+   - send_burst_bytes: 2048
+
+3. `testing/ble/configs/mac-testD.yaml`:
+   - send_rate_bps: 0 → 100000
+   - send_burst_bytes: 2048
+
+4. `testing/ble/configs/linux-test4.yaml`:
+   - Added send_rate_bps: 100000
+   - Added send_burst_bytes: 2048
+
+5. `testing/ble/configs/mac-test4.yaml`:
+   - Added send_rate_bps: 100000
+   - Added send_burst_bytes: 2048

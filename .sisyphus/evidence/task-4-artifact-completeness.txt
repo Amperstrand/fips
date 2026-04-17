@@ -1,0 +1,51 @@
+Artifact Completeness Check
+============================
+Date: 2026-04-17
+Task: Task 4 — Verify checklist includes all required artifacts
+
+================================================================================
+REQUIRED ARTIFACTS PER TEST
+================================================================================
+
+1. IPERF OUTPUTS
+   - Must include end summary (not just connection established)
+   - Must show: interval throughput, end throughput, transfer size
+   - Both directions required for TEST D
+
+2. PEER LOGS
+   - macOS FIPS log: stdout/stderr from FIPS process
+   - Linux FIPS log: journalctl -u fips output
+   - Must cover entire test duration (start to finish)
+
+3. LINK/PEER STATUS
+   - fipsctl show links output
+   - fipsctl show peers output
+   - Captured AFTER test completes
+
+4. PING OUTPUT (Phase 2 and TEST D/E concurrent)
+   - Individual RTT values (min/avg/max)
+   - Packet loss percentage
+   - Timestamp correlation with iperf intervals
+
+================================================================================
+PING-UNDER-LOAD ARTIFACT REQUIREMENT
+================================================================================
+
+The ping-under-load test MUST produce:
+- ping6 output with individual RTT values
+- Concurrent iperf output showing active transfer
+- Time-correlated evidence that ping ran during iperf
+
+Without these three, ping-under-load validation is incomplete.
+
+================================================================================
+CHECKLIST VERIFICATION
+================================================================================
+
+task-4-validation-checklist.txt includes:
+✓ iperf outputs for both directions
+✓ peer/link logs required
+✓ ping-under-load artifact requirement
+✓ Pass/fail criteria per phase
+✓ Artifact inspection between phases
+✓ Evidence completeness gate (run not valid without all artifacts)

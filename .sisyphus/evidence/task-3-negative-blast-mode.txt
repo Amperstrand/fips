@@ -1,0 +1,54 @@
+Negative Check: Unlimited Blast Mode Not Acceptable
+====================================================
+Date: 2026-04-17
+Task: Task 3 — Verify stability-first profile avoids uncontrolled burst mode
+
+================================================================================
+WHY UNLIMITED MODE (send_rate_bps: 0) IS NOT ACCEPTABLE
+================================================================================
+
+1. CREDIT WINDOW EXHAUSTION
+   - L2CAP LE CoC uses credit-based flow control
+   - Initial credit window: typically ~16 SDUs (~4 KB at 244 bytes/SDU)
+   - Unlimited send exhausts credits in <1ms at typical CPU speeds
+   - After credit exhaustion, sender must WAIT for credit replenishment
+   - If credit replenishment is not monitored → indefinite stall
+
+2. BLUEST QUEUE SATURATION
+   - bluest's L2CAP writer uses bounded(16) async_channel
+   - Unlimited send fills the channel rapidly
+   - write_all() blocks indefinitely when channel is full
+   - No partial-write retention → data loss on timeout
+
+3. COREBLUETOOTH BACKPRESSURE
+   - NSOutputStream write_maxLength can return 0 (backpressure)
+   - Current code treats this as fatal error (peripheral path)
+   - Unlimited mode increases frequency of backpressure events
+   - Without proper handling → connection teardown
+
+4. EVIDENCE FROM TEST D/E
+   - TEST D/E used send_rate_bps: 0 (effectively 150 Kbps auto-rate)
+   - But even at 150 Kbps, stalls occur because backpressure handling is broken
+   - Unlimited mode would make the problem WORSE, not better
+
+5. BLE PHYSICAL LIMITS
+   - BLE 4.2+ theoretical max: ~250 Kbps (LE Data Packet Length Extension)
+   - BLE 5.0 2M PHY: ~500 Kbps theoretical
+   - ESP32 hardware MTU: 512 bytes
+   - Practical sustained throughput: 100-200 Kbps
+   - Sending faster than physical limit just creates bufferbloat
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The stability-first profile MUST use conservative pacing:
+- Start at 100 Kbps (well below physical limits)
+- Let AIMD (BleRateAdapter) increase if link is healthy
+- Small bursts (2 KB) to avoid overwhelming L2CAP credits
+- Adequate timeouts (15s) to tolerate transient congestion
+
+Unlimited mode is explicitly rejected as the default because:
+- It makes the existing backpressure bugs worse
+- It exceeds BLE physical layer capacity
+- It provides no benefit — the bottleneck is backpressure handling, not send rate

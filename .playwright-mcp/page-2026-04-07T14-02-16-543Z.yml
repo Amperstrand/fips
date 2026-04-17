@@ -1,0 +1,7 @@
+- generic [active]:
+  - generic [ref=e2]: ✗ Failed to load Cytoscape.js library
+  - generic [ref=e3]:
+    - button "Refresh" [ref=e4] [cursor=pointer]
+    - button "Circle" [ref=e5] [cursor=pointer]
+    - button "Tree" [ref=e6] [cursor=pointer]
+    - button "Force" [ref=e7] [cursor=pointer]

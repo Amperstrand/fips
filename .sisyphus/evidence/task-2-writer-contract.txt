@@ -1,0 +1,286 @@
+================================================================================
+WRITER/BACKPRESSURE CONTRACT FOR macOS BLE CENTRAL + PERIPHERAL
+================================================================================
+Date: 2026-04-17
+Task: 2 — Define stable writer/backpressure contract
+Evidence: task-2-writer-contract.txt
+
+================================================================================
+1. ARCHITECTURE CONTEXT
+================================================================================
+
+Two distinct writer paths exist in io_macos.rs, sharing the same BleStream trait
+but using different underlying transports:
+
+  CENTRAL ROLE (BluestStream):
+    - Uses forked bluest crate (Amperstrand/bluest, not crates.io 0.6.9)
+    - bluest wraps NSOutputStream in a piper pipe (1MB capacity)
+    - L2capChannelWriter implements AsyncWrite over piper::Writer
+    - OutputStreamDelegate drains piper::Reader → NSOutputStream on HasSpaceAvailable
+    - FIPS calls write_all() with 3s timeout
+
+  PERIPHERAL ROLE (PeripheralStream):
+    - Uses raw objc2 NSOutputStream via PeripheralOutputDelegate
+    - VecDeque<Vec<u8>> write_queue (currently UNBOUNDED)
+    - drain_to_stream: HasSpaceAvailable event → pop from queue → write_maxLength loop
+    - send(): spawn_blocking → direct write_maxLength loop (no timeout)
+    - write_maxLength==0 treated as FATAL (should be backpressure)
+
+================================================================================
+2. DISCOVERED BUGS IN BLUEST FORK (OutputStreamDelegate::send_packet)
+================================================================================
+
+  BUG-1: PARTIAL-WRITE DATA LOSS
+    Location: bluest/l2cap_channel.rs:261-289 (OutputStreamDelegate::send_packet)
+    Code reads N bytes from piper, calls write_maxLength once.
+    If write_maxLength returns R < N, bytes (R..N) are SILENTLY DROPPED.
+    The data was already consumed from the piper pipe.
+
+  BUG-2: ZERO-WRITE DATA LOSS
+    When write_maxLength returns 0 (CoreBluetooth backpressure),
+    ALL data read from piper is silently dropped.
+    This is the "No data to write" trace observed in TEST D/E failure logs.
+
+  BUG-3: SINGLE-SHOT DRAINING
+    send_packet reads whatever is available and does ONE write_maxLength call.
+    If the pipe has more data after a successful write, it does NOT loop.
+    Must wait for next HasSpaceAvailable event or notification.
+
+  IMPLICATION: We CANNOT rely on bluest's piper pipe for reliable data delivery.
+  The contract MUST harden at the FIPS integration layer.
+
+================================================================================
+3. WRITER CONTRACT INVARIANTS
+================================================================================
+
+Both roles (central and peripheral) MUST satisfy these 5 invariants:
+
+------------------------------------------------------------------------
+INVARIANT 1: BOUNDED QUEUE DEPTH
+------------------------------------------------------------------------
+  Queue depth: 32 frames
+  Queue byte cap: 65,536 bytes (64 KB)
+  Rationale:
+    - 32 frames × ~2KB average FMP frame = 64KB — fits comfortably in memory
+    - BLE L2CAP CoC at 250kbps drains 64KB in ~2 seconds
+    - Small enough to drain quickly, large enough to absorb routing bursts
+    - Matches L2CAP credit-based flow control window (typically 16-32 SDUs)
+
+  CENTRAL implementation:
+    - Add tokio::sync::mpsc::bounded(32) between FIPS send() and bluest write_all
+    - Drain task reads from mpsc, writes to bluest piper (one frame at a time)
+    - bluest's piper (1MB) becomes a secondary buffer, not primary queue
+
+  PERIPHERAL implementation:
+    - Bound PeripheralOutputDelegateIvars.write_queue to 32 entries
+    - Enqueue returns WouldBlock when full
+    - Keep existing drain_to_stream logic (correct partial-write handling)
+
+------------------------------------------------------------------------
+INVARIANT 2: PARTIAL-WRITE RETENTION
+------------------------------------------------------------------------
+  Policy: NO DATA LOSS on partial writes. Unsent tail MUST be retained.
+
+  CENTRAL implementation:
+    - FIPS writes ONE framed message per mpsc send (atomic enqueue)
+    - Drain task writes to bluest's write_all which blocks until complete
+    - bluest's piper pipe absorbs the full frame; send_packet data loss
+      is mitigated because FIPS frames are typically < MTU (≤512 bytes)
+    - For oversized frames: rate limiter ensures no single frame exceeds
+      practical write size. If bluest's send_packet loses data, it's a
+      bluest bug that must be patched separately.
+    - MITIGATION: Ensure framed messages written to bluest are ≤ 1024 bytes.
+      FMP frames exceeding this (e.g., FilterAnnounce at ~1071 bytes) are
+      rare and can be handled by the rate limiter's burst cap.
+
+  PERIPHERAL implementation:
+    - EXISTING CODE IS CORRECT: drain_to_stream (line 459-478) retains
+      unsent tail via `queue.push_front(data[offset..].to_vec())`
+    - send() (line 647-664) loops with offset — correct
+    - Only fix needed: write_maxLength==0 must NOT be fatal (see Invariant 4)
+
+------------------------------------------------------------------------
+INVARIANT 3: WRITABLE-EVENT DRIVEN DRAINING
+------------------------------------------------------------------------
+  Policy: Queue drains ONLY when the transport signals writability.
+
+  CENTRAL implementation:
+    - Existing bluest architecture already does this:
+      - NSStreamEvent::HasSpaceAvailable → OutputStreamDelegate::send_packet
+      - NSNotification "ChannelWriteNotification" → on_notified → send_packet
+    - FIPS drain task awaits mpsc recv + bluest write_all, naturally
+      yielding when piper pipe is full (Pending poll)
+    - NO CHANGE NEEDED to event-driven draining
+
+  PERIPHERAL implementation:
+    - Existing architecture already does this:
+      - NSStreamEvent::HasSpaceAvailable → drain_to_stream
+      - send() also writes directly (bypasses queue for current frame)
+    - IMPROVEMENT: send() should enqueue instead of writing directly,
+      letting the delegate-driven drain handle all writes uniformly
+
+------------------------------------------------------------------------
+INVARIANT 4: EXPLICIT BACKPRESSURE WHEN QUEUE IS FULL
+------------------------------------------------------------------------
+  Policy: Caller receives clear signal when queue cannot accept more data.
+
+  CENTRAL implementation:
+    - mpsc::Sender::send() returns TrySendError::Full when bounded(32) is full
+    - FIPS send() wraps this as:
+      ```
+      match tx.try_send(framed) {
+          Ok(()) => Ok(()),
+          Err(TrySendError::Full(_)) => {
+              // Wait with timeout for queue to drain
+              tokio::time::timeout(SEND_TIMEOUT, tx.send(framed)).await
+          }
+          Err(TrySendError::Closed(_)) => Err(TransportError::ConnectionClosed)
+      }
+      ```
+    - Caller sees TransportError::Timeout if queue doesn't drain in time
+
+  PERIPHERAL implementation:
+    - Enqueue checks queue length; if full, returns WouldBlock equivalent
+    - send() waits with timeout for space in queue:
+      ```
+      if queue.len() >= QUEUE_DEPTH_LIMIT {
+          tokio::time::timeout(SEND_TIMEOUT, wait_for_queue_space()).await?
+      }
+      queue.push_back(framed);
+      notify_write(); // trigger HasSpaceAvailable drain
+      ```
+    - write_maxLength==0 → RETRY (not fatal): schedule via HasSpaceAvailable
+    - Caller sees TransportError::Timeout if queue doesn't drain in time
+
+------------------------------------------------------------------------
+INVARIANT 5: TIMEOUT POLICY
+------------------------------------------------------------------------
+  Default send timeout: 15 seconds (matches Linux, Task 3 stability profile)
+  Configurable via existing BleConfig send_timeout_secs field
+
+  Rationale for 15s:
+    - BLE L2CAP at 150kbps (stability profile) drains 64KB queue in ~3.4s
+    - 15s gives 4× safety margin for link-level retransmissions
+    - Matches Linux BLE send timeout (already proven stable)
+    - Task 3 config audit recommended 15s for all paths
+
+  Timeout behavior:
+    - On timeout: return Err(TransportError::Timeout)
+    - Caller (receive_loop in mod.rs) treats timeout as transient:
+      - Log warning, do NOT disconnect
+      - Retry on next send cycle
+    - Timeout does NOT drop queued data — frame remains in queue for draining
+
+================================================================================
+4. CHOSEN IMPLEMENTATION SHAPE
+================================================================================
+
+SHAPE: Per-role bounded queues with unified invariants, minimal abstraction.
+
+  No new traits. No new shared types. Each role gets its own queue:
+
+  CENTRAL — BleQueuedWriter (new struct in io_macos.rs):
+    Fields:
+      tx: tokio::sync::mpsc::Sender<Vec<u8>>  (bounded(32))
+      rate_limiter: Option<Mutex<SendRateLimiter>>
+      timeout: Duration (15s default)
+    Method:
+      async fn send(&self, data: &[u8]) -> Result<(), TransportError>
+        1. Rate-limit acquire (existing logic)
+        2. Frame data with 2-byte BE prefix (existing logic)
+        3. try_send → if full, timeout(send) → Err(Timeout)
+    Spawned drain task:
+      while let Some(frame) = rx.recv().await {
+          writer.write_all(&frame).await?;
+      }
+
+  PERIPHERAL — modifications to PeripheralStream:
+    - Add const QUEUE_DEPTH: usize = 32;
+    - Add const QUEUE_BYTE_CAP: usize = 65536;
+    - Add tokio::sync::Notify for queue-space notification
+    - send(): enqueue + notify, wait for space with 15s timeout
+    - PeripheralOutputDelegate: check queue depth on enqueue
+    - drain_to_stream: notify waiters when queue drops below threshold
+    - write_maxLength==0: return (don't error), re-trigger via HasSpaceAvailable
+
+  INTEGRATION:
+    - BleStream trait unchanged — implementations handle queueing internally
+    - AnyStream dispatch unchanged — each variant uses its own queue
+    - receive_loop (mod.rs) unchanged — calls send() as before
+
+================================================================================
+5. BEHAVIORAL GUARANTEES
+================================================================================
+
+  G1: No unbounded memory growth
+      - Both queues bounded at 32 frames / 64KB
+      - Backpressure returns error to caller before exceeding bounds
+
+  G2: No silent data loss within FIPS layer
+      - Central: mpsc channel guarantees delivery or timeout error
+      - Peripheral: queue retains partial writes; no fatal on write_maxLength==0
+      - NOTE: bluest's OutputStreamDelegate has known data loss bugs (Section 2)
+        which are outside FIPS control; mitigated by small frame sizes
+
+  G3: No indefinite blocking
+      - Both paths have configurable timeout (default 15s)
+      - No spawn_blocking without timeout
+
+  G4: Timeout does not corrupt state
+      - Timed-out frame remains in queue for eventual draining
+      - Subsequent sends see same queue state
+      - No partial-frame artifacts
+
+  G5: Fairness between send and send_urgent
+      - send_urgent bypasses rate limiter but uses SAME bounded queue
+      - Urgent frames are enqueued at front (VecDeque push_front)
+      - mpsc doesn't support priority; for central, urgent uses same channel
+      - If needed, urgent could use a separate mpsc(4) drained first
+
+================================================================================
+6. WHAT THIS CONTRACT DOES NOT REQUIRE
+================================================================================
+
+  EXCLUDED (explicitly out of scope):
+
+  X1: No framing format change
+      - 2-byte BE length prefix unchanged on all platforms
+      - Contract operates on already-framed messages
+
+  X2: No BLE pairing requirement
+      - FIPS uses Noise encryption, not BLE SMP
+      - Unencrypted L2CAP CoC is the working path
+
+  X3: No protocol redesign
+      - FMP message format unchanged
+      - No new message types for flow control
+      - Backpressure is purely local (queue management)
+
+  X4: No bluest crate fork changes
+      - Contract hardens at FIPS integration layer
+      - bluest bugs documented but not patched here
+      - Future task may patch bluest's OutputStreamDelegate
+
+  X5: No cross-platform unification
+      - Linux io.rs unchanged (SeqPacket, different constraints)
+      - Contract applies to macOS central + peripheral only
+
+================================================================================
+7. ALIGNMENT WITH EXISTING PATTERNS
+================================================================================
+
+  - SendRateLimiter: continues to provide token-bucket pacing before enqueue
+  - BleRateAdapter: continues to adjust rate based on MMP SRTT feedback
+  - BleStream trait: unchanged — queueing is internal to implementations
+  - 2-byte BE framing: unchanged — applied before enqueue
+  - AnyStream enum: unchanged — dispatches to role-specific implementation
+
+  The contract adds a bounded-queue + timeout layer BETWEEN the rate limiter
+  and the transport writer. This is the "credit window" equivalent from
+  Zephyr's L2CAP CoC flow control model:
+
+    FIPS layer:  [rate limiter] → [bounded queue (32)] → [timeout] → [transport]
+    Zephyr L2CAP: [app] → [credit window (16-32)] → [credit refresh] → [radio]
+
+  The bounded queue IS our credit window. The timeout IS our credit exhaustion
+  policy. HasSpaceAvailable IS our credit refresh signal.

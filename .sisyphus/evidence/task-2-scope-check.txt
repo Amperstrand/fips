@@ -1,0 +1,173 @@
+================================================================================
+SCOPE CHECK — Writer Contract Boundaries
+================================================================================
+Date: 2026-04-17
+Task: 2 — Scope verification for writer/backpressure contract
+Evidence: task-2-scope-check.txt
+
+================================================================================
+1. SCOPE VERIFICATION: DOES CONTRACT REQUIRE FRAMING CHANGE?
+================================================================================
+
+  ANSWER: NO
+
+  Evidence:
+    - Both writer paths (central, peripheral) already apply 2-byte BE length
+      prefix framing BEFORE calling into the queue/transport layer.
+      - Central: io_macos.rs:165-167 (framed assembled, then write_all)
+      - Peripheral: io_macos.rs:642-644 (framed assembled, then write)
+    - The contract operates on framed messages (Vec<u8> with prefix already
+      applied). Queue stores complete framed messages.
+    - No framing logic in the queue or drain layers.
+
+  Conclusion: Contract is framing-agnostic. No framing change needed.
+
+================================================================================
+2. SCOPE VERIFICATION: DOES CONTRACT REQUIRE PAIRING?
+================================================================================
+
+  ANSWER: NO
+
+  Evidence:
+    - Task 1 negative-cause-check.txt confirmed pairing/auth/PSM are NOT blockers
+    - PeripheralStream uses unencrypted L2CAP (publishL2CAPChannelWithEncryption: false)
+      at io_macos.rs:1119
+    - CentralStream uses bluest's open_l2cap_channel which connects to
+      unencrypted PSM
+    - FIPS Noise IK provides hop-by-hop encryption independently
+    - The writer contract is purely a queueing/backpressure mechanism — no
+      dependency on link-layer security
+
+  Conclusion: Contract works with or without BLE pairing.
+
+================================================================================
+3. SCOPE VERIFICATION: DOES CONTRACT REQUIRE PROTOCOL REDESIGN?
+================================================================================
+
+  ANSWER: NO
+
+  Evidence:
+    - No new FMP message types needed
+    - No flow-control signaling between peers (purely local queue management)
+    - No changes to FMP frame format, session protocol, or routing
+    - The contract is a local buffering layer between FIPS's protocol engine
+      (receive_loop in mod.rs) and the BLE transport writer
+    - Existing BleStream::send() signature unchanged
+    - Existing BleStream::send_urgent() signature unchanged
+
+  Conclusion: Zero protocol impact.
+
+================================================================================
+4. SCOPE VERIFICATION: DOES CONTRACT REQUIRE BLUEST CRATE CHANGES?
+================================================================================
+
+  ANSWER: NO (with documented caveats)
+
+  The contract hardens at the FIPS integration layer:
+    - Central: Bounded mpsc channel wraps bluest's L2capChannelWriter
+    - Peripheral: Bounded VecDeque replaces unbounded VecDeque
+    - Both use existing transport APIs (write_all, write_maxLength)
+
+  CAVEATS (documented, not blockers):
+    - bluest's OutputStreamDelegate::send_packet has partial-write data loss
+      (Section 2 of writer-contract.txt). This is a bluest bug but does NOT
+      block the contract — FIPS frames are small enough that write_maxLength
+      typically accepts them in one shot.
+    - If bluest is patched in the future, the FIPS queue becomes defense-in-
+      depth rather than primary protection.
+
+  Conclusion: No bluest changes required for contract implementation.
+
+================================================================================
+5. SCOPE VERIFICATION: DOES CONTRACT REQUIRE LINUX CHANGES?
+================================================================================
+
+  ANSWER: NO
+
+  Evidence:
+    - Linux uses io.rs (SeqPacket socket, 15s timeout, bounded(16) channel)
+    - Linux writer already has bounded queue + timeout
+    - Contract is macOS-specific (central + peripheral roles)
+    - No shared code needs modification
+
+  Conclusion: Linux untouched.
+
+================================================================================
+6. SCOPE VERIFICATION: DOES CONTRACT COVER BOTH ROLES?
+================================================================================
+
+  ANSWER: YES
+
+  Central role (BluestStream):
+    - Queue: tokio::sync::mpsc::bounded(32)
+    - Drain: spawned task reads mpsc → write_all
+    - Backpressure: try_send + timeout
+    - Timeout: 15s configurable
+    - Partial-write: mitigated via small frame sizes + rate limiter
+
+  Peripheral role (PeripheralStream):
+    - Queue: bounded VecDeque (32 entries / 64KB)
+    - Drain: existing drain_to_stream on HasSpaceAvailable
+    - Backpressure: queue-full check + notify + timeout
+    - Timeout: 15s configurable
+    - Partial-write: existing offset-retry loop (correct)
+
+  Both roles share:
+    - Same queue depth (32 frames)
+    - Same byte cap (64KB)
+    - Same timeout (15s)
+    - Same rate limiter (existing SendRateLimiter)
+    - Same framing (2-byte BE prefix, already applied)
+
+  Conclusion: Full coverage of both macOS BLE roles.
+
+================================================================================
+7. SCOPE VERIFICATION: SMALLEST VIABLE IMPLEMENTATION?
+================================================================================
+
+  Assessment: YES
+
+  What was considered but rejected:
+    - Shared BleWriter trait: Adds abstraction layer, each role has different
+      transport APIs (AsyncWrite vs raw NSOutputStream). Not worth the vtable.
+    - Cross-platform unified queue: Linux has different constraints (SeqPacket
+      preserves boundaries, different timeout model). Would over-abstract.
+    - Priority queue for send_urgent: Adds complexity. Simple "same queue" is
+      sufficient since urgent frames are rare and small.
+
+  What was kept minimal:
+    - Central: One struct (BleQueuedWriter) + one spawned drain task
+    - Peripheral: Existing struct with bounded queue + notify + timeout
+    - No new traits, no new files, no shared abstractions
+    - Existing code preserved where correct (peripheral partial-write loop,
+      rate limiter, framing)
+
+  Lines of code estimate:
+    - Central new code: ~40 lines (struct + drain task)
+    - Central modified code: ~15 lines (send/urgent use new queue)
+    - Peripheral modified code: ~30 lines (bound queue + notify + timeout)
+    - Total: ~85 lines of changes
+
+  Conclusion: Smallest viable shape.
+
+================================================================================
+8. SCOPE VERIFICATION: FORWARD COMPATIBILITY
+================================================================================
+
+  mac↔mac (both central and peripheral on macOS):
+    - Contract covers both roles — mac↔mac uses one central + one peripheral
+    - Both sides get bounded queues and timeouts
+    - No role-specific assumptions that break symmetry
+
+  ESP32 ↔ macOS:
+    - ESP32 is always peripheral (advertises, macOS connects as central)
+    - Central contract handles ESP32 writes
+    - ESP32's 512-byte MTU constraint respected by rate limiter burst cap
+
+  Future bluest patches:
+    - If bluest fixes OutputStreamDelegate partial-write bug, FIPS queue
+      becomes defense-in-depth — no changes needed
+    - If bluest adds credit-based API, FIPS queue can be removed but
+      invariants remain the same
+
+  Conclusion: Forward compatible with planned topology changes.

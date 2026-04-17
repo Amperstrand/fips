@@ -1,0 +1,111 @@
+Focused Bulk-Transfer Validation Checklist
+===========================================
+Date: 2026-04-17
+Task: Task 4 — Define focused tests before full campaign
+
+================================================================================
+FOCUSED TEST SEQUENCE
+================================================================================
+
+Run these BEFORE the full TEST A-E campaign, in order:
+
+PHASE 1: Isolated Directional iperf (TEST E)
+---------------------------------------------
+Purpose: Verify each direction works independently before testing both
+
+Step 1.1: Linux → macOS (macOS as peripheral, receives data)
+  Command: bash testing/ble/run-ble-test-campaign.sh --test E
+  Artifacts to inspect:
+    - /tmp/fips-ble-campaign/testE-linux-to-mac-iperf     — iperf summary
+    - /tmp/fips-ble-campaign/testE-mac-peer-log            — macOS FIPS log
+    - /tmp/fips-ble-campaign/testE-linux-peer-log           — Linux FIPS log
+  Pass criteria:
+    - iperf summary shows non-zero end throughput
+    - No stall/reset in either log
+    - Transfer completes within 60 seconds
+
+Step 1.2: macOS → Linux (macOS as central, sends data)
+  Command: (same run, opposite direction)
+  Artifacts to inspect:
+    - /tmp/fips-ble-campaign/testE-mac-to-linux-iperf      — iperf summary
+    - Same peer logs as Step 1.1
+  Pass criteria:
+    - iperf summary shows non-zero end throughput
+    - No stall/reset in either log
+
+PHASE 2: Ping Under Load
+-------------------------
+Purpose: Verify latency remains acceptable during bulk transfer
+
+Step 2.1: Start iperf in one direction, then run ping
+  Steps:
+    1. Start FIPS on both sides with updated writer
+    2. Start iperf (one direction)
+    3. Concurrently: ping6 <peer-fips-address> (10 pings, 1s interval)
+  Artifacts:
+    - iperf output
+    - ping output (latency values)
+  Pass criteria:
+    - All pings return (no 100% loss)
+    - Median latency < 500ms
+    - Max latency < 1000ms
+
+PHASE 3: Regression Check (TEST A/B/C)
+---------------------------------------
+Purpose: Verify writer hardening didn't break control plane
+
+Step 3.1: TEST A (Linux outbound → macOS inbound)
+  Command: bash testing/ble/run-ble-test-campaign.sh --test A
+  Pass: Authenticated peer established
+
+Step 3.2: TEST B (macOS outbound → Linux inbound)
+  Command: bash testing/ble/run-ble-test-campaign.sh --test B
+  Pass: Authenticated peer established
+
+Step 3.3: TEST C (dual-role + tiebreak + reconnect)
+  Command: bash testing/ble/run-ble-test-campaign.sh --test C
+  Pass: Role negotiation and reconnect succeed
+
+================================================================================
+FULL CAMPAIGN (after focused tests pass)
+================================================================================
+
+Command: bash testing/ble/run-ble-test-campaign.sh
+Artifacts: All testA-E outputs in /tmp/fips-ble-campaign/
+Pass criteria:
+- TEST A/B/C: authenticated peers, role symmetry intact
+- TEST D: bidirectional iperf completes without stall
+- TEST E: isolated directional iperf completes without stall
+- All iperf summaries show non-zero throughput
+
+================================================================================
+ARTIFACT INSPECTION CHECKLIST
+================================================================================
+
+Between EACH focused test phase, inspect:
+[ ] iperf end summary (not just interval reports)
+[ ] macOS FIPS log for errors/timeouts
+[ ] Linux FIPS log for errors/timeouts
+[ ] ping output (Phase 2 only)
+[ ] No "No data to write" stall pattern
+[ ] No unexpected disconnect/reconnect
+
+Required artifacts per test run:
+1. iperf output (both directions)
+2. macOS FIPS log (stdout/stderr)
+3. Linux FIPS log (journalctl -u fips)
+4. Link status (fipsctl show links)
+5. Ping output (if concurrent test)
+
+================================================================================
+EVIDENCE COMPLETENESS CHECK
+================================================================================
+
+A focused run is NOT complete without:
+✓ iperf output showing end summary (not just connection)
+✓ Both peer logs (macOS + Linux)
+✓ Confirmation of no errors/timeouts in logs
+✓ If ping-under-load: ping latency values recorded
+✗ Missing any above = run not valid for proceeding
+
+================================================================================

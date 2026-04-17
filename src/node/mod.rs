@@ -378,6 +378,8 @@ pub struct Node {
     /// On Linux, deleting the interface via netlink serves the same purpose.
     #[cfg(target_os = "macos")]
     tun_shutdown_fd: Option<std::os::unix::io::RawFd>,
+    /// Shared TCP MSS clamp value, updated dynamically when transport MTU changes.
+    tun_max_mss: Option<std::sync::Arc<std::sync::atomic::AtomicU16>>,
 
     // === DNS Responder ===
     /// Receiver for resolved identities from the DNS responder.
@@ -569,6 +571,7 @@ impl Node {
             tun_writer_handle: None,
             #[cfg(target_os = "macos")]
             tun_shutdown_fd: None,
+            tun_max_mss: None,
             dns_identity_rx: None,
             dns_task: None,
             tcp_proxy_outbound_rx: None,
@@ -700,6 +703,7 @@ impl Node {
             tun_writer_handle: None,
             #[cfg(target_os = "macos")]
             tun_shutdown_fd: None,
+            tun_max_mss: None,
             dns_identity_rx: None,
             dns_task: None,
             tcp_proxy_outbound_rx: None,
@@ -1325,6 +1329,26 @@ impl Node {
     /// Get the TUN interface name, if active.
     pub fn tun_name(&self) -> Option<&str> {
         self.tun_name.as_deref()
+    }
+
+    /// Recompute and update the shared TCP MSS clamp value from the current
+    /// transport MTU. Called when a link connects and the actual path MTU
+    /// becomes known.
+    pub fn refresh_tun_mss(&self) {
+        use std::sync::atomic::Ordering;
+        if let Some(shared) = &self.tun_max_mss {
+            let effective_mtu = self.effective_ipv6_mtu();
+            let new_mss = effective_mtu.saturating_sub(40).saturating_sub(20);
+            let old_mss = shared.swap(new_mss, Ordering::Relaxed);
+            if old_mss != new_mss {
+                tracing::info!(
+                    old_mss = old_mss,
+                    new_mss = new_mss,
+                    effective_mtu = effective_mtu,
+                    "Updated TUN TCP MSS clamp"
+                );
+            }
+        }
     }
 
     // === Resource Limits ===

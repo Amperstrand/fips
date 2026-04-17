@@ -1,0 +1,27 @@
+[      86ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[    5087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   10087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   15087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   20086ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   25088ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   30087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   35087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   40086ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   45087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   50086ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   55087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   60087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   65087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   70088ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   75088ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   80087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   85087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   90086ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[   95086ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[  100089ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[  105087ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8088/api:0
+[  110087ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8088/api:0
+[  115086ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8088/api:0
+[  120086ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8088/api:0
+[  125085ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8088/api:0
+[  130086ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8088/api:0
