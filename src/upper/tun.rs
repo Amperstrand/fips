@@ -336,7 +336,13 @@ pub fn run_tun_reader(
     outbound_tx: TunOutboundTx,
     max_mss: Arc<AtomicU16>,
 ) {
-    let (name, mut buf, _shared_mss) = tun_reader_setup(&device, mtu, 2048);
+    let name = device.name().to_string();
+    let mut buf = vec![0u8; mtu as usize + 100];
+    debug!(
+        name = %name,
+        max_mss = max_mss.load(Ordering::Relaxed),
+        "TUN reader starting"
+    );
 
     loop {
         match device.read_packet(&mut buf) {
@@ -373,7 +379,13 @@ pub fn run_tun_reader(
     shutdown_fd: std::os::unix::io::RawFd,
 ) {
     let tun_fd = device.device().as_raw_fd();
-    let (name, mut buf, _shared_mss) = tun_reader_setup(&device, mtu, 2048);
+    let name = device.name().to_string();
+    let mut buf = vec![0u8; mtu as usize + 100];
+    debug!(
+        name = %name,
+        max_mss = max_mss.load(Ordering::Relaxed),
+        "TUN reader starting"
+    );
 
     // Set TUN fd to non-blocking so we can use select + read without blocking
     // past the point where select returns readable.
@@ -438,32 +450,6 @@ pub fn run_tun_reader(
     }
 
     unsafe { libc::close(shutdown_fd); }
-}
-
-/// Common setup for TUN reader: extracts name, allocates buffer, creates shared max MSS.
-fn tun_reader_setup(device: &TunDevice, mtu: u16, initial_transport_mtu: u16) -> (String, Vec<u8>, Arc<AtomicU16>) {
-    use super::icmp::effective_ipv6_mtu;
-
-    let name = device.name().to_string();
-    let buf = vec![0u8; mtu as usize + 100];
-
-    const IPV6_HEADER: u16 = 40;
-    const TCP_HEADER: u16 = 20;
-    let effective_mtu = effective_ipv6_mtu(initial_transport_mtu);
-    let max_mss = effective_mtu
-        .saturating_sub(IPV6_HEADER)
-        .saturating_sub(TCP_HEADER);
-
-    debug!(
-        name = %name,
-        tun_mtu = mtu,
-        transport_mtu = initial_transport_mtu,
-        effective_mtu = effective_mtu,
-        max_mss = max_mss,
-        "TUN reader starting"
-    );
-
-    (name, buf, Arc::new(AtomicU16::new(max_mss)))
 }
 
 /// Process a single TUN packet. Returns `false` if the reader should exit.
