@@ -81,12 +81,15 @@ impl SendRateLimiter {
 // ============================================================================
 
 /// RTT below this (ms) → uncongested → probe for bandwidth.
-/// BLE L2CAP baseline RTT is ~150ms; set threshold just above baseline.
-const RTT_LOW_MS: f64 = 150.0;
+/// BLE baseline (heartbeat) RTT ~100ms; data-transfer RTT ~250-400ms.
+/// Set at 200ms to allow probing when link is lightly loaded.
+const RTT_LOW_MS: f64 = 200.0;
 
 /// RTT above this (ms) → congested → reduce rate to drain queue.
-/// Data queuing in L2CAP buffers pushes RTT above baseline quickly.
-const RTT_HIGH_MS: f64 = 350.0;
+/// Observed data-transfer RTT is 280-370ms. Setting at 500ms avoids
+/// false congestion signals during normal data transfer while still
+/// catching genuine queue buildup (>500ms = real congestion).
+const RTT_HIGH_MS: f64 = 500.0;
 
 /// Minimum rate. Must be BELOW actual BLE throughput (~34kbps) so the
 /// adapter can slow down to match the link. Previous 50kbps was above
