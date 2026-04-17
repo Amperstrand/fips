@@ -29,10 +29,10 @@ const TCP_WINDOW_OFFSET: usize = 14;
 /// TCP SYN flag bit.
 const TCP_FLAG_SYN: u8 = 0x02;
 
-/// Maximum TCP receive window for constrained BLE links (4 × MSS=373).
-/// At ~30kbps and ~300ms RTT, BDP ≈ 1125 bytes. 1460 bytes ≈ 1.3× BDP,
-/// allowing pipelining without excessive queuing.
-const MAX_BLE_TCP_WINDOW: u16 = 1460;
+/// Maximum TCP receive window for constrained BLE links.
+/// BDP at 30kbps × 400ms RTT ≈ 1500 bytes. Previous 900 bytes was too
+/// restrictive, yielding only 11-19 kbps. 1500 targets 25-30 kbps.
+const MAX_BLE_TCP_WINDOW: u16 = 1500;
 
 /// Check if a TCP packet is a SYN packet (has SYN flag set).
 fn is_tcp_syn(tcp_header: &[u8]) -> bool {
