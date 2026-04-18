@@ -42,17 +42,39 @@ impl SendRateLimiter {
             return;
         }
 
+        let mut waits = 0u32;
         loop {
             self.refill();
 
             if self.tokens >= bytes as f64 {
                 self.tokens -= bytes as f64;
+                if waits > 0 || bytes > 512 {
+                    tracing::trace!(
+                        bytes,
+                        tokens_remaining = self.tokens as u32,
+                        waits,
+                        rate_kbps = (self.rate_bytes_per_sec * 8.0 / 1000.0) as u32,
+                        burst_cap = self.burst_bytes as u32,
+                        "rate_limiter: acquire completed"
+                    );
+                }
                 return;
             }
 
             let deficit = bytes as f64 - self.tokens;
             let wait_secs = deficit / self.rate_bytes_per_sec;
             let wait = Duration::from_secs_f64(wait_secs).max(Duration::from_millis(1));
+            waits += 1;
+            if waits == 1 {
+                tracing::trace!(
+                    bytes,
+                    tokens = self.tokens as u32,
+                    deficit = deficit as u32,
+                    wait_ms = wait.as_millis() as u32,
+                    rate_kbps = (self.rate_bytes_per_sec * 8.0 / 1000.0) as u32,
+                    "rate_limiter: waiting for tokens"
+                );
+            }
             tokio::time::sleep(wait).await;
         }
     }
