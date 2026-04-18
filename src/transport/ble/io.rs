@@ -841,32 +841,98 @@ mod bluer_impl {
             addr: &BleAddr,
             psm: u16,
         ) -> Result<Self::Stream, TransportError> {
+            let connect_start = std::time::Instant::now();
             let mut effective_psm = psm;
             let addr_type = self.resolve_addr_type(addr).await;
             let bluer_addr = addr.to_bluer_address();
             let device = self.device_handle(addr)?;
 
             debug!(addr = %addr, configured_psm = psm, addr_type = ?addr_type, "BLE connect: GATT-first connect");
-            match device.connect().await {
-                Ok(()) => {
-                    debug!(addr = %addr, "BLE connect: GATT connected");
 
-                    match timeout(Duration::from_secs(5), self.read_psm_from_gatt(&device, addr)).await {
-                        Ok(Ok(discovered_psm)) => {
-                            effective_psm = discovered_psm;
-                            debug!(addr = %addr, configured_psm = psm, discovered_psm, "BLE connect: using GATT-discovered PSM");
+            // Attempt GATT connect with one retry for transient abort-by-local
+            // errors.  BlueZ's Device1.Connect() can fail with
+            // le-connection-abort-by-local on the first attempt after adapter
+            // reset; the retry typically succeeds within ~2s.
+            const GATT_RETRY_DELAY: Duration = Duration::from_secs(2);
+            const MAX_GATT_ATTEMPTS: usize = 2;
+
+            let gatt_start = std::time::Instant::now();
+            let mut gatt_connected = false;
+            for attempt in 1..=MAX_GATT_ATTEMPTS {
+                match device.connect().await {
+                    Ok(()) => {
+                        debug!(
+                            addr = %addr, attempt,
+                            gatt_ms = gatt_start.elapsed().as_millis() as u64,
+                            "BLE connect: GATT connected"
+                        );
+                        gatt_connected = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = format!("{e}");
+                        if attempt < MAX_GATT_ATTEMPTS
+                            && (err_str.contains("abort-by-local")
+                                || err_str.contains("Not Ready"))
+                        {
+                            debug!(
+                                addr = %addr, attempt,
+                                gatt_ms = gatt_start.elapsed().as_millis() as u64,
+                                error = %e,
+                                "BLE connect: GATT connect aborted by local stack, retrying"
+                            );
+                            // Disconnect partial GATT state so the retry
+                            // starts clean.
+                            if let Err(de) = device.disconnect().await {
+                                debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect before retry (non-fatal)");
+                            }
+                            tokio::time::sleep(GATT_RETRY_DELAY).await;
+                            continue;
                         }
-                        Ok(Err(e)) => {
-                            debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery unavailable, using configured PSM");
-                        }
-                        Err(_) => {
-                            debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT PSM discovery timed out, using configured PSM");
+                        debug!(
+                            addr = %addr, attempt,
+                            gatt_ms = gatt_start.elapsed().as_millis() as u64,
+                            error = %e,
+                            "BLE connect: GATT connect failed"
+                        );
+                        // Disconnect partial GATT state so retries from
+                        // higher-level loops start clean.
+                        if let Err(de) = device.disconnect().await {
+                            debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after failure (non-fatal)");
                         }
                     }
                 }
-                Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE connect: GATT connect failed, trying direct L2CAP");
+            }
+
+            if gatt_connected {
+                let psm_start = std::time::Instant::now();
+                match timeout(Duration::from_secs(5), self.read_psm_from_gatt(&device, addr)).await {
+                    Ok(Ok(discovered_psm)) => {
+                        effective_psm = discovered_psm;
+                        debug!(
+                            addr = %addr, configured_psm = psm, discovered_psm,
+                            psm_discovery_ms = psm_start.elapsed().as_millis() as u64,
+                            "BLE connect: using GATT-discovered PSM"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery unavailable, using configured PSM");
+                    }
+                    Err(_) => {
+                        debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT PSM discovery timed out, using configured PSM");
+                    }
                 }
+            } else {
+                // GATT connect failed after retries — return error instead of
+                // falling through to L2CAP with the static PSM.  Mac
+                // peripherals assign dynamic PSMs (197, 199, …) that differ
+                // from the configured PSM (196), so L2CAP with the static PSM
+                // is guaranteed to fail with ECONNRESET anyway.  Returning the
+                // error here lets the higher-level retry loop handle it
+                // cleanly without the confusing "wrong PSM" failure.
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "BLE connect {addr}: GATT connect failed after {MAX_GATT_ATTEMPTS} attempts"
+                ))));
             }
 
             if let Ok(paired) = device.is_paired().await {
@@ -890,6 +956,7 @@ mod bluer_impl {
 
             let target_sa = SocketAddr::new(bluer_addr, addr_type, effective_psm);
 
+            let l2cap_start = std::time::Instant::now();
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
             socket
@@ -908,11 +975,20 @@ mod bluer_impl {
                 debug!(error = %e, "BLE connect: set_power_forced_active not supported");
             }
 
-            debug!(addr = %addr, addr_type = ?addr_type, psm = effective_psm, "BLE connect: opening LE L2CAP socket");
+            debug!(
+                addr = %addr, addr_type = ?addr_type, psm = effective_psm,
+                "BLE connect: opening LE L2CAP socket"
+            );
 
             let conn_result = socket.connect(target_sa).await;
             match conn_result {
                 Ok(conn) => {
+                    debug!(
+                        addr = %addr,
+                        l2cap_ms = l2cap_start.elapsed().as_millis() as u64,
+                        total_ms = connect_start.elapsed().as_millis() as u64,
+                        "BLE connect: L2CAP channel established"
+                    );
                     let remote = addr.clone();
                     BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
                 }
