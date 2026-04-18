@@ -220,35 +220,35 @@ mod tests {
 
     #[test]
     fn test_rate_adapter_additive_increase() {
-        let mut adapter = BleRateAdapter::new(150_000);
-        assert_eq!(adapter.current_rate_bps(), 150_000);
+        let mut adapter = BleRateAdapter::new(60_000);
+        assert_eq!(adapter.current_rate_bps(), 60_000);
 
-        let rate = adapter.update(200.0);
-        assert_eq!(rate, 155_000);
+        let rate = adapter.update(150.0);
+        assert_eq!(rate, 65_000);
     }
 
     #[test]
     fn test_rate_adapter_multiplicative_decrease() {
-        let mut adapter = BleRateAdapter::new(150_000);
+        let mut adapter = BleRateAdapter::new(80_000);
 
         let rate = adapter.update(600.0);
-        assert_eq!(rate, 105_000); // 150k * 0.7
+        assert_eq!(rate, 56_000); // 80k * 0.7
     }
 
     #[test]
     fn test_rate_adapter_steady_zone() {
-        let mut adapter = BleRateAdapter::new(150_000);
+        let mut adapter = BleRateAdapter::new(60_000);
 
         let rate = adapter.update(400.0);
-        assert_eq!(rate, 150_000);
+        assert_eq!(rate, 60_000);
     }
 
     #[test]
     fn test_rate_adapter_clamps_to_min() {
-        let mut adapter = BleRateAdapter::new(50_000);
+        let mut adapter = BleRateAdapter::new(20_000);
 
         let rate = adapter.update(1000.0);
-        assert_eq!(rate, 50_000); // 50k * 0.7 = 35k, clamped to MIN
+        assert_eq!(rate, 15_000); // 20k * 0.7 = 14k, clamped to MIN (15k)
     }
 
     #[test]
