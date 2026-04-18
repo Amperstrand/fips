@@ -96,8 +96,12 @@ const RTT_HIGH_MS: f64 = 500.0;
 /// BLE capacity, causing permanent buffer accumulation.
 const MIN_RATE_BPS: u64 = 15_000;
 
-/// BLE 4.2 practical throughput limit (~250 Kbps with L2CAP overhead).
-const MAX_RATE_BPS: u64 = 250_000;
+/// Maximum sustainable BLE rate. Experiments show the L2CAP link dies after
+/// 3-5 minutes at ~110 kbps. Setting a conservative ceiling to let the AIMD
+/// adapter probe safely without overshooting into link-death territory.
+/// The adapter will increase from MIN up to this cap; adjust down if links
+/// still drop.
+const MAX_RATE_BPS: u64 = 80_000;
 
 /// On congestion: `rate *= MD_FACTOR` (0.7 = 30% reduction).
 const MD_FACTOR: f64 = 0.7;
@@ -227,10 +231,10 @@ mod tests {
 
     #[test]
     fn test_rate_adapter_clamps_to_max() {
-        let mut adapter = BleRateAdapter::new(250_000);
+        let mut adapter = BleRateAdapter::new(80_000);
 
         let rate = adapter.update(200.0);
-        assert_eq!(rate, 250_000); // already at max
+        assert_eq!(rate, 80_000);
     }
 
     #[test]
