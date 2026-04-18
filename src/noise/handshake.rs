@@ -1,3 +1,38 @@
+//! Noise Protocol handshake implementation (IK and XK patterns).
+//!
+//! # Deviations from Standard Noise Specification
+//!
+//! FIPS uses Noise IK with three deviations from the standard specification.
+//! Any third-party implementation MUST match these deviations for interoperability.
+//!
+//! ## D1: Empty AAD during handshake
+//!
+//! Standard Noise uses the running hash state `h` as Additional Authenticated Data
+//! during AEAD operations. FIPS always passes **empty AAD (0 bytes)** during the
+//! handshake phase. Post-handshake encrypted frames use the 16-byte FMP header as AAD.
+//!
+//! ## D2: `se` token uses initiator's ephemeral key (not static)
+//!
+//! Standard Noise IK defines the `se` token as `DH(s_initiator, re_responder)`.
+//! FIPS replaces this with `DH(e_initiator, rs_responder)` — the initiator's
+//! **ephemeral** key paired with the responder's **static** key.
+//!
+//! Both sides compute the same ECDH shared secret because:
+//! - Responder: `DH(s_responder, e_initiator)` (line ~682)
+//! - Initiator: `DH(e_initiator, s_responder)` (line ~732)
+//!
+//! ## D3: SHA-256 of ECDH x-coordinate (not raw shared secret)
+//!
+//! Standard Noise uses the raw ECDH output as the shared secret. FIPS hashes only
+//! the x-coordinate: `SHA256(shared_x_coordinate)`. This is necessary because
+//! Nostr npubs encode x-only keys without parity information, so both `P` and
+//! `-P` must produce the same shared secret. See `HandshakeState::ecdh()`.
+//!
+//! ## Parity normalization
+//!
+//! Pre-message public key hashing forces the `0x02` (even parity) prefix regardless
+//! of the key's actual parity. See `HandshakeState::normalize_for_premessage()`.
+
 use super::{
     CipherState, HandshakeProgress, HandshakeRole, NoiseError, NoisePattern, NoiseSession,
     EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, PROTOCOL_NAME_IK,

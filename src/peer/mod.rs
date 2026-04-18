@@ -124,6 +124,10 @@ impl PromotionResult {
 /// Rule: The node with the smaller node_addr prefers its OUTBOUND connection.
 /// This is deterministic and symmetric: both nodes will reach the same conclusion.
 ///
+/// NodeAddr derivation: `SHA256(x_only_pubkey)[0..16]` where `x_only_pubkey`
+/// is the 32-byte x-coordinate of the secp256k1 public key (without the 0x02/0x03
+/// parity prefix). See `NodeAddr::from_pubkey` in `node/local_endpoint.rs`.
+///
 /// # Arguments
 /// * `our_node_addr` - Our node's ID
 /// * `their_node_addr` - The peer's node ID

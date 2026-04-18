@@ -409,6 +409,11 @@ pub struct Node {
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
     msg1_rate_limiter: HandshakeRateLimiter,
+    /// Per-peer competing MSG1 counter. Tracks how many times a peer at a
+    /// given address has sent MSG1 without completing the handshake.
+    /// Once a peer hits MAX_COMPETING_MSG1_PER_PEER, further MSG1 are dropped
+    /// until the counter resets (on successful promotion or timeout).
+    competing_msg1_count: HashMap<crate::transport::TransportAddr, u8>,
     /// Rate limiter for ICMP Packet Too Big messages.
     icmp_rate_limiter: IcmpRateLimiter,
     /// Rate limiter for routing error signals (CoordsRequired / PathBroken).
@@ -585,6 +590,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            competing_msg1_count: HashMap::new(),
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
@@ -717,6 +723,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            competing_msg1_count: HashMap::new(),
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(

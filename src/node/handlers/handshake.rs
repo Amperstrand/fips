@@ -11,6 +11,11 @@ use crate::PeerIdentity;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Maximum competing MSG1 attempts from the same peer before we stop
+/// processing them. Prevents a single misbehaving peer from monopolizing
+/// the handshake path with repeated MSG1 floods.
+const MAX_COMPETING_MSG1_PER_PEER: u8 = 5;
+
 fn should_reject_new_inbound_msg1(
     transport_accepts_connections: bool,
     possible_restart: bool,
@@ -33,6 +38,23 @@ impl Node {
             );
             return;
         }
+
+        // === PER-PEER COMPETING MSG1 LIMIT ===
+        // Track how many times this address has sent MSG1 without completing
+        // the handshake. This prevents a single misbehaving peer from flooding
+        // the handshake path (see issue #22 section 2).
+        let competing_count = self.competing_msg1_count.entry(packet.remote_addr.clone()).or_insert(0);
+        if *competing_count >= MAX_COMPETING_MSG1_PER_PEER {
+            debug!(
+                transport_id = %packet.transport_id,
+                remote_addr = %packet.remote_addr,
+                count = *competing_count,
+                "Msg1 dropped: per-peer competing limit reached"
+            );
+            self.msg1_rate_limiter.complete_handshake();
+            return;
+        }
+        *competing_count += 1;
 
         // Parse header
         let header = match Msg1Header::parse(&packet.data) {
@@ -448,6 +470,7 @@ impl Node {
         // Promote the connection to active peer now.
         match self.promote_connection(link_id, peer_identity, packet.timestamp_ms) {
             Ok(result) => {
+                self.competing_msg1_count.remove(&packet.remote_addr);
                 match result {
                     PromotionResult::Promoted(node_addr) => {
                         // Store msg2 on peer for resend on duplicate msg1
