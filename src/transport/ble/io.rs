@@ -203,12 +203,24 @@ mod bluer_impl {
 
     use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{adv::Advertisement, AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport};
+    use bluer::Address;
     use futures::StreamExt;
     use std::collections::{BTreeSet, HashSet};
     use std::pin::Pin;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
     use tracing::{debug, trace, warn};
+
+    fn local_addr_addr_type(addr: &Address) -> AddressType {
+        // BLE spec: bit 0 of MSB determines address type.
+        // 0 = public (company-assigned), 1 = random (static/RPA/non-resolvable).
+        // BlueZ enforces matching the adapter's physical address type on bind.
+        if addr.0[0] & 0x01 == 0 {
+            AddressType::LePublic
+        } else {
+            AddressType::LeRandom
+        }
+    }
 
     const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
     const STARTUP_RETRY_ATTEMPTS: usize = 3;
@@ -820,7 +832,11 @@ mod bluer_impl {
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
 
-            let sa = SocketAddr::new(local_addr, AddressType::LeRandom, psm);
+            // BlueZ requires the bind address type to match the adapter's
+            // physical address type. USB dongles use LePublic; built-in
+            // adapters and virtual peripherals use LeRandom.
+            let addr_type = local_addr_addr_type(&local_addr);
+            let sa = SocketAddr::new(local_addr, addr_type, psm);
             socket.bind(sa).map_err(|e| map_io_err("bind", e))?;
             socket.set_flow_control(FlowControl::Le)
                 .map_err(|e| map_io_err("set_flow_control", e))?;
