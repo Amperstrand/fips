@@ -175,6 +175,13 @@ fn try_take_framed_payload(
         )));
     }
 
+    if payload_len == 0 {
+        recv_buf.drain(..2);
+        return Err(TransportError::RecvFailed(
+            "BLE recv: framed message too short (0 bytes)".into(),
+        ));
+    }
+
     if recv_buf.len() < 2 + payload_len {
         return Ok(None);
     }
@@ -1624,5 +1631,15 @@ mod tests {
         assert!(err
             .to_string()
             .contains("invalid frame header 12486 exceeds max payload 510"));
+    }
+
+    #[test]
+    fn test_try_take_framed_payload_rejects_zero_length_frame() {
+        let mut recv_buf = vec![0x00, 0x00];
+        let mut out = [0u8; 32];
+
+        let err = try_take_framed_payload(&mut recv_buf, &mut out, 510).unwrap_err();
+        assert!(err.to_string().contains("framed message too short (0 bytes)"));
+        assert!(recv_buf.is_empty());
     }
 }
