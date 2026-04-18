@@ -369,7 +369,7 @@ packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
 | #65 | Dead-code static-PSM fallback + no GATT retry | `25a69d3` |
 | #14 | Same as #50 (SSH over BLE timeout) | `206908c` |
 | #69 | BLE throughput (WS burst-stall) | `206908c` |
-| #7 | `LePublic` → `LeRandom` for BLE socket addresses | `60e2dc9` |
+| #7 | `LePublic` → `LeRandom` everywhere (BLE socket addresses) | `60e2dc9`, `7448b63` |
 | #10 | Unused `BleDeviceAddr` imports already cleaned | prior commit |
 | #22 | Protocol documentation gaps (payload_len, D1/D2/D3, NodeAddr, MSG1 flood) | `0f5e2c0` |
 

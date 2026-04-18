@@ -817,13 +817,10 @@ mod bluer_impl {
                 .await
                 .map_err(|e| map_err("address", e))?;
 
-            // Local adapters on Linux typically use LePublic (USB dongles).
-            // Using LeRandom here causes "Address already in use" because
-            // BlueZ expects the bind address type to match the adapter's
-            // actual address type.
-            let sa = SocketAddr::new(local_addr, AddressType::LePublic, psm);
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
+
+            let sa = SocketAddr::new(local_addr, AddressType::LeRandom, psm);
             socket.bind(sa).map_err(|e| map_io_err("bind", e))?;
             socket.set_flow_control(FlowControl::Le)
                 .map_err(|e| map_io_err("set_flow_control", e))?;
