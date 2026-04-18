@@ -371,7 +371,8 @@ packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
 | #69 | BLE throughput (WS burst-stall) | `206908c` |
 | #7 | `LePublic` → `LeRandom` everywhere (BLE socket addresses) | `60e2dc9`, `7448b63` |
 | #10 | Unused `BleDeviceAddr` imports already cleaned | prior commit |
-| #22 | Protocol documentation gaps (payload_len, D1/D2/D3, NodeAddr, MSG1 flood) | `0f5e2c0` |
+ | #22 | Protocol documentation gaps (payload_len, D1/D2/D3, NodeAddr, MSG1 flood) | `0f5e2c0` |
+| #24 | BLE L2CAP framing retrospective (2-byte BE prefix history + downstream fixes) | multiple |
 
 ### PR Planning
 
