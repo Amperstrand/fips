@@ -1061,7 +1061,19 @@ mod bluer_impl {
             Ok(())
         }
 
-        async fn disconnect_device(&self, _addr: &BleAddr) {}
+        async fn disconnect_device(&self, addr: &BleAddr) {
+            let device = match self.device_handle(addr) {
+                Ok(d) => d,
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE disconnect: device not found");
+                    return;
+                }
+            };
+            match device.disconnect().await {
+                Ok(()) => debug!(addr = %addr, "BLE device disconnected"),
+                Err(e) => debug!(addr = %addr, error = %e, "BLE disconnect failed (non-fatal)"),
+            }
+        }
 
         async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
             // Clear cached devices so BlueZ fires DeviceAdded for every

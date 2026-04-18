@@ -1203,6 +1203,11 @@ async fn receive_loop<S: BleStream>(
                 }
             }
             Ok(Err(e)) => {
+                let err_str = format!("{e}");
+                if err_str.contains("framed message too short") {
+                    stats.record_recv_error();
+                    continue;
+                }
                 debug!(addr = %addr, error = %e, "BLE receive error");
                 stats.record_recv_error();
                 break;
