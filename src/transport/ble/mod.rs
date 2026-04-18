@@ -1268,6 +1268,8 @@ async fn scan_probe_loop<I: io::BleIo>(
 ) {
     // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
+    let mut yielded_at: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
+    let yield_cooldown = std::time::Duration::from_secs(cooldown_secs * 3);
     // Addresses discovered but not yet connected — retried after cooldown
     // even if the scanner doesn't fire again (BlueZ deduplicates).
     let mut pending_addrs: Vec<BleAddr> = Vec::new();
@@ -1326,6 +1328,13 @@ async fn scan_probe_loop<I: io::BleIo>(
             continue;
         }
 
+        if yielded_at
+            .get(&addr)
+            .is_some_and(|last| last.elapsed() < yield_cooldown)
+        {
+            continue;
+        }
+
         // Record probe time (before attempt, so cooldown applies on failure too)
         last_probed.insert(addr.clone(), tokio::time::Instant::now());
 
@@ -1377,6 +1386,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                         "BLE probe: peer cannot accept inbound, yielding to peer's outbound"
                     );
                     buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                    yielded_at.insert(addr.clone(), tokio::time::Instant::now());
+                    drop(stream);
+                    io.disconnect_device(&addr).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
 
@@ -1386,6 +1399,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                         "BLE probe: peer prefers outbound, yielding to peer's outbound"
                     );
                     buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                    yielded_at.insert(addr.clone(), tokio::time::Instant::now());
+                    drop(stream);
+                    io.disconnect_device(&addr).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
 
@@ -1398,6 +1415,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                             "BLE probe tie-breaker: yielding to peer's outbound"
                         );
                         buffer.add_peer_with_pubkey(&addr, peer_pubkey);
+                        yielded_at.insert(addr.clone(), tokio::time::Instant::now());
+                        drop(stream);
+                        io.disconnect_device(&addr).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         continue;
                     }
                 }
