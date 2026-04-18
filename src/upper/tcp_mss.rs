@@ -30,9 +30,16 @@ const TCP_WINDOW_OFFSET: usize = 14;
 const TCP_FLAG_SYN: u8 = 0x02;
 
 /// Maximum TCP receive window for constrained BLE links.
-/// BDP at 30kbps × 400ms RTT ≈ 1500 bytes. Previous 900 bytes was too
-/// restrictive, yielding only 11-19 kbps. 1500 targets 25-30 kbps.
-const MAX_BLE_TCP_WINDOW: u16 = 1500;
+///
+/// BDP at 80 Kbps (AIMD ceiling) × 200ms RTT = 2000 bytes; with 400ms
+/// RTT the BDP reaches 4000 bytes. Setting this to 4× BDP ensures the
+/// rate limiter (not the TCP window) is always the throughput bottleneck.
+/// With scale=0, the field directly represents bytes (no shift).
+///
+/// Previous value of 1500 was below the BDP at the AIMD ceiling, causing
+/// TCP to be the bottleneck and producing pathological burst-stall
+/// behavior: 128KB bursts followed by 20-43 second gaps.
+const MAX_BLE_TCP_WINDOW: u16 = 8192;
 
 /// Check if a TCP packet is a SYN packet (has SYN flag set).
 fn is_tcp_syn(tcp_header: &[u8]) -> bool {
@@ -385,5 +392,57 @@ mod tests {
         let modified = clamp_tcp_mss(&mut packet, 1200);
 
         assert!(!modified);
+    }
+
+    #[test]
+    fn test_clamp_tcp_window_large_window_clamped() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        let window_offset = 40 + TCP_WINDOW_OFFSET;
+        packet[window_offset..window_offset + 2].copy_from_slice(&65535u16.to_be_bytes());
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        let modified = clamp_tcp_window(&mut packet);
+
+        assert!(modified);
+        let clamped_window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
+        assert_eq!(clamped_window, MAX_BLE_TCP_WINDOW);
+    }
+
+    #[test]
+    fn test_clamp_tcp_window_at_limit_unchanged() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        let window_offset = 40 + TCP_WINDOW_OFFSET;
+        packet[window_offset..window_offset + 2]
+            .copy_from_slice(&(MAX_BLE_TCP_WINDOW).to_be_bytes());
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        let modified = clamp_tcp_window(&mut packet);
+
+        assert!(!modified);
+        let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
+        assert_eq!(window, MAX_BLE_TCP_WINDOW);
+    }
+
+    #[test]
+    fn test_clamp_tcp_window_below_limit_unchanged() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        let window_offset = 40 + TCP_WINDOW_OFFSET;
+        packet[window_offset..window_offset + 2].copy_from_slice(&100u16.to_be_bytes());
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        let modified = clamp_tcp_window(&mut packet);
+
+        assert!(!modified);
+        let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
+        assert_eq!(window, 100);
     }
 }
