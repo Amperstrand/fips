@@ -28,6 +28,7 @@
 //! static (configured) peers get priority over discovered peers.
 
 pub mod addr;
+pub mod backoff;
 pub mod discovery;
 pub mod io;
 pub mod pool;
@@ -90,42 +91,23 @@ pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
 /// Each peer has its own L2CAP connection; the pool enforces hardware
 /// connection limits with priority eviction.
 pub struct BleTransport<I: BleIo> {
-    /// Unique transport identifier.
     transport_id: TransportId,
-    /// Optional instance name.
     name: Option<String>,
-    /// Configuration.
     config: BleConfig,
-    /// Current state.
     state: TransportState,
-    /// BLE I/O implementation (BluerIo or MockBleIo).
     io: Arc<I>,
-    /// Established connection pool.
     pool: Arc<Mutex<ConnectionPool<Arc<I::Stream>>>>,
-    /// Pending connection attempts.
     connecting: Arc<Mutex<HashMap<TransportAddr, ConnectingEntry>>>,
-    /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
-    /// Channel for notifying Node when a live connection disappears.
     disconnect_tx: Option<DisconnectTx>,
-    /// Accept loop task handle.
     accept_task: Option<JoinHandle<()>>,
-    /// Combined scan + probe loop task handle.
     scan_probe_task: Option<JoinHandle<()>>,
-    /// Discovery buffer for discovered peers.
     discovery_buffer: Arc<DiscoveryBuffer>,
-    /// Transport statistics.
     stats: Arc<BleStats>,
-    /// Our public key for pre-handshake identity exchange.
-    ///
-    /// BLE advertisements carry only the FIPS UUID, not the pubkey.
-    /// After L2CAP connection, both sides exchange `[0x00][pubkey:32]`
-    /// so the node layer can initiate the IK handshake.
-    /// Temporary — removed when FMP switches to XX.
     local_pubkey: Option<[u8; 32]>,
     local_capabilities: PeerCapabilities,
-    /// Adaptive rate controller using MMP SRTT feedback.
     rate_adapter: Arc<Mutex<BleRateAdapter>>,
+    backoff: Arc<Mutex<backoff::PeerBackoff>>,
 }
 
 /// A pending background connection attempt.
@@ -161,6 +143,7 @@ impl<I: BleIo> BleTransport<I> {
             local_pubkey: None,
             local_capabilities: PeerCapabilities::linux_default(),
             rate_adapter: Arc::new(Mutex::new(BleRateAdapter::new(initial_rate_bps))),
+            backoff: Arc::new(Mutex::new(backoff::PeerBackoff::with_defaults())),
         }
     }
 
@@ -239,6 +222,7 @@ impl<I: BleIo> BleTransport<I> {
                         local_node_addr,
                         self.local_capabilities,
                         recv_timeout_secs,
+                        Arc::clone(&self.backoff),
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
@@ -280,6 +264,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.disconnect_tx.clone(),
                         self.transport_id,
                         self.local_capabilities,
+                        Arc::clone(&self.backoff),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -1045,6 +1030,7 @@ async fn accept_loop<A>(
     local_node_addr: Option<NodeAddr>,
     local_capabilities: PeerCapabilities,
     recv_timeout_secs: u64,
+    backoff: Arc<Mutex<backoff::PeerBackoff>>,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -1054,6 +1040,11 @@ async fn accept_loop<A>(
             Ok(stream) => {
                 let addr = stream.remote_addr().clone();
                 let ta = addr.to_transport_addr();
+
+                if backoff.lock().await.is_denied(&addr) {
+                    debug!(addr = %ta, "BLE inbound: denied, dropping");
+                    continue;
+                }
 
                 // Skip if already connected (outbound won the race)
                 {
@@ -1102,6 +1093,10 @@ async fn accept_loop<A>(
                             }
                             Err(e) => {
                                 debug!(addr = %ta, error = %e, "BLE inbound pubkey exchange failed");
+                                let denied = backoff.lock().await.record_failure(&addr);
+                                if denied {
+                                    warn!(addr = %ta, "BLE inbound: auto-denied after repeated failures");
+                                }
                                 continue;
                             }
                         }
@@ -1128,6 +1123,7 @@ async fn accept_loop<A>(
                     recv_timeout_secs,
                 ));
 
+                let backoff_addr = addr.clone();
                 let conn = BleConnection {
                     stream,
                     recv_task: Some(recv_task),
@@ -1155,6 +1151,7 @@ async fn accept_loop<A>(
                     }
                 }
                 stats.record_connection_accepted();
+                backoff.lock().await.clear(&backoff_addr);
             }
             Err(e) => {
                 warn!(error = %e, "BLE accept error");
@@ -1265,6 +1262,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     disconnect_tx: Option<DisconnectTx>,
     transport_id: TransportId,
     local_capabilities: PeerCapabilities,
+    backoff: Arc<Mutex<backoff::PeerBackoff>>,
 ) {
     // Track last probe time per address for cooldown
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
@@ -1306,6 +1304,17 @@ async fn scan_probe_loop<I: io::BleIo>(
 
         trace!(addr = %addr, "BLE scan result");
         stats.record_scan_result();
+
+        // Skip if auto-denied
+        if backoff.lock().await.is_denied(&addr) {
+            trace!(addr = %addr, "BLE scan result: denied, skipping");
+            continue;
+        }
+
+        // Skip if in backoff
+        if backoff.lock().await.is_in_backoff(&addr) {
+            continue;
+        }
 
         // Skip if already connected
         {
@@ -1362,11 +1371,21 @@ async fn scan_probe_loop<I: io::BleIo>(
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 debug!(addr = %addr, error = %e, "BLE probe connect failed");
+                let denied = backoff.lock().await.record_failure(&addr);
+                if denied {
+                    warn!(addr = %addr, "BLE probe: auto-denied after repeated connect failures");
+                    pending_addrs.retain(|a| a != &addr);
+                }
                 continue;
             }
             Err(_) => {
                 debug!(addr = %addr, "BLE probe connect timeout");
                 stats.record_connect_timeout();
+                let denied = backoff.lock().await.record_failure(&addr);
+                if denied {
+                    warn!(addr = %addr, "BLE probe: auto-denied after repeated timeouts");
+                    pending_addrs.retain(|a| a != &addr);
+                }
                 continue;
             }
         };
@@ -1478,12 +1497,18 @@ async fn scan_probe_loop<I: io::BleIo>(
                 drop(pool_guard);
                 stats.record_connection_established();
                 pending_addrs.retain(|a| a != &addr);
+                backoff.lock().await.clear(&addr);
 
                 // Report to node layer for auto-connect / handshake
                 buffer.add_peer_with_pubkey(&addr, peer_pubkey);
             }
             Err(e) => {
                 debug!(addr = %addr, error = %e, "BLE probe pubkey exchange failed");
+                let denied = backoff.lock().await.record_failure(&addr);
+                if denied {
+                    warn!(addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
+                    pending_addrs.retain(|a| a != &addr);
+                }
             }
         }
     }
