@@ -947,16 +947,10 @@ mod bluer_impl {
                     }
                 }
             } else {
-                // GATT connect failed after retries — return error instead of
-                // falling through to L2CAP with the static PSM.  Mac
-                // peripherals assign dynamic PSMs (197, 199, …) that differ
-                // from the configured PSM (196), so L2CAP with the static PSM
-                // is guaranteed to fail with ECONNRESET anyway.  Returning the
-                // error here lets the higher-level retry loop handle it
-                // cleanly without the confusing "wrong PSM" failure.
-                return Err(TransportError::Io(std::io::Error::other(format!(
-                    "BLE connect {addr}: GATT connect failed after {MAX_GATT_ATTEMPTS} attempts"
-                ))));
+                debug!(
+                    addr = %addr, configured_psm = psm,
+                    "BLE connect: GATT connect failed, falling back to L2CAP with configured PSM"
+                );
             }
 
             if let Ok(paired) = device.is_paired().await {
