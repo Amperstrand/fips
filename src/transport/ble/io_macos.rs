@@ -33,38 +33,72 @@ const MACOS_ADAPTER_NAME: &str = "default";
 
 /// BLE stream wrapping a bluest L2CAP channel.
 ///
-/// Raw byte-stream — no framing is added at this layer. CoreBluetooth
-/// may fragment or coalesce L2CAP SDUs across reads, so callers that
-/// need message boundaries must handle reassembly (see `receive_loop`
-/// and `pubkey_exchange` in mod.rs).
+/// Uses 2-byte big-endian length-prefix framing to match the Linux BLE
+/// transport. CoreBluetooth may fragment or coalesce L2CAP SDUs across
+/// reads, so `recv_buf` accumulates raw bytes and `recv()` returns one
+/// complete framed payload at a time.
 pub struct BluestStream {
     reader: Mutex<bluest::L2capChannelReader>,
     writer: Mutex<bluest::L2capChannelWriter>,
     remote: BleAddr,
     mtu: u16,
+    recv_buf: Mutex<Vec<u8>>,
 }
 
 impl BleStream for BluestStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        trace!(len = data.len(), addr = %self.remote, "BLE macOS send");
+        // Length-prefix framing: [len:2 BE][payload]
+        let framed_len = 2 + data.len();
+        let mut framed = Vec::with_capacity(framed_len);
+        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        framed.extend_from_slice(data);
+        trace!(len = data.len(), framed_len, addr = %self.remote, "BLE macOS send");
         self.writer
             .lock()
             .await
-            .write(data)
+            .write(&framed)
             .await
             .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE send: {e}"))))
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        let n = self
-            .reader
-            .lock()
-            .await
-            .read(buf)
-            .await
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE recv: {e}"))))?;
-        trace!(len = n, addr = %self.remote, "BLE macOS recv");
-        Ok(n)
+        loop {
+            // Check if we have a complete frame in recv_buf
+            {
+                let mut recv_buf = self.recv_buf.lock().await;
+                if recv_buf.len() >= 2 {
+                    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+                    if recv_buf.len() >= 2 + payload_len {
+                        let copy_len = payload_len.min(buf.len());
+                        buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
+                        recv_buf.drain(..2 + payload_len);
+                        trace!(
+                            len = copy_len,
+                            buf_remaining = recv_buf.len(),
+                            addr = %self.remote,
+                            "BLE macOS recv frame"
+                        );
+                        return Ok(copy_len);
+                    }
+                }
+            }
+
+            let mut tmp = [0u8; 2048];
+            let n = self
+                .reader
+                .lock()
+                .await
+                .read(&mut tmp)
+                .await
+                .map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!("BLE recv: {e}")))
+                })?;
+            if n == 0 {
+                return Ok(0);
+            }
+            trace!(raw_bytes = n, addr = %self.remote, "BLE macOS recv raw");
+            self.recv_buf.lock().await.extend_from_slice(&tmp[..n]);
+        }
     }
 
     fn send_mtu(&self) -> u16 {
@@ -218,6 +252,7 @@ impl BleIo for BluestIo {
             writer: Mutex::new(writer),
             remote: addr.clone(),
             mtu: self.mtu,
+            recv_buf: Mutex::new(Vec::with_capacity(self.mtu as usize)),
         })
     }
 
