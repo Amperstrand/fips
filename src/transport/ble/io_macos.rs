@@ -963,6 +963,7 @@ pub struct BluestIo {
     event_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PeripheralManagerEvent>>>,
     inbound_tx: StdMutex<Option<tokio::sync::mpsc::Sender<AnyStream>>>,
     _delegate_sender: tokio::sync::mpsc::Sender<PeripheralManagerEvent>,
+    was_powered_off: Arc<tokio::sync::Mutex<bool>>,
 }
 
 unsafe impl Sync for BluestIo {}
@@ -988,6 +989,7 @@ impl BluestIo {
             event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
             inbound_tx: StdMutex::new(None),
             _delegate_sender: event_tx,
+            was_powered_off: Arc::new(tokio::sync::Mutex::new(false)),
         })
     }
 
@@ -1140,18 +1142,83 @@ impl BleIo for BluestIo {
 
         *self.event_rx.lock().await = new_event_rx;
 
-        // Wait for PoweredOn
+        // Wait for PoweredOn or detect sleep/wake cycle
         loop {
             let mut rx = self.event_rx.lock().await;
             match rx.recv().await {
                 Some(PeripheralManagerEvent::StateChanged(state)) => {
-                    if state == CBManagerState::PoweredOn { debug!("Peripheral manager powered on"); break; }
+                    if state == CBManagerState::PoweredOff {
+                        warn!("Peripheral manager powered off (sleep)");
+                        *self.was_powered_off.lock().await = true;
+                        continue;
+                    }
+                    if state == CBManagerState::PoweredOn {
+                        if *self.was_powered_off.lock().await {
+                            warn!("Recovering from sleep/wake: Peripheral manager powered on");
+                            *self.was_powered_off.lock().await = false;
+                            break;
+                        }
+                        debug!("Peripheral manager powered on");
+                        break;
+                    }
                     if state == CBManagerState::Unsupported || state == CBManagerState::Unauthorized {
                         return Err(TransportError::StartFailed(format!("Bluetooth not available: state {:?}", state)));
                     }
                 }
                 Some(_) => {}
                 None => return Err(TransportError::StartFailed("Peripheral manager event channel closed".into())),
+            }
+        }
+
+        // Recovery: Re-publish L2CAP channel
+        if *self.was_powered_off.lock().await {
+            warn!("Recovering from sleep/wake: re-publishing L2CAP channel");
+            *self.was_powered_off.lock().await = false;
+            manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
+
+            // Wait for L2CAP published
+            loop {
+                let mut rx = self.event_rx.lock().await;
+                match rx.recv().await {
+                    Some(PeripheralManagerEvent::L2CAPPublished { psm }) => {
+                        info!("Recovery: L2CAP published with PSM {}", psm);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return Err(TransportError::StartFailed("L2CAP publish event channel closed".into())),
+                }
+            }
+
+            // Recovery: Re-add GATT service
+            warn!("Recovering from sleep/wake: re-adding GATT service");
+            let svc_uuid_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
+            let char_uuid_str = format_uuid(&FIPS_GATT_PSM_CHAR_UUID);
+            manager.dispatch(move |m| unsafe {
+                let svc_uuid = CBUUID::UUIDWithString(&NSString::from_str(&svc_uuid_str));
+                let char_uuid = CBUUID::UUIDWithString(&NSString::from_str(&char_uuid_str));
+                let psm_char = CBMutableCharacteristic::initWithType_properties_value_permissions(
+                    CBMutableCharacteristic::alloc(), &char_uuid,
+                    CBCharacteristicProperties::Read, None, CBAttributePermissions::Readable,
+                );
+                let service = CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
+                let chars = NSArray::from_retained_slice(&[psm_char]);
+                let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
+                    &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
+                service.setCharacteristics(Some(chars_ptr));
+                m.addService(&service);
+            });
+
+            // Wait for service added
+            loop {
+                let mut rx = self.event_rx.lock().await;
+                match rx.recv().await {
+                    Some(PeripheralManagerEvent::ServiceAdded) => {
+                        info!("Recovery: GATT service re-added");
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return Err(TransportError::StartFailed("Service add event channel closed".into())),
+                }
             }
         }
 
