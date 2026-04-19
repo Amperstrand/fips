@@ -100,22 +100,26 @@ pub enum LinkMessageType {
     /// No payload — the msg_type byte alone is sufficient.
     Heartbeat = 0x51,
 
-    // Benchmark (0x60-0x6F) — experimental, feature-gated
-    /// Benchmark echo request: measures RTT, loss, jitter.
+    // Experimental benchmark (0xFB-0xFF) — TEMPORARY, NOT FINAL PROTOCOL ASSIGNMENTS
+    // These high-range message types are intentionally chosen to avoid claiming
+    // low-range numbers without community consensus. They WILL change if this
+    // feature is formally adopted into the FIPS protocol. Do NOT rely on these
+    // numbers in production firmware.
+    /// Experimental echo request: measures RTT, loss, jitter.
     /// Body: `[timestamp_us:8 LE][sequence:4 LE][payload...]`
-    EchoRequest = 0x61,
-    /// Benchmark echo response: echoes request timestamps.
+    EchoRequest = 0xFF,
+    /// Experimental echo response: echoes request timestamps.
     /// Body: `[send_timestamp_us:8 LE][recv_timestamp_us:8 LE][sequence:4 LE][payload...]`
-    EchoResponse = 0x62,
-    /// Benchmark throughput request: negotiate a throughput test.
+    EchoResponse = 0xFE,
+    /// Experimental throughput request: negotiate a throughput test.
     /// Body: `[test_id:4 LE][direction:1][duration_secs:1][frame_size:2 LE][rate_bps:4 LE]`
-    ThroughputRequest = 0x63,
-    /// Benchmark throughput stream: bulk data frames during test.
+    ThroughputRequest = 0xFD,
+    /// Experimental throughput stream: bulk data frames during test.
     /// Body: `[test_id:4 LE][sequence:4 LE][data...]`
-    ThroughputStream = 0x64,
-    /// Benchmark throughput report: final test results.
+    ThroughputStream = 0xFC,
+    /// Experimental throughput report: final test results.
     /// Body: `[test_id:4 LE][frames_sent:4 LE][frames_recv:4 LE][bytes_recv:8 LE][duration_us:8 LE][achieved_bps:8 LE]`
-    ThroughputReport = 0x65,
+    ThroughputReport = 0xFB,
 }
 
 impl LinkMessageType {
@@ -131,11 +135,11 @@ impl LinkMessageType {
             0x31 => Some(LinkMessageType::LookupResponse),
             0x50 => Some(LinkMessageType::Disconnect),
             0x51 => Some(LinkMessageType::Heartbeat),
-            0x61 => Some(LinkMessageType::EchoRequest),
-            0x62 => Some(LinkMessageType::EchoResponse),
-            0x63 => Some(LinkMessageType::ThroughputRequest),
-            0x64 => Some(LinkMessageType::ThroughputStream),
-            0x65 => Some(LinkMessageType::ThroughputReport),
+            0xFF => Some(LinkMessageType::EchoRequest),
+            0xFE => Some(LinkMessageType::EchoResponse),
+            0xFD => Some(LinkMessageType::ThroughputRequest),
+            0xFC => Some(LinkMessageType::ThroughputStream),
+            0xFB => Some(LinkMessageType::ThroughputReport),
             _ => None,
         }
     }
@@ -472,9 +476,9 @@ mod tests {
 
     #[test]
     fn test_link_message_type_invalid() {
-        assert!(LinkMessageType::from_byte(0xFF).is_none());
         assert!(LinkMessageType::from_byte(0x03).is_none());
         assert!(LinkMessageType::from_byte(0x40).is_none());
+        assert!(LinkMessageType::from_byte(0x70).is_none());
     }
 
     // ===== DisconnectReason Tests =====

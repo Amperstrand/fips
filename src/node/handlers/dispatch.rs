@@ -69,7 +69,7 @@ impl Node {
                             debug!(error = %e, "TCP proxy: inbound channel full or closed, dropping data");
                         }
             }
-            0x61 | 0x62 | 0x63 | 0x64 | 0x65 => {
+            0xFB | 0xFC | 0xFD | 0xFE | 0xFF => {
                 #[cfg(feature = "benchmark")]
                 {
                     if let Some(response) = self.benchmark.handle_link_message(from, msg_type, payload) {

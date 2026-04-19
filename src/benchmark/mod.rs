@@ -81,17 +81,17 @@ impl BenchmarkManager {
         payload: &[u8],
     ) -> Option<Vec<u8>> {
         match msg_type {
-            0x61 => self.handle_echo_request(from, payload),
-            0x62 => {
+            0xFF => self.handle_echo_request(from, payload),
+            0xFE => {
                 self.handle_echo_response(from, payload);
                 None
             }
-            0x63 => self.handle_throughput_request(from, payload),
-            0x64 => {
+            0xFD => self.handle_throughput_request(from, payload),
+            0xFC => {
                 self.handle_throughput_stream(from, payload);
                 None
             }
-            0x65 => {
+            0xFB => {
                 self.handle_throughput_report(from, payload);
                 None
             }
