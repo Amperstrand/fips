@@ -12,33 +12,32 @@ use crate::transport::{TransportAddr, TransportError};
 
 use super::addr::BleAddr;
 
-/// A single BLE connection in the pool.
+pub const BLE_FRAME_PREFIX_LEN: u16 = 2;
+
 pub struct BleConnection<S> {
-    /// The L2CAP stream for this connection.
     pub stream: S,
-    /// Background receive task handle.
     pub recv_task: Option<JoinHandle<()>>,
-    /// Negotiated L2CAP send MTU.
     pub send_mtu: u16,
-    /// Negotiated L2CAP receive MTU.
     pub recv_mtu: u16,
-    /// When the connection was established.
     pub established_at: tokio::time::Instant,
-    /// Whether this is a static (configured) peer.
     pub is_static: bool,
-    /// Parsed remote address.
     pub addr: BleAddr,
+    pub on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<S> BleConnection<S> {
-    /// Effective MTU for this connection: min(send, recv).
     pub fn effective_mtu(&self) -> u16 {
-        self.send_mtu.min(self.recv_mtu)
+        self.send_mtu
+            .min(self.recv_mtu)
+            .saturating_sub(BLE_FRAME_PREFIX_LEN)
     }
 }
 
 impl<S> Drop for BleConnection<S> {
     fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
         if let Some(task) = self.recv_task.take() {
             task.abort();
         }
@@ -195,6 +194,7 @@ mod tests {
             established_at: tokio::time::Instant::now(),
             is_static,
             addr: test_ble_addr(n),
+            on_drop: None,
         }
     }
 
@@ -274,7 +274,7 @@ mod tests {
         let mut conn = test_conn(1, false);
         conn.send_mtu = 1024;
         conn.recv_mtu = 2048;
-        assert_eq!(conn.effective_mtu(), 1024);
+        assert_eq!(conn.effective_mtu(), 1022);
     }
 
     #[test]
