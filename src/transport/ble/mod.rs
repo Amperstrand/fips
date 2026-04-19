@@ -1388,8 +1388,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                     buffer.add_peer_with_pubkey(&addr, peer_pubkey);
                     yielded_at.insert(addr.clone(), tokio::time::Instant::now());
                     drop(stream);
-                    io.disconnect_device(&addr).await;
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // NOTE: do NOT call disconnect_device() here — it tears down
+                    // the entire BLE ACL link via BlueZ Device1.Disconnect(), which
+                    // kills any L2CAP that auto_connect opened in the interim.
+                    // drop(stream) closes only the L2CAP channel.
                     continue;
                 }
 
@@ -1401,8 +1403,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     buffer.add_peer_with_pubkey(&addr, peer_pubkey);
                     yielded_at.insert(addr.clone(), tokio::time::Instant::now());
                     drop(stream);
-                    io.disconnect_device(&addr).await;
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // Do NOT call disconnect_device() — see comment above.
                     continue;
                 }
 
@@ -1417,8 +1418,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                         buffer.add_peer_with_pubkey(&addr, peer_pubkey);
                         yielded_at.insert(addr.clone(), tokio::time::Instant::now());
                         drop(stream);
-                        io.disconnect_device(&addr).await;
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // Do NOT call disconnect_device() — see comment above.
                         continue;
                     }
                 }
