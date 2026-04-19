@@ -877,14 +877,15 @@ mod bluer_impl {
             // errors.  BlueZ's Device1.Connect() can fail with
             // le-connection-abort-by-local on the first attempt after adapter
             // reset; the retry typically succeeds within ~2s.
-            const GATT_RETRY_DELAY: Duration = Duration::from_secs(2);
+            const GATT_RETRY_DELAY: Duration = Duration::from_secs(1);
             const MAX_GATT_ATTEMPTS: usize = 2;
+            const GATT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
             let gatt_start = std::time::Instant::now();
             let mut gatt_connected = false;
             for attempt in 1..=MAX_GATT_ATTEMPTS {
-                match device.connect().await {
-                    Ok(()) => {
+                match timeout(GATT_CONNECT_TIMEOUT, device.connect()).await {
+                    Ok(Ok(())) => {
                         debug!(
                             addr = %addr, attempt,
                             gatt_ms = gatt_start.elapsed().as_millis() as u64,
@@ -893,7 +894,7 @@ mod bluer_impl {
                         gatt_connected = true;
                         break;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let err_str = format!("{e}");
                         if attempt < MAX_GATT_ATTEMPTS
                             && (err_str.contains("abort-by-local")
@@ -905,8 +906,6 @@ mod bluer_impl {
                                 error = %e,
                                 "BLE connect: GATT connect aborted by local stack, retrying"
                             );
-                            // Disconnect partial GATT state so the retry
-                            // starts clean.
                             if let Err(de) = device.disconnect().await {
                                 debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect before retry (non-fatal)");
                             }
@@ -919,11 +918,21 @@ mod bluer_impl {
                             error = %e,
                             "BLE connect: GATT connect failed"
                         );
-                        // Disconnect partial GATT state so retries from
-                        // higher-level loops start clean.
                         if let Err(de) = device.disconnect().await {
                             debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after failure (non-fatal)");
                         }
+                        break;
+                    }
+                    Err(_) => {
+                        debug!(
+                            addr = %addr, attempt,
+                            gatt_ms = gatt_start.elapsed().as_millis() as u64,
+                            "BLE connect: GATT connect timed out"
+                        );
+                        if let Err(de) = device.disconnect().await {
+                            debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after timeout (non-fatal)");
+                        }
+                        break;
                     }
                 }
             }
