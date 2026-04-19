@@ -36,6 +36,15 @@ pub trait BleStream: Send + Sync {
 
     /// Get the remote device address.
     fn remote_addr(&self) -> &BleAddr;
+
+    /// Update the send rate limiter's throughput ceiling.
+    /// No-op if rate limiting is disabled.
+    fn set_rate_bps(
+        &self,
+        _rate_bps: u64,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// An acceptor that yields inbound L2CAP connections.
@@ -184,10 +193,11 @@ mod bluer_impl {
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
+        rate_limiter: Option<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
     }
 
     impl BluerStream {
-        pub fn new(conn: SeqPacket, remote: BleAddr) -> Result<Self, TransportError> {
+        pub fn new(conn: SeqPacket, remote: BleAddr, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
             let send_mtu = conn.send_mtu().map_err(|e| map_io_err("send_mtu", e))? as u16;
             let recv_mtu = conn.recv_mtu().map_err(|e| map_io_err("recv_mtu", e))? as u16;
 
@@ -201,13 +211,25 @@ mod bluer_impl {
                 remote,
                 send_mtu,
                 recv_mtu,
+                rate_limiter: if send_rate_bps > 0 {
+                    Some(tokio::sync::Mutex::new(
+                        super::super::rate_limit::SendRateLimiter::new(send_rate_bps, send_burst_bytes)
+                    ))
+                } else {
+                    None
+                },
             })
         }
     }
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-            let mut framed = Vec::with_capacity(2 + data.len());
+            let framed_len = 2 + data.len();
+            if let Some(ref limiter) = self.rate_limiter {
+                limiter.lock().await.acquire(framed_len).await;
+            }
+
+            let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
             self.conn
@@ -260,6 +282,12 @@ mod bluer_impl {
         fn remote_addr(&self) -> &BleAddr {
             &self.remote
         }
+
+        async fn set_rate_bps(&self, rate_bps: u64) {
+            if let Some(ref limiter) = self.rate_limiter {
+                limiter.lock().await.set_rate_bps(rate_bps);
+            }
+        }
     }
 
     // ----------------------------------------------------------------
@@ -269,6 +297,8 @@ mod bluer_impl {
     pub struct BluerAcceptor {
         listener: SeqPacketListener,
         adapter_name: String,
+        send_rate_bps: u64,
+        send_burst_bytes: u32,
     }
 
     impl BleAcceptor for BluerAcceptor {
@@ -282,7 +312,7 @@ mod bluer_impl {
                 .map_err(|e| map_io_err("accept", e))?;
 
             let remote = BleAddr::from_bluer(peer_sa.addr, &self.adapter_name);
-            BluerStream::new(conn, remote)
+            BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
         }
     }
 
@@ -337,6 +367,8 @@ mod bluer_impl {
         #[allow(dead_code)]
         agent_handle: bluer::agent::AgentHandle,
         mtu: u16,
+        send_rate_bps: u64,
+        send_burst_bytes: u32,
     }
 
     impl BluerIo {
@@ -346,7 +378,7 @@ mod bluer_impl {
                 .map_err(|e| map_err("device", e))
         }
 
-        pub async fn new(adapter_name: &str, mtu: u16) -> Result<Self, TransportError> {
+        pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
             let session = bluer::Session::new()
                 .await
                 .map_err(|e| map_err("Session::new", e))?;
@@ -395,6 +427,8 @@ mod bluer_impl {
                 adv_handle: Mutex::new(None),
                 agent_handle,
                 mtu,
+                send_rate_bps,
+                send_burst_bytes,
             })
         }
 
@@ -622,6 +656,8 @@ mod bluer_impl {
             Ok(BluerAcceptor {
                 listener,
                 adapter_name: self.adapter_name.clone(),
+                send_rate_bps: self.send_rate_bps,
+                send_burst_bytes: self.send_burst_bytes,
             })
         }
 
@@ -752,7 +788,7 @@ mod bluer_impl {
                         "BLE connect: L2CAP channel established"
                     );
                     let remote = addr.clone();
-                    BluerStream::new(conn, remote)
+                    BluerStream::new(conn, remote, self.send_rate_bps, self.send_burst_bytes)
                 }
                 Err(e) => {
                     if let Err(e) = device.disconnect().await {
