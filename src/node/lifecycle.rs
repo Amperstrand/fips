@@ -1073,4 +1073,162 @@ impl Node {
             "disconnected": true,
         }))
     }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) async fn api_benchmark_echo(
+        &mut self,
+        npub: &str,
+        count: u32,
+        payload_size: usize,
+    ) -> Result<serde_json::Value, String> {
+        let peer_identity = PeerIdentity::from_npub(npub)
+            .map_err(|e| format!("invalid npub '{npub}': {e}"))?;
+        let node_addr = *peer_identity.node_addr();
+
+        if !self.peers.contains_key(&node_addr) {
+            return Err(format!("peer not connected: {npub}"));
+        }
+
+        let mut results = Vec::new();
+        for i in 0..count {
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+
+            let request = crate::benchmark::types::EchoRequest::new(now_us, i)
+                .with_payload(vec![0u8; payload_size]);
+            let encoded = request.encode();
+            let mut plaintext = Vec::with_capacity(1 + encoded.len());
+            plaintext.push(crate::protocol::LinkMessageType::EchoRequest.to_byte());
+            plaintext.extend_from_slice(&encoded);
+
+            if let Err(e) = self.send_encrypted_link_message(&node_addr, &plaintext).await {
+                return Err(format!("send failed at sequence {i}: {e}"));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let echo_results = self.benchmark.drain_echo_results();
+        for event in &echo_results {
+            let crate::benchmark::echo::BenchmarkEvent::EchoResponseReceived {
+                rtt_us, sequence, ..
+            } = event;
+            results.push(serde_json::json!({
+                "sequence": sequence,
+                "rtt_us": rtt_us,
+                "rtt_ms": *rtt_us as f64 / 1000.0,
+            }));
+        }
+
+        let sent = count;
+        let recv = results.len() as u32;
+        let loss_rate = if sent > 0 {
+            (1.0 - (recv as f64 / sent as f64)) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(serde_json::json!({
+            "npub": npub,
+            "sent": sent,
+            "received": recv,
+            "loss_rate_pct": format!("{:.1}", loss_rate),
+            "results": results,
+        }))
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) async fn api_benchmark_throughput(
+        &mut self,
+        npub: &str,
+        direction: &str,
+        duration_secs: u8,
+        frame_size: u16,
+        rate_bps: u32,
+    ) -> Result<serde_json::Value, String> {
+        let peer_identity = PeerIdentity::from_npub(npub)
+            .map_err(|e| format!("invalid npub '{npub}': {e}"))?;
+        let node_addr = *peer_identity.node_addr();
+
+        if !self.peers.contains_key(&node_addr) {
+            return Err(format!("peer not connected: {npub}"));
+        }
+
+        let dir: u8 = match direction {
+            "download" => 0,
+            "upload" => 1,
+            _ => return Err("direction must be 'download' or 'upload'".into()),
+        };
+
+        let test_id = rand::random::<u32>();
+
+        let request = crate::benchmark::types::ThroughputRequest::new(
+            test_id, dir, duration_secs, frame_size, rate_bps,
+        );
+        let encoded = request.encode();
+        let mut plaintext = Vec::with_capacity(1 + encoded.len());
+        plaintext.push(crate::protocol::LinkMessageType::ThroughputRequest.to_byte());
+        plaintext.extend_from_slice(&encoded);
+
+        if let Err(e) = self.send_encrypted_link_message(&node_addr, &plaintext).await {
+            return Err(format!("send failed: {e}"));
+        }
+
+        if dir == 1 {
+            let frame_interval = if rate_bps > 0 {
+                std::time::Duration::from_secs_f64((frame_size as f64 * 8.0) / rate_bps as f64)
+            } else {
+                std::time::Duration::from_millis(10)
+            };
+            let mut interval = tokio::time::interval(frame_interval);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(duration_secs as u64);
+            let mut seq: u32 = 0;
+
+            while tokio::time::Instant::now() < deadline {
+                interval.tick().await;
+                let stream = crate::benchmark::types::ThroughputStream::new(test_id, seq)
+                    .with_data(vec![0u8; frame_size as usize]);
+                let encoded = stream.encode();
+                let mut plaintext = Vec::with_capacity(1 + encoded.len());
+                plaintext.push(crate::protocol::LinkMessageType::ThroughputStream.to_byte());
+                plaintext.extend_from_slice(&encoded);
+                if self.send_encrypted_link_message(&node_addr, &plaintext).await.is_err() {
+                    break;
+                }
+                seq += 1;
+            }
+
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+            let report = crate::benchmark::types::ThroughputReport::new(
+                test_id, seq, seq, (seq as u64) * (frame_size as u64),
+                elapsed, 0,
+            );
+            let encoded = report.encode();
+            let mut plaintext = Vec::with_capacity(1 + encoded.len());
+            plaintext.push(crate::protocol::LinkMessageType::ThroughputReport.to_byte());
+            plaintext.extend_from_slice(&encoded);
+            let _ = self.send_encrypted_link_message(&node_addr, &plaintext).await;
+
+            return Ok(serde_json::json!({
+                "npub": npub,
+                "test_id": test_id,
+                "direction": direction,
+                "frames_sent": seq,
+                "bytes_sent": (seq as u64) * (frame_size as u64),
+                "duration_secs": duration_secs,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "npub": npub,
+            "test_id": test_id,
+            "direction": direction,
+            "status": "request_sent",
+        }))
+    }
 }

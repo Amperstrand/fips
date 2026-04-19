@@ -464,6 +464,10 @@ pub struct Node {
     host_map: Arc<HostMap>,
     /// Reloadable peer allow/deny lists.
     peer_acl: PeerAclReloader,
+
+    // === Benchmark ===
+    #[cfg(feature = "benchmark")]
+    benchmark: crate::benchmark::BenchmarkManager,
 }
 
 impl Node {
@@ -612,6 +616,8 @@ impl Node {
             peer_aliases: HashMap::new(),
             host_map,
             peer_acl,
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -740,6 +746,8 @@ impl Node {
             peer_aliases: HashMap::new(),
             host_map,
             peer_acl,
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         }
     }
 

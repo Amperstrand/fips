@@ -69,6 +69,20 @@ impl Node {
                             debug!(error = %e, "TCP proxy: inbound channel full or closed, dropping data");
                         }
             }
+            0x61 | 0x62 | 0x63 | 0x64 | 0x65 => {
+                #[cfg(feature = "benchmark")]
+                {
+                    if let Some(response) = self.benchmark.handle_link_message(from, msg_type, payload) {
+                        if let Err(e) = self.send_encrypted_link_message(from, &response).await {
+                            debug!(peer = %self.peer_display_name(from), error = %e, "Failed to send benchmark response");
+                        }
+                    }
+                }
+                #[cfg(not(feature = "benchmark"))]
+                {
+                    debug!(msg_type, "Benchmark message received but feature not enabled");
+                }
+            }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");
             }
