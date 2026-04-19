@@ -47,12 +47,21 @@ jobs:
           - os: ubuntu-latest
           - os: ubuntu-24.04-arm
           - os: macos-latest
+          - os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set SOURCE_DATE_EPOCH from git
+      - name: Set SOURCE_DATE_EPOCH from git (Unix)
+        if: runner.os != 'Windows'
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Set SOURCE_DATE_EPOCH from git (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $epoch = git log -1 --format=%ct
+          echo "SOURCE_DATE_EPOCH=$epoch" >> $env:GITHUB_ENV
 
       - name: Install system dependencies (Linux only)
         if: runner.os == 'Linux'
@@ -82,6 +91,11 @@ jobs:
       - name: SHA-256 hashes (macOS)
         if: runner.os == 'macOS'
         run: shasum -a 256 target/release/fips target/release/fipsctl target/release/fipstop
+
+      - name: SHA-256 hashes (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Get-FileHash target\release\fips.exe, target\release\fipsctl.exe, target\release\fipstop.exe -Algorithm SHA256
 
       # Upload the Linux binary so integration jobs can use it without rebuilding
       - name: Upload Linux binary
@@ -186,6 +200,35 @@ jobs:
         run: cargo nextest run --all --profile ci --no-default-features --features tui,ble-macos
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 2c – Unit tests (Windows)
+# ─────────────────────────────────────────────────────────────────────────────
+  test-windows:
+    name: Unit tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run unit tests
+        run: cargo nextest run --all --profile ci --no-default-features --features tui
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Job 3 – Integration tests (static mesh + chaos simulation)
 #
 # Runs only when both build and test succeed.  Each topology / scenario is a
@@ -215,6 +258,8 @@ jobs:
           - suite: rekey
             type: rekey
             topology: rekey
+          - suite: acl-allowlist
+            type: acl-allowlist
           # ── Chaos / stochastic scenarios ───────────────────────────────────
           - suite: chaos-smoke-10
             type: chaos
@@ -335,6 +380,21 @@ jobs:
         run: |
           docker compose -f testing/static/docker-compose.yml \
             --profile rekey down --volumes --remove-orphans
+
+      # ── ACL allowlist integration test ─────────────────────────────────────
+      - name: Run ACL allowlist integration test
+        if: matrix.type == 'acl-allowlist'
+        run: bash testing/acl-allowlist/test.sh --skip-build --keep-up
+
+      - name: Collect logs on failure (acl-allowlist)
+        if: matrix.type == 'acl-allowlist' && failure()
+        run: |
+          docker compose -f testing/acl-allowlist/docker-compose.yml logs --no-color
+
+      - name: Stop containers (acl-allowlist)
+        if: matrix.type == 'acl-allowlist' && always()
+        run: |
+          docker compose -f testing/acl-allowlist/docker-compose.yml down --volumes --remove-orphans
 
       # ── Chaos simulation ───────────────────────────────────────────────────
       - name: Install Python deps (chaos)

@@ -4,6 +4,7 @@
 //! holds all state required for mesh routing: identity, tree state,
 //! Bloom filters, coordinate caches, transports, links, and peers.
 
+mod acl;
 mod bloom;
 mod discovery_rate_limit;
 mod handlers;
@@ -14,6 +15,7 @@ mod routing_error_rate_limit;
 pub(crate) mod session;
 pub(crate) mod session_wire;
 pub(crate) mod stats;
+pub(crate) mod stats_history;
 #[cfg(test)]
 mod tests;
 mod tree;
@@ -30,6 +32,7 @@ use crate::bloom::BloomState;
 use crate::cache::CoordCache;
 use crate::node::session::SessionEntry;
 use crate::peer::{ActivePeer, PeerConnection};
+#[cfg(unix)]
 use crate::transport::ethernet::EthernetTransport;
 use crate::transport::tcp::TcpTransport;
 use crate::transport::tor::TorTransport;
@@ -85,6 +88,9 @@ pub enum NodeError {
 
     #[error("invalid peer npub '{npub}': {reason}")]
     InvalidPeerNpub { npub: String, reason: String },
+
+    #[error("access denied: {0}")]
+    AccessDenied(String),
 
     #[error("max connections exceeded: {max}")]
     MaxConnectionsExceeded { max: usize },
@@ -357,6 +363,9 @@ pub struct Node {
     /// Routing, forwarding, discovery, and error signal counters.
     stats: stats::NodeStats,
 
+    /// Time-series history of node-level metrics (1s/1m rings).
+    stats_history: stats_history::StatsHistory,
+
     // === TUN Interface ===
     /// TUN device state.
     tun_state: TunState,
@@ -438,6 +447,9 @@ pub struct Node {
     /// Populated at startup from peer config.
     peer_aliases: HashMap<NodeAddr, String>,
 
+    /// Reloadable peer ACL state from standard allow/deny files.
+    peer_acl: acl::PeerAclReloader,
+
     // === Host Map ===
     /// Static hostname → npub mapping for DNS resolution.
     /// Built at construction from peer aliases and /etc/fips/hosts.
@@ -498,12 +510,20 @@ impl Node {
         let backoff_max_secs = config.node.discovery.backoff_max_secs;
         let forward_min_interval_secs = config.node.discovery.forward_min_interval_secs;
 
-        let mut host_map = HostMap::from_peer_configs(config.peers());
+        let base_host_map = HostMap::from_peer_configs(config.peers());
+        let mut host_map = base_host_map.clone();
+        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
         let hosts_file = HostMap::load_hosts_file(std::path::Path::new(
             crate::upper::hosts::DEFAULT_HOSTS_PATH,
         ));
         host_map.merge(hosts_file);
         let host_map = Arc::new(host_map);
+        let peer_acl = acl::PeerAclReloader::with_alias_sources(
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_ALLOW_PATH),
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_DENY_PATH),
+            base_host_map,
+            hosts_path,
+        );
 
         Ok(Self {
             identity,
@@ -534,6 +554,7 @@ impl Node {
             next_link_id: 1,
             next_transport_id: 1,
             stats: stats::NodeStats::new(),
+            stats_history: stats_history::StatsHistory::new(),
             tun_state,
             tun_name: None,
             tun_tx: None,
@@ -564,6 +585,7 @@ impl Node {
             estimated_mesh_size: None,
             last_mesh_size_log: None,
             peer_aliases: HashMap::new(),
+            peer_acl,
             host_map,
         })
     }
@@ -612,7 +634,18 @@ impl Node {
         let max_links = config.node.limits.max_links;
         let coords_response_interval_ms = config.node.session.coords_response_interval_ms;
 
-        let host_map = Arc::new(HostMap::new());
+        let base_host_map = HostMap::from_peer_configs(config.peers());
+        let mut host_map = base_host_map.clone();
+        host_map.merge(HostMap::load_hosts_file(std::path::Path::new(
+            crate::upper::hosts::DEFAULT_HOSTS_PATH,
+        )));
+        let host_map = Arc::new(host_map);
+        let peer_acl = acl::PeerAclReloader::with_alias_sources(
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_ALLOW_PATH),
+            std::path::PathBuf::from(acl::DEFAULT_PEERS_DENY_PATH),
+            base_host_map,
+            std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH),
+        );
 
         Self {
             identity,
@@ -643,6 +676,7 @@ impl Node {
             next_link_id: 1,
             next_transport_id: 1,
             stats: stats::NodeStats::new(),
+            stats_history: stats_history::StatsHistory::new(),
             tun_state,
             tun_name: None,
             tun_tx: None,
@@ -671,6 +705,7 @@ impl Node {
             estimated_mesh_size: None,
             last_mesh_size_log: None,
             peer_aliases: HashMap::new(),
+            peer_acl,
             host_map,
         }
     }
@@ -705,20 +740,24 @@ impl Node {
             transports.push(TransportHandle::Udp(udp));
         }
 
-        // Create Ethernet transport instances
-        let eth_instances: Vec<_> = self
-            .config
-            .transports
-            .ethernet
-            .iter()
-            .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
-            .collect();
-        let xonly = self.identity.pubkey();
-        for (name, eth_config) in eth_instances {
-            let transport_id = self.allocate_transport_id();
-            let mut eth = EthernetTransport::new(transport_id, name, eth_config, packet_tx.clone());
-            eth.set_local_pubkey(xonly);
-            transports.push(TransportHandle::Ethernet(eth));
+        // Create Ethernet transport instances (Unix only — requires raw sockets)
+        #[cfg(unix)]
+        {
+            let eth_instances: Vec<_> = self
+                .config
+                .transports
+                .ethernet
+                .iter()
+                .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
+                .collect();
+            let xonly = self.identity.pubkey();
+            for (name, eth_config) in eth_instances {
+                let transport_id = self.allocate_transport_id();
+                let mut eth =
+                    EthernetTransport::new(transport_id, name, eth_config, packet_tx.clone());
+                eth.set_local_pubkey(xonly);
+                transports.push(TransportHandle::Ethernet(eth));
+            }
         }
 
         // Create TCP transport instances
@@ -837,39 +876,49 @@ impl Node {
     ///
     /// Finds the Ethernet transport instance bound to the named interface
     /// and parses the MAC portion into a 6-byte TransportAddr.
+    #[allow(unused_variables)]
     fn resolve_ethernet_addr(
         &self,
         addr_str: &str,
     ) -> Result<(TransportId, TransportAddr), NodeError> {
-        let (iface, mac_str) = addr_str.split_once('/').ok_or_else(|| {
-            NodeError::NoTransportForType(format!(
-                "invalid Ethernet address format '{}': expected 'interface/mac'",
-                addr_str
-            ))
-        })?;
-
-        // Find the Ethernet transport bound to this interface
-        let transport_id = self
-            .transports
-            .iter()
-            .find(|(_, handle)| {
-                handle.transport_type().name == "ethernet"
-                    && handle.is_operational()
-                    && handle.interface_name() == Some(iface)
-            })
-            .map(|(id, _)| *id)
-            .ok_or_else(|| {
+        #[cfg(unix)]
+        {
+            let (iface, mac_str) = addr_str.split_once('/').ok_or_else(|| {
                 NodeError::NoTransportForType(format!(
-                    "no operational Ethernet transport for interface '{}'",
-                    iface
+                    "invalid Ethernet address format '{}': expected 'interface/mac'",
+                    addr_str
                 ))
             })?;
 
-        let mac = crate::transport::ethernet::parse_mac_string(mac_str).map_err(|e| {
-            NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
-        })?;
+            // Find the Ethernet transport bound to this interface
+            let transport_id = self
+                .transports
+                .iter()
+                .find(|(_, handle)| {
+                    handle.transport_type().name == "ethernet"
+                        && handle.is_operational()
+                        && handle.interface_name() == Some(iface)
+                })
+                .map(|(id, _)| *id)
+                .ok_or_else(|| {
+                    NodeError::NoTransportForType(format!(
+                        "no operational Ethernet transport for interface '{}'",
+                        iface
+                    ))
+                })?;
 
-        Ok((transport_id, TransportAddr::from_bytes(&mac)))
+            let mac = crate::transport::ethernet::parse_mac_string(mac_str).map_err(|e| {
+                NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
+            })?;
+
+            Ok((transport_id, TransportAddr::from_bytes(&mac)))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(NodeError::NoTransportForType(
+                "Ethernet transport is not supported on this platform".to_string(),
+            ))
+        }
     }
 
     /// Resolve a BLE address string (`"adapter/AA:BB:CC:DD:EE:FF"`) to a
@@ -1123,6 +1172,70 @@ impl Node {
     /// Get mutable node statistics.
     pub(crate) fn stats_mut(&mut self) -> &mut stats::NodeStats {
         &mut self.stats
+    }
+
+    /// Get the stats history collector.
+    pub fn stats_history(&self) -> &stats_history::StatsHistory {
+        &self.stats_history
+    }
+
+    /// Sample the current node state into the stats history ring.
+    /// Called once per tick from the RX loop.
+    pub(crate) fn record_stats_history(&mut self) {
+        let fwd = &self.stats.forwarding;
+        let peers_with_mmp: Vec<f64> = self
+            .peers
+            .values()
+            .filter_map(|p| p.mmp().map(|m| m.metrics.loss_rate()))
+            .collect();
+        let loss_rate = if peers_with_mmp.is_empty() {
+            0.0
+        } else {
+            peers_with_mmp.iter().sum::<f64>() / peers_with_mmp.len() as f64
+        };
+
+        let snap = stats_history::Snapshot {
+            mesh_size: self.estimated_mesh_size,
+            tree_depth: self.tree_state.my_coords().depth() as u32,
+            peer_count: self.peers.len() as u64,
+            parent_switches_total: self.stats.tree.parent_switches,
+            bytes_in_total: fwd.received_bytes,
+            bytes_out_total: fwd.forwarded_bytes + fwd.originated_bytes,
+            packets_in_total: fwd.received_packets,
+            packets_out_total: fwd.forwarded_packets + fwd.originated_packets,
+            loss_rate,
+            active_sessions: self.sessions.len() as u64,
+        };
+
+        let now = std::time::Instant::now();
+        let peer_snaps: Vec<stats_history::PeerSnapshot> = self
+            .peers
+            .values()
+            .map(|p| {
+                let stats = p.link_stats();
+                let (srtt_ms, loss_rate, ecn_ce) = match p.mmp() {
+                    Some(m) => (
+                        m.metrics.srtt_ms(),
+                        Some(m.metrics.loss_rate()),
+                        m.receiver.ecn_ce_count() as u64,
+                    ),
+                    None => (None, None, 0),
+                };
+                stats_history::PeerSnapshot {
+                    node_addr: *p.node_addr(),
+                    last_seen: now,
+                    srtt_ms,
+                    loss_rate,
+                    bytes_in_total: stats.bytes_recv,
+                    bytes_out_total: stats.bytes_sent,
+                    packets_in_total: stats.packets_recv,
+                    packets_out_total: stats.packets_sent,
+                    ecn_ce_total: ecn_ce,
+                }
+            })
+            .collect();
+
+        self.stats_history.tick(now, &snap, &peer_snaps);
     }
 
     // === TUN Interface ===
@@ -1435,14 +1548,53 @@ impl Node {
         self.identity_cache.len()
     }
 
+    /// Iterate over identity cache entries.
+    ///
+    /// Returns `(NodeAddr, PublicKey, last_seen_ms)` for each cached identity.
+    /// Used by the `show_identity_cache` control query.
+    pub fn identity_cache_iter(
+        &self,
+    ) -> impl Iterator<Item = (&NodeAddr, &secp256k1::PublicKey, u64)> {
+        self.identity_cache
+            .values()
+            .map(|(addr, pk, ts)| (addr, pk, *ts))
+    }
+
+    /// Configured maximum identity cache size.
+    pub fn identity_cache_max(&self) -> usize {
+        self.config.node.cache.identity_size
+    }
+
     /// Number of pending discovery lookups.
     pub fn pending_lookup_count(&self) -> usize {
         self.pending_lookups.len()
     }
 
+    /// Iterate over pending discovery lookups for diagnostics.
+    pub fn pending_lookups_iter(
+        &self,
+    ) -> impl Iterator<Item = (&NodeAddr, &handlers::discovery::PendingLookup)> {
+        self.pending_lookups.iter()
+    }
+
     /// Number of recent discovery requests tracked.
     pub fn recent_request_count(&self) -> usize {
         self.recent_requests.len()
+    }
+
+    /// Count of destinations with queued TUN packets awaiting session setup.
+    pub fn pending_tun_destinations(&self) -> usize {
+        self.pending_tun_packets.len()
+    }
+
+    /// Total TUN packets queued across all destinations.
+    pub fn pending_tun_total_packets(&self) -> usize {
+        self.pending_tun_packets.values().map(|q| q.len()).sum()
+    }
+
+    /// Iterate over retry state for diagnostics.
+    pub fn retry_state_iter(&self) -> impl Iterator<Item = (&NodeAddr, &retry::RetryState)> {
+        self.retry_pending.iter()
     }
 
     // === Routing ===

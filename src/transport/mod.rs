@@ -8,12 +8,14 @@ pub mod tcp;
 pub mod tor;
 pub mod udp;
 
+#[cfg(unix)]
 pub mod ethernet;
 
 pub mod ble;
 
 #[cfg(any(all(feature = "ble", target_os = "linux"), feature = "ble-macos"))]
 use ble::DefaultBleTransport;
+#[cfg(unix)]
 use ethernet::EthernetTransport;
 use secp256k1::XOnlyPublicKey;
 use std::fmt;
@@ -850,6 +852,7 @@ pub enum TransportHandle {
     /// UDP/IP transport.
     Udp(UdpTransport),
     /// Raw Ethernet transport.
+    #[cfg(unix)]
     Ethernet(EthernetTransport),
     /// TCP/IP transport.
     Tcp(TcpTransport),
@@ -865,6 +868,7 @@ impl TransportHandle {
     pub async fn start(&mut self) -> Result<(), TransportError> {
         match self {
             TransportHandle::Udp(t) => t.start_async().await,
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.start_async().await,
             TransportHandle::Tcp(t) => t.start_async().await,
             TransportHandle::Tor(t) => t.start_async().await,
@@ -877,6 +881,7 @@ impl TransportHandle {
     pub async fn stop(&mut self) -> Result<(), TransportError> {
         match self {
             TransportHandle::Udp(t) => t.stop_async().await,
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.stop_async().await,
             TransportHandle::Tcp(t) => t.stop_async().await,
             TransportHandle::Tor(t) => t.stop_async().await,
@@ -889,6 +894,7 @@ impl TransportHandle {
     pub async fn send(&self, addr: &TransportAddr, data: &[u8]) -> Result<usize, TransportError> {
         match self {
             TransportHandle::Udp(t) => t.send_async(addr, data).await,
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.send_async(addr, data).await,
             TransportHandle::Tcp(t) => t.send_async(addr, data).await,
             TransportHandle::Tor(t) => t.send_async(addr, data).await,
@@ -901,6 +907,7 @@ impl TransportHandle {
     pub fn transport_id(&self) -> TransportId {
         match self {
             TransportHandle::Udp(t) => t.transport_id(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.transport_id(),
             TransportHandle::Tcp(t) => t.transport_id(),
             TransportHandle::Tor(t) => t.transport_id(),
@@ -913,6 +920,7 @@ impl TransportHandle {
     pub fn name(&self) -> Option<&str> {
         match self {
             TransportHandle::Udp(t) => t.name(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.name(),
             TransportHandle::Tcp(t) => t.name(),
             TransportHandle::Tor(t) => t.name(),
@@ -925,6 +933,7 @@ impl TransportHandle {
     pub fn transport_type(&self) -> &TransportType {
         match self {
             TransportHandle::Udp(t) => t.transport_type(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.transport_type(),
             TransportHandle::Tcp(t) => t.transport_type(),
             TransportHandle::Tor(t) => t.transport_type(),
@@ -937,6 +946,7 @@ impl TransportHandle {
     pub fn state(&self) -> TransportState {
         match self {
             TransportHandle::Udp(t) => t.state(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.state(),
             TransportHandle::Tcp(t) => t.state(),
             TransportHandle::Tor(t) => t.state(),
@@ -949,6 +959,7 @@ impl TransportHandle {
     pub fn mtu(&self) -> u16 {
         match self {
             TransportHandle::Udp(t) => t.mtu(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.mtu(),
             TransportHandle::Tcp(t) => t.mtu(),
             TransportHandle::Tor(t) => t.mtu(),
@@ -964,6 +975,7 @@ impl TransportHandle {
     pub fn link_mtu(&self, addr: &TransportAddr) -> u16 {
         match self {
             TransportHandle::Udp(t) => t.link_mtu(addr),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.link_mtu(addr),
             TransportHandle::Tcp(t) => t.link_mtu(addr),
             TransportHandle::Tor(t) => t.link_mtu(addr),
@@ -976,6 +988,7 @@ impl TransportHandle {
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             TransportHandle::Udp(t) => t.local_addr(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(_) => None,
             TransportHandle::Tcp(t) => t.local_addr(),
             TransportHandle::Tor(_) => None,
@@ -988,6 +1001,7 @@ impl TransportHandle {
     pub fn interface_name(&self) -> Option<&str> {
         match self {
             TransportHandle::Udp(_) => None,
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => Some(t.interface_name()),
             TransportHandle::Tcp(_) => None,
             TransportHandle::Tor(_) => None,
@@ -1024,6 +1038,7 @@ impl TransportHandle {
     pub fn discover(&self) -> Result<Vec<DiscoveredPeer>, TransportError> {
         match self {
             TransportHandle::Udp(t) => t.discover(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.discover(),
             TransportHandle::Tcp(t) => t.discover(),
             TransportHandle::Tor(t) => t.discover(),
@@ -1036,6 +1051,7 @@ impl TransportHandle {
     pub fn auto_connect(&self) -> bool {
         match self {
             TransportHandle::Udp(t) => t.auto_connect(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.auto_connect(),
             TransportHandle::Tcp(t) => t.auto_connect(),
             TransportHandle::Tor(t) => t.auto_connect(),
@@ -1048,6 +1064,7 @@ impl TransportHandle {
     pub fn accept_connections(&self) -> bool {
         match self {
             TransportHandle::Udp(t) => t.accept_connections(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.accept_connections(),
             TransportHandle::Tcp(t) => t.accept_connections(),
             TransportHandle::Tor(t) => t.accept_connections(),
@@ -1065,7 +1082,8 @@ impl TransportHandle {
     /// Poll `connection_state()` to check when the connection is ready.
     pub async fn connect(&self, addr: &TransportAddr) -> Result<(), TransportError> {
         match self {
-            TransportHandle::Udp(_) => Ok(()),      // connectionless
+            TransportHandle::Udp(_) => Ok(()), // connectionless
+            #[cfg(unix)]
             TransportHandle::Ethernet(_) => Ok(()), // connectionless
             TransportHandle::Tcp(t) => t.connect_async(addr).await,
             TransportHandle::Tor(t) => t.connect_async(addr).await,
@@ -1082,6 +1100,7 @@ impl TransportHandle {
     pub fn connection_state(&self, addr: &TransportAddr) -> ConnectionState {
         match self {
             TransportHandle::Udp(_) => ConnectionState::Connected,
+            #[cfg(unix)]
             TransportHandle::Ethernet(_) => ConnectionState::Connected,
             TransportHandle::Tcp(t) => t.connection_state_sync(addr),
             TransportHandle::Tor(t) => t.connection_state_sync(addr),
@@ -1097,6 +1116,7 @@ impl TransportHandle {
     pub async fn close_connection(&self, addr: &TransportAddr) {
         match self {
             TransportHandle::Udp(t) => t.close_connection(addr),
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.close_connection(addr),
             TransportHandle::Tcp(t) => t.close_connection_async(addr).await,
             TransportHandle::Tor(t) => t.close_connection_async(addr).await,
@@ -1118,6 +1138,7 @@ impl TransportHandle {
     pub fn congestion(&self) -> TransportCongestion {
         match self {
             TransportHandle::Udp(t) => t.congestion(),
+            #[cfg(unix)]
             TransportHandle::Ethernet(_) => TransportCongestion::default(),
             TransportHandle::Tcp(_) => TransportCongestion::default(),
             TransportHandle::Tor(_) => TransportCongestion::default(),
@@ -1134,6 +1155,7 @@ impl TransportHandle {
             TransportHandle::Udp(t) => {
                 serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
             }
+            #[cfg(unix)]
             TransportHandle::Ethernet(t) => {
                 let snap = t.stats().snapshot();
                 serde_json::json!({

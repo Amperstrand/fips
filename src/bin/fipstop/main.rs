@@ -9,7 +9,7 @@ use client::ControlClient;
 use event::{Event, EventHandler};
 use fips::version;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// FIPS mesh monitoring TUI
@@ -34,31 +34,12 @@ struct Cli {
     refresh: u64,
 }
 
-/// Determine the default socket path.
-///
-/// Checks the system-wide path first (used when the daemon runs as a
-/// systemd service), then falls back to the user's XDG runtime directory.
-/// Uses directory existence rather than socket file existence so the check
-/// works even when the user lacks traverse permission on /run/fips/ (0750).
 fn default_socket_path() -> PathBuf {
-    if Path::new("/run/fips").exists() {
-        PathBuf::from("/run/fips/control.sock")
-    } else if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(format!("{runtime_dir}/fips/control.sock"))
-    } else {
-        PathBuf::from("/tmp/fips-control.sock")
-    }
+    fips::config::default_control_path()
 }
 
-/// Determine the default gateway socket path.
 fn default_gateway_socket_path() -> PathBuf {
-    if Path::new("/run/fips").exists() {
-        PathBuf::from("/run/fips/gateway.sock")
-    } else if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(format!("{runtime_dir}/fips/gateway.sock"))
-    } else {
-        PathBuf::from("/tmp/fips-gateway.sock")
-    }
+    fips::config::default_gateway_path()
 }
 
 fn restore_terminal() {
@@ -114,12 +95,97 @@ fn fetch_data(
 
     // Fetch active tab data (if not Dashboard, which we already fetched)
     if app.active_tab != Tab::Node {
-        match rt.block_on(client.query(app.active_tab.command())) {
-            Ok(data) => {
-                app.data.insert(app.active_tab, data);
+        // Graphs tab pulls all metrics in one round trip via
+        // show_stats_all_history; all other tabs use the generic
+        // command() path.
+        if app.active_tab == Tab::Graphs {
+            let (window, granularity) = app.graphs_window();
+
+            // Always refresh the peer list on Graphs-tab fetches so
+            // selector indices stay current across peer churn.
+            if let Ok(data) = rt.block_on(client.query("show_stats_peers")) {
+                app.graphs_peers = data
+                    .get("peers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|p| crate::app::GraphsPeer {
+                                npub: p
+                                    .get("npub")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                display_name: p
+                                    .get("display_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if app.graphs_peer_idx >= app.graphs_peers.len().max(1) {
+                    app.graphs_peer_idx = 0;
+                }
             }
-            Err(e) => {
-                app.last_error = Some((std::time::Instant::now(), e));
+
+            let (command, params) = match app.graphs_mode {
+                crate::app::GraphsMode::Node => (
+                    "show_stats_all_history",
+                    serde_json::json!({
+                        "window": window,
+                        "granularity": granularity,
+                    }),
+                ),
+                crate::app::GraphsMode::MetricByPeer => (
+                    "show_stats_history_all_peers",
+                    serde_json::json!({
+                        "metric": app.graphs_selected_peer_metric(),
+                        "window": window,
+                        "granularity": granularity,
+                    }),
+                ),
+                crate::app::GraphsMode::PeerByMetric => {
+                    let npub = app
+                        .graphs_selected_peer()
+                        .map(|p| p.npub.clone())
+                        .unwrap_or_default();
+                    (
+                        "show_stats_all_history",
+                        serde_json::json!({
+                            "peer": npub,
+                            "window": window,
+                            "granularity": granularity,
+                        }),
+                    )
+                }
+            };
+
+            // Only issue the per-peer query if there is a peer to query.
+            let should_query = match app.graphs_mode {
+                crate::app::GraphsMode::PeerByMetric => !app.graphs_peers.is_empty(),
+                _ => true,
+            };
+            if should_query {
+                match rt.block_on(client.query_with_params(command, params)) {
+                    Ok(data) => {
+                        app.data.insert(Tab::Graphs, data);
+                    }
+                    Err(e) => {
+                        app.last_error = Some((std::time::Instant::now(), e));
+                    }
+                }
+            } else {
+                app.data.insert(Tab::Graphs, serde_json::json!({}));
+            }
+        } else {
+            match rt.block_on(client.query(app.active_tab.command())) {
+                Ok(data) => {
+                    app.data.insert(app.active_tab, data);
+                }
+                Err(e) => {
+                    app.last_error = Some((std::time::Instant::now(), e));
+                }
             }
         }
     }
@@ -212,6 +278,8 @@ fn main() {
                     (KeyCode::Down, _) => {
                         if app.detail_view.is_some() {
                             app.scroll_detail_down();
+                        } else if app.active_tab == Tab::Graphs {
+                            app.graphs_scroll_down();
                         } else if app.active_tab.has_table() {
                             app.select_next();
                         }
@@ -219,6 +287,8 @@ fn main() {
                     (KeyCode::Up, _) => {
                         if app.detail_view.is_some() {
                             app.scroll_detail_up();
+                        } else if app.active_tab == Tab::Graphs {
+                            app.graphs_scroll_up();
                         } else if app.active_tab.has_table() {
                             app.select_prev();
                         }
@@ -229,7 +299,10 @@ fn main() {
                         }
                     }
                     (KeyCode::Char(' '), _) | (KeyCode::Right, _) => {
-                        if app.active_tab == Tab::Transports
+                        if app.active_tab == Tab::Graphs && app.detail_view.is_none() {
+                            app.graphs_next_window();
+                            fetch_data(&rt, &client, &gateway_client, &mut app);
+                        } else if app.active_tab == Tab::Transports
                             && app.detail_view.is_none()
                             && let SelectedTreeItem::Transport(tid) = app.selected_tree_item
                         {
@@ -240,8 +313,29 @@ fn main() {
                             }
                         }
                     }
+                    (KeyCode::Char('m'), KeyModifiers::NONE)
+                        if app.active_tab == Tab::Graphs && app.detail_view.is_none() =>
+                    {
+                        app.graphs_next_mode();
+                        fetch_data(&rt, &client, &gateway_client, &mut app);
+                    }
+                    (KeyCode::Char('n'), KeyModifiers::NONE)
+                        if app.active_tab == Tab::Graphs && app.detail_view.is_none() =>
+                    {
+                        app.graphs_next_selector();
+                        fetch_data(&rt, &client, &gateway_client, &mut app);
+                    }
+                    (KeyCode::Char('N'), KeyModifiers::SHIFT)
+                        if app.active_tab == Tab::Graphs && app.detail_view.is_none() =>
+                    {
+                        app.graphs_prev_selector();
+                        fetch_data(&rt, &client, &gateway_client, &mut app);
+                    }
                     (KeyCode::Left, _) => {
-                        if app.active_tab == Tab::Transports
+                        if app.active_tab == Tab::Graphs && app.detail_view.is_none() {
+                            app.graphs_prev_window();
+                            fetch_data(&rt, &client, &gateway_client, &mut app);
+                        } else if app.active_tab == Tab::Transports
                             && app.detail_view.is_none()
                             && let SelectedTreeItem::Transport(tid) = app.selected_tree_item
                         {
@@ -269,6 +363,12 @@ fn main() {
                         if app.active_tab == Tab::Transports {
                             app.expanded_transports.clear();
                         }
+                    }
+                    (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                        app.close_detail();
+                        app.active_tab = Tab::Graphs;
+                        app.graphs_scroll = 0;
+                        fetch_data(&rt, &client, &gateway_client, &mut app);
                     }
                     _ => {}
                 }

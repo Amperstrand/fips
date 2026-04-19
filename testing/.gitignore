@@ -1,0 +1,17 @@
+# Staged binaries (copied from target/release/ for test runs)
+fips
+fipsctl
+fipstop
+fips-gateway
+
+# Generated test configs
+generated-configs/
+
+# Simulation results
+sim-results/
+
+# Python caches
+__pycache__/
+
+# Staged binary directory
+static/bin/

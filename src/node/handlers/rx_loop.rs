@@ -100,7 +100,7 @@ impl Node {
                 }
                 Some((request, response_tx)) = control_rx.recv() => {
                     let response = if request.command.starts_with("show_") {
-                        queries::dispatch(self, &request.command)
+                        queries::dispatch(self, &request.command, request.params.as_ref())
                     } else {
                         commands::dispatch(
                             self,
@@ -116,6 +116,7 @@ impl Node {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+                    self.reload_peer_acl();
                     self.poll_pending_connects().await;
                     self.resend_pending_handshakes(now_ms).await;
                     self.resend_pending_rekeys(now_ms).await;
@@ -125,6 +126,7 @@ impl Node {
                     self.check_tree_state().await;
                     self.check_bloom_state().await;
                     self.compute_mesh_size();
+                    self.record_stats_history();
                     self.check_mmp_reports().await;
                     self.check_session_mmp_reports().await;
                     self.check_link_heartbeats().await;
