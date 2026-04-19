@@ -13,7 +13,7 @@ default = ["tui", "ble"]
 tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
 gateway = ["dep:rustables"]
-ble-macos = ["dep:bluest"]
+ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2"]
 benchmark = []
 
 [dependencies]
@@ -51,6 +51,17 @@ bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true 
 
 [target.'cfg(target_os = "macos")'.dependencies]
 bluest = { version = "0.6", features = ["l2cap", "unstable"], optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-core-bluetooth = { version = "0.3", optional = true, features = [
+    "CBPeripheralManager", "CBService", "CBCharacteristic", "CBAttribute",
+    "CBManager", "CBAdvertisementData", "CBATTRequest",
+    "CBError", "CBL2CAPChannel", "CBUUID",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSArray", "NSData", "NSDictionary", "NSError", "NSNotification",
+    "NSObject", "NSRunLoop", "NSStream", "NSString", "NSUUID",
+] }
+dispatch2 = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
