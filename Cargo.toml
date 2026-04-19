@@ -14,6 +14,7 @@ tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
 ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2"]
 gateway = ["dep:rustables"]
+benchmark = []
 
 [dependencies]
 ratatui = { version = "0.30", optional = true }

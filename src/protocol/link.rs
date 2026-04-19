@@ -99,6 +99,23 @@ pub enum LinkMessageType {
     /// Periodic heartbeat for link liveness detection.
     /// No payload — the msg_type byte alone is sufficient.
     Heartbeat = 0x51,
+
+    // Benchmark (0x60-0x6F) — experimental, feature-gated
+    /// Benchmark echo request: measures RTT, loss, jitter.
+    /// Body: `[timestamp_us:8 LE][sequence:4 LE][payload...]`
+    EchoRequest = 0x61,
+    /// Benchmark echo response: echoes request timestamps.
+    /// Body: `[send_timestamp_us:8 LE][recv_timestamp_us:8 LE][sequence:4 LE][payload...]`
+    EchoResponse = 0x62,
+    /// Benchmark throughput request: negotiate a throughput test.
+    /// Body: `[test_id:4 LE][direction:1][duration_secs:1][frame_size:2 LE][rate_bps:4 LE]`
+    ThroughputRequest = 0x63,
+    /// Benchmark throughput stream: bulk data frames during test.
+    /// Body: `[test_id:4 LE][sequence:4 LE][data...]`
+    ThroughputStream = 0x64,
+    /// Benchmark throughput report: final test results.
+    /// Body: `[test_id:4 LE][frames_sent:4 LE][frames_recv:4 LE][bytes_recv:8 LE][duration_us:8 LE][achieved_bps:8 LE]`
+    ThroughputReport = 0x65,
 }
 
 impl LinkMessageType {
@@ -114,6 +131,11 @@ impl LinkMessageType {
             0x31 => Some(LinkMessageType::LookupResponse),
             0x50 => Some(LinkMessageType::Disconnect),
             0x51 => Some(LinkMessageType::Heartbeat),
+            0x61 => Some(LinkMessageType::EchoRequest),
+            0x62 => Some(LinkMessageType::EchoResponse),
+            0x63 => Some(LinkMessageType::ThroughputRequest),
+            0x64 => Some(LinkMessageType::ThroughputStream),
+            0x65 => Some(LinkMessageType::ThroughputReport),
             _ => None,
         }
     }
@@ -136,6 +158,11 @@ impl fmt::Display for LinkMessageType {
             LinkMessageType::LookupResponse => "LookupResponse",
             LinkMessageType::Disconnect => "Disconnect",
             LinkMessageType::Heartbeat => "Heartbeat",
+            LinkMessageType::EchoRequest => "EchoRequest",
+            LinkMessageType::EchoResponse => "EchoResponse",
+            LinkMessageType::ThroughputRequest => "ThroughputRequest",
+            LinkMessageType::ThroughputStream => "ThroughputStream",
+            LinkMessageType::ThroughputReport => "ThroughputReport",
         };
         write!(f, "{}", name)
     }
@@ -429,6 +456,11 @@ mod tests {
             LinkMessageType::SessionDatagram,
             LinkMessageType::Disconnect,
             LinkMessageType::Heartbeat,
+            LinkMessageType::EchoRequest,
+            LinkMessageType::EchoResponse,
+            LinkMessageType::ThroughputRequest,
+            LinkMessageType::ThroughputStream,
+            LinkMessageType::ThroughputReport,
         ];
 
         for ty in types {
@@ -533,8 +565,7 @@ mod tests {
         let src = make_node_addr(0xAA);
         let dest = make_node_addr(0xBB);
         let payload = vec![0x10, 0x00, 0x05, 0x00, 1, 2, 3, 4, 5]; // session payload
-        let dg = SessionDatagram::new(src, dest, payload.clone())
-            .with_ttl(32);
+        let dg = SessionDatagram::new(src, dest, payload.clone()).with_ttl(32);
 
         let encoded = dg.encode();
         assert_eq!(encoded[0], 0x00); // msg_type (SessionDatagram)

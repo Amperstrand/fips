@@ -3,6 +3,9 @@
 //! A distributed, decentralized network routing protocol for mesh nodes
 //! connecting over arbitrary transports.
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
+
 pub mod version;
 pub mod bloom;
 pub mod cache;
