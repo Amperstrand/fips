@@ -248,7 +248,7 @@ impl<I: BleIo> BleTransport<I> {
         if self.config.scan() {
             match self.io.start_scanning().await {
                 Ok(scanner) => {
-                    self.scan_probe_task = Some(tokio::spawn(scan_probe_loop::<I>(
+                    self.scan_probe_task = Some(tokio::spawn(scan_probe_supervisor::<I>(
                         scanner,
                         Arc::clone(&self.io),
                         Arc::clone(&self.pool),
@@ -266,7 +266,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.local_capabilities,
                         Arc::clone(&self.backoff),
                     )));
-                    debug!(adapter = %adapter, "BLE scan+probe loop started");
+                    debug!(adapter = %adapter, "BLE scan+probe supervisor started");
                 }
                 Err(e) => {
                     warn!(adapter = %adapter, error = %e, "failed to start BLE scanning");
@@ -1242,6 +1242,78 @@ async fn receive_loop<S: BleStream>(
 /// needed) and the peer is reported to the discovery buffer for the node
 /// layer to auto-connect.
 ///
+#[allow(clippy::too_many_arguments)]
+async fn scan_probe_supervisor<I: io::BleIo>(
+    scanner: I::Scanner,
+    io: Arc<I>,
+    pool: Arc<Mutex<ConnectionPool<Arc<I::Stream>>>>,
+    buffer: Arc<DiscoveryBuffer>,
+    stats: Arc<BleStats>,
+    local_pubkey: Option<[u8; 32]>,
+    psm: u16,
+    connect_timeout_ms: u64,
+    cooldown_secs: u64,
+    recv_timeout_secs: u64,
+    local_node_addr: Option<NodeAddr>,
+    packet_tx: PacketTx,
+    disconnect_tx: Option<DisconnectTx>,
+    transport_id: TransportId,
+    local_capabilities: PeerCapabilities,
+    backoff: Arc<Mutex<backoff::PeerBackoff>>,
+) {
+    let mut scanner = Some(scanner);
+    let mut restart_backoff = tokio::time::Duration::from_secs(2);
+    const MAX_RESTART_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+
+    loop {
+        if let Some(s) = scanner.take() {
+            scan_probe_loop::<I>(
+                s,
+                Arc::clone(&io),
+                Arc::clone(&pool),
+                Arc::clone(&buffer),
+                Arc::clone(&stats),
+                local_pubkey,
+                psm,
+                connect_timeout_ms,
+                cooldown_secs,
+                recv_timeout_secs,
+                local_node_addr,
+                packet_tx.clone(),
+                disconnect_tx.clone(),
+                transport_id,
+                local_capabilities,
+                Arc::clone(&backoff),
+            )
+            .await;
+        }
+
+        warn!(
+            adapter = io.adapter_name(),
+            restart_after = ?restart_backoff,
+            "BLE scanner ended, restarting"
+        );
+
+        tokio::time::sleep(restart_backoff).await;
+        restart_backoff = (restart_backoff * 2).min(MAX_RESTART_BACKOFF);
+
+        match io.start_scanning().await {
+            Ok(s) => {
+                info!(adapter = io.adapter_name(), "BLE scanner restarted");
+                scanner = Some(s);
+                restart_backoff = tokio::time::Duration::from_secs(2);
+            }
+            Err(e) => {
+                warn!(
+                    adapter = io.adapter_name(),
+                    error = %e,
+                    "BLE scanner restart failed, will retry"
+                );
+            }
+        }
+    }
+}
+
 /// Cooldown prevents rapid re-probing of the same address: after any probe
 /// attempt (success or failure), the address is suppressed for
 /// `cooldown_secs`. Connected peers are filtered by pool membership.
