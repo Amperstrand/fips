@@ -14,6 +14,7 @@ tui = ["dep:ratatui"]
 ble = ["dep:bluer"]
 gateway = ["dep:rustables"]
 ble-macos = ["dep:bluest"]
+benchmark = []
 
 [dependencies]
 ratatui = { version = "0.30", optional = true }
@@ -49,7 +50,7 @@ rtnetlink = "0.20.0"
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-bluest = { path = "../bluest-patched", features = ["l2cap", "unstable"], optional = true }
+bluest = { version = "0.6", features = ["l2cap", "unstable"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
