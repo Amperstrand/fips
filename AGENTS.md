@@ -297,8 +297,30 @@ Internal design notes in `.sisyphus/notepad/`:
 | Amperstrand/fips#8 | Tie-breaker needs NodeAddr comparison | Closed — implemented |
 | Amperstrand/fips#52 | BLE GATT PSM discovery protocol needs documentation | Open |
 | Amperstrand/fips#66 | ESP32 MTU limitation (512B), bloom filter skip | Open — firmware blocked |
-| Amperstrand/fips#64 | CoreBluetooth peripheral rejects SMP pairing | Open — OS limitation |
+| Amperstrand/fips#64 | CoreBluetooth peripheral rejects SMP pairing | Open — OS limitation, not a blocker |
 | Amperstrand/fips#65 | GATT-first connect abort-on-local retry | Closed — fixed with retry |
+| Amperstrand/fips#63 | xHCI controller death after bluetooth restart | Open — kernel/hardware issue, not reproducible |
+| Amperstrand/fips#55 | Dual-role tie-breaker deadlock | Closed — yield path fixed |
+| Amperstrand/fips#50 | TCP burst-stall over BLE | Closed — WS stripping + window clamp |
+| Amperstrand/fips#24 | BLE L2CAP framing retrospective | Closed — documented |
+| Amperstrand/fips#7 | LePublic → LeRandom address type | Closed — auto-detect for local, LeRandom for remote |
+
+### BLE Adapter Recovery Playbook (Linux)
+
+If the BLE adapter becomes unresponsive (HCI commands timeout, `btmgmt` returns
+`Authentication Failed`, or `dmesg` shows `Opcode 0xNNNN failed: -110`):
+
+| Level | Method | Command |
+|-------|--------|---------|
+| 1 | Daemon restart (safest) | `sudo pkill -9 bluetoothd` |
+| 2 | HCI reset | `sudo hciconfig hci0 down && sleep 2 && sudo hciconfig hci0 up` |
+| 3 | USB authorized toggle | `echo 0 \| sudo tee /sys/bus/usb/devices/1-10/authorized; sleep 3; echo 1 \| sudo tee /sys/bus/usb/devices/1-10/authorized` |
+| 4 | PCI FLR reset | `echo 1 \| sudo tee /sys/bus/pci/devices/0000:07:00.3/reset` |
+| 5 | Reboot | `sudo reboot` |
+
+**Do NOT** use `systemctl restart bluetooth` while FIPS BLE is active — while it
+usually works fine, it has caused xHCI controller death once (Amperstrand/fips#63).
+Use `sudo systemctl stop fips` first, then restart bluetooth, then `sudo systemctl start fips`.
 
 ---
 
@@ -357,7 +379,7 @@ packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
 - `BleConnection.is_static`: Always set to `false` — unimplemented
 - Leaf proxy commits (15+): Experimental feature, separate from BLE fixes
 - Wire-incompatible with upstream (we use 2-byte prefix, upstream doesn't)
-- xHCI controller death after `systemctl restart bluetooth` (Amperstrand/fips#63)
+- xHCI controller death after `systemctl restart bluetooth` (Amperstrand/fips#63) — **not reproducible** after 30+ attempts across 3 sessions. Documented recovery playbook in the issue. Treat as kernel/hardware issue, not FIPS bug.
 - CoreBluetooth peripheral mode rejects SMP pairing (Amperstrand/fips#64)
 - ~~GATT-first connect sometimes aborts on first attempt (Amperstrand/fips#65)~~ Fixed — retry added
 
