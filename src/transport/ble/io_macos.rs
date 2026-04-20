@@ -478,7 +478,10 @@ define_class!(
         fn on_write_notify(&self, _notification: &NSNotification) {
             if let Ok(guard) = self.ivars().output_stream.lock() {
                 if let Some(ref stream) = *guard {
+                    trace!("BLE peripheral output: draining write queue via notification");
                     unsafe { stream.with(|os| self.drain_to_stream(os)) };
+                } else {
+                    trace!("BLE peripheral output: on_write_notify but output_stream is None");
                 }
             }
         }
@@ -494,6 +497,21 @@ impl PeripheralOutputDelegate {
         };
         let this = PeripheralOutputDelegate::alloc().set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Store the output stream eagerly, without waiting for HasSpaceAvailable.
+    ///
+    /// In a Rust CLI app the main NSRunLoop is never pumped, so NSStream
+    /// delegate events (including HasSpaceAvailable) are never delivered.
+    /// The notification-based write path (`on_write_notify`) needs this reference
+    /// to drain the queue.
+    fn set_output_stream(&self, stream: SendableOutputStream) {
+        if let Ok(mut guard) = self.ivars().output_stream.lock() {
+            if guard.is_none() {
+                debug!("BLE peripheral: eagerly storing output stream reference");
+                *guard = Some(stream);
+            }
+        }
     }
 
     fn try_enqueue(&self, data: &[u8]) -> bool {
@@ -620,6 +638,11 @@ impl PeripheralStream {
                 trace!("BLE peripheral: output stream scheduled and opened, status={:?}", stream.streamStatus());
             });
         });
+
+        // Eagerly store the output stream reference. The main NSRunLoop is never
+        // pumped in a Rust CLI app, so HasSpaceAvailable events are never delivered.
+        // Without this, on_write_notify finds output_stream = None and silently drops writes.
+        output_delegate.set_output_stream(output_stream.clone());
 
         let center = NSNotificationCenter::defaultCenter();
         let notify_name = NSString::from_str(WRITE_NOTIFY_NAME);
