@@ -34,7 +34,7 @@ use super::{
 use crate::config::BleConfig;
 use crate::identity::NodeAddr;
 use addr::BleAddr;
-use capabilities::PeerCapabilities;
+pub use capabilities::PeerCapabilities;
 use discovery::DiscoveryBuffer;
 use io::{BleIo, BleScanner, BleStream};
 use pool::{BleConnection, BLE_FRAME_PREFIX_LEN, ConnectionPool};
@@ -126,7 +126,7 @@ impl<I: BleIo> BleTransport<I> {
             discovery_buffer: Arc::new(DiscoveryBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
-            local_capabilities: PeerCapabilities::macos_default(),
+            local_capabilities: PeerCapabilities::linux_default(),
             rate_adapter: Arc::new(Mutex::new(BleRateAdapter::new(initial_rate_bps))),
             backoff: Arc::new(Mutex::new(backoff::PeerBackoff::with_defaults())),
         }
@@ -715,45 +715,6 @@ async fn pubkey_exchange<S: BleStream>(
     Ok(PubkeyExchangeResult { peer_pubkey, peer_capabilities })
 }
 
-fn should_drop_inbound(
-    local_node_addr: &Option<NodeAddr>,
-    peer_addr: &NodeAddr,
-    local_caps: PeerCapabilities,
-    peer_caps: PeerCapabilities,
-) -> bool {
-    if peer_caps.is_central_only() {
-        return false;
-    }
-    if local_caps.is_central_only() {
-        return true;
-    }
-    if peer_caps.prefers_outbound() && !local_caps.prefers_outbound() {
-        return true;
-    }
-    if let Some(our_addr) = local_node_addr {
-        return our_addr < peer_addr;
-    }
-    false
-}
-
-fn should_yield_outbound(
-    local_node_addr: &Option<NodeAddr>,
-    peer_addr: &NodeAddr,
-    local_caps: PeerCapabilities,
-    peer_caps: PeerCapabilities,
-) -> bool {
-    if local_caps.is_central_only() {
-        return false;
-    }
-    if peer_caps.prefers_outbound() && !local_caps.prefers_outbound() {
-        return true;
-    }
-    if let Some(our_addr) = local_node_addr {
-        return our_addr >= peer_addr;
-    }
-    false
-}
-
 /// Accept loop: accepts inbound L2CAP connections, exchanges pubkeys,
 /// and adds to pool.
 #[allow(clippy::too_many_arguments)]
@@ -801,17 +762,23 @@ async fn accept_loop<A>(
                             debug!(addr = %ta, "BLE inbound pubkey exchange complete");
                             discovery_buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
 
-                            let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
-                            let should_drop = should_drop_inbound(
-                                &local_node_addr,
-                                &peer_addr,
-                                local_capabilities,
-                                result.peer_capabilities,
-                            );
-                            if should_drop {
-                                debug!(addr = %ta, "BLE inbound tie-breaker: dropping (outbound wins)");
-                                backoff.lock().await.clear(&addr);
-                                continue;
+                            let peer_capabilities = result.peer_capabilities;
+                            if !peer_capabilities.can_accept_inbound() {
+                                // Peer is central-only but connected to us inbound.
+                                // Accept the connection — the peer is stating a hard constraint
+                                // about roles it supports, not rejecting the connection.
+                                debug!(addr = %ta, "BLE inbound: peer is central-only, accepting inbound connection anyway");
+                            } else if peer_capabilities.prefers_outbound()
+                                && !local_capabilities.prefers_outbound()
+                            {
+                                debug!(addr = %ta, "BLE inbound: peer prefers outbound, keeping connection");
+                            } else if let Some(ref our_addr) = local_node_addr {
+                                let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
+                                if our_addr < &peer_addr {
+                                    debug!(addr = %ta, "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)");
+                                    backoff.lock().await.clear(&addr);
+                                    continue;
+                                }
                             }
                         }
                         Err(e) => {
@@ -1124,19 +1091,33 @@ async fn scan_probe_loop<I: io::BleIo>(
             Ok(result) => {
                 debug!(addr = %addr, "BLE probe complete");
 
-                let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
-                let should_yield = should_yield_outbound(
-                    &local_node_addr,
-                    &peer_addr,
-                    local_capabilities,
-                    result.peer_capabilities,
-                );
-                if should_yield {
-                    debug!(addr = %addr, "BLE probe tie-breaker: yielding to peer's outbound");
+                let peer_capabilities = result.peer_capabilities;
+                if !peer_capabilities.can_accept_inbound() {
+                    debug!(addr = %addr, "BLE probe: peer cannot accept inbound, yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
                     yielded_at.insert(addr.clone(), tokio::time::Instant::now());
                     drop(stream);
                     continue;
+                }
+
+                if peer_capabilities.prefers_outbound() && !local_capabilities.prefers_outbound() {
+                    debug!(addr = %addr, "BLE probe: peer prefers outbound, yielding to peer's outbound");
+                    buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
+                    yielded_at.insert(addr.clone(), tokio::time::Instant::now());
+                    drop(stream);
+                    continue;
+                }
+
+                // Cross-probe tie-breaker: smaller NodeAddr's outbound wins.
+                if let Some(ref our_addr) = local_node_addr {
+                    let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
+                    if peer_capabilities.can_initiate_outbound() && our_addr >= &peer_addr {
+                        debug!(addr = %addr, "BLE probe tie-breaker: yielding to peer's outbound");
+                        buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
+                        yielded_at.insert(addr.clone(), tokio::time::Instant::now());
+                        drop(stream);
+                        continue;
+                    }
                 }
 
                 let peer_pubkey = result.peer_pubkey;

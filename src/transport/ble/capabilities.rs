@@ -33,6 +33,10 @@ impl PeerCapabilities {
         Self(Self::L2CAP_SUPPORTED | Self::CAN_CENTRAL | Self::PREFER_OUTBOUND)
     }
 
+    pub fn peripheral_only() -> Self {
+        Self(Self::L2CAP_SUPPORTED | Self::CAN_PERIPHERAL | Self::GATT_SUPPORTED)
+    }
+
     pub fn macos_default() -> Self {
         Self(
             Self::L2CAP_SUPPORTED
@@ -123,6 +127,15 @@ mod tests {
         assert!(!caps.is_central_only());
         assert!(caps.can_accept_inbound());
         assert!(caps.can_initiate_outbound());
+        assert!(!caps.prefers_outbound());
+    }
+
+    #[test]
+    fn peripheral_only_has_peripheral_capabilities() {
+        let caps = PeerCapabilities::peripheral_only();
+        assert!(!caps.is_central_only());
+        assert!(caps.can_accept_inbound());
+        assert!(!caps.can_initiate_outbound());
         assert!(!caps.prefers_outbound());
     }
 

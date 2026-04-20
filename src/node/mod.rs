@@ -817,7 +817,8 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
-                match crate::transport::ble::io::BluerIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes()).await {
+                let accept_connections = ble_config.accept_connections();
+                match crate::transport::ble::io::BluerIo::new(&adapter, mtu, ble_config.effective_send_rate_bps(), ble_config.send_burst_bytes()).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,
@@ -827,6 +828,11 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        if !accept_connections {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        }
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -840,6 +846,8 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
+                let accept_connections = ble_config.accept_connections();
+                let scan_enabled = ble_config.scan();
                 match crate::transport::ble::io::BluestIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes()).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
@@ -850,6 +858,19 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        if !accept_connections {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        } else if !scan_enabled {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::peripheral_only(),
+                            );
+                        } else {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::macos_default(),
+                            );
+                        }
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
