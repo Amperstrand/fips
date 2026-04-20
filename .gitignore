@@ -16,6 +16,10 @@
 AGENTS.md
 CLAUDE.md
 agents/
+.sisyphus/
+
+# Bluest local dep (when present)
+bluest/
 
 deploy/
 vps.env
