@@ -784,7 +784,7 @@ impl BleStream for PeripheralStream {
         }
     }
 
-    fn supports_bidirectional_pubkey_exchange(&self) -> bool { false }
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool { true }
 }
 
 // ============================================================================
