@@ -339,10 +339,33 @@ mod bluer_impl {
         events: Pin<Box<dyn futures::Stream<Item = AdapterEvent> + Send>>,
         adapter: bluer::Adapter,
         adapter_name: String,
+        initialized: bool,
     }
 
     impl BleScanner for BluerScanner {
         async fn next(&mut self) -> Option<BleAddr> {
+            // On first call, emit FIPS peers already in BlueZ cache.
+            // Devices persist in BlueZ across FIPS restarts, so DeviceAdded
+            // won't fire for them. Scan the cache once to pick them up.
+            if !self.initialized {
+                self.initialized = true;
+                if let Ok(addrs) = self.adapter.device_addresses().await {
+                    for addr in addrs {
+                        if let Ok(device) = self.adapter.device(addr) {
+                            match device.uuids().await {
+                                Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
+                                    let rssi = device.rssi().await.ok().flatten();
+                                    let ble_addr = BleAddr::from_bluer(addr, &self.adapter_name, rssi);
+                                    debug!(addr = %ble_addr, "BLE scanner: cached FIPS peer found");
+                                    return Some(ble_addr);
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                }
+            }
+
             loop {
                 match self.events.next().await {
                     Some(AdapterEvent::DeviceAdded(addr)) => {
@@ -912,6 +935,7 @@ mod bluer_impl {
                             events: Box::pin(events),
                             adapter: self.adapter.clone(),
                             adapter_name: self.adapter_name.clone(),
+                            initialized: false,
                         });
                     }
                     Err(error)
