@@ -872,8 +872,8 @@ define_class!(
                 let remote = unsafe { channel.peer() }.map(|p| {
                     let identifier = unsafe { p.identifier() };
                     let bytes = unsafe { nsuuid_to_bytes(&identifier) };
-                    BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: bytes }
-                }).unwrap_or_else(|| BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: [0, 0, 0, 0, 0, 0] });
+                    BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: bytes, rssi: None }
+                }).unwrap_or_else(|| BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: [0, 0, 0, 0, 0, 0], rssi: None });
                 let stream = unsafe {
                     PeripheralStream::setup_channel(
                         SendableChannel(channel.retain()),
@@ -1397,6 +1397,7 @@ impl BleIo for BluestIo {
                     let addr = BleAddr {
                         adapter: MACOS_ADAPTER_NAME.to_string(),
                         device: existing,
+                        rssi: None,
                     };
                     if tx.send(addr).await.is_err() {
                         break;
@@ -1424,6 +1425,7 @@ impl BleIo for BluestIo {
                 let addr = BleAddr {
                     adapter: MACOS_ADAPTER_NAME.to_string(),
                     device: bytes,
+                    rssi: None,
                 };
 
                 if tx.send(addr).await.is_err() {
@@ -1440,6 +1442,7 @@ impl BleIo for BluestIo {
         Ok(BleAddr {
             adapter: MACOS_ADAPTER_NAME.to_string(),
             device: [0, 0, 0, 0, 0, 0],
+            rssi: None,
         })
     }
 
