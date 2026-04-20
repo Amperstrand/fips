@@ -454,6 +454,10 @@ pub struct Node {
     /// Static hostname → npub mapping for DNS resolution.
     /// Built at construction from peer aliases and /etc/fips/hosts.
     host_map: Arc<HostMap>,
+
+    // === Benchmark ===
+    #[cfg(feature = "benchmark")]
+    benchmark: crate::benchmark::BenchmarkManager,
 }
 
 impl Node {
@@ -587,6 +591,8 @@ impl Node {
             peer_aliases: HashMap::new(),
             peer_acl,
             host_map,
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -707,6 +713,8 @@ impl Node {
             peer_aliases: HashMap::new(),
             peer_acl,
             host_map,
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         }
     }
 

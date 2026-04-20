@@ -58,6 +58,20 @@ impl Node {
                 // Heartbeat — no-op, last_recv_time already updated by record_recv()
                 trace!(peer = %self.peer_display_name(from), "Received heartbeat");
             }
+            0xFB | 0xFC | 0xFD | 0xFE | 0xFF => {
+                #[cfg(feature = "benchmark")]
+                {
+                    if let Some(response) = self.benchmark.handle_link_message(from, msg_type, payload) {
+                        if let Err(e) = self.send_encrypted_link_message(from, &response).await {
+                            debug!(peer = %self.peer_display_name(from), error = %e, "Failed to send benchmark response");
+                        }
+                    }
+                }
+                #[cfg(not(feature = "benchmark"))]
+                {
+                    debug!(msg_type, "Benchmark message received but feature not enabled");
+                }
+            }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");
             }

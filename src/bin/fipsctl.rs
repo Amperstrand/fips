@@ -71,6 +71,11 @@ enum Commands {
         /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
         peer: String,
     },
+    /// Run a link benchmark (requires --features benchmark)
+    Benchmark {
+        #[command(subcommand)]
+        what: BenchmarkCommands,
+    },
     /// Query historical node statistics
     Stats {
         #[command(subcommand)]
@@ -139,6 +144,38 @@ enum AclCommands {
     Show,
 }
 
+#[derive(Subcommand, Debug)]
+enum BenchmarkCommands {
+    /// Measure RTT and packet loss to a peer
+    Echo {
+        /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
+        peer: String,
+        /// Number of echo requests to send (default: 10)
+        #[arg(short = 'n', long, default_value = "10")]
+        count: u32,
+        /// Payload size in bytes (default: 0)
+        #[arg(short = 's', long, default_value = "0")]
+        payload_size: usize,
+    },
+    /// Measure throughput to a peer
+    Throughput {
+        /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
+        peer: String,
+        /// Test direction: upload or download (default: upload)
+        #[arg(short = 'd', long, default_value = "upload")]
+        direction: String,
+        /// Test duration in seconds (default: 5)
+        #[arg(short = 't', long, default_value = "5")]
+        duration: u8,
+        /// Frame payload size in bytes (default: 256)
+        #[arg(short = 'f', long, default_value = "256")]
+        frame_size: u16,
+        /// Target bitrate in bps (default: 40000)
+        #[arg(short = 'r', long, default_value = "40000")]
+        rate: u32,
+    },
+}
+
 impl ShowCommands {
     fn command_name(&self) -> &'static str {
         match self {
@@ -175,7 +212,7 @@ fn default_socket_path() -> PathBuf {
 /// On Unix, connects via Unix domain socket.
 /// On Windows, connects via TCP to localhost.
 #[cfg(unix)]
-fn send_request(socket_path: &Path, request_json: &str) -> Result<serde_json::Value, String> {
+fn send_request(socket_path: &Path, request_json: &str, timeout: Duration) -> Result<serde_json::Value, String> {
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
@@ -216,7 +253,7 @@ fn send_request(socket_path: &Path, request_json: &str) -> Result<serde_json::Va
 }
 
 #[cfg(windows)]
-fn send_request(socket_path: &Path, request_json: &str) -> Result<serde_json::Value, String> {
+fn send_request(socket_path: &Path, request_json: &str, timeout: Duration) -> Result<serde_json::Value, String> {
     use std::net::TcpStream;
 
     let port_str = socket_path.to_string_lossy();
@@ -236,7 +273,6 @@ fn send_request(socket_path: &Path, request_json: &str) -> Result<serde_json::Va
         )
     })?;
 
-    let timeout = Duration::from_secs(5);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
@@ -420,6 +456,11 @@ fn main() {
 
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
 
+    let timeout = match &cli.command {
+        Commands::Benchmark { .. } => Duration::from_secs(300),
+        _ => Duration::from_secs(5),
+    };
+
     let request = match &cli.command {
         Commands::Show { what } => build_query(what.command_name()),
         Commands::Acl { what } => build_query(what.command_name()),
@@ -468,6 +509,42 @@ fn main() {
                 build_command("show_stats_history", params)
             }
         },
+        Commands::Benchmark { what } => match what {
+            BenchmarkCommands::Echo {
+                peer,
+                count,
+                payload_size,
+            } => {
+                let npub = resolve_peer(peer);
+                build_command(
+                    "benchmark_echo",
+                    serde_json::json!({
+                        "npub": npub,
+                        "count": count,
+                        "payload_size": payload_size,
+                    }),
+                )
+            }
+            BenchmarkCommands::Throughput {
+                peer,
+                direction,
+                duration,
+                frame_size,
+                rate,
+            } => {
+                let npub = resolve_peer(peer);
+                build_command(
+                    "benchmark_throughput",
+                    serde_json::json!({
+                        "npub": npub,
+                        "direction": direction,
+                        "duration_secs": duration,
+                        "frame_size": frame_size,
+                        "rate_bps": rate,
+                    }),
+                )
+            }
+        },
         Commands::Keygen { .. } => unreachable!(),
     };
 
@@ -479,7 +556,7 @@ fn main() {
         },
     } = &cli.command
     {
-        match send_request(&socket_path, &request) {
+        match send_request(&socket_path, &request, timeout) {
             Ok(value) => print_plot(&value, metric),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -489,7 +566,7 @@ fn main() {
         return;
     }
 
-    match send_request(&socket_path, &request) {
+    match send_request(&socket_path, &request, timeout) {
         Ok(value) => print_response(&value),
         Err(e) => {
             eprintln!("error: {e}");

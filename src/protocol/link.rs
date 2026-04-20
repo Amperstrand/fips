@@ -99,6 +99,27 @@ pub enum LinkMessageType {
     /// Periodic heartbeat for link liveness detection.
     /// No payload — the msg_type byte alone is sufficient.
     Heartbeat = 0x51,
+
+    // Experimental benchmark (0xFB-0xFF) — TEMPORARY, NOT FINAL PROTOCOL ASSIGNMENTS
+    // These high-range message types are intentionally chosen to avoid claiming
+    // low-range numbers without community consensus. They WILL change if this
+    // feature is formally adopted into the FIPS protocol. Do NOT rely on these
+    // numbers in production firmware.
+    /// Experimental echo request: measures RTT, loss, jitter.
+    /// Body: `[timestamp_us:8 LE][sequence:4 LE][payload...]`
+    EchoRequest = 0xFF,
+    /// Experimental echo response: echoes request timestamps.
+    /// Body: `[send_timestamp_us:8 LE][recv_timestamp_us:8 LE][sequence:4 LE][payload...]`
+    EchoResponse = 0xFE,
+    /// Experimental throughput request: negotiate a throughput test.
+    /// Body: `[test_id:4 LE][direction:1][duration_secs:1][frame_size:2 LE][rate_bps:4 LE]`
+    ThroughputRequest = 0xFD,
+    /// Experimental throughput stream: bulk data frames during test.
+    /// Body: `[test_id:4 LE][sequence:4 LE][data...]`
+    ThroughputStream = 0xFC,
+    /// Experimental throughput report: final test results.
+    /// Body: `[test_id:4 LE][frames_sent:4 LE][frames_recv:4 LE][bytes_recv:8 LE][duration_us:8 LE][achieved_bps:8 LE]`
+    ThroughputReport = 0xFB,
 }
 
 impl LinkMessageType {
@@ -114,6 +135,11 @@ impl LinkMessageType {
             0x31 => Some(LinkMessageType::LookupResponse),
             0x50 => Some(LinkMessageType::Disconnect),
             0x51 => Some(LinkMessageType::Heartbeat),
+            0xFF => Some(LinkMessageType::EchoRequest),
+            0xFE => Some(LinkMessageType::EchoResponse),
+            0xFD => Some(LinkMessageType::ThroughputRequest),
+            0xFC => Some(LinkMessageType::ThroughputStream),
+            0xFB => Some(LinkMessageType::ThroughputReport),
             _ => None,
         }
     }
@@ -136,6 +162,11 @@ impl fmt::Display for LinkMessageType {
             LinkMessageType::LookupResponse => "LookupResponse",
             LinkMessageType::Disconnect => "Disconnect",
             LinkMessageType::Heartbeat => "Heartbeat",
+            LinkMessageType::EchoRequest => "EchoRequest",
+            LinkMessageType::EchoResponse => "EchoResponse",
+            LinkMessageType::ThroughputRequest => "ThroughputRequest",
+            LinkMessageType::ThroughputStream => "ThroughputStream",
+            LinkMessageType::ThroughputReport => "ThroughputReport",
         };
         write!(f, "{}", name)
     }
@@ -429,6 +460,11 @@ mod tests {
             LinkMessageType::SessionDatagram,
             LinkMessageType::Disconnect,
             LinkMessageType::Heartbeat,
+            LinkMessageType::EchoRequest,
+            LinkMessageType::EchoResponse,
+            LinkMessageType::ThroughputRequest,
+            LinkMessageType::ThroughputStream,
+            LinkMessageType::ThroughputReport,
         ];
 
         for ty in types {
@@ -440,9 +476,9 @@ mod tests {
 
     #[test]
     fn test_link_message_type_invalid() {
-        assert!(LinkMessageType::from_byte(0xFF).is_none());
         assert!(LinkMessageType::from_byte(0x03).is_none());
         assert!(LinkMessageType::from_byte(0x40).is_none());
+        assert!(LinkMessageType::from_byte(0x70).is_none());
     }
 
     // ===== DisconnectReason Tests =====
