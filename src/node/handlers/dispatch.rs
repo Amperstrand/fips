@@ -2,6 +2,7 @@
 
 use crate::NodeAddr;
 use crate::node::Node;
+use crate::transport::TransportDisconnect;
 use tracing::{debug, info, trace};
 
 impl Node {
@@ -211,5 +212,44 @@ impl Node {
             tree_changed = tree_changed,
             "Peer removed and state cleaned up"
         );
+    }
+
+    pub(in crate::node) fn handle_transport_disconnect(&mut self, disconnect: TransportDisconnect) {
+        let Some(link_id) = self.find_link_by_addr(disconnect.transport_id, &disconnect.remote_addr) else {
+            debug!(
+                transport_id = %disconnect.transport_id,
+                remote_addr = %disconnect.remote_addr,
+                "Transport disconnect for unknown address, ignoring"
+            );
+            return;
+        };
+
+        if let Some(node_addr) = self.peers.iter()
+            .find_map(|(node_addr, peer)| (peer.link_id() == link_id).then_some(*node_addr))
+        {
+            info!(
+                peer = %self.peer_display_name(&node_addr),
+                transport_id = %disconnect.transport_id,
+                "Transport disconnect, removing peer immediately"
+            );
+            self.remove_active_peer(&node_addr);
+            self.schedule_reconnect(node_addr, Self::now_ms());
+            return;
+        }
+
+        if let Some(conn) = self.connections.get(&link_id)
+            && conn.is_outbound()
+            && let Some(identity) = conn.expected_identity()
+        {
+            self.schedule_retry(*identity.node_addr(), Self::now_ms());
+        }
+
+        debug!(
+            link_id = %link_id,
+            transport_id = %disconnect.transport_id,
+            remote_addr = %disconnect.remote_addr,
+            "Transport disconnect during handshake, cleaning up pending connection"
+        );
+        self.cleanup_stale_connection(link_id, Self::now_ms());
     }
 }
