@@ -810,6 +810,7 @@ async fn accept_loop<A>(
                             );
                             if should_drop {
                                 debug!(addr = %ta, "BLE inbound tie-breaker: dropping (outbound wins)");
+                                backoff.lock().await.clear(&addr);
                                 continue;
                             }
                         }
@@ -1009,8 +1010,10 @@ async fn scan_probe_loop<I: io::BleIo>(
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
 ) {
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
+    let mut yielded_at: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
     let mut pending_addrs: Vec<BleAddr> = Vec::new();
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
+    let yield_cooldown = std::time::Duration::from_secs(cooldown_secs * 3);
     let retry_interval = tokio::time::interval(std::time::Duration::from_secs(cooldown_secs));
     tokio::pin!(retry_interval);
     retry_interval.tick().await;
@@ -1069,6 +1072,13 @@ async fn scan_probe_loop<I: io::BleIo>(
             continue;
         }
 
+        if yielded_at
+            .get(&addr)
+            .is_some_and(|last| last.elapsed() < yield_cooldown)
+        {
+            continue;
+        }
+
         last_probed.insert(addr.clone(), tokio::time::Instant::now());
 
         let our_pubkey = match local_pubkey {
@@ -1123,6 +1133,8 @@ async fn scan_probe_loop<I: io::BleIo>(
                 if should_yield {
                     debug!(addr = %addr, "BLE probe tie-breaker: yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
+                    yielded_at.insert(addr.clone(), tokio::time::Instant::now());
+                    drop(stream);
                     continue;
                 }
 
