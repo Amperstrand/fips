@@ -964,8 +964,17 @@ impl Node {
                 return Err(format!("send failed at sequence {i}: {e}"));
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+
+        // Wait for remaining in-flight responses to arrive.
+        // BLE links have RTTs of ~130ms+ and the rate limiter adds further
+        // latency, so give generous headroom: 500ms per outstanding packet
+        // (worst case: none have arrived yet), plus a 2-second floor.
+        let collection_wait = std::time::Duration::from_millis(
+            2000 + (count as u64 * 500),
+        );
+        tokio::time::sleep(collection_wait).await;
 
         let echo_results = self.benchmark.drain_echo_results();
         for event in &echo_results {
