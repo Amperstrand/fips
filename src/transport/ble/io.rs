@@ -38,28 +38,19 @@ pub trait BleStream: Send + Sync {
     fn remote_addr(&self) -> &BleAddr;
 
     /// Update the send rate limiter's throughput ceiling.
-    /// No-op if rate limiting is disabled.
     fn set_rate_bps(
         &self,
-        _rate_bps: u64,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        async {}
-    }
+        rate_bps: u64,
+    ) -> impl std::future::Future<Output = ()> + Send;
 
     /// Send data with higher priority (bypasses rate limiting).
-    /// Default implementation delegates to `send`.
     fn send_urgent(
         &self,
         data: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
-        self.send(data)
-    }
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
     /// Whether this stream supports bidirectional pubkey exchange.
-    /// Peripheral streams do not (CoreBluetooth rejects SMP pairing).
-    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
-        false
-    }
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool;
 }
 
 /// An acceptor that yields inbound L2CAP connections.
@@ -137,6 +128,41 @@ pub trait BleIo: Send + Sync + 'static {
     }
 }
 
+#[cfg(any(test, all(feature = "ble", target_os = "linux")))]
+fn try_take_framed_payload(
+    recv_buf: &mut Vec<u8>,
+    buf: &mut [u8],
+    max_payload_len: usize,
+) -> Result<Option<usize>, TransportError> {
+    if recv_buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+    if payload_len > max_payload_len {
+        return Err(TransportError::RecvFailed(format!(
+            "BLE recv: invalid frame header {} exceeds max payload {}",
+            payload_len, max_payload_len
+        )));
+    }
+
+    if payload_len == 0 {
+        recv_buf.drain(..2);
+        return Err(TransportError::RecvFailed(
+            "BLE recv: framed message too short (0 bytes)".into(),
+        ));
+    }
+
+    if recv_buf.len() < 2 + payload_len {
+        return Ok(None);
+    }
+
+    let copy_len = payload_len.min(buf.len());
+    buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
+    recv_buf.drain(..2 + payload_len);
+    Ok(Some(copy_len))
+}
+
 // ============================================================================
 // BluerIo — Production BLE I/O via BlueZ D-Bus
 // ============================================================================
@@ -188,6 +214,7 @@ mod bluer_impl {
 
     const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
     const STARTUP_RETRY_ATTEMPTS: usize = 3;
+    const BLE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
     fn is_transient_startup_error(error: &bluer::Error) -> bool {
         matches!(
@@ -209,6 +236,7 @@ mod bluer_impl {
         send_mtu: u16,
         recv_mtu: u16,
         rate_limiter: Option<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
+        recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
 
     impl BluerStream {
@@ -233,6 +261,7 @@ mod bluer_impl {
                 } else {
                     None
                 },
+                recv_buf: tokio::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -244,46 +273,81 @@ mod bluer_impl {
                 limiter.lock().await.acquire(framed_len).await;
             }
 
+            if framed_len > self.send_mtu as usize {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: framed_len,
+                    mtu: self.send_mtu,
+                });
+            }
+
             let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
-            self.conn
-                .send(&framed)
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
                 .await
+                .map_err(|_| {
+                    warn!(len = framed.len(), timeout_secs = BLE_SEND_TIMEOUT.as_secs(), "BLE write timeout");
+                    TransportError::Timeout
+                })?
+                .map(|_| ())
+                .map_err(|e| TransportError::SendFailed(format!("{}", e)))
+        }
+
+        async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
+            let framed_len = 2 + data.len();
+            if framed_len > self.send_mtu as usize {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: framed_len,
+                    mtu: self.send_mtu,
+                });
+            }
+
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            framed.extend_from_slice(data);
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
+                .await
+                .map_err(|_| {
+                    warn!(len = framed.len(), timeout_secs = BLE_SEND_TIMEOUT.as_secs(), "BLE write timeout");
+                    TransportError::Timeout
+                })?
                 .map(|_| ())
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            let mut raw = vec![0u8; buf.len() + 2];
-            let n = self
-                .conn
-                .recv(&mut raw)
-                .await
-                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+            let max_payload_len = self.recv_mtu.saturating_sub(2) as usize;
 
-            if n == 0 {
-                return Ok(0);
+            loop {
+                {
+                    let mut recv_buf = self.recv_buf.lock().await;
+                    if let Some(copy_len) =
+                        try_take_framed_payload(&mut recv_buf, buf, max_payload_len)?
+                    {
+                        trace!(
+                            len = copy_len,
+                            buf_remaining = recv_buf.len(),
+                            addr = %self.remote,
+                            "BLE linux recv frame"
+                        );
+                        return Ok(copy_len);
+                    }
+                }
+
+                let mut chunk = vec![0u8; self.recv_mtu as usize];
+                let n = self
+                    .conn
+                    .recv(&mut chunk)
+                    .await
+                    .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+
+                if n == 0 {
+                    return Ok(0);
+                }
+
+                trace!(raw_bytes = n, addr = %self.remote, "BLE linux recv raw");
+                self.recv_buf.lock().await.extend_from_slice(&chunk[..n]);
             }
-
-            if n < 2 {
-                return Err(TransportError::RecvFailed(format!(
-                    "BLE frame too short: {n} bytes"
-                )));
-            }
-
-            let payload_len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-
-            if payload_len == 0 {
-                return Err(TransportError::RecvFailed(
-                    "BLE recv: framed message too short (0 bytes)".into(),
-                ));
-            }
-
-            let available = n - 2;
-            let copy_len = payload_len.min(available).min(buf.len());
-            buf[..copy_len].copy_from_slice(&raw[2..2 + copy_len]);
-            Ok(copy_len)
         }
 
         fn send_mtu(&self) -> u16 {
@@ -302,6 +366,10 @@ mod bluer_impl {
             if let Some(ref limiter) = self.rate_limiter {
                 limiter.lock().await.set_rate_bps(rate_bps);
             }
+        }
+
+        fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+            true
         }
     }
 
@@ -1050,6 +1118,10 @@ impl BleStream for MockBleStream {
             .map_err(|_| TransportError::SendFailed("channel closed".into()))
     }
 
+    async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
+        self.send(data).await
+    }
+
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
         let mut rx = self.rx.lock().await;
         match rx.recv().await {
@@ -1082,6 +1154,12 @@ impl BleStream for MockBleStream {
 
     fn remote_addr(&self) -> &BleAddr {
         &self.addr
+    }
+
+    async fn set_rate_bps(&self, _rate_bps: u64) {}
+
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        true
     }
 }
 
