@@ -21,8 +21,12 @@ use tracing::{debug, info, warn};
 /// Maximum request size in bytes (4 KB).
 const MAX_REQUEST_SIZE: usize = 4096;
 
-/// I/O timeout for client connections.
+/// I/O timeout for reading requests and writing responses.
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timeout waiting for the main event loop to produce a response.
+/// Benchmarks can take minutes, so this is much longer than IO_TIMEOUT.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A message sent from the accept loop to the main event loop.
 pub type ControlMessage = (Request, oneshot::Sender<Response>);
@@ -76,7 +80,7 @@ where
                     if control_tx.send((request, resp_tx)).await.is_err() {
                         Response::error("node shutting down")
                     } else {
-                        match tokio::time::timeout(IO_TIMEOUT, resp_rx).await {
+                        match tokio::time::timeout(RESPONSE_TIMEOUT, resp_rx).await {
                             Ok(Ok(resp)) => resp,
                             Ok(Err(_)) => Response::error("response channel closed"),
                             Err(_) => Response::error("query timeout"),

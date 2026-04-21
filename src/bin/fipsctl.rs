@@ -233,7 +233,6 @@ fn send_request(socket_path: &Path, request_json: &str, timeout: Duration) -> Re
         }
     })?;
 
-    let timeout = Duration::from_secs(5);
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
