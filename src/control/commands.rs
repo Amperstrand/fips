@@ -16,6 +16,8 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         #[cfg(feature = "benchmark")]
         "benchmark_echo" => benchmark_echo(node, params).await,
         #[cfg(feature = "benchmark")]
+        "benchmark_collect" => benchmark_collect(node, params),
+        #[cfg(feature = "benchmark")]
         "benchmark_throughput" => benchmark_throughput(node, params).await,
         _ => Response::error(format!("unknown command: {command}")),
     }
@@ -85,6 +87,24 @@ async fn benchmark_echo(node: &mut Node, params: Option<&Value>) -> Response {
     let payload_size = params.get("payload_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     match node.api_benchmark_echo(npub, count, payload_size).await {
+        Ok(data) => Response::ok(data),
+        Err(msg) => Response::error(msg),
+    }
+}
+
+#[cfg(feature = "benchmark")]
+fn benchmark_collect(node: &mut Node, params: Option<&Value>) -> Response {
+    let Some(params) = params else {
+        return Response::error("missing params for benchmark_collect");
+    };
+
+    let npub = match params.get("npub").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return Response::error("missing 'npub' parameter"),
+    };
+    let sent = params.get("sent").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+    match node.api_benchmark_collect(npub, sent) {
         Ok(data) => Response::ok(data),
         Err(msg) => Response::error(msg),
     }

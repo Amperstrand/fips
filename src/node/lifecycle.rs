@@ -946,7 +946,6 @@ impl Node {
             return Err(format!("peer not connected: {npub}"));
         }
 
-        let mut results = Vec::new();
         for i in 0..count {
             let now_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -967,15 +966,22 @@ impl Node {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        // Wait for remaining in-flight responses to arrive.
-        // BLE links have RTTs of ~130ms+ and the rate limiter adds further
-        // latency, so give generous headroom: 500ms per outstanding packet
-        // (worst case: none have arrived yet), plus a 2-second floor.
-        let collection_wait = std::time::Duration::from_millis(
-            2000 + (count as u64 * 500),
-        );
-        tokio::time::sleep(collection_wait).await;
+        // Return immediately so the event loop can process incoming responses.
+        // Caller must wait then call api_benchmark_collect to retrieve results.
+        Ok(serde_json::json!({
+            "npub": npub,
+            "sent": count,
+            "status": "sent",
+        }))
+    }
 
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn api_benchmark_collect(
+        &mut self,
+        npub: &str,
+        sent: u32,
+    ) -> Result<serde_json::Value, String> {
+        let mut results = Vec::new();
         let echo_results = self.benchmark.drain_echo_results();
         for event in &echo_results {
             let crate::benchmark::echo::BenchmarkEvent::EchoResponseReceived {
@@ -988,7 +994,6 @@ impl Node {
             }));
         }
 
-        let sent = count;
         let recv = results.len() as u32;
         let loss_rate = if sent > 0 {
             (1.0 - (recv as f64 / sent as f64)) * 100.0

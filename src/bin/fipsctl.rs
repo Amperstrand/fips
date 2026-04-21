@@ -565,6 +565,44 @@ fn main() {
         return;
     }
 
+    // Benchmark echo uses a two-step protocol: send requests, then collect
+    // responses after the event loop has processed them.
+    if let Commands::Benchmark {
+        what: BenchmarkCommands::Echo { count, .. },
+    } = &cli.command
+    {
+        match send_request(&socket_path, &request, timeout) {
+            Ok(value) => {
+                let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let npub = value.get("npub").and_then(|v| v.as_str()).unwrap_or("");
+                let sent = value.get("sent").and_then(|v| v.as_u64()).unwrap_or(*count as u64);
+                if status != "sent" {
+                    print_response(&value);
+                    return;
+                }
+                // Wait for responses to arrive and be processed by the event loop.
+                let wait_ms = 2000 + (sent * 500);
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                let collect = build_command(
+                    "benchmark_collect",
+                    serde_json::json!({ "npub": npub, "sent": sent }),
+                );
+                match send_request(&socket_path, &collect, timeout) {
+                    Ok(result) => print_response(&result),
+                    Err(e) => {
+                        eprintln!("error collecting results: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     match send_request(&socket_path, &request, timeout) {
         Ok(value) => print_response(&value),
         Err(e) => {
