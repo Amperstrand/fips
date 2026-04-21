@@ -946,6 +946,8 @@ impl Node {
             return Err(format!("peer not connected: {npub}"));
         }
 
+        self.benchmark.drain_echo_results();
+
         for i in 0..count {
             let now_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

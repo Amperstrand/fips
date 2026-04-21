@@ -573,14 +573,30 @@ fn main() {
     {
         match send_request(&socket_path, &request, timeout) {
             Ok(value) => {
-                let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                let npub = value.get("npub").and_then(|v| v.as_str()).unwrap_or("");
-                let sent = value.get("sent").and_then(|v| v.as_u64()).unwrap_or(*count as u64);
-                if status != "sent" {
+                // The daemon wraps the response: {"status":"ok","data":{...}}
+                // Extract the inner data payload.
+                let outer_status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if outer_status == "error" {
                     print_response(&value);
                     return;
                 }
-                // Wait for responses to arrive and be processed by the event loop.
+                let data = value.get("data").unwrap_or(&value);
+                let inner_status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let npub = data
+                    .get("npub")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let sent = data
+                    .get("sent")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*count as u64);
+
+                if inner_status != "sent" {
+                    print_response(&value);
+                    return;
+                }
+
                 let wait_ms = 2000 + (sent * 500);
                 std::thread::sleep(std::time::Duration::from_millis(wait_ms));
                 let collect = build_command(
