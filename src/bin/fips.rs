@@ -160,16 +160,6 @@ async fn run_daemon(
     }
 
     info!("FIPS shutdown complete");
-
-    // On macOS with BLE, stop the main run loop so the process exits
-    #[cfg(feature = "ble-macos")]
-    unsafe {
-        unsafe extern "C" {
-            fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
-            fn CFRunLoopStop(rl: *mut std::ffi::c_void);
-        }
-        CFRunLoopStop(CFRunLoopGetMain());
-    }
 }
 
 /// Build a shutdown future for foreground mode (Ctrl+C / SIGTERM).
@@ -191,10 +181,70 @@ async fn foreground_shutdown_signal() {
 }
 
 // ============================================================================
+// macOS CFRunLoop pump
+// ============================================================================
+// bluest's CoreBluetooth L2CAP reader schedules NSInputStream on the main
+// NSRunLoop.  Rust CLI apps never pump that loop, so HasBytesAvailable
+// callbacks never fire and central-side L2CAP reads hang forever.  We fix
+// this by pumping CFRunLoop on the main thread and running tokio on a
+// background thread.
+
+#[cfg(all(unix, target_os = "macos"))]
+mod run_loop {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::info;
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRunLoopRun();
+        fn CFRunLoopStop(rl: *mut std::ffi::c_void);
+        fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
+    }
+
+    pub fn run() {
+        ACTIVE.store(true, Ordering::SeqCst);
+        info!("macOS CFRunLoop pump started on main thread");
+        unsafe { CFRunLoopRun() };
+        info!("macOS CFRunLoop pump stopped");
+    }
+
+    pub fn stop() {
+        if ACTIVE.swap(false, Ordering::SeqCst) {
+            info!("Stopping macOS CFRunLoop pump");
+            unsafe { CFRunLoopStop(CFRunLoopGetMain()) };
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_active() -> bool {
+        ACTIVE.load(Ordering::SeqCst)
+    }
+}
+
+// ============================================================================
 // Unix entry point
 // ============================================================================
 
-#[cfg(not(windows))]
+#[cfg(all(unix, target_os = "macos"))]
+fn main() {
+    let args = Args::parse();
+    let config = args.config;
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        rt.block_on(run_daemon(config, foreground_shutdown_signal()));
+        run_loop::stop();
+    });
+
+    run_loop::run();
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
