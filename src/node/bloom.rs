@@ -5,8 +5,10 @@
 
 use crate::NodeAddr;
 use crate::bloom::BloomFilter;
+use crate::noise::TAG_SIZE;
 use crate::protocol::FilterAnnounce;
 
+use super::wire::{ESTABLISHED_HEADER_SIZE, INNER_HEADER_SIZE};
 use super::{Node, NodeError};
 use std::collections::HashMap;
 use tracing::debug;
@@ -62,13 +64,59 @@ impl Node {
             return Ok(());
         }
 
-        // Build and encode
+        // Build the outgoing filter (needed early to check MTU and to record
+        // for change detection even if we skip the send).
         let announce = self.build_filter_announce(peer_addr);
         let sent_filter = announce.filter.clone();
         let encoded = announce.encode().map_err(|e| NodeError::SendFailed {
             node_addr: *peer_addr,
             reason: format!("FilterAnnounce encode failed: {}", e),
         })?;
+
+        // Check if the peer's transport MTU can fit a FilterAnnounce.
+        //
+        // v1 FilterAnnounce plaintext is 1035 bytes (1 + 8 + 1 + 1 + 1024).
+        // After encryption: + INNER_HEADER_SIZE (5, includes msg_type) + TAG_SIZE (16)
+        // + ESTABLISHED_HEADER_SIZE (16) = 1072 bytes on the wire before
+        // transport framing. BLE adds a 2-byte prefix → 1074 bytes total.
+        //
+        // Typical BLE L2CAP effective MTU is ~1022 bytes (negotiated MTU minus
+        // 2-byte frame prefix). The filter won't fit, so we skip the send,
+        // record the filter for change detection, and clear the pending flag.
+        //
+        // This is a known limitation — see Amperstrand/fips#82 for the full
+        // analysis and long-term fix (protocol-level size class negotiation).
+        // Bloom filters are an optimization, not a correctness requirement;
+        // routing falls back to greedy tree distance without them.
+        if let Some(peer) = self.peers.get(peer_addr) {
+            if let Some(transport_id) = peer.transport_id() {
+                if let Some(transport) = self.transports.get(&transport_id) {
+                    let link_mtu = if let Some(addr) = peer.current_addr() {
+                        transport.link_mtu(addr)
+                    } else {
+                        transport.mtu()
+                    } as usize;
+
+                    let estimated_wire = encoded.len() + INNER_HEADER_SIZE + TAG_SIZE
+                        + ESTABLISHED_HEADER_SIZE;
+                    if link_mtu > 0 && estimated_wire > link_mtu {
+                        debug!(
+                            peer = %self.peer_display_name(peer_addr),
+                            estimated_wire,
+                            link_mtu,
+                            "Skipping FilterAnnounce: transport MTU too small (see Amperstrand/fips#82)"
+                        );
+                        self.stats_mut().bloom.mtu_skipped += 1;
+                        self.bloom_state.record_update_sent(*peer_addr, now_ms);
+                        self.bloom_state.record_sent_filter(*peer_addr, sent_filter);
+                        if let Some(peer) = self.peers.get_mut(peer_addr) {
+                            peer.clear_filter_update_needed();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
         // Send
         if let Err(e) = self.send_encrypted_link_message(peer_addr, &encoded).await {
