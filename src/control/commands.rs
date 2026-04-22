@@ -19,6 +19,8 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         "benchmark_collect" => benchmark_collect(node, params),
         #[cfg(feature = "benchmark")]
         "benchmark_throughput" => benchmark_throughput(node, params).await,
+        #[cfg(feature = "benchmark")]
+        "benchmark_throughput_collect" => benchmark_throughput_collect(node, params),
         _ => Response::error(format!("unknown command: {command}")),
     }
 }
@@ -129,6 +131,23 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
     let rate_bps = params.get("rate_bps").and_then(|v| v.as_u64()).unwrap_or(40000) as u32;
 
     match node.api_benchmark_throughput(npub, &direction, duration_secs, frame_size, rate_bps).await {
+        Ok(data) => Response::ok(data),
+        Err(msg) => Response::error(msg),
+    }
+}
+
+#[cfg(feature = "benchmark")]
+fn benchmark_throughput_collect(node: &mut Node, params: Option<&Value>) -> Response {
+    let Some(params) = params else {
+        return Response::error("missing params for benchmark_throughput_collect");
+    };
+
+    let test_id = match params.get("test_id").and_then(|v| v.as_u64()) {
+        Some(v) => v as u32,
+        None => return Response::error("missing 'test_id' parameter"),
+    };
+
+    match node.api_benchmark_throughput_collect(test_id) {
         Ok(data) => Response::ok(data),
         Err(msg) => Response::error(msg),
     }

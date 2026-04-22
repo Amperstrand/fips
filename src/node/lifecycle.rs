@@ -1097,25 +1097,37 @@ impl Node {
             }));
         }
 
-        let timeout_duration = std::time::Duration::from_secs(duration_secs as u64 + 15);
-        let start = std::time::Instant::now();
-        loop {
-            let results = self.benchmark.drain_throughput_results();
-            if let Some(result) = results.into_iter().find(|r| r.test_id == test_id) {
-                return Ok(serde_json::json!({
-                    "npub": npub,
-                    "test_id": test_id,
-                    "direction": direction,
-                    "frames_sent": result.frames_sent,
-                    "frames_recv": result.frames_recv,
-                    "bytes_recv": result.bytes_recv,
-                    "duration_secs": result.duration_us / 1_000_000,
-                }));
-            }
-            if start.elapsed() > timeout_duration {
-                return Err("download throughput test timed out waiting for report".into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(serde_json::json!({
+            "npub": npub,
+            "test_id": test_id,
+            "direction": direction,
+            "duration_secs": duration_secs,
+            "status": "request_sent",
+        }))
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn api_benchmark_throughput_collect(
+        &mut self,
+        test_id: u32,
+    ) -> Result<serde_json::Value, String> {
+        let results = self.benchmark.drain_throughput_results();
+        let result = results.into_iter().find(|r| r.test_id == test_id);
+        match result {
+            Some(r) => Ok(serde_json::json!({
+                "test_id": r.test_id,
+                "frames_sent": r.frames_sent,
+                "frames_recv": r.frames_recv,
+                "bytes_recv": r.bytes_recv,
+                "duration_us": r.duration_us,
+                "achieved_bps": r.achieved_bps,
+                "loss_rate": format!("{:.1}%", r.loss_rate * 100.0),
+                "status": "completed",
+            })),
+            None => Ok(serde_json::json!({
+                "test_id": test_id,
+                "status": "pending",
+            })),
         }
     }
 }

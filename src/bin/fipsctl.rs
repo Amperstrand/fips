@@ -641,6 +641,46 @@ fn main() {
         return;
     }
 
+    // Download throughput uses a two-step protocol: send request, wait for
+    // the responder to stream data back, then collect the report.
+    if let Commands::Benchmark {
+        what: BenchmarkCommands::Throughput { direction, duration, .. },
+    } = &cli.command
+    {
+        if direction == "download" {
+            match send_request(&socket_path, &request, timeout) {
+                Ok(value) => {
+                    let data = value.get("data").unwrap_or(&value);
+                    let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if status != "request_sent" {
+                        print_response(&value);
+                        return;
+                    }
+                    let test_id = data.get("test_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let duration_secs = data.get("duration_secs").and_then(|v| v.as_u64()).unwrap_or(*duration as u64);
+                    let wait_ms = (duration_secs * 1000) + 5000;
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    let collect = build_command(
+                        "benchmark_throughput_collect",
+                        serde_json::json!({ "test_id": test_id }),
+                    );
+                    match send_request(&socket_path, &collect, timeout) {
+                        Ok(result) => print_response(&result),
+                        Err(e) => {
+                            eprintln!("error collecting download results: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+    }
+
     match send_request(&socket_path, &request, timeout) {
         Ok(value) => print_response(&value),
         Err(e) => {
