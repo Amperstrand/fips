@@ -43,8 +43,8 @@ impl BenchmarkManager {
         }
     }
 
-    pub fn handle_throughput_request(&mut self, from: &NodeAddr, body: &[u8]) -> Option<(Vec<u8>, Option<DownloadStreamPlan>)> {
-        let (state, response_bytes) = throughput::handle_throughput_request(from, body)?;
+    pub fn handle_throughput_request(&mut self, from: &NodeAddr, body: &[u8]) -> Option<Option<DownloadStreamPlan>> {
+        let state = throughput::handle_throughput_request(from, body)?;
         let download_plan = if state.direction == 0 {
             Some(DownloadStreamPlan {
                 peer: state.peer,
@@ -58,7 +58,7 @@ impl BenchmarkManager {
         };
         let key = (state.peer, state.test_id);
         self.throughput_tests.insert(key, state);
-        Some((response_bytes, download_plan))
+        Some(download_plan)
     }
 
     pub fn handle_throughput_stream(&mut self, from: &NodeAddr, body: &[u8]) {
@@ -106,7 +106,7 @@ impl BenchmarkManager {
             }
             0xFD => {
                 match self.handle_throughput_request(from, payload) {
-                    Some((bytes, plan)) => (Some(bytes), plan),
+                    Some(plan) => (None, plan),
                     None => (None, None),
                 }
             }

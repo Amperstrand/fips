@@ -1,7 +1,6 @@
 //! Throughput benchmark handler — measures link capacity with bulk frame transfer.
 
 use super::types::{ThroughputReport, ThroughputRequest, ThroughputStream};
-use crate::protocol::LinkMessageType;
 use crate::NodeAddr;
 use tracing::{debug, info, warn};
 
@@ -55,7 +54,7 @@ pub struct ThroughputTestResult {
 pub fn handle_throughput_request(
     from: &NodeAddr,
     body: &[u8],
-) -> Option<(ThroughputTestState, Vec<u8>)> {
+) -> Option<ThroughputTestState> {
     let request = match ThroughputRequest::decode(body) {
         Ok(req) => req,
         Err(e) => {
@@ -93,12 +92,7 @@ pub fn handle_throughput_request(
         "ThroughputRequest accepted"
     );
 
-    let encoded = request.encode();
-    let mut out = Vec::with_capacity(1 + encoded.len());
-    out.push(LinkMessageType::ThroughputRequest.to_byte());
-    out.extend_from_slice(&encoded);
-
-    Some((state, out))
+    Some(state)
 }
 
 pub fn handle_throughput_stream(
