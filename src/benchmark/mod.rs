@@ -73,9 +73,22 @@ impl BenchmarkManager {
     }
 
     pub fn handle_throughput_report(&mut self, from: &NodeAddr, body: &[u8]) {
-        if let Some(result) = throughput::handle_throughput_report(from, body) {
+        if let Some(mut result) = throughput::handle_throughput_report(from, body) {
             let key = (result.peer, result.test_id);
-            self.throughput_tests.remove(&key);
+            if let Some(state) = self.throughput_tests.remove(&key) {
+                result.frames_recv = state.frames_recv;
+                result.bytes_recv = state.bytes_recv;
+                if result.frames_sent > 0 {
+                    result.loss_rate = 1.0 - (result.frames_recv as f64 / result.frames_sent as f64);
+                }
+                if let Some(start) = state.start_time {
+                    let recv_elapsed = start.elapsed();
+                    result.duration_us = recv_elapsed.as_micros() as u64;
+                }
+                if result.duration_us > 0 {
+                    result.achieved_bps = result.bytes_recv * 8 * 1_000_000 / result.duration_us;
+                }
+            }
             self.throughput_results.push(result);
         }
     }

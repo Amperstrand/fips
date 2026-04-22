@@ -79,6 +79,7 @@ impl Node {
                         let test_id = plan.test_id;
                         let frame_size = plan.frame_size;
                         let mut seq: u32 = 0;
+                        let stream_start = std::time::Instant::now();
 
                         while tokio::time::Instant::now() < deadline {
                             interval.tick().await;
@@ -94,13 +95,17 @@ impl Node {
                             seq += 1;
                         }
 
-                        let elapsed = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
+                        let stream_elapsed = stream_start.elapsed();
+                        let total_bytes = (seq as u64) * (frame_size as u64);
+                        let achieved_bps = if stream_elapsed.as_micros() > 0 {
+                            total_bytes * 8 * 1_000_000 / stream_elapsed.as_micros() as u64
+                        } else {
+                            0
+                        };
                         let report = crate::benchmark::types::ThroughputReport::new(
-                            test_id, seq, seq, (seq as u64) * (frame_size as u64),
-                            elapsed, 0,
+                            test_id, seq, 0, 0,
+                            stream_elapsed.as_micros() as u64,
+                            achieved_bps,
                         );
                         let encoded = report.encode();
                         let mut plaintext = Vec::with_capacity(1 + encoded.len());
