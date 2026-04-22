@@ -1097,11 +1097,25 @@ impl Node {
             }));
         }
 
-        Ok(serde_json::json!({
-            "npub": npub,
-            "test_id": test_id,
-            "direction": direction,
-            "status": "request_sent",
-        }))
+        let timeout_duration = std::time::Duration::from_secs(duration_secs as u64 + 15);
+        let start = std::time::Instant::now();
+        loop {
+            let results = self.benchmark.drain_throughput_results();
+            if let Some(result) = results.into_iter().find(|r| r.test_id == test_id) {
+                return Ok(serde_json::json!({
+                    "npub": npub,
+                    "test_id": test_id,
+                    "direction": direction,
+                    "frames_sent": result.frames_sent,
+                    "frames_recv": result.frames_recv,
+                    "bytes_recv": result.bytes_recv,
+                    "duration_secs": result.duration_us / 1_000_000,
+                }));
+            }
+            if start.elapsed() > timeout_duration {
+                return Err("download throughput test timed out waiting for report".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 }

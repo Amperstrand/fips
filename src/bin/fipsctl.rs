@@ -597,13 +597,35 @@ fn main() {
                     return;
                 }
 
-                let wait_ms = 2000 + (sent * 500);
-                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                let wait_per_packet_ms: u64 = if sent > 50 { 2000 } else { 500 };
+                let max_wait_ms = 120_000;
+                let initial_wait_ms = 3000 + (sent * wait_per_packet_ms).min(max_wait_ms);
+                std::thread::sleep(std::time::Duration::from_millis(initial_wait_ms));
+
                 let collect = build_command(
                     "benchmark_collect",
                     serde_json::json!({ "npub": npub, "sent": sent }),
                 );
-                match send_request(&socket_path, &collect, timeout) {
+                let mut result = send_request(&socket_path, &collect, timeout);
+
+                if let Ok(ref val) = result {
+                    let recv = val.get("data")
+                        .unwrap_or(val)
+                        .get("received")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if (recv as u64) < sent && initial_wait_ms < max_wait_ms {
+                        let extra_wait = ((sent - recv as u64) * wait_per_packet_ms).min(60_000);
+                        std::thread::sleep(std::time::Duration::from_millis(extra_wait));
+                        let retry = build_command(
+                            "benchmark_collect",
+                            serde_json::json!({ "npub": npub, "sent": sent }),
+                        );
+                        result = send_request(&socket_path, &retry, timeout);
+                    }
+                }
+
+                match result {
                     Ok(result) => print_response(&result),
                     Err(e) => {
                         eprintln!("error collecting results: {e}");

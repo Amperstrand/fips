@@ -10,7 +10,14 @@ pub mod types;
 use crate::NodeAddr;
 use std::collections::HashMap;
 
-/// Synchronous benchmark handler — caller sends returned bytes via `send_encrypted_link_message`.
+pub struct DownloadStreamPlan {
+    pub peer: NodeAddr,
+    pub test_id: u32,
+    pub duration_secs: u8,
+    pub frame_size: u16,
+    pub rate_bps: u32,
+}
+
 pub struct BenchmarkManager {
     throughput_tests: HashMap<(NodeAddr, u32), throughput::ThroughputTestState>,
     pending_echo_results: Vec<echo::BenchmarkEvent>,
@@ -36,11 +43,22 @@ impl BenchmarkManager {
         }
     }
 
-    pub fn handle_throughput_request(&mut self, from: &NodeAddr, body: &[u8]) -> Option<Vec<u8>> {
+    pub fn handle_throughput_request(&mut self, from: &NodeAddr, body: &[u8]) -> Option<(Vec<u8>, Option<DownloadStreamPlan>)> {
         let (state, response_bytes) = throughput::handle_throughput_request(from, body)?;
+        let download_plan = if state.direction == 0 {
+            Some(DownloadStreamPlan {
+                peer: state.peer,
+                test_id: state.test_id,
+                duration_secs: state.duration_secs,
+                frame_size: state.frame_size,
+                rate_bps: state.rate_bps,
+            })
+        } else {
+            None
+        };
         let key = (state.peer, state.test_id);
         self.throughput_tests.insert(key, state);
-        Some(response_bytes)
+        Some((response_bytes, download_plan))
     }
 
     pub fn handle_throughput_stream(&mut self, from: &NodeAddr, body: &[u8]) {
@@ -79,25 +97,30 @@ impl BenchmarkManager {
         from: &NodeAddr,
         msg_type: u8,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
+    ) -> (Option<Vec<u8>>, Option<DownloadStreamPlan>) {
         match msg_type {
-            0xFF => self.handle_echo_request(from, payload),
+            0xFF => (self.handle_echo_request(from, payload), None),
             0xFE => {
                 self.handle_echo_response(from, payload);
-                None
+                (None, None)
             }
-            0xFD => self.handle_throughput_request(from, payload),
+            0xFD => {
+                match self.handle_throughput_request(from, payload) {
+                    Some((bytes, plan)) => (Some(bytes), plan),
+                    None => (None, None),
+                }
+            }
             0xFC => {
                 self.handle_throughput_stream(from, payload);
-                None
+                (None, None)
             }
             0xFB => {
                 self.handle_throughput_report(from, payload);
-                None
+                (None, None)
             }
             _ => {
                 tracing::debug!(msg_type, "Unknown benchmark message type");
-                None
+                (None, None)
             }
         }
     }

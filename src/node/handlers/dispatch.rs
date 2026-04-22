@@ -62,10 +62,51 @@ impl Node {
             0xFB | 0xFC | 0xFD | 0xFE | 0xFF => {
                 #[cfg(feature = "benchmark")]
                 {
-                    if let Some(response) = self.benchmark.handle_link_message(from, msg_type, payload) {
-                        if let Err(e) = self.send_encrypted_link_message(from, &response).await {
+                    let (response, download_plan) = self.benchmark.handle_link_message(from, msg_type, payload);
+                    if let Some(bytes) = response {
+                        if let Err(e) = self.send_encrypted_link_message(from, &bytes).await {
                             debug!(peer = %self.peer_display_name(from), error = %e, "Failed to send benchmark response");
                         }
+                    }
+                    if let Some(plan) = download_plan {
+                        let frame_interval = std::time::Duration::from_secs_f64(
+                            (plan.frame_size as f64 * 8.0) / plan.rate_bps as f64
+                        );
+                        let mut interval = tokio::time::interval(frame_interval);
+                        let deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(plan.duration_secs as u64);
+                        let peer = plan.peer;
+                        let test_id = plan.test_id;
+                        let frame_size = plan.frame_size;
+                        let mut seq: u32 = 0;
+
+                        while tokio::time::Instant::now() < deadline {
+                            interval.tick().await;
+                            let stream = crate::benchmark::types::ThroughputStream::new(test_id, seq)
+                                .with_data(vec![0u8; frame_size as usize]);
+                            let encoded = stream.encode();
+                            let mut plaintext = Vec::with_capacity(1 + encoded.len());
+                            plaintext.push(crate::protocol::LinkMessageType::ThroughputStream.to_byte());
+                            plaintext.extend_from_slice(&encoded);
+                            if self.send_encrypted_link_message(&peer, &plaintext).await.is_err() {
+                                break;
+                            }
+                            seq += 1;
+                        }
+
+                        let elapsed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+                        let report = crate::benchmark::types::ThroughputReport::new(
+                            test_id, seq, seq, (seq as u64) * (frame_size as u64),
+                            elapsed, 0,
+                        );
+                        let encoded = report.encode();
+                        let mut plaintext = Vec::with_capacity(1 + encoded.len());
+                        plaintext.push(crate::protocol::LinkMessageType::ThroughputReport.to_byte());
+                        plaintext.extend_from_slice(&encoded);
+                        let _ = self.send_encrypted_link_message(&peer, &plaintext).await;
                     }
                 }
                 #[cfg(not(feature = "benchmark"))]
