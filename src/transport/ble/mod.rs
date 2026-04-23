@@ -167,6 +167,22 @@ impl<I: BleIo> BleTransport<I> {
         }
         self.state = TransportState::Starting;
 
+        // Warn about contradictory BLE config combinations.
+        let scan = self.config.scan();
+        let advertise = self.config.advertise();
+        let auto_connect = self.config.auto_connect();
+        let accept = self.config.accept_connections();
+
+        if !scan && !advertise && !accept {
+            warn!("BLE config: scan=false, advertise=false, accept_connections=false — transport will do nothing useful");
+        }
+        if auto_connect && !scan {
+            warn!("BLE config: auto_connect=true but scan=false — auto-connect requires scanning to discover peers");
+        }
+        if !scan && !advertise {
+            warn!("BLE config: scan=false and advertise=false — peers cannot discover or connect to this node");
+        }
+
         let psm = self.config.psm();
         let adapter = self.io.adapter_name().to_string();
 
