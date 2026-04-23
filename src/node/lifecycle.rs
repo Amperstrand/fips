@@ -1103,6 +1103,16 @@ impl Node {
             }));
         }
 
+        if dir == 0 {
+            let state = crate::benchmark::throughput::ThroughputTestState::new(
+                node_addr,
+                &crate::benchmark::types::ThroughputRequest::new(
+                    test_id, dir, duration_secs, frame_size, rate_bps,
+                ),
+            );
+            self.benchmark.insert_throughput_test(state);
+        }
+
         Ok(serde_json::json!({
             "npub": npub,
             "test_id": test_id,

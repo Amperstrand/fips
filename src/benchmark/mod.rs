@@ -101,6 +101,11 @@ impl BenchmarkManager {
         std::mem::take(&mut self.throughput_results)
     }
 
+    pub fn insert_throughput_test(&mut self, state: throughput::ThroughputTestState) {
+        let key = (state.peer, state.test_id);
+        self.throughput_tests.insert(key, state);
+    }
+
     pub fn active_tests(&self) -> usize {
         self.throughput_tests.len()
     }
