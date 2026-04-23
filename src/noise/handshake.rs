@@ -10,6 +10,9 @@ use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, ecdh::shared_secret_po
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+#[cfg(feature = "diagnostic")]
+use hex;
+
 /// Symmetric state during handshake.
 ///
 /// Maintains the chaining key (ck), handshake hash (h), and current cipher.
@@ -868,6 +871,22 @@ impl HandshakeState {
             HandshakeRole::Initiator => (c1, c2),
             HandshakeRole::Responder => (c2, c1),
         };
+
+        #[cfg(feature = "diagnostic")]
+        {
+            let role_label = match self.role {
+                HandshakeRole::Initiator => "initiator",
+                HandshakeRole::Responder => "responder",
+            };
+            eprintln!(
+                r#"{{"fips_diagnostic":"transport_keys","role":"{}","remote_static":"{}","k_send":"{}","k_recv":"{}","handshake_hash":"{}"}}"#,
+                role_label,
+                hex::encode(remote_static.serialize()),
+                hex::encode(send_cipher.key_bytes()),
+                hex::encode(recv_cipher.key_bytes()),
+                hex::encode(handshake_hash),
+            );
+        }
 
         Ok(NoiseSession::from_handshake(
             self.role,

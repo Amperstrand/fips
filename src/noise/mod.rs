@@ -216,6 +216,12 @@ impl CipherState {
         self.has_key = true;
     }
 
+    /// Return the raw encryption key (diagnostic only).
+    #[cfg(feature = "diagnostic")]
+    pub fn key_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+
     /// Encrypt plaintext, returning ciphertext with appended tag.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
         if !self.has_key {
