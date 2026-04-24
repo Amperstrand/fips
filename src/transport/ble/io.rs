@@ -63,46 +63,89 @@ pub trait BleScanner: Send {
 /// can be tested with `MockBleIo` (in-memory channels) in CI without
 /// requiring Bluetooth hardware, D-Bus, or bluetoothd.
 pub trait BleIo: Send + Sync + 'static {
-    /// The concrete stream type returned by this I/O implementation.
     type Stream: BleStream + 'static;
-    /// The concrete acceptor type.
     type Acceptor: BleAcceptor<Stream = Self::Stream> + 'static;
-    /// The concrete scanner type.
     type Scanner: BleScanner + 'static;
 
-    /// Start listening for inbound L2CAP connections on the given PSM.
     fn listen(
         &self,
         psm: u16,
     ) -> impl std::future::Future<Output = Result<Self::Acceptor, TransportError>> + Send;
 
-    /// Connect to a remote BLE device on the given PSM.
     fn connect(
         &self,
         addr: &BleAddr,
         psm: u16,
     ) -> impl std::future::Future<Output = Result<Self::Stream, TransportError>> + Send;
 
-    /// Start advertising the FIPS service UUID.
     fn start_advertising(
         &self,
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
-    /// Stop advertising.
     fn stop_advertising(
         &self,
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
-    /// Start passive scanning for FIPS service UUID advertisements.
+    fn disconnect_device(
+        &self,
+        _addr: &BleAddr,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
     fn start_scanning(
         &self,
     ) -> impl std::future::Future<Output = Result<Self::Scanner, TransportError>> + Send;
 
-    /// Get the adapter's BLE address.
     fn local_addr(&self) -> Result<BleAddr, TransportError>;
 
-    /// Get the adapter name (e.g., "hci0").
     fn adapter_name(&self) -> &str;
+
+    fn discover_gatt_psm(
+        &self,
+        _addr: &BleAddr,
+    ) -> impl std::future::Future<Output = Result<u16, TransportError>> + Send {
+        async {
+            Err(TransportError::Io(std::io::Error::other(
+                "GATT PSM discovery not supported",
+            )))
+        }
+    }
+}
+
+#[cfg(all(feature = "ble", target_os = "linux"))]
+fn try_take_framed_payload(
+    recv_buf: &mut Vec<u8>,
+    buf: &mut [u8],
+    max_payload_len: usize,
+) -> Result<Option<usize>, TransportError> {
+    if recv_buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+    if payload_len > max_payload_len {
+        return Err(TransportError::RecvFailed(format!(
+            "BLE recv: invalid frame header {} exceeds max payload {}",
+            payload_len, max_payload_len
+        )));
+    }
+
+    if payload_len == 0 {
+        recv_buf.drain(..2);
+        return Err(TransportError::RecvFailed(
+            "BLE recv: framed message too short (0 bytes)".into(),
+        ));
+    }
+
+    if recv_buf.len() < 2 + payload_len {
+        return Ok(None);
+    }
+
+    let copy_len = payload_len.min(buf.len());
+    buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
+    recv_buf.drain(..2 + payload_len);
+    Ok(Some(copy_len))
 }
 
 // ============================================================================
@@ -114,59 +157,80 @@ mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
 
-    use bluer::l2cap::{SeqPacket, SeqPacketListener, Socket, SocketAddr};
+    use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{
         AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport, adv::Advertisement,
     };
+    use bluer::Address;
     use futures::StreamExt;
     use std::collections::{BTreeSet, HashSet};
     use std::pin::Pin;
     use tokio::sync::Mutex;
-    use tracing::{debug, trace};
+    use tokio::time::{Duration, timeout};
+    use tracing::{debug, trace, warn};
 
-    /// FIPS BLE service UUID.
-    ///
-    /// Derived from SHA-256("FIPS: welcome to cryptoanarchy") with UUID v4
-    /// version/variant bits applied.
     pub const FIPS_SERVICE_UUID: bluer::Uuid =
         bluer::Uuid::from_u128(0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c);
 
-    /// Map a bluer error to a TransportError.
+    pub const FIPS_GATT_PSM_SERVICE_UUID: bluer::Uuid =
+        bluer::Uuid::from_u128(0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b);
+
+    pub const FIPS_GATT_PSM_CHAR_UUID: bluer::Uuid =
+        bluer::Uuid::from_u128(0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc);
+
     fn map_err(context: &str, e: bluer::Error) -> TransportError {
         TransportError::Io(std::io::Error::other(format!("{}: {}", context, e)))
     }
 
-    /// Map a std::io::Error to a TransportError.
     fn map_io_err(context: &str, e: std::io::Error) -> TransportError {
-        TransportError::Io(std::io::Error::new(e.kind(), format!("{}: {}", context, e)))
+        TransportError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {}", context, e),
+        ))
+    }
+
+    fn local_addr_addr_type(addr: &Address) -> AddressType {
+        if addr.0[0] & 0x01 == 0 {
+            AddressType::LePublic
+        } else {
+            AddressType::LeRandom
+        }
+    }
+
+    const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
+    const STARTUP_RETRY_ATTEMPTS: usize = 3;
+    const BLE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn is_transient_startup_error(error: &bluer::Error) -> bool {
+        matches!(
+            error.kind,
+            bluer::ErrorKind::AuthenticationFailed
+                | bluer::ErrorKind::Failed
+                | bluer::ErrorKind::InProgress
+                | bluer::ErrorKind::NotReady
+        )
     }
 
     // ----------------------------------------------------------------
     // BluerStream
     // ----------------------------------------------------------------
 
-    /// BLE stream wrapping a bluer L2CAP SeqPacket connection.
     pub struct BluerStream {
         conn: SeqPacket,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
+        recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
 
     impl BluerStream {
-        /// Construct from a connected SeqPacket, querying MTU values.
         pub fn new(conn: SeqPacket, remote: BleAddr) -> Result<Self, TransportError> {
             let send_mtu = conn.send_mtu().map_err(|e| map_io_err("send_mtu", e))? as u16;
             let recv_mtu = conn.recv_mtu().map_err(|e| map_io_err("recv_mtu", e))? as u16;
 
-            // Log negotiated PHY for diagnostics (2M vs 1M)
             match conn.as_ref().phy() {
-                Ok(phy) => {
-                    debug!(addr = %remote, phy, send_mtu, recv_mtu, "BLE connection established")
-                }
-                Err(_) => {
-                    debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)")
-                }
+                Ok(phy) => debug!(addr = %remote, phy, send_mtu, recv_mtu, "BLE connection established"),
+                Err(_) => debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)"),
             }
 
             Ok(Self {
@@ -174,24 +238,67 @@ mod bluer_impl {
                 remote,
                 send_mtu,
                 recv_mtu,
+                recv_buf: tokio::sync::Mutex::new(Vec::new()),
             })
         }
     }
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-            self.conn
-                .send(data)
+            let framed_len = 2 + data.len();
+            if framed_len > self.send_mtu as usize {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: framed_len,
+                    mtu: self.send_mtu,
+                });
+            }
+
+            let mut framed = Vec::with_capacity(framed_len);
+            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            framed.extend_from_slice(data);
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
                 .await
+                .map_err(|_| {
+                    warn!(len = framed.len(), timeout_secs = BLE_SEND_TIMEOUT.as_secs(), "BLE write timeout");
+                    TransportError::Timeout
+                })?
                 .map(|_| ())
                 .map_err(|e| TransportError::SendFailed(format!("{}", e)))
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            self.conn
-                .recv(buf)
-                .await
-                .map_err(|e| TransportError::RecvFailed(format!("{}", e)))
+            let max_payload_len = self.recv_mtu.saturating_sub(2) as usize;
+
+            loop {
+                {
+                    let mut recv_buf = self.recv_buf.lock().await;
+                    if let Some(copy_len) =
+                        try_take_framed_payload(&mut recv_buf, buf, max_payload_len)?
+                    {
+                        trace!(
+                            len = copy_len,
+                            buf_remaining = recv_buf.len(),
+                            addr = %self.remote,
+                            "BLE linux recv frame"
+                        );
+                        return Ok(copy_len);
+                    }
+                }
+
+                let mut chunk = vec![0u8; self.recv_mtu as usize];
+                let n = self
+                    .conn
+                    .recv(&mut chunk)
+                    .await
+                    .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+
+                if n == 0 {
+                    return Ok(0);
+                }
+
+                trace!(raw_bytes = n, addr = %self.remote, "BLE linux recv raw");
+                self.recv_buf.lock().await.extend_from_slice(&chunk[..n]);
+            }
         }
 
         fn send_mtu(&self) -> u16 {
@@ -211,7 +318,6 @@ mod bluer_impl {
     // BluerAcceptor
     // ----------------------------------------------------------------
 
-    /// Acceptor wrapping a bluer L2CAP SeqPacketListener.
     pub struct BluerAcceptor {
         listener: SeqPacketListener,
         adapter_name: String,
@@ -236,19 +342,39 @@ mod bluer_impl {
     // BluerScanner
     // ----------------------------------------------------------------
 
-    /// Scanner wrapping a bluer discovery event stream.
     pub struct BluerScanner {
         events: Pin<Box<dyn futures::Stream<Item = AdapterEvent> + Send>>,
         adapter: bluer::Adapter,
         adapter_name: String,
+        initialized: bool,
     }
 
     impl BleScanner for BluerScanner {
         async fn next(&mut self) -> Option<BleAddr> {
+            // On first call, emit FIPS peers already in BlueZ cache.
+            // Devices persist in BlueZ across FIPS restarts, so DeviceAdded
+            // won't fire for them. Scan the cache once to pick them up.
+            if !self.initialized {
+                self.initialized = true;
+                if let Ok(addrs) = self.adapter.device_addresses().await {
+                    for addr in addrs {
+                        if let Ok(device) = self.adapter.device(addr) {
+                            match device.uuids().await {
+                                Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
+                                    let ble_addr = BleAddr::from_bluer(addr, &self.adapter_name);
+                                    debug!(addr = %ble_addr, "BLE scanner: cached FIPS peer found");
+                                    return Some(ble_addr);
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                }
+            }
+
             loop {
                 match self.events.next().await {
                     Some(AdapterEvent::DeviceAdded(addr)) => {
-                        // Check if device advertises FIPS UUID
                         if let Ok(device) = self.adapter.device(addr) {
                             match device.uuids().await {
                                 Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
@@ -276,20 +402,24 @@ mod bluer_impl {
     // BluerIo
     // ----------------------------------------------------------------
 
-    /// Production BLE I/O implementation via BlueZ D-Bus (bluer crate).
     pub struct BluerIo {
-        #[allow(dead_code)] // Session must be kept alive for the adapter.
+        #[allow(dead_code)]
         session: bluer::Session,
         adapter: bluer::Adapter,
         adapter_name: String,
         adv_handle: Mutex<Option<bluer::adv::AdvertisementHandle>>,
+        #[allow(dead_code)]
+        agent_handle: bluer::agent::AgentHandle,
         mtu: u16,
     }
 
     impl BluerIo {
-        /// Create a new BluerIo for the given adapter.
-        ///
-        /// Connects to BlueZ via D-Bus and powers on the adapter.
+        fn device_handle(&self, addr: &BleAddr) -> Result<bluer::Device, TransportError> {
+            self.adapter
+                .device(addr.to_bluer_address())
+                .map_err(|e| map_err("device", e))
+        }
+
         pub async fn new(adapter_name: &str, mtu: u16) -> Result<Self, TransportError> {
             let session = bluer::Session::new()
                 .await
@@ -311,7 +441,25 @@ mod bluer_impl {
                 .await
                 .map_err(|e| map_err("set_powered", e))?;
 
+            if let Err(e) = adapter.set_pairable_timeout(0).await {
+                debug!(error = %e, "BLE: failed to set pairable timeout to 0");
+            }
+
+            if let Err(e) = adapter.set_pairable(true).await {
+                debug!(error = %e, "BLE: failed to set adapter pairable");
+            }
+
             let name = adapter.name().to_string();
+
+            let agent = bluer::agent::Agent {
+                request_default: true,
+                ..Default::default()
+            };
+            let agent_handle = session
+                .register_agent(agent)
+                .await
+                .map_err(|e| map_err("register_agent", e))?;
+
             debug!(adapter = %name, "BluerIo initialized");
 
             Ok(Self {
@@ -319,9 +467,199 @@ mod bluer_impl {
                 adapter,
                 adapter_name: name,
                 adv_handle: Mutex::new(None),
+                agent_handle,
                 mtu,
             })
         }
+
+        async fn resolve_addr_type(&self, addr: &BleAddr) -> AddressType {
+            let bluer_addr = addr.to_bluer_address();
+            let device = match self.device_handle(addr) {
+                Ok(device) => device,
+                Err(_) => return AddressType::LeRandom,
+            };
+
+            if let Ok(addr_type) = device.address_type().await {
+                return addr_type;
+            }
+
+            debug!(addr = %addr, "BLE connect: device not in cache, starting discovery scan");
+
+            let filter = DiscoveryFilter {
+                transport: DiscoveryTransport::Le,
+                ..Default::default()
+            };
+
+            if let Err(e) = self.adapter.set_discovery_filter(filter).await {
+                debug!(addr = %addr, error = %e, "BLE connect: failed to set discovery filter");
+                return AddressType::LeRandom;
+            }
+
+            match self.adapter.discover_devices_with_changes().await {
+                Ok(mut events) => {
+                    let scan_result = timeout(Duration::from_secs(5), async {
+                        while let Some(event) = events.next().await {
+                            if let AdapterEvent::DeviceAdded(found_addr) = event
+                                && found_addr == bluer_addr
+                                && let Ok(addr_type) = device.address_type().await
+                            {
+                                debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
+                                return Some(addr_type);
+                            }
+                        }
+                        None
+                    })
+                    .await;
+
+                    drop(events);
+
+                    match scan_result {
+                        Ok(Some(addr_type)) => addr_type,
+                        Ok(None) | Err(_) => {
+                            let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
+                            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
+                            addr_type
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: failed to start discovery scan");
+                    AddressType::LeRandom
+                }
+            }
+        }
+
+        pub async fn discover_gatt_psm(&self, addr: &BleAddr) -> Result<u16, TransportError> {
+            let discover = async {
+                let _ = self.resolve_addr_type(addr).await;
+                let device = self.device_handle(addr)?;
+
+                debug!(addr = %addr, "GATT PSM discovery: connecting GATT");
+
+                device.connect().await.map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: GATT connect failed for {}: {}",
+                        addr, e
+                    )))
+                })?;
+
+                let result = self.read_psm_from_gatt(&device, addr).await;
+
+                if let Err(e) = device.disconnect().await {
+                    debug!(addr = %addr, error = %e, "GATT PSM discovery: GATT disconnect failed (non-fatal)");
+                }
+
+                result
+            };
+
+            timeout(Duration::from_secs(10), discover)
+                .await
+                .map_err(|_| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: timed out discovering PSM for {}",
+                        addr
+                    )))
+                })?
+        }
+
+        async fn read_psm_from_gatt(
+            &self,
+            device: &bluer::Device,
+            addr: &BleAddr,
+        ) -> Result<u16, TransportError> {
+            let services = device.services().await.map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: failed to enumerate services for {}: {}",
+                    addr, e
+                )))
+            })?;
+
+            debug!(addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
+
+            let psm_service = find_service_by_uuid(&services, FIPS_GATT_PSM_SERVICE_UUID).await;
+            let psm_service = match psm_service {
+                Some(s) => s,
+                None => {
+                    return Err(TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: FIPS GATT PSM service not found on {}",
+                        addr
+                    ))));
+                }
+            };
+
+            let characteristics = psm_service.characteristics().await.map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
+                    addr, e
+                )))
+            })?;
+
+            let psm_char = find_char_by_uuid(&characteristics, FIPS_GATT_PSM_CHAR_UUID).await;
+            let psm_char = match psm_char {
+                Some(c) => c,
+                None => {
+                    return Err(TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: PSM characteristic not found on {}",
+                        addr
+                    ))));
+                }
+            };
+
+            let value = psm_char.read().await.map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
+                    addr, e
+                )))
+            })?;
+
+            if value.len() != 2 {
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
+                    value.len(),
+                    addr
+                ))));
+            }
+
+            let psm = u16::from_le_bytes([value[0], value[1]]);
+
+            if psm == 0 {
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "discover_gatt_psm: invalid PSM value 0 from {}",
+                    addr
+                ))));
+            }
+
+            debug!(addr = %addr, psm, "GATT PSM discovery: discovered PSM");
+            Ok(psm)
+        }
+    }
+
+    async fn find_service_by_uuid(
+        services: &[bluer::gatt::remote::Service],
+        target: bluer::Uuid,
+    ) -> Option<bluer::gatt::remote::Service> {
+        for svc in services {
+            if let Ok(uuid) = svc.uuid().await {
+                if uuid == target {
+                    return Some(svc.clone());
+                }
+            }
+        }
+        None
+    }
+
+    async fn find_char_by_uuid(
+        chars: &[bluer::gatt::remote::Characteristic],
+        target: bluer::Uuid,
+    ) -> Option<bluer::gatt::remote::Characteristic> {
+        for ch in chars {
+            if let Ok(uuid) = ch.uuid().await {
+                if uuid == target {
+                    return Some(ch.clone());
+                }
+            }
+        }
+        None
     }
 
     impl BleIo for BluerIo {
@@ -336,18 +674,19 @@ mod bluer_impl {
                 .await
                 .map_err(|e| map_err("address", e))?;
 
-            let sa = SocketAddr::new(local_addr, AddressType::LePublic, psm);
-            let listener = SeqPacketListener::bind(sa)
-                .await
-                .map_err(|e| map_io_err("bind", e))?;
+            let socket = Socket::<SeqPacket>::new_seq_packet()
+                .map_err(|e| map_io_err("new_seq_packet", e))?;
 
-            // Request high MTU for accepted connections
-            listener
-                .as_ref()
-                .set_recv_mtu(self.mtu)
+            let addr_type = local_addr_addr_type(&local_addr);
+            let sa = SocketAddr::new(local_addr, addr_type, psm);
+            socket.bind(sa).map_err(|e| map_io_err("bind", e))?;
+            socket.set_flow_control(FlowControl::Le)
+                .map_err(|e| map_io_err("set_flow_control", e))?;
+            socket.set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
+            let listener = socket.listen(1)
+                .map_err(|e| map_io_err("listen", e))?;
 
-            // Prevent sniff mode to reduce latency during data transfer
             if let Err(e) = listener.as_ref().set_power_forced_active(true) {
                 debug!(error = %e, "BLE listener: set_power_forced_active not supported");
             }
@@ -361,54 +700,184 @@ mod bluer_impl {
         }
 
         async fn connect(&self, addr: &BleAddr, psm: u16) -> Result<Self::Stream, TransportError> {
-            let target_sa = addr.to_socket_addr(psm);
+            let connect_start = std::time::Instant::now();
+            let mut effective_psm = psm;
+            let addr_type = self.resolve_addr_type(addr).await;
+            let bluer_addr = addr.to_bluer_address();
+            let device = self.device_handle(addr)?;
 
+            debug!(addr = %addr, configured_psm = psm, addr_type = ?addr_type, "BLE connect: starting");
+
+            // GATT connect with retry for transient errors
+            const GATT_RETRY_DELAY: Duration = Duration::from_secs(1);
+            const MAX_GATT_ATTEMPTS: usize = 2;
+            const GATT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+            let gatt_start = std::time::Instant::now();
+            let mut gatt_connected = false;
+            for attempt in 1..=MAX_GATT_ATTEMPTS {
+                match timeout(GATT_CONNECT_TIMEOUT, device.connect()).await {
+                    Ok(Ok(())) => {
+                        debug!(
+                            addr = %addr, attempt,
+                            gatt_ms = gatt_start.elapsed().as_millis() as u64,
+                            "BLE connect: GATT connected"
+                        );
+                        gatt_connected = true;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        let err_str = format!("{e}");
+                        if attempt < MAX_GATT_ATTEMPTS
+                            && (err_str.contains("abort-by-local") || err_str.contains("Not Ready"))
+                        {
+                            debug!(
+                                addr = %addr, attempt, error = %e,
+                                "BLE connect: GATT connect aborted by local stack, retrying"
+                            );
+                            if let Err(de) = device.disconnect().await {
+                                debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect before retry (non-fatal)");
+                            }
+                            tokio::time::sleep(GATT_RETRY_DELAY).await;
+                            continue;
+                        }
+                        debug!(addr = %addr, attempt, error = %e, "BLE connect: GATT connect failed");
+                        if let Err(de) = device.disconnect().await {
+                            debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after failure (non-fatal)");
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        debug!(addr = %addr, attempt, "BLE connect: GATT connect timed out");
+                        if let Err(de) = device.disconnect().await {
+                            debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after timeout (non-fatal)");
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if gatt_connected {
+                let psm_start = std::time::Instant::now();
+                match timeout(Duration::from_secs(5), self.read_psm_from_gatt(&device, addr)).await {
+                    Ok(Ok(discovered_psm)) => {
+                        effective_psm = discovered_psm;
+                        debug!(
+                            addr = %addr, configured_psm = psm, discovered_psm,
+                            psm_discovery_ms = psm_start.elapsed().as_millis() as u64,
+                            "BLE connect: using GATT-discovered PSM"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery failed, using configured PSM");
+                    }
+                    Err(_) => {
+                        debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT PSM discovery timed out, using configured PSM");
+                    }
+                }
+            } else {
+                debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT connect failed, falling back to L2CAP with configured PSM");
+            }
+
+            // Set trusted if not already
+            match device.is_trusted().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(e) = device.set_trusted(true).await {
+                        debug!(addr = %addr, error = %e, "BLE connect: set_trusted(true) failed (non-fatal)");
+                    }
+                }
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE connect: failed to query trusted state");
+                }
+            }
+
+            let addr_type = device.address_type().await.unwrap_or(addr_type);
+            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type after GATT");
+
+            let target_sa = SocketAddr::new(bluer_addr, addr_type, effective_psm);
+
+            let l2cap_start = std::time::Instant::now();
             let socket = Socket::<SeqPacket>::new_seq_packet()
                 .map_err(|e| map_io_err("new_seq_packet", e))?;
             socket
                 .bind(SocketAddr::any_le())
                 .map_err(|e| map_io_err("bind", e))?;
             socket
+                .set_flow_control(FlowControl::Le)
+                .map_err(|e| map_io_err("set_flow_control", e))?;
+            socket
                 .set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
 
-            // Prevent sniff mode to reduce latency during data transfer
             if let Err(e) = socket.set_power_forced_active(true) {
                 debug!(error = %e, "BLE connect: set_power_forced_active not supported");
             }
 
-            let conn = socket
-                .connect(target_sa)
-                .await
-                .map_err(|e| map_io_err("connect", e))?;
+            debug!(addr = %addr, addr_type = ?addr_type, psm = effective_psm, "BLE connect: opening LE L2CAP socket");
 
-            let remote = addr.clone();
-            BluerStream::new(conn, remote)
+            let conn_result = socket.connect(target_sa).await;
+            match conn_result {
+                Ok(conn) => {
+                    debug!(
+                        addr = %addr,
+                        l2cap_ms = l2cap_start.elapsed().as_millis() as u64,
+                        total_ms = connect_start.elapsed().as_millis() as u64,
+                        "BLE connect: L2CAP channel established"
+                    );
+                    let remote = addr.clone();
+                    BluerStream::new(conn, remote)
+                }
+                Err(e) => {
+                    if let Err(e) = device.disconnect().await {
+                        debug!(addr = %addr, error = %e, "BLE connect: GATT disconnect after L2CAP failure (non-fatal)");
+                    }
+                    Err(map_io_err("connect", e))
+                }
+            }
         }
 
         async fn start_advertising(&self) -> Result<(), TransportError> {
-            let adv = Advertisement {
-                advertisement_type: bluer::adv::Type::Peripheral,
-                service_uuids: {
-                    let mut s = BTreeSet::new();
-                    s.insert(FIPS_SERVICE_UUID);
-                    s
-                },
-                local_name: Some("fips".to_string()),
-                min_interval: Some(std::time::Duration::from_millis(400)),
-                max_interval: Some(std::time::Duration::from_millis(600)),
-                ..Default::default()
-            };
+            for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
+                let adv = Advertisement {
+                    advertisement_type: bluer::adv::Type::Peripheral,
+                    service_uuids: {
+                        let mut s = BTreeSet::new();
+                        s.insert(FIPS_SERVICE_UUID);
+                        s
+                    },
+                    local_name: Some("fips".to_string()),
+                    min_interval: Some(std::time::Duration::from_millis(400)),
+                    max_interval: Some(std::time::Duration::from_millis(600)),
+                    ..Default::default()
+                };
 
-            let handle = self
-                .adapter
-                .advertise(adv)
-                .await
-                .map_err(|e| map_err("advertise", e))?;
+                match self.adapter.advertise(adv).await {
+                    Ok(handle) => {
+                        *self.adv_handle.lock().await = Some(handle);
+                        debug!(attempt, "BLE advertising started");
+                        return Ok(());
+                    }
+                    Err(error)
+                        if attempt < STARTUP_RETRY_ATTEMPTS
+                            && is_transient_startup_error(&error) =>
+                    {
+                        warn!(
+                            attempt,
+                            retry_in_ms = STARTUP_RETRY_DELAY.as_millis(),
+                            kind = ?error.kind,
+                            message = %error.message,
+                            "BLE advertising start hit transient controller state; retrying"
+                        );
+                        tokio::time::sleep(STARTUP_RETRY_DELAY).await;
+                    }
+                    Err(error) => return Err(map_err("advertise", error)),
+                }
+            }
 
-            *self.adv_handle.lock().await = Some(handle);
-            debug!("BLE advertising started");
-            Ok(())
+            Err(TransportError::Io(std::io::Error::other(
+                "advertise: exhausted retries",
+            )))
         }
 
         async fn stop_advertising(&self) -> Result<(), TransportError> {
@@ -417,12 +886,21 @@ mod bluer_impl {
             Ok(())
         }
 
+        async fn disconnect_device(&self, addr: &BleAddr) {
+            let device = match self.device_handle(addr) {
+                Ok(d) => d,
+                Err(e) => {
+                    debug!(addr = %addr, error = %e, "BLE disconnect: device not found");
+                    return;
+                }
+            };
+            match device.disconnect().await {
+                Ok(()) => debug!(addr = %addr, "BLE device disconnected"),
+                Err(e) => debug!(addr = %addr, error = %e, "BLE disconnect failed (non-fatal)"),
+            }
+        }
+
         async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
-            // Clear cached devices so BlueZ fires DeviceAdded for every
-            // advertisement. Without this, already-known devices only
-            // produce PropertyChanged events (which bluer doesn't expose
-            // at the device level), causing the scanner to miss peers
-            // after a daemon restart.
             if let Ok(cached) = self.adapter.device_addresses().await {
                 let count = cached.len();
                 for addr in cached {
@@ -433,7 +911,6 @@ mod bluer_impl {
                 }
             }
 
-            // Set discovery filter for LE transport with FIPS UUID
             let filter = DiscoveryFilter {
                 transport: DiscoveryTransport::Le,
                 uuids: {
@@ -449,25 +926,40 @@ mod bluer_impl {
                 .await
                 .map_err(|e| map_err("set_discovery_filter", e))?;
 
-            let events = self
-                .adapter
-                .discover_devices()
-                .await
-                .map_err(|e| map_err("discover_devices", e))?;
+            for attempt in 1..=STARTUP_RETRY_ATTEMPTS {
+                match self.adapter.discover_devices().await {
+                    Ok(events) => {
+                        debug!(attempt, "BLE scanning started");
+                        return Ok(BluerScanner {
+                            events: Box::pin(events),
+                            adapter: self.adapter.clone(),
+                            adapter_name: self.adapter_name.clone(),
+                            initialized: false,
+                        });
+                    }
+                    Err(error)
+                        if attempt < STARTUP_RETRY_ATTEMPTS
+                            && is_transient_startup_error(&error) =>
+                    {
+                        warn!(
+                            attempt,
+                            retry_in_ms = STARTUP_RETRY_DELAY.as_millis(),
+                            kind = ?error.kind,
+                            message = %error.message,
+                            "BLE scanning start hit transient controller state; retrying"
+                        );
+                        tokio::time::sleep(STARTUP_RETRY_DELAY).await;
+                    }
+                    Err(error) => return Err(map_err("discover_devices", error)),
+                }
+            }
 
-            debug!("BLE scanning started");
-
-            Ok(BluerScanner {
-                events: Box::pin(events),
-                adapter: self.adapter.clone(),
-                adapter_name: self.adapter_name.clone(),
-            })
+            Err(TransportError::Io(std::io::Error::other(
+                "discover_devices: exhausted retries",
+            )))
         }
 
         fn local_addr(&self) -> Result<BleAddr, TransportError> {
-            // Use futures::executor::block_on since this is a sync method
-            // but needs an async call. The adapter address is cached so
-            // the D-Bus call is fast.
             let addr = futures::executor::block_on(self.adapter.address())
                 .map_err(|e| map_err("address", e))?;
             Ok(BleAddr::from_bluer(addr, &self.adapter_name))
@@ -476,9 +968,15 @@ mod bluer_impl {
         fn adapter_name(&self) -> &str {
             &self.adapter_name
         }
+
+        fn discover_gatt_psm(
+            &self,
+            addr: &BleAddr,
+        ) -> impl std::future::Future<Output = Result<u16, TransportError>> + Send {
+            BluerIo::discover_gatt_psm(self, addr)
+        }
     }
 
-    // Compile-time assertion that BluerIo satisfies Send + Sync.
     #[allow(dead_code)]
     fn _assert_bluer_io_send_sync() {
         fn require<T: Send + Sync>() {}
@@ -487,7 +985,10 @@ mod bluer_impl {
 }
 
 #[cfg(bluer_available)]
-pub use bluer_impl::{BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SERVICE_UUID};
+pub use bluer_impl::{
+    BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SERVICE_UUID,
+    FIPS_GATT_PSM_SERVICE_UUID, FIPS_GATT_PSM_CHAR_UUID,
+};
 
 // ============================================================================
 // Mock BLE I/O (for testing without hardware)
@@ -537,11 +1038,21 @@ impl BleStream for MockBleStream {
         let mut rx = self.rx.lock().await;
         match rx.recv().await {
             Some(data) => {
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
+                if data.len() < 2 {
+                    return Err(TransportError::RecvFailed("frame too short".into()));
+                }
+                let payload_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if payload_len == 0 {
+                    return Err(TransportError::RecvFailed(
+                        "BLE recv: framed message too short (0 bytes)".into(),
+                    ));
+                }
+                let payload = &data[2..];
+                let len = payload_len.min(payload.len()).min(buf.len());
+                buf[..len].copy_from_slice(&payload[..len]);
                 Ok(len)
             }
-            None => Ok(0), // channel closed = connection closed = zero-length read
+            None => Ok(0),
         }
     }
 
@@ -556,6 +1067,7 @@ impl BleStream for MockBleStream {
     fn remote_addr(&self) -> &BleAddr {
         &self.addr
     }
+
 }
 
 /// Mock BLE acceptor backed by a channel of pre-connected streams.
@@ -668,6 +1180,8 @@ impl BleIo for MockBleIo {
     async fn stop_advertising(&self) -> Result<(), TransportError> {
         Ok(())
     }
+
+    async fn disconnect_device(&self, _addr: &BleAddr) {}
 
     async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
         let rx = self
