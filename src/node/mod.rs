@@ -800,7 +800,7 @@ impl Node {
         }
 
         // Create BLE transport instances
-        #[cfg(bluer_available)]
+        #[cfg(any(bluer_available, feature = "ble-macos"))]
         {
             let ble_instances: Vec<_> = self
                 .config
@@ -815,6 +815,7 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
+                let accept_connections = ble_config.accept_connections();
                 match crate::transport::ble::io::BluerIo::new(&adapter, mtu).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
@@ -825,6 +826,11 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        if !accept_connections {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        }
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -833,10 +839,51 @@ impl Node {
                 }
             }
 
-            #[cfg(any(not(bluer_available), test))]
+            #[cfg(all(feature = "ble-macos", not(test)))]
+            for (name, ble_config) in ble_instances {
+                let transport_id = self.allocate_transport_id();
+                let adapter = ble_config.adapter().to_string();
+                let mtu = ble_config.mtu();
+                let accept_connections = ble_config.accept_connections();
+                let scan_enabled = ble_config.scan();
+                match crate::transport::ble::io::BluestIo::new(&adapter, mtu).await {
+                    Ok(io) => {
+                        let mut ble = crate::transport::ble::BleTransport::new(
+                            transport_id,
+                            name,
+                            ble_config,
+                            io,
+                            packet_tx.clone(),
+                        );
+                        ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        if !accept_connections {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        } else if !scan_enabled {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::peripheral_only(),
+                            );
+                        } else {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::macos_default(),
+                            );
+                        }
+                        transports.push(TransportHandle::Ble(ble));
+                    }
+                    Err(e) => {
+                        tracing::warn!(adapter = %adapter, error = %e, "failed to initialize BLE adapter");
+                    }
+                }
+            }
+
+            #[cfg(any(
+                not(any(bluer_available, feature = "ble-macos")),
+                test,
+            ))]
             if !ble_instances.is_empty() {
                 #[cfg(not(test))]
-                tracing::warn!("BLE transport configured but this build lacks BlueZ support");
+                tracing::warn!("BLE transport configured but this build lacks BLE support");
             }
         }
 
