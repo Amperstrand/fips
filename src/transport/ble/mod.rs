@@ -24,6 +24,7 @@ pub mod capabilities;
 pub mod discovery;
 pub mod io;
 pub mod pool;
+pub mod rate_limit;
 pub mod stats;
 
 use super::{
@@ -37,6 +38,7 @@ pub use capabilities::PeerCapabilities;
 use discovery::DiscoveryBuffer;
 use io::{BleIo, BleScanner, BleStream};
 use pool::{BleConnection, BLE_FRAME_PREFIX_LEN, ConnectionPool};
+use rate_limit::BleRateAdapter;
 use stats::BleStats;
 
 use secp256k1::XOnlyPublicKey;
@@ -85,6 +87,7 @@ pub struct BleTransport<I: BleIo> {
     stats: Arc<BleStats>,
     local_pubkey: Option<[u8; 32]>,
     local_capabilities: PeerCapabilities,
+    rate_adapter: Arc<Mutex<BleRateAdapter>>,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
 }
 
@@ -102,6 +105,7 @@ impl<I: BleIo> BleTransport<I> {
         packet_tx: PacketTx,
     ) -> Self {
         let max_conns = config.max_connections();
+        let initial_rate_bps = config.effective_send_rate_bps();
         Self {
             transport_id,
             name,
@@ -117,6 +121,7 @@ impl<I: BleIo> BleTransport<I> {
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
             local_capabilities: PeerCapabilities::linux_default(),
+            rate_adapter: Arc::new(Mutex::new(BleRateAdapter::new(initial_rate_bps))),
             backoff: Arc::new(Mutex::new(backoff::PeerBackoff::with_defaults())),
         }
     }
@@ -581,6 +586,21 @@ impl<I: BleIo> BleTransport<I> {
             debug!(addr = %addr, "BLE connection closed");
             drop(conn);
         }
+    }
+
+    /// Feed MMP SRTT measurement to the adaptive rate controller.
+    ///
+    /// Returns the new rate in bps after AIMD adjustment.
+    /// Updates the rate limiter on the specific connection's stream.
+    pub async fn update_rate_from_srtt(&self, addr: &TransportAddr, srtt_ms: f64) -> u64 {
+        let new_rate = self.rate_adapter.lock().await.update(srtt_ms);
+
+        let pool = self.pool.lock().await;
+        if let Some(conn) = pool.get(addr) {
+            conn.stream.set_rate_bps(new_rate).await;
+        }
+
+        new_rate
     }
 
     /// Get the link MTU for a specific address.
