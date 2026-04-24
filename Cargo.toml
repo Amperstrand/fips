@@ -10,6 +10,7 @@ readme = "README.md"
 
 [features]
 default = []
+ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2"]
 
 [dependencies]
 ratatui = "0.30"
@@ -46,6 +47,20 @@ rustables = "0.8.7"
 # bluer/BlueZ needs glibc — see build.rs `bluer_available` cfg gate.
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bluest = { path = "../bluest-patched", features = ["l2cap", "unstable"], optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-core-bluetooth = { version = "0.3", optional = true, features = [
+    "CBPeripheralManager", "CBService", "CBCharacteristic", "CBAttribute",
+    "CBManager", "CBAdvertisementData", "CBATTRequest",
+    "CBError", "CBL2CAPChannel", "CBUUID",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSArray", "NSData", "NSDictionary", "NSError", "NSNotification",
+    "NSObject", "NSRunLoop", "NSStream", "NSString", "NSUUID",
+] }
+dispatch2 = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"

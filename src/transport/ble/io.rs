@@ -45,6 +45,21 @@ pub trait BleStream: Send + Sync {
     ) -> impl std::future::Future<Output = ()> + Send {
         async {}
     }
+
+    /// Send data with higher priority (bypasses rate limiting).
+    /// Default implementation delegates to `send`.
+    fn send_urgent(
+        &self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
+        self.send(data)
+    }
+
+    /// Whether this stream supports bidirectional pubkey exchange.
+    /// Peripheral streams do not (CoreBluetooth rejects SMP pairing).
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        false
+    }
 }
 
 /// An acceptor that yields inbound L2CAP connections.
@@ -1023,6 +1038,17 @@ pub use bluer_impl::{
     BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SERVICE_UUID,
     FIPS_GATT_PSM_SERVICE_UUID, FIPS_GATT_PSM_CHAR_UUID,
 };
+
+// ============================================================================
+// BluestIo — macOS BLE I/O via CoreBluetooth (bluest)
+// ============================================================================
+
+#[cfg(feature = "ble-macos")]
+#[path = "io_macos.rs"]
+mod bluest_impl;
+
+#[cfg(feature = "ble-macos")]
+pub use bluest_impl::{AnyStream, BluestAcceptor, BluestIo, BluestScanner, BluestStream};
 
 // ============================================================================
 // Mock BLE I/O (for testing without hardware)
