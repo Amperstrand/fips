@@ -163,8 +163,8 @@ impl BleRateAdapter {
         }
 
         if srtt_ms > RTT_HIGH_MS {
-            self.current_rate_bps = ((self.current_rate_bps as f64 * MD_FACTOR) as u64)
-                .max(MIN_RATE_BPS);
+            self.current_rate_bps =
+                ((self.current_rate_bps as f64 * MD_FACTOR) as u64).max(MIN_RATE_BPS);
         } else if srtt_ms < RTT_LOW_MS {
             self.current_rate_bps = self
                 .current_rate_bps

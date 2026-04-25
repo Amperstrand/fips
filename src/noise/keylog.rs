@@ -28,14 +28,9 @@ fn keylog_enabled() -> Option<&'static str> {
 }
 
 /// Log link-layer (FMP) Noise keys after IK handshake completion.
-pub fn log_link_keys(
-    local_npub: &str,
-    peer_npub: &str,
-    send_key: &[u8; 32],
-    recv_key: &[u8; 32],
-) {
-    if let Some(path) = keylog_enabled() {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+pub fn log_link_keys(local_npub: &str, peer_npub: &str, send_key: &[u8; 32], recv_key: &[u8; 32]) {
+    if let Some(path) = keylog_enabled()
+        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(
                 f,
                 "FIPS_LINK {} {} {} {}",
@@ -45,7 +40,6 @@ pub fn log_link_keys(
                 hex::encode(recv_key),
             );
         }
-    }
 }
 
 /// Log session-layer (FSP) Noise keys after XK handshake completion.
@@ -55,8 +49,8 @@ pub fn log_session_keys(
     send_key: &[u8; 32],
     recv_key: &[u8; 32],
 ) {
-    if let Some(path) = keylog_enabled() {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+    if let Some(path) = keylog_enabled()
+        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(
                 f,
                 "FIPS_SESSION {} {} {} {}",
@@ -66,7 +60,6 @@ pub fn log_session_keys(
                 hex::encode(recv_key),
             );
         }
-    }
 }
 
 #[cfg(test)]
@@ -76,7 +69,15 @@ mod tests {
 
     fn write_entry(path: &str, label: &str, a: &str, b: &str, k1: &[u8; 32], k2: &[u8; 32]) {
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{} {} {} {} {}", label, a, b, hex::encode(k1), hex::encode(k2));
+            let _ = writeln!(
+                f,
+                "{} {} {} {} {}",
+                label,
+                a,
+                b,
+                hex::encode(k1),
+                hex::encode(k2)
+            );
         }
     }
 
@@ -86,7 +87,14 @@ mod tests {
         let path = dir.path().join("keys.log");
         let path_str = path.to_str().unwrap();
 
-        write_entry(path_str, "FIPS_LINK", "aabbccdd", "11223344", &[1u8; 32], &[2u8; 32]);
+        write_entry(
+            path_str,
+            "FIPS_LINK",
+            "aabbccdd",
+            "11223344",
+            &[1u8; 32],
+            &[2u8; 32],
+        );
 
         let contents = fs::read_to_string(path_str).unwrap();
         let line = contents.lines().next().unwrap();

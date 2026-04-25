@@ -876,18 +876,12 @@ impl HandshakeState {
         let recv_key = *recv_cipher.key_bytes();
 
         match self.pattern {
-            NoisePattern::Ik => super::keylog::log_link_keys(
-                &local_npub,
-                &peer_npub,
-                &send_key,
-                &recv_key,
-            ),
-            NoisePattern::Xk => super::keylog::log_session_keys(
-                &local_npub,
-                &peer_npub,
-                &send_key,
-                &recv_key,
-            ),
+            NoisePattern::Ik => {
+                super::keylog::log_link_keys(&local_npub, &peer_npub, &send_key, &recv_key)
+            }
+            NoisePattern::Xk => {
+                super::keylog::log_session_keys(&local_npub, &peer_npub, &send_key, &recv_key)
+            }
         }
 
         Ok(NoiseSession::from_handshake(

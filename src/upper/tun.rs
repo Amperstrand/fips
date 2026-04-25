@@ -23,9 +23,9 @@ use std::io::Write;
 use std::net::Ipv6Addr;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use thiserror::Error;
 #[cfg(unix)]
 use tracing::error;
@@ -752,7 +752,10 @@ mod windows_tun {
         /// submitting packets to be written.
         ///
         /// The `max_mss` parameter is used for TCP MSS clamping on inbound packets.
-        pub fn create_writer(&self, max_mss: Arc<AtomicU16>) -> Result<(TunWriter, TunTx), TunError> {
+        pub fn create_writer(
+            &self,
+            max_mss: Arc<AtomicU16>,
+        ) -> Result<(TunWriter, TunTx), TunError> {
             let (tx, rx) = mpsc::channel();
             Ok((
                 TunWriter {

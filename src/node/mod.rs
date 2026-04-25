@@ -907,10 +907,7 @@ impl Node {
                 }
             }
 
-            #[cfg(any(
-                not(any(bluer_available, feature = "ble-macos")),
-                test,
-            ))]
+            #[cfg(any(not(any(bluer_available, feature = "ble-macos")), test,))]
             if !ble_instances.is_empty() {
                 #[cfg(not(test))]
                 tracing::warn!("BLE transport configured but this build lacks BLE support");

@@ -1059,7 +1059,9 @@ async fn receive_loop_fmp<S: BleStream>(
         let total = match phase {
             PHASE_MSG1 => MSG1_WIRE_SIZE,
             PHASE_MSG2 => MSG2_WIRE_SIZE,
-            PHASE_ESTABLISHED => FMP_PREFIX + ESTABLISHED_REMAINING_HEADER + payload_len + AEAD_TAG_SIZE,
+            PHASE_ESTABLISHED => {
+                FMP_PREFIX + ESTABLISHED_REMAINING_HEADER + payload_len + AEAD_TAG_SIZE
+            }
             _ => {
                 debug!(addr = %addr, phase, "BLE FMP unknown phase, dropping");
                 stats.record_recv_error();

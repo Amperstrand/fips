@@ -1,13 +1,13 @@
 //! macOS BLE I/O via bluest (central role) and objc2-core-bluetooth (peripheral role).
 
 use super::*;
+use crate::transport::TransportError;
 use crate::transport::ble::addr::BleAddr;
 use crate::transport::ble::rate_limit::SendRateLimiter;
-use crate::transport::TransportError;
 
 use bluest::{Adapter, Device, DeviceId};
-use futures::{AsyncReadExt, AsyncWriteExt};
 use futures::StreamExt;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -17,25 +17,27 @@ use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::OnceLock;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU16, Ordering};
 
+use dispatch2::{
+    DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, GlobalQueueIdentifier,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AnyThread, DefinedClass, Message};
+use objc2::{AnyThread, DefinedClass, Message, define_class, msg_send};
 use objc2_core_bluetooth::{
-    CBAdvertisementDataServiceUUIDsKey, CBATTError, CBATTRequest, CBAttributePermissions,
-    CBCharacteristicProperties, CBL2CAPChannel, CBL2CAPPSM,
-    CBManagerState, CBMutableCharacteristic, CBMutableService, CBPeripheralManager,
-    CBPeripheralManagerDelegate, CBUUID,
+    CBATTError, CBATTRequest, CBAdvertisementDataServiceUUIDsKey, CBAttributePermissions,
+    CBCharacteristicProperties, CBL2CAPChannel, CBL2CAPPSM, CBManagerState,
+    CBMutableCharacteristic, CBMutableService, CBPeripheralManager, CBPeripheralManagerDelegate,
+    CBUUID,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSDictionary, NSError, NSDefaultRunLoopMode, NSInputStream, NSNotificationCenter,
-    NSNotification, NSObject, NSObjectProtocol, NSOutputStream, NSRunLoop, NSStream, NSStreamDelegate,
-    NSStreamEvent, NSStreamStatus, NSString,
+    NSArray, NSData, NSDefaultRunLoopMode, NSDictionary, NSError, NSInputStream, NSNotification,
+    NSNotificationCenter, NSObject, NSObjectProtocol, NSOutputStream, NSRunLoop, NSStream,
+    NSStreamDelegate, NSStreamEvent, NSStreamStatus, NSString,
 };
-use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, GlobalQueueIdentifier};
 
 const FIPS_SERVICE_UUID: uuid::Uuid =
     uuid::Uuid::from_u128(0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c);
@@ -76,9 +78,9 @@ const BLE_PERIPHERAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::fr
 fn peripheral_queue() -> &'static DispatchQueue {
     static CELL: OnceLock<DispatchRetained<DispatchQueue>> = OnceLock::new();
     CELL.get_or_init(|| {
-        let utility = DispatchQueue::global_queue(
-            GlobalQueueIdentifier::QualityOfService(DispatchQoS::Utility),
-        );
+        let utility = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+            DispatchQoS::Utility,
+        ));
         DispatchQueue::new_with_target(
             "FIPS-BLE-Peripheral",
             DispatchQueueAttr::SERIAL,
@@ -198,9 +200,9 @@ impl BleStream for BluestStream {
                     })?
                     .map_err(|_| TransportError::Io(std::io::Error::other("BLE central send channel closed")))
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                Err(TransportError::Io(std::io::Error::other("BLE central send channel closed")))
-            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
+                std::io::Error::other("BLE central send channel closed"),
+            )),
         }
     }
 
@@ -222,9 +224,9 @@ impl BleStream for BluestStream {
                     })?
                     .map_err(|_| TransportError::Io(std::io::Error::other("BLE central send channel closed")))
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                Err(TransportError::Io(std::io::Error::other("BLE central send channel closed")))
-            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
+                std::io::Error::other("BLE central send channel closed"),
+            )),
         }
     }
 
@@ -250,13 +252,10 @@ impl BleStream for BluestStream {
             }
 
             let mut tmp = [0u8; 2048];
-            let n = self
-                .reader
-                .lock()
-                .await
-                .read(&mut tmp)
-                .await
-                .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE recv: {e}"))))?;
+            let n =
+                self.reader.lock().await.read(&mut tmp).await.map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!("BLE recv: {e}")))
+                })?;
             if n == 0 {
                 return Ok(0);
             }
@@ -265,9 +264,15 @@ impl BleStream for BluestStream {
         }
     }
 
-    fn send_mtu(&self) -> u16 { self.mtu }
-    fn recv_mtu(&self) -> u16 { self.mtu }
-    fn remote_addr(&self) -> &BleAddr { &self.remote }
+    fn send_mtu(&self) -> u16 {
+        self.mtu
+    }
+    fn recv_mtu(&self) -> u16 {
+        self.mtu
+    }
+    fn remote_addr(&self) -> &BleAddr {
+        &self.remote
+    }
 
     async fn set_rate_bps(&self, rate_bps: u64) {
         if let Some(ref limiter) = self.rate_limiter {
@@ -275,7 +280,9 @@ impl BleStream for BluestStream {
         }
     }
 
-    fn supports_bidirectional_pubkey_exchange(&self) -> bool { true }
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
@@ -307,13 +314,22 @@ impl BleStream for AnyStream {
         }
     }
     fn send_mtu(&self) -> u16 {
-        match self { AnyStream::Central(s) => s.send_mtu(), AnyStream::Peripheral(s) => s.send_mtu() }
+        match self {
+            AnyStream::Central(s) => s.send_mtu(),
+            AnyStream::Peripheral(s) => s.send_mtu(),
+        }
     }
     fn recv_mtu(&self) -> u16 {
-        match self { AnyStream::Central(s) => s.recv_mtu(), AnyStream::Peripheral(s) => s.recv_mtu() }
+        match self {
+            AnyStream::Central(s) => s.recv_mtu(),
+            AnyStream::Peripheral(s) => s.recv_mtu(),
+        }
     }
     fn remote_addr(&self) -> &BleAddr {
-        match self { AnyStream::Central(s) => s.remote_addr(), AnyStream::Peripheral(s) => s.remote_addr() }
+        match self {
+            AnyStream::Central(s) => s.remote_addr(),
+            AnyStream::Peripheral(s) => s.remote_addr(),
+        }
     }
     async fn set_rate_bps(&self, rate_bps: u64) {
         match self {
@@ -410,7 +426,9 @@ define_class!(
             match event_code {
                 NSStreamEvent::EndEncountered | NSStreamEvent::ErrorOccurred => {
                     debug!(?event_code, "PeripheralInputDelegate EOF or error");
-                    if let Ok(mut eof) = self.ivars().eof.lock() { *eof = true; }
+                    if let Ok(mut eof) = self.ivars().eof.lock() {
+                        *eof = true;
+                    }
                     self.ivars().notify.notify_one();
                 }
                 _ => {}
@@ -464,9 +482,17 @@ define_class!(
         #[unsafe(method(stream:handleEvent:))]
         fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
             debug!(?event_code, "PeripheralOutputDelegate event");
-            if event_code != NSStreamEvent::HasSpaceAvailable { return; }
+            if event_code != NSStreamEvent::HasSpaceAvailable {
+                return;
+            }
             let output_stream = stream.downcast_ref::<NSOutputStream>().unwrap();
-            if self.ivars().output_stream.lock().ok().map_or(true, |s| s.is_none()) {
+            if self
+                .ivars()
+                .output_stream
+                .lock()
+                .ok()
+                .is_none_or(|s| s.is_none())
+            {
                 let sendable = SendableOutputStream(output_stream.retain());
                 if let Ok(mut guard) = self.ivars().output_stream.lock() {
                     *guard = Some(sendable);
@@ -507,12 +533,11 @@ impl PeripheralOutputDelegate {
     /// The notification-based write path (`on_write_notify`) needs this reference
     /// to drain the queue.
     fn set_output_stream(&self, stream: SendableOutputStream) {
-        if let Ok(mut guard) = self.ivars().output_stream.lock() {
-            if guard.is_none() {
+        if let Ok(mut guard) = self.ivars().output_stream.lock()
+            && guard.is_none() {
                 debug!("BLE peripheral: eagerly storing output stream reference");
                 *guard = Some(stream);
             }
-        }
     }
 
     fn try_enqueue(&self, data: &[u8]) -> bool {
@@ -532,7 +557,10 @@ impl PeripheralOutputDelegate {
     }
 
     fn drain_to_stream(&self, output_stream: &NSOutputStream) {
-        let mut queue = match self.ivars().write_queue.lock() { Ok(q) => q, Err(_) => return };
+        let mut queue = match self.ivars().write_queue.lock() {
+            Ok(q) => q,
+            Err(_) => return,
+        };
         let initial_len = queue.len();
         while let Some(data) = queue.pop_front() {
             let mut offset = 0;
@@ -543,7 +571,9 @@ impl PeripheralOutputDelegate {
                         data.len() - offset,
                     )
                 };
-                if res < 0 { return; }
+                if res < 0 {
+                    return;
+                }
                 if res == 0 {
                     queue.push_front(data[offset..].to_vec());
                     return;
@@ -559,7 +589,11 @@ impl PeripheralOutputDelegate {
 
     #[allow(dead_code)]
     fn queue_len(&self) -> usize {
-        self.ivars().write_queue.lock().map(|q| q.len()).unwrap_or(0)
+        self.ivars()
+            .write_queue
+            .lock()
+            .map(|q| q.len())
+            .unwrap_or(0)
     }
 }
 
@@ -575,8 +609,14 @@ struct PeripheralCloser {
 
 impl Drop for PeripheralCloser {
     fn drop(&mut self) {
-        self.input_stream.dispatch(|s| unsafe { s.setDelegate(None); s.close(); });
-        self.output_stream.dispatch(|s| unsafe { s.setDelegate(None); s.close(); });
+        self.input_stream.dispatch(|s| unsafe {
+            s.setDelegate(None);
+            s.close();
+        });
+        self.output_stream.dispatch(|s| unsafe {
+            s.setDelegate(None);
+            s.close();
+        });
         unsafe {
             let center = NSNotificationCenter::defaultCenter();
             center.removeObserver(&self._center_observer);
@@ -607,8 +647,10 @@ impl PeripheralStream {
         send_rate_bps: u64,
         send_burst_bytes: u32,
     ) -> Self {
-        let input_stream = unsafe { channel.0.inputStream() }.expect("CBL2CAPChannel has no input stream");
-        let output_stream = unsafe { channel.0.outputStream() }.expect("CBL2CAPChannel has no output stream");
+        let input_stream =
+            unsafe { channel.0.inputStream() }.expect("CBL2CAPChannel has no input stream");
+        let output_stream =
+            unsafe { channel.0.outputStream() }.expect("CBL2CAPChannel has no output stream");
 
         let read_notify = Arc::new(tokio::sync::Notify::new());
         let input_delegate = PeripheralInputDelegate::new(read_notify.clone());
@@ -628,15 +670,22 @@ impl PeripheralStream {
                 stream.setDelegate(Some(&input_protocol));
                 stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
                 stream.open();
-                trace!("BLE peripheral: input stream scheduled and opened, status={:?}", stream.streamStatus());
+                trace!(
+                    "BLE peripheral: input stream scheduled and opened, status={:?}",
+                    stream.streamStatus()
+                );
             });
 
-            let output_protocol = ProtocolObject::from_retained(output_delegate_for_setup.retained());
+            let output_protocol =
+                ProtocolObject::from_retained(output_delegate_for_setup.retained());
             output_stream_for_setup.with(|stream| {
                 stream.setDelegate(Some(&output_protocol));
                 stream.scheduleInRunLoop_forMode(ble_rl, NSDefaultRunLoopMode);
                 stream.open();
-                trace!("BLE peripheral: output stream scheduled and opened, status={:?}", stream.streamStatus());
+                trace!(
+                    "BLE peripheral: output stream scheduled and opened, status={:?}",
+                    stream.streamStatus()
+                );
             });
         });
 
@@ -647,9 +696,14 @@ impl PeripheralStream {
 
         let center = NSNotificationCenter::defaultCenter();
         let notify_name = NSString::from_str(WRITE_NOTIFY_NAME);
-        unsafe { center.addObserver_selector_name_object(
-            &output_delegate, objc2::sel!(onWriteNotify:), Some(&notify_name), None,
-        ) };
+        unsafe {
+            center.addObserver_selector_name_object(
+                &output_delegate,
+                objc2::sel!(onWriteNotify:),
+                Some(&notify_name),
+                None,
+            )
+        };
 
         let input_dispatched = unsafe { RunLoopDispatched::new(input_stream.retained()) };
         let output_dispatched = unsafe { RunLoopDispatched::new(output_stream.retained()) };
@@ -661,10 +715,7 @@ impl PeripheralStream {
             loop {
                 let res = unsafe {
                     input_stream_for_reader.with(|stream| {
-                        stream.read_maxLength(
-                            NonNull::new_unchecked(buf.as_mut_ptr()),
-                            buf.len(),
-                        )
+                        stream.read_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len())
                     })
                 };
 
@@ -678,13 +729,23 @@ impl PeripheralStream {
                     continue;
                 }
 
-                let status = unsafe { input_stream_for_reader.with(|stream| stream.streamStatus()) };
-                if res < 0 || matches!(status, NSStreamStatus::AtEnd | NSStreamStatus::Closed | NSStreamStatus::Error) {
+                let status =
+                    unsafe { input_stream_for_reader.with(|stream| stream.streamStatus()) };
+                if res < 0
+                    || matches!(
+                        status,
+                        NSStreamStatus::AtEnd | NSStreamStatus::Closed | NSStreamStatus::Error
+                    )
+                {
                     if let Ok(mut eof) = input_delegate_for_reader.0.ivars().eof.lock() {
                         *eof = true;
                     }
                     input_delegate_for_reader.0.ivars().notify.notify_one();
-                    debug!(?status, read_result = res, "PeripheralInput reader thread stopping");
+                    debug!(
+                        ?status,
+                        read_result = res,
+                        "PeripheralInput reader thread stopping"
+                    );
                     break;
                 }
 
@@ -709,8 +770,13 @@ impl PeripheralStream {
             mtu,
             recv_buf: Mutex::new(Vec::new()),
             rate_limiter: if send_rate_bps > 0 {
-                Some(Mutex::new(SendRateLimiter::new(send_rate_bps, send_burst_bytes)))
-            } else { None },
+                Some(Mutex::new(SendRateLimiter::new(
+                    send_rate_bps,
+                    send_burst_bytes,
+                )))
+            } else {
+                None
+            },
         }
     }
 
@@ -721,7 +787,11 @@ impl PeripheralStream {
         }
     }
 
-    async fn enqueue_with_backpressure(&self, framed: &[u8], label: &str) -> Result<(), TransportError> {
+    async fn enqueue_with_backpressure(
+        &self,
+        framed: &[u8],
+        label: &str,
+    ) -> Result<(), TransportError> {
         loop {
             let notified = self.queue_space_notify.notified();
             if self.output_delegate.try_enqueue(framed) {
@@ -777,7 +847,10 @@ impl BleStream for PeripheralStream {
                         let copy_len = payload_len.min(buf.len());
                         buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
                         recv_buf.drain(..2 + payload_len);
-                        trace!("BLE peripheral recv: returned {} bytes from recv_buf", copy_len);
+                        trace!(
+                            "BLE peripheral recv: returned {} bytes from recv_buf",
+                            copy_len
+                        );
                         return Ok(copy_len);
                     }
                 }
@@ -799,16 +872,24 @@ impl BleStream for PeripheralStream {
         }
     }
 
-    fn send_mtu(&self) -> u16 { self.mtu }
-    fn recv_mtu(&self) -> u16 { self.mtu }
-    fn remote_addr(&self) -> &BleAddr { &self.remote }
+    fn send_mtu(&self) -> u16 {
+        self.mtu
+    }
+    fn recv_mtu(&self) -> u16 {
+        self.mtu
+    }
+    fn remote_addr(&self) -> &BleAddr {
+        &self.remote
+    }
     async fn set_rate_bps(&self, rate_bps: u64) {
         if let Some(ref limiter) = self.rate_limiter {
             limiter.lock().await.set_rate_bps(rate_bps);
         }
     }
 
-    fn supports_bidirectional_pubkey_exchange(&self) -> bool { true }
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
@@ -856,29 +937,58 @@ define_class!(
         fn did_update_state(&self, _peripheral: &CBPeripheralManager) {
             let state = unsafe { _peripheral.state() };
             debug!("Peripheral manager state changed: {:?}", state);
-            let _ = self.ivars().sender.lock()
+            let _ = self
+                .ivars()
+                .sender
+                .lock()
                 .map(|s| s.try_send(PeripheralManagerEvent::StateChanged(state)));
         }
 
         #[unsafe(method(peripheralManager:didPublishL2CAPChannel:error:))]
-        fn did_publish_l2cap(&self, _peripheral: &CBPeripheralManager, psm: CBL2CAPPSM, error: Option<&NSError>) {
-            if let Some(e) = error { error!("L2CAP channel publish failed: {:?}", e); return; }
+        fn did_publish_l2cap(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            psm: CBL2CAPPSM,
+            error: Option<&NSError>,
+        ) {
+            if let Some(e) = error {
+                error!("L2CAP channel publish failed: {:?}", e);
+                return;
+            }
             info!("L2CAP channel published with PSM: {}", psm);
             self.ivars().published_psm.store(psm, Ordering::SeqCst);
-            let _ = self.ivars().sender.lock()
+            let _ = self
+                .ivars()
+                .sender
+                .lock()
                 .map(|s| s.try_send(PeripheralManagerEvent::L2CAPPublished { psm }));
         }
 
         #[unsafe(method(peripheralManager:didAddService:error:))]
-        fn did_add_service(&self, _peripheral: &CBPeripheralManager, _service: &objc2_core_bluetooth::CBService, error: Option<&NSError>) {
-            if let Some(e) = error { error!("GATT service add failed: {:?}", e); return; }
+        fn did_add_service(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            _service: &objc2_core_bluetooth::CBService,
+            error: Option<&NSError>,
+        ) {
+            if let Some(e) = error {
+                error!("GATT service add failed: {:?}", e);
+                return;
+            }
             debug!("GATT service added");
-            let _ = self.ivars().sender.lock()
+            let _ = self
+                .ivars()
+                .sender
+                .lock()
                 .map(|s| s.try_send(PeripheralManagerEvent::ServiceAdded));
         }
 
         #[unsafe(method(peripheralManager:didReceiveReadRequest:))]
-        fn did_receive_read_request(&self, peripheral: &CBPeripheralManager, request: &CBATTRequest) {
+        fn did_receive_read_request(
+            &self,
+            peripheral: &CBPeripheralManager,
+            request: &CBATTRequest,
+        ) {
             let psm = self.ivars().published_psm.load(Ordering::SeqCst);
             let value = NSData::with_bytes(&psm.to_le_bytes());
             unsafe {
@@ -889,15 +999,31 @@ define_class!(
         }
 
         #[unsafe(method(peripheralManager:didOpenL2CAPChannel:error:))]
-        fn did_open_l2cap_channel(&self, _peripheral: &CBPeripheralManager, channel: Option<&CBL2CAPChannel>, error: Option<&NSError>) {
-            if let Some(e) = error { error!("L2CAP channel open failed: {:?}", e); return; }
+        fn did_open_l2cap_channel(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            channel: Option<&CBL2CAPChannel>,
+            error: Option<&NSError>,
+        ) {
+            if let Some(e) = error {
+                error!("L2CAP channel open failed: {:?}", e);
+                return;
+            }
             if let Some(channel) = channel {
                 debug!("Incoming L2CAP channel opened");
-                let remote = unsafe { channel.peer() }.map(|p| {
-                    let identifier = unsafe { p.identifier() };
-                    let bytes = unsafe { nsuuid_to_bytes(&identifier) };
-                    BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: bytes }
-                }).unwrap_or_else(|| BleAddr { adapter: MACOS_ADAPTER_NAME.to_string(), device: [0, 0, 0, 0, 0, 0] });
+                let remote = unsafe { channel.peer() }
+                    .map(|p| {
+                        let identifier = unsafe { p.identifier() };
+                        let bytes = unsafe { nsuuid_to_bytes(&identifier) };
+                        BleAddr {
+                            adapter: MACOS_ADAPTER_NAME.to_string(),
+                            device: bytes,
+                        }
+                    })
+                    .unwrap_or_else(|| BleAddr {
+                        adapter: MACOS_ADAPTER_NAME.to_string(),
+                        device: [0, 0, 0, 0, 0, 0],
+                    });
                 let stream = unsafe {
                     PeripheralStream::setup_channel(
                         SendableChannel(channel.retain()),
@@ -910,15 +1036,29 @@ define_class!(
                 if let Ok(mut pending) = self.ivars().pending_streams.lock() {
                     pending.push(SendablePeripheralStream(stream));
                 }
-                let _ = self.ivars().sender.lock()
+                let _ = self
+                    .ivars()
+                    .sender
+                    .lock()
                     .map(|s| s.try_send(PeripheralManagerEvent::L2CAPChannelOpened));
             }
         }
 
         #[unsafe(method(peripheralManagerDidStartAdvertising:error:))]
-        fn did_start_advertising(&self, _peripheral: &CBPeripheralManager, error: Option<&NSError>) {
-            if let Some(e) = error { warn!("Advertising start failed: {:?}", e); } else { debug!("Advertising started"); }
-            let _ = self.ivars().sender.lock()
+        fn did_start_advertising(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            error: Option<&NSError>,
+        ) {
+            if let Some(e) = error {
+                warn!("Advertising start failed: {:?}", e);
+            } else {
+                debug!("Advertising started");
+            }
+            let _ = self
+                .ivars()
+                .sender
+                .lock()
                 .map(|s| s.try_send(PeripheralManagerEvent::AdvertisingStarted));
         }
     }
@@ -956,7 +1096,11 @@ pub struct BluestAcceptor {
 impl BleAcceptor for BluestAcceptor {
     type Stream = AnyStream;
     async fn accept(&mut self) -> Result<AnyStream, TransportError> {
-        self.rx.lock().await.recv().await
+        self.rx
+            .lock()
+            .await
+            .recv()
+            .await
             .ok_or_else(|| TransportError::Io(std::io::Error::other("acceptor channel closed")))
     }
 }
@@ -965,10 +1109,14 @@ impl BleAcceptor for BluestAcceptor {
 // BluestScanner
 // ============================================================================
 
-pub struct BluestScanner { rx: tokio::sync::mpsc::Receiver<BleAddr> }
+pub struct BluestScanner {
+    rx: tokio::sync::mpsc::Receiver<BleAddr>,
+}
 
 impl BleScanner for BluestScanner {
-    async fn next(&mut self) -> Option<BleAddr> { self.rx.recv().await }
+    async fn next(&mut self) -> Option<BleAddr> {
+        self.rx.recv().await
+    }
 }
 
 // ============================================================================
@@ -996,18 +1144,26 @@ unsafe impl Send for BluestIo {}
 
 impl BluestIo {
     pub async fn new(
-        _adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32,
+        _adapter_name: &str,
+        mtu: u16,
+        send_rate_bps: u64,
+        send_burst_bytes: u32,
     ) -> Result<Self, TransportError> {
-        let adapter = Adapter::default().await
-            .map_err(|e| TransportError::StartFailed(format!("CoreBluetooth adapter not found: {e}")))?;
-        adapter.wait_available().await
+        let adapter = Adapter::default().await.map_err(|e| {
+            TransportError::StartFailed(format!("CoreBluetooth adapter not found: {e}"))
+        })?;
+        adapter
+            .wait_available()
+            .await
             .map_err(|e| TransportError::StartFailed(format!("Bluetooth not available: {e}")))?;
         debug!("CoreBluetooth adapter ready");
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
         Ok(Self {
-            adapter, mtu,
+            adapter,
+            mtu,
             devices: Arc::new(Mutex::new(HashMap::new())),
-            send_rate_bps, send_burst_bytes,
+            send_rate_bps,
+            send_burst_bytes,
             peripheral_manager: StdMutex::new(None),
             peripheral_delegate: Arc::new(StdMutex::new(None)),
             published_psm: Arc::new(AtomicU16::new(0)),
@@ -1025,7 +1181,9 @@ impl BluestIo {
         advertising_enabled: bool,
     ) -> Result<(), TransportError> {
         warn!("Recovering from sleep/wake: re-publishing L2CAP channel");
-        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
+        manager.dispatch(|m| unsafe {
+            m.publishL2CAPChannelWithEncryption(false);
+        });
 
         loop {
             let mut rx = event_rx.lock().await;
@@ -1056,11 +1214,8 @@ impl BluestIo {
                 None,
                 CBAttributePermissions::Readable,
             );
-            let service = CBMutableService::initWithType_primary(
-                CBMutableService::alloc(),
-                &svc_uuid,
-                true,
-            );
+            let service =
+                CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
             let chars = NSArray::from_retained_slice(&[psm_char]);
             let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
                 &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
@@ -1124,7 +1279,8 @@ impl BluestIo {
             let device = { self.devices.lock().await.get(&addr.device).cloned() };
             let device = device.ok_or_else(|| {
                 TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: device not found in cache: {}", addr
+                    "discover_gatt_psm: device not found in cache: {}",
+                    addr
                 )))
             })?;
 
@@ -1132,48 +1288,58 @@ impl BluestIo {
 
             let services = device.services().await.map_err(|e| {
                 TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to enumerate services for {}: {}", addr, e
+                    "discover_gatt_psm: failed to enumerate services for {}: {}",
+                    addr, e
                 )))
             })?;
 
             debug!(addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
 
-            let psm_service = services.iter().find(|s| s.uuid() == FIPS_GATT_PSM_SERVICE_UUID);
+            let psm_service = services
+                .iter()
+                .find(|s| s.uuid() == FIPS_GATT_PSM_SERVICE_UUID);
             let psm_service = match psm_service {
                 Some(s) => s,
                 None => {
                     return Err(TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: FIPS GATT PSM service not found on {}", addr
+                        "discover_gatt_psm: FIPS GATT PSM service not found on {}",
+                        addr
                     ))));
                 }
             };
 
             let characteristics = psm_service.characteristics().await.map_err(|e| {
                 TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to enumerate characteristics for {}: {}", addr, e
+                    "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
+                    addr, e
                 )))
             })?;
 
-            let psm_char = characteristics.iter().find(|c| c.uuid() == FIPS_GATT_PSM_CHAR_UUID);
+            let psm_char = characteristics
+                .iter()
+                .find(|c| c.uuid() == FIPS_GATT_PSM_CHAR_UUID);
             let psm_char = match psm_char {
                 Some(c) => c,
                 None => {
                     return Err(TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: PSM characteristic not found on {}", addr
+                        "discover_gatt_psm: PSM characteristic not found on {}",
+                        addr
                     ))));
                 }
             };
 
             let value = psm_char.read().await.map_err(|e| {
                 TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to read PSM characteristic on {}: {}", addr, e
+                    "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
+                    addr, e
                 )))
             })?;
 
             if value.len() != 2 {
                 return Err(TransportError::Io(std::io::Error::other(format!(
                     "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
-                    value.len(), addr
+                    value.len(),
+                    addr
                 ))));
             }
 
@@ -1181,7 +1347,8 @@ impl BluestIo {
 
             if psm == 0 {
                 return Err(TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: invalid PSM value 0 from {}", addr
+                    "discover_gatt_psm: invalid PSM value 0 from {}",
+                    addr
                 ))));
             }
 
@@ -1194,7 +1361,8 @@ impl BluestIo {
             .await
             .map_err(|_| {
                 TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: timed out discovering PSM for {}", addr
+                    "discover_gatt_psm: timed out discovering PSM for {}",
+                    addr
                 )))
             })?
     }
@@ -1219,7 +1387,9 @@ unsafe fn nsuuid_to_bytes(uuid: &objc2_foundation::NSUUID) -> [u8; 6] {
     if let Ok(parsed) = uuid::Uuid::parse_str(&s.to_string()) {
         let b = parsed.as_bytes();
         [b[0], b[1], b[2], b[3], b[4], b[5]]
-    } else { [0, 0, 0, 0, 0, 0] }
+    } else {
+        [0, 0, 0, 0, 0, 0]
+    }
 }
 
 fn format_uuid(uuid: &uuid::Uuid) -> String {
@@ -1234,7 +1404,9 @@ impl BleIo for BluestIo {
     async fn listen(&self, _psm: u16) -> Result<BluestAcceptor, TransportError> {
         if self.peripheral_manager.lock().unwrap().is_some() {
             let (_, inbound_rx) = tokio::sync::mpsc::channel(8);
-            return Ok(BluestAcceptor { rx: tokio::sync::Mutex::new(inbound_rx) });
+            return Ok(BluestAcceptor {
+                rx: tokio::sync::Mutex::new(inbound_rx),
+            });
         }
 
         let (event_tx, new_event_rx) = tokio::sync::mpsc::channel(32);
@@ -1280,18 +1452,28 @@ impl BleIo for BluestIo {
                     }
                     if state == CBManagerState::PoweredOn {
                         if *self.was_powered_off.lock().await {
-                            warn!("Recovering from sleep/wake: Peripheral manager powered on during startup");
+                            warn!(
+                                "Recovering from sleep/wake: Peripheral manager powered on during startup"
+                            );
                         } else {
                             debug!("Peripheral manager powered on");
                         }
                         break;
                     }
-                    if state == CBManagerState::Unsupported || state == CBManagerState::Unauthorized {
-                        return Err(TransportError::StartFailed(format!("Bluetooth not available: state {:?}", state)));
+                    if state == CBManagerState::Unsupported || state == CBManagerState::Unauthorized
+                    {
+                        return Err(TransportError::StartFailed(format!(
+                            "Bluetooth not available: state {:?}",
+                            state
+                        )));
                     }
                 }
                 Some(_) => {}
-                None => return Err(TransportError::StartFailed("Peripheral manager event channel closed".into())),
+                None => {
+                    return Err(TransportError::StartFailed(
+                        "Peripheral manager event channel closed".into(),
+                    ));
+                }
             }
         }
 
@@ -1301,15 +1483,24 @@ impl BleIo for BluestIo {
             *self.was_powered_off.lock().await = false;
         }
 
-        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
+        manager.dispatch(|m| unsafe {
+            m.publishL2CAPChannelWithEncryption(false);
+        });
 
         // Wait for PSM
         loop {
             let mut rx = self.event_rx.lock().await;
             match rx.recv().await {
-                Some(PeripheralManagerEvent::L2CAPPublished { psm }) => { info!("L2CAP published with PSM {}", psm); break; }
+                Some(PeripheralManagerEvent::L2CAPPublished { psm }) => {
+                    info!("L2CAP published with PSM {}", psm);
+                    break;
+                }
                 Some(_) => {}
-                None => return Err(TransportError::StartFailed("L2CAP publish event channel closed".into())),
+                None => {
+                    return Err(TransportError::StartFailed(
+                        "L2CAP publish event channel closed".into(),
+                    ));
+                }
             }
         }
 
@@ -1320,10 +1511,14 @@ impl BleIo for BluestIo {
             let svc_uuid = CBUUID::UUIDWithString(&NSString::from_str(&svc_uuid_str));
             let char_uuid = CBUUID::UUIDWithString(&NSString::from_str(&char_uuid_str));
             let psm_char = CBMutableCharacteristic::initWithType_properties_value_permissions(
-                CBMutableCharacteristic::alloc(), &char_uuid,
-                CBCharacteristicProperties::Read, None, CBAttributePermissions::Readable,
+                CBMutableCharacteristic::alloc(),
+                &char_uuid,
+                CBCharacteristicProperties::Read,
+                None,
+                CBAttributePermissions::Readable,
             );
-            let service = CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
+            let service =
+                CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
             let chars = NSArray::from_retained_slice(&[psm_char]);
             let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
                 &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
@@ -1337,7 +1532,11 @@ impl BleIo for BluestIo {
             match rx.recv().await {
                 Some(PeripheralManagerEvent::ServiceAdded) => break,
                 Some(_) => {}
-                None => return Err(TransportError::StartFailed("Service add event channel closed".into())),
+                None => {
+                    return Err(TransportError::StartFailed(
+                        "Service add event channel closed".into(),
+                    ));
+                }
             }
         }
 
@@ -1368,7 +1567,9 @@ impl BleIo for BluestIo {
                                 &manager_for_bridge,
                                 &event_rx_bridge,
                                 advertising_enabled,
-                            ).await {
+                            )
+                            .await
+                            {
                                 error!(error = %error, "BLE peripheral manager recovery failed");
                                 return;
                             }
@@ -1382,7 +1583,13 @@ impl BleIo for BluestIo {
                             std::mem::take(&mut *pending)
                         };
                         for stream in streams {
-                            if inbound_tx.send(AnyStream::Peripheral(stream.0)).await.is_err() { return; }
+                            if inbound_tx
+                                .send(AnyStream::Peripheral(stream.0))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                     Some(_) => {}
@@ -1392,15 +1599,22 @@ impl BleIo for BluestIo {
         });
 
         debug!("BLE listen: macOS peripheral acceptor ready");
-        Ok(BluestAcceptor { rx: tokio::sync::Mutex::new(inbound_rx) })
+        Ok(BluestAcceptor {
+            rx: tokio::sync::Mutex::new(inbound_rx),
+        })
     }
 
     async fn connect(&self, addr: &BleAddr, psm: u16) -> Result<AnyStream, TransportError> {
         let device = { self.devices.lock().await.get(&addr.device).cloned() };
-        let device = device.ok_or_else(|| TransportError::Io(std::io::Error::other(format!("BLE device not found in cache: {addr}"))))?;
+        let device = device.ok_or_else(|| {
+            TransportError::Io(std::io::Error::other(format!(
+                "BLE device not found in cache: {addr}"
+            )))
+        })?;
 
-        self.adapter.connect_device(&device).await
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("BLE connect {addr}: {e}"))))?;
+        self.adapter.connect_device(&device).await.map_err(|e| {
+            TransportError::Io(std::io::Error::other(format!("BLE connect {addr}: {e}")))
+        })?;
         let effective_psm = match self.discover_gatt_psm(addr).await {
             Ok(discovered_psm) => {
                 debug!(addr = %addr, configured_psm = psm, discovered_psm, "BLE connect: using GATT-discovered PSM");
@@ -1413,8 +1627,14 @@ impl BleIo for BluestIo {
         };
         debug!(addr = %addr, psm = effective_psm, "Opening L2CAP channel");
 
-        let channel = device.open_l2cap_channel(effective_psm, false).await
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("L2CAP open {addr} PSM {effective_psm}: {e}"))))?;
+        let channel = device
+            .open_l2cap_channel(effective_psm, false)
+            .await
+            .map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!(
+                    "L2CAP open {addr} PSM {effective_psm}: {e}"
+                )))
+            })?;
         let (reader, mut writer) = channel.split();
         debug!(addr = %addr, psm = effective_psm, "L2CAP channel open");
 
@@ -1431,12 +1651,19 @@ impl BleIo for BluestIo {
         });
 
         Ok(AnyStream::Central(BluestStream {
-            reader: Mutex::new(reader), tx,
-            remote: addr.clone(), mtu: self.mtu,
+            reader: Mutex::new(reader),
+            tx,
+            remote: addr.clone(),
+            mtu: self.mtu,
             recv_buf: Mutex::new(Vec::new()),
             rate_limiter: if self.send_rate_bps > 0 {
-                Some(Mutex::new(SendRateLimiter::new(self.send_rate_bps, self.send_burst_bytes)))
-            } else { None },
+                Some(Mutex::new(SendRateLimiter::new(
+                    self.send_rate_bps,
+                    self.send_burst_bytes,
+                )))
+            } else {
+                None
+            },
         }))
     }
 
@@ -1445,7 +1672,10 @@ impl BleIo for BluestIo {
         let guard = self.peripheral_manager.lock().unwrap();
         let manager = match guard.as_ref() {
             Some(m) => m.clone(),
-            None => { debug!("BLE advertising: no peripheral manager"); return Ok(()); }
+            None => {
+                debug!("BLE advertising: no peripheral manager");
+                return Ok(());
+            }
         };
         drop(guard);
         let fips_str = format_uuid(&FIPS_SERVICE_UUID);
@@ -1454,7 +1684,10 @@ impl BleIo for BluestIo {
             let fips_uuid = CBUUID::UUIDWithString(&NSString::from_str(&fips_str));
             let psm_uuid = CBUUID::UUIDWithString(&NSString::from_str(&psm_str));
             let uuids = NSArray::from_retained_slice(&[fips_uuid, psm_uuid]);
-            let ad = NSDictionary::from_retained_objects(&[CBAdvertisementDataServiceUUIDsKey], &[uuids.into()]);
+            let ad = NSDictionary::from_retained_objects(
+                &[CBAdvertisementDataServiceUUIDsKey],
+                &[uuids.into()],
+            );
             m.startAdvertising(Some(&ad));
         });
         debug!("BLE advertising: started");
@@ -1465,7 +1698,9 @@ impl BleIo for BluestIo {
         *self.advertising_enabled.lock().unwrap() = false;
         let guard = self.peripheral_manager.lock().unwrap();
         if let Some(manager) = guard.as_ref() {
-            manager.dispatch(|m: &CBPeripheralManager| unsafe { m.stopAdvertising(); });
+            manager.dispatch(|m: &CBPeripheralManager| unsafe {
+                m.stopAdvertising();
+            });
             debug!("BLE advertising: stopped");
         }
         Ok(())
@@ -1521,8 +1756,10 @@ impl BleIo for BluestIo {
                     .unwrap_or("unknown");
                 debug!(
                     name = name,
-                    addr = format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]),
+                    addr = format!(
+                        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+                    ),
                     "Discovered FIPS BLE device"
                 );
 
