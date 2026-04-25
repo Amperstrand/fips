@@ -317,6 +317,7 @@ dependencies = [
 [[package]]
 name = "bluest"
 version = "0.6.10"
+source = "git+https://github.com/Amperstrand/bluest.git?branch=fix%2Fsend-packet-partial-write#9224e0164551d61e9ff73c55da013af8b87ce451"
 dependencies = [
  "async-broadcast",
  "async-channel",

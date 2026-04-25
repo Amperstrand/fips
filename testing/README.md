@@ -42,3 +42,21 @@ testing. Scenarios are
 defined in YAML and executed via a Python harness that manages the full
 lifecycle: topology generation, Docker orchestration, fault scheduling,
 log collection, and analysis.
+
+### [ble/](ble/) -- BLE Transport Hardware Validation
+
+Hardware-in-the-loop BLE testing using real Bluetooth Low Energy adapters.
+Requires physical BLE hardware (Linux with BlueZ or macOS with
+CoreBluetooth). Includes a standalone spike test (`ble_spike.rs`) for
+verifying BLE hardware/stack setup, and integrates with the chaos
+simulation harness via native (non-Docker) process runner.
+
+| Scenario | Nodes | Description |
+| -------- | ----- | ----------- |
+| `ble-smoke` | 2 | Basic BLE connectivity validation (30s) |
+| `ble-only` | 4 | BLE-only ring topology with traffic |
+| `ble-cost` | 4 | Cost-based parent selection over heterogeneous links |
+| `ble-mesh` | 6 | Mixed UDP + BLE mesh |
+
+BLE transport logic is fully tested via `MockBleIo` unit tests in CI
+(no hardware needed). The scenarios above validate against real BLE radios.

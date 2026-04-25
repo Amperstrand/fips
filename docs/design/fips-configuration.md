@@ -502,9 +502,17 @@ HiddenServicePort 8443 127.0.0.1:8444
 ### BLE (`transports.ble.*`)
 
 Bluetooth Low Energy transport using L2CAP Connection-Oriented Channels.
-Requires BlueZ and the `ble` Cargo feature flag (default-on). Linux only;
-guarded by `#[cfg(target_os = "linux")]`. Communicates with BlueZ via D-Bus
-using the `bluer` crate.
+
+| Platform | Crate | Feature flag | Backend |
+| -------- | ----- | ------------ | ------- |
+| Linux (glibc) | `bluer` | Automatic (`bluer_available` via `build.rs`) | BlueZ D-Bus API |
+| macOS | `bluest` | `--features ble-macos` | CoreBluetooth |
+| Other / test | `MockBleIo` | *(built during `cargo test`)* | In-memory channels |
+
+Linux does not require a feature flag — the `build.rs` script detects
+BlueZ availability and sets `bluer_available` automatically for glibc
+targets. macOS requires `--features ble-macos` to enable the `bluest`
+dependency and CoreBluetooth bindings.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -806,7 +814,7 @@ transports:
   #   #   hostname_file: "/var/lib/tor/fips/hostname"
   #   #   bind_addr: "127.0.0.1:8444"
   #   # max_inbound_connections: 64
-  # ble:                              # uncomment to enable BLE transport (Linux only, requires BlueZ)
+  # ble:                              # BLE transport (Linux: automatic with BlueZ; macOS: --features ble-macos)
   #   adapter: "hci0"                 # HCI adapter name
   #   psm: 0x0085                     # L2CAP PSM (133)
   #   mtu: 2048                       # default MTU (negotiated per-link)
