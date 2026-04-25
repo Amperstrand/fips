@@ -986,7 +986,9 @@ pub struct BluestIo {
     published_psm: Arc<AtomicU16>,
     event_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PeripheralManagerEvent>>>,
     inbound_tx: StdMutex<Option<tokio::sync::mpsc::Sender<AnyStream>>>,
+    advertising_enabled: StdMutex<bool>,
     _delegate_sender: tokio::sync::mpsc::Sender<PeripheralManagerEvent>,
+    was_powered_off: Arc<tokio::sync::Mutex<bool>>,
 }
 
 unsafe impl Sync for BluestIo {}
@@ -1011,8 +1013,110 @@ impl BluestIo {
             published_psm: Arc::new(AtomicU16::new(0)),
             event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
             inbound_tx: StdMutex::new(None),
+            advertising_enabled: StdMutex::new(false),
             _delegate_sender: event_tx,
+            was_powered_off: Arc::new(tokio::sync::Mutex::new(false)),
         })
+    }
+
+    async fn recover_peripheral_manager(
+        manager: &Dispatched<CBPeripheralManager>,
+        event_rx: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PeripheralManagerEvent>>>,
+        advertising_enabled: bool,
+    ) -> Result<(), TransportError> {
+        warn!("Recovering from sleep/wake: re-publishing L2CAP channel");
+        manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
+
+        loop {
+            let mut rx = event_rx.lock().await;
+            match rx.recv().await {
+                Some(PeripheralManagerEvent::L2CAPPublished { psm }) => {
+                    info!(psm, "Recovery: L2CAP published");
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    return Err(TransportError::StartFailed(
+                        "L2CAP publish event channel closed".into(),
+                    ));
+                }
+            }
+        }
+
+        warn!("Recovering from sleep/wake: re-adding GATT service");
+        let svc_uuid_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
+        let char_uuid_str = format_uuid(&FIPS_GATT_PSM_CHAR_UUID);
+        manager.dispatch(move |m| unsafe {
+            let svc_uuid = CBUUID::UUIDWithString(&NSString::from_str(&svc_uuid_str));
+            let char_uuid = CBUUID::UUIDWithString(&NSString::from_str(&char_uuid_str));
+            let psm_char = CBMutableCharacteristic::initWithType_properties_value_permissions(
+                CBMutableCharacteristic::alloc(),
+                &char_uuid,
+                CBCharacteristicProperties::Read,
+                None,
+                CBAttributePermissions::Readable,
+            );
+            let service = CBMutableService::initWithType_primary(
+                CBMutableService::alloc(),
+                &svc_uuid,
+                true,
+            );
+            let chars = NSArray::from_retained_slice(&[psm_char]);
+            let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
+                &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
+            service.setCharacteristics(Some(chars_ptr));
+            m.addService(&service);
+        });
+
+        loop {
+            let mut rx = event_rx.lock().await;
+            match rx.recv().await {
+                Some(PeripheralManagerEvent::ServiceAdded) => {
+                    info!("Recovery: GATT service re-added");
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    return Err(TransportError::StartFailed(
+                        "Service add event channel closed".into(),
+                    ));
+                }
+            }
+        }
+
+        if advertising_enabled {
+            warn!("Recovering from sleep/wake: restarting advertising");
+            let fips_str = format_uuid(&FIPS_SERVICE_UUID);
+            let psm_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
+            manager.dispatch(move |m: &CBPeripheralManager| unsafe {
+                let fips_uuid = CBUUID::UUIDWithString(&NSString::from_str(&fips_str));
+                let psm_uuid = CBUUID::UUIDWithString(&NSString::from_str(&psm_str));
+                let uuids = NSArray::from_retained_slice(&[fips_uuid, psm_uuid]);
+                let ad = NSDictionary::from_retained_objects(
+                    &[CBAdvertisementDataServiceUUIDsKey],
+                    &[uuids.into()],
+                );
+                m.startAdvertising(Some(&ad));
+            });
+
+            loop {
+                let mut rx = event_rx.lock().await;
+                match rx.recv().await {
+                    Some(PeripheralManagerEvent::AdvertisingStarted) => {
+                        info!("Recovery: advertising restarted");
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(TransportError::StartFailed(
+                            "Advertising event channel closed".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn discover_gatt_psm(&self, addr: &BleAddr) -> Result<u16, TransportError> {
@@ -1164,12 +1268,24 @@ impl BleIo for BluestIo {
 
         *self.event_rx.lock().await = new_event_rx;
 
-        // Wait for PoweredOn
+        // Wait for PoweredOn or detect an immediate sleep/wake cycle.
         loop {
             let mut rx = self.event_rx.lock().await;
             match rx.recv().await {
                 Some(PeripheralManagerEvent::StateChanged(state)) => {
-                    if state == CBManagerState::PoweredOn { debug!("Peripheral manager powered on"); break; }
+                    if state == CBManagerState::PoweredOff {
+                        warn!("Peripheral manager powered off during listen startup");
+                        *self.was_powered_off.lock().await = true;
+                        continue;
+                    }
+                    if state == CBManagerState::PoweredOn {
+                        if *self.was_powered_off.lock().await {
+                            warn!("Recovering from sleep/wake: Peripheral manager powered on during startup");
+                        } else {
+                            debug!("Peripheral manager powered on");
+                        }
+                        break;
+                    }
                     if state == CBManagerState::Unsupported || state == CBManagerState::Unauthorized {
                         return Err(TransportError::StartFailed(format!("Bluetooth not available: state {:?}", state)));
                     }
@@ -1177,6 +1293,12 @@ impl BleIo for BluestIo {
                 Some(_) => {}
                 None => return Err(TransportError::StartFailed("Peripheral manager event channel closed".into())),
             }
+        }
+
+        if *self.was_powered_off.lock().await {
+            let advertising_enabled = *self.advertising_enabled.lock().unwrap();
+            Self::recover_peripheral_manager(&manager, &self.event_rx, advertising_enabled).await?;
+            *self.was_powered_off.lock().await = false;
         }
 
         manager.dispatch(|m| unsafe { m.publishL2CAPChannelWithEncryption(false); });
@@ -1222,10 +1344,36 @@ impl BleIo for BluestIo {
         // Bridge incoming L2CAP channels to acceptor
         let event_rx_bridge = self.event_rx.clone();
         let delegate_arc = self.peripheral_delegate.clone();
+        let manager_for_bridge = manager.clone();
+        let was_powered_off = Arc::clone(&self.was_powered_off);
+        let advertising_enabled = *self.advertising_enabled.lock().unwrap();
         tokio::spawn(async move {
             loop {
-                let mut rx = event_rx_bridge.lock().await;
-                match rx.recv().await {
+                let event = {
+                    let mut rx = event_rx_bridge.lock().await;
+                    rx.recv().await
+                };
+                match event {
+                    Some(PeripheralManagerEvent::StateChanged(CBManagerState::PoweredOff)) => {
+                        warn!("Peripheral manager powered off (sleep)");
+                        *was_powered_off.lock().await = true;
+                    }
+                    Some(PeripheralManagerEvent::StateChanged(CBManagerState::PoweredOn)) => {
+                        let mut powered_off = was_powered_off.lock().await;
+                        if *powered_off {
+                            warn!("Recovering from sleep/wake: Peripheral manager powered on");
+                            *powered_off = false;
+                            drop(powered_off);
+                            if let Err(error) = BluestIo::recover_peripheral_manager(
+                                &manager_for_bridge,
+                                &event_rx_bridge,
+                                advertising_enabled,
+                            ).await {
+                                error!(error = %error, "BLE peripheral manager recovery failed");
+                                return;
+                            }
+                        }
+                    }
                     Some(PeripheralManagerEvent::L2CAPChannelOpened) => {
                         let streams: Vec<SendablePeripheralStream> = {
                             let guard = delegate_arc.lock().unwrap();
@@ -1293,6 +1441,7 @@ impl BleIo for BluestIo {
     }
 
     async fn start_advertising(&self) -> Result<(), TransportError> {
+        *self.advertising_enabled.lock().unwrap() = true;
         let guard = self.peripheral_manager.lock().unwrap();
         let manager = match guard.as_ref() {
             Some(m) => m.clone(),
@@ -1313,6 +1462,7 @@ impl BleIo for BluestIo {
     }
 
     async fn stop_advertising(&self) -> Result<(), TransportError> {
+        *self.advertising_enabled.lock().unwrap() = false;
         let guard = self.peripheral_manager.lock().unwrap();
         if let Some(manager) = guard.as_ref() {
             manager.dispatch(|m: &CBPeripheralManager| unsafe { m.stopAdvertising(); });
