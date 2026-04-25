@@ -39,10 +39,7 @@ pub trait BleStream: Send + Sync {
 
     /// Update the send rate limiter's throughput ceiling.
     /// No-op if rate limiting is disabled.
-    fn set_rate_bps(
-        &self,
-        _rate_bps: u64,
-    ) -> impl std::future::Future<Output = ()> + Send {
+    fn set_rate_bps(&self, _rate_bps: u64) -> impl std::future::Future<Output = ()> + Send {
         async {}
     }
 
@@ -110,10 +107,7 @@ pub trait BleIo: Send + Sync + 'static {
         &self,
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
-    fn disconnect_device(
-        &self,
-        _addr: &BleAddr,
-    ) -> impl std::future::Future<Output = ()> + Send {
+    fn disconnect_device(&self, _addr: &BleAddr) -> impl std::future::Future<Output = ()> + Send {
         async {}
     }
 
@@ -137,7 +131,7 @@ pub trait BleIo: Send + Sync + 'static {
     }
 }
 
-#[cfg(all(feature = "ble", target_os = "linux"))]
+#[cfg(all(bluer_available, target_os = "linux"))]
 fn try_take_framed_payload(
     recv_buf: &mut Vec<u8>,
     buf: &mut [u8],
@@ -181,11 +175,11 @@ mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
 
+    use bluer::Address;
     use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{
         AdapterEvent, AddressType, DiscoveryFilter, DiscoveryTransport, adv::Advertisement,
     };
-    use bluer::Address;
     use futures::StreamExt;
     use std::collections::{BTreeSet, HashSet};
     use std::pin::Pin;
@@ -207,10 +201,7 @@ mod bluer_impl {
     }
 
     fn map_io_err(context: &str, e: std::io::Error) -> TransportError {
-        TransportError::Io(std::io::Error::new(
-            e.kind(),
-            format!("{}: {}", context, e),
-        ))
+        TransportError::Io(std::io::Error::new(e.kind(), format!("{}: {}", context, e)))
     }
 
     fn local_addr_addr_type(addr: &Address) -> AddressType {
@@ -249,13 +240,22 @@ mod bluer_impl {
     }
 
     impl BluerStream {
-        pub fn new(conn: SeqPacket, remote: BleAddr, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
+        pub fn new(
+            conn: SeqPacket,
+            remote: BleAddr,
+            send_rate_bps: u64,
+            send_burst_bytes: u32,
+        ) -> Result<Self, TransportError> {
             let send_mtu = conn.send_mtu().map_err(|e| map_io_err("send_mtu", e))? as u16;
             let recv_mtu = conn.recv_mtu().map_err(|e| map_io_err("recv_mtu", e))? as u16;
 
             match conn.as_ref().phy() {
-                Ok(phy) => debug!(addr = %remote, phy, send_mtu, recv_mtu, "BLE connection established"),
-                Err(_) => debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)"),
+                Ok(phy) => {
+                    debug!(addr = %remote, phy, send_mtu, recv_mtu, "BLE connection established")
+                }
+                Err(_) => {
+                    debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)")
+                }
             }
 
             Ok(Self {
@@ -265,7 +265,10 @@ mod bluer_impl {
                 recv_mtu,
                 rate_limiter: if send_rate_bps > 0 {
                     Some(tokio::sync::Mutex::new(
-                        super::super::rate_limit::SendRateLimiter::new(send_rate_bps, send_burst_bytes)
+                        super::super::rate_limit::SendRateLimiter::new(
+                            send_rate_bps,
+                            send_burst_bytes,
+                        ),
                     ))
                 } else {
                     None
@@ -294,7 +297,11 @@ mod bluer_impl {
             tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
                 .await
                 .map_err(|_| {
-                    warn!(len = framed.len(), timeout_secs = BLE_SEND_TIMEOUT.as_secs(), "BLE write timeout");
+                    warn!(
+                        len = framed.len(),
+                        timeout_secs = BLE_SEND_TIMEOUT.as_secs(),
+                        "BLE write timeout"
+                    );
                     TransportError::Timeout
                 })?
                 .map(|_| ())
@@ -352,6 +359,10 @@ mod bluer_impl {
             if let Some(ref limiter) = self.rate_limiter {
                 limiter.lock().await.set_rate_bps(rate_bps);
             }
+        }
+
+        fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+            true
         }
     }
 
@@ -465,7 +476,12 @@ mod bluer_impl {
                 .map_err(|e| map_err("device", e))
         }
 
-        pub async fn new(adapter_name: &str, mtu: u16, send_rate_bps: u64, send_burst_bytes: u32) -> Result<Self, TransportError> {
+        pub async fn new(
+            adapter_name: &str,
+            mtu: u16,
+            send_rate_bps: u64,
+            send_burst_bytes: u32,
+        ) -> Result<Self, TransportError> {
             let session = bluer::Session::new()
                 .await
                 .map_err(|e| map_err("Session::new", e))?;
@@ -563,7 +579,8 @@ mod bluer_impl {
                     match scan_result {
                         Ok(Some(addr_type)) => addr_type,
                         Ok(None) | Err(_) => {
-                            let addr_type = device.address_type().await.unwrap_or(AddressType::LeRandom);
+                            let addr_type =
+                                device.address_type().await.unwrap_or(AddressType::LeRandom);
                             debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
                             addr_type
                         }
@@ -727,12 +744,13 @@ mod bluer_impl {
             let addr_type = local_addr_addr_type(&local_addr);
             let sa = SocketAddr::new(local_addr, addr_type, psm);
             socket.bind(sa).map_err(|e| map_io_err("bind", e))?;
-            socket.set_flow_control(FlowControl::Le)
+            socket
+                .set_flow_control(FlowControl::Le)
                 .map_err(|e| map_io_err("set_flow_control", e))?;
-            socket.set_recv_mtu(self.mtu)
+            socket
+                .set_recv_mtu(self.mtu)
                 .map_err(|e| map_io_err("set_recv_mtu", e))?;
-            let listener = socket.listen(1)
-                .map_err(|e| map_io_err("listen", e))?;
+            let listener = socket.listen(1).map_err(|e| map_io_err("listen", e))?;
 
             if let Err(e) = listener.as_ref().set_power_forced_active(true) {
                 debug!(error = %e, "BLE listener: set_power_forced_active not supported");
@@ -808,7 +826,12 @@ mod bluer_impl {
 
             if gatt_connected {
                 let psm_start = std::time::Instant::now();
-                match timeout(Duration::from_secs(5), self.read_psm_from_gatt(&device, addr)).await {
+                match timeout(
+                    Duration::from_secs(5),
+                    self.read_psm_from_gatt(&device, addr),
+                )
+                .await
+                {
                     Ok(Ok(discovered_psm)) => {
                         effective_psm = discovered_psm;
                         debug!(
@@ -1035,8 +1058,8 @@ mod bluer_impl {
 
 #[cfg(bluer_available)]
 pub use bluer_impl::{
-    BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_SERVICE_UUID,
-    FIPS_GATT_PSM_SERVICE_UUID, FIPS_GATT_PSM_CHAR_UUID,
+    BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_GATT_PSM_CHAR_UUID,
+    FIPS_GATT_PSM_SERVICE_UUID, FIPS_SERVICE_UUID,
 };
 
 // ============================================================================
@@ -1128,6 +1151,9 @@ impl BleStream for MockBleStream {
         &self.addr
     }
 
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        true
+    }
 }
 
 /// Mock BLE acceptor backed by a channel of pre-connected streams.

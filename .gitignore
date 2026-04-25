@@ -27,6 +27,8 @@ dist/
 
 sim-results/
 
+bluest/
+
 # Python
 __pycache__/
 *.py[cod]

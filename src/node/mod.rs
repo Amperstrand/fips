@@ -38,7 +38,8 @@ use crate::transport::tcp::TcpTransport;
 use crate::transport::tor::TorTransport;
 use crate::transport::udp::UdpTransport;
 use crate::transport::{
-    Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError, TransportHandle, TransportId,
+    DisconnectRx, DisconnectTx, Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError,
+    TransportHandle, TransportId,
 };
 use crate::tree::TreeState;
 use crate::upper::hosts::HostMap;
@@ -314,6 +315,8 @@ pub struct Node {
     packet_tx: Option<PacketTx>,
     /// Packet receiver (for event loop).
     packet_rx: Option<PacketRx>,
+    /// Disconnect receiver for connection-oriented transports.
+    disconnect_rx: Option<DisconnectRx>,
 
     // === Connections (Handshake Phase) ===
     /// Pending connections (handshake in progress).
@@ -551,6 +554,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -675,6 +679,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -734,7 +739,12 @@ impl Node {
     /// Create transport instances from configuration.
     ///
     /// Returns a vector of TransportHandles for all configured transports.
-    async fn create_transports(&mut self, packet_tx: &PacketTx) -> Vec<TransportHandle> {
+    #[allow(unused_variables)]
+    async fn create_transports(
+        &mut self,
+        packet_tx: &PacketTx,
+        disconnect_tx: &DisconnectTx,
+    ) -> Vec<TransportHandle> {
         let mut transports = Vec::new();
 
         // Collect UDP configs with optional names to avoid borrow conflicts
@@ -837,6 +847,7 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
                         if !accept_connections {
                             ble.set_local_capabilities(
                                 crate::transport::ble::PeerCapabilities::central_only(),
@@ -874,6 +885,7 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
                         if !accept_connections {
                             ble.set_local_capabilities(
                                 crate::transport::ble::PeerCapabilities::central_only(),

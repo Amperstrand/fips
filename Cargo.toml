@@ -10,7 +10,7 @@ readme = "README.md"
 
 [features]
 default = []
-ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2"]
+ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2", "dep:uuid"]
 
 [dependencies]
 ratatui = "0.30"
@@ -49,7 +49,8 @@ rustables = "0.8.7"
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-bluest = { path = "../bluest-patched", features = ["l2cap", "unstable"], optional = true }
+bluest = { git = "https://github.com/Amperstrand/bluest.git", branch = "fix/send-packet-partial-write", features = ["l2cap", "unstable"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-core-bluetooth = { version = "0.3", optional = true, features = [
     "CBPeripheralManager", "CBService", "CBCharacteristic", "CBAttribute",

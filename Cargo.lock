@@ -1100,6 +1100,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun",
+ "uuid",
  "windows-service",
  "wintun",
 ]
