@@ -1,0 +1,48 @@
+# BLE-only: 4-node ring, all BLE transport
+#
+# All links use BLE L2CAP. Nodes discover each other via beacon/scan
+# (no static peer config). Tests basic BLE mesh convergence.
+# Requires native backend (BLE doesn't work in Docker).
+#
+# Topology:
+#
+#   n01 --ble-- n02
+#    |           |
+#   ble         ble
+#    |           |
+#   n04 --ble-- n03
+
+scenario:
+  name: "ble-only"
+  seed: 42
+  duration_secs: 60
+
+topology:
+  algorithm: explicit
+  num_nodes: 4
+  backend: native
+  params:
+    adjacency:
+      - [n01, n02, ble]
+      - [n02, n03, ble]
+      - [n03, n04, ble]
+      - [n04, n01, ble]
+  subnet: "172.20.0.0/24"
+  ip_start: 10
+
+netem:
+  enabled: false
+
+link_flaps:
+  enabled: false
+
+traffic:
+  enabled: true
+  max_concurrent: 2
+  interval_secs: {min: 10, max: 20}
+  duration_secs: {min: 5, max: 10}
+  parallel_streams: 1
+
+logging:
+  rust_log: "info"
+  output_dir: "./sim-results"

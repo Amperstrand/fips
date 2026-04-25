@@ -22,7 +22,7 @@ class Range:
             raise ValueError(f"{name}: min ({self.min}) must be >= 0")
 
 
-VALID_TRANSPORTS = ("udp", "ethernet", "tcp")
+VALID_TRANSPORTS = ("udp", "ethernet", "tcp", "ble")
 
 
 @dataclass
@@ -38,6 +38,11 @@ class TopologyConfig:
     # When set, each edge is randomly assigned a transport based on weights.
     # Only valid for non-explicit algorithms (explicit uses per-edge syntax).
     transport_mix: dict[str, float] | None = None
+    # Execution backend: "docker" (default) or "native" (local processes).
+    # BLE transport requires native backend on real hardware.
+    backend: str = "docker"
+    # BLE adapter interface for native backend (e.g. "hci0").
+    ble_interface: str = "hci0"
 
 
 @dataclass
@@ -232,6 +237,8 @@ def load_scenario(path: str) -> Scenario:
         if not isinstance(mix, dict) or not mix:
             raise ValueError("topology.transport_mix must be a non-empty dict")
         s.topology.transport_mix = {str(k): float(v) for k, v in mix.items()}
+    s.topology.backend = tc.get("backend", "docker")
+    s.topology.ble_interface = tc.get("ble_interface", "hci0")
 
     # Netem section
     nc = raw.get("netem", {})
@@ -346,6 +353,28 @@ def _validate(s: Scenario):
         raise ValueError(
             f"topology.default_transport: '{s.topology.default_transport}' "
             f"not in {VALID_TRANSPORTS}"
+        )
+    if s.topology.backend not in ("docker", "native"):
+        raise ValueError(
+            f"topology.backend: '{s.topology.backend}' "
+            f"(must be 'docker' or 'native')"
+        )
+    has_ble_edges = (
+        s.topology.default_transport == "ble"
+        or (s.topology.transport_mix and "ble" in s.topology.transport_mix)
+        or (
+            s.topology.algorithm == "explicit"
+            and any(
+                len(e) == 3 and str(e[2]) == "ble"
+                for e in s.topology.params.get("adjacency", [])
+            )
+        )
+    )
+    if has_ble_edges and s.topology.backend == "docker":
+        import logging
+        logging.getLogger(__name__).warning(
+            "BLE transport edges configured with backend=docker; "
+            "BLE requires real hardware (use backend: native)"
         )
     if s.topology.transport_mix is not None:
         if s.topology.algorithm == "explicit":

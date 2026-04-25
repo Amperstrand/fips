@@ -1,0 +1,32 @@
+# BLE smoke test: 2 nodes, 1 BLE edge
+#
+# Quickest possible BLE connectivity validation.
+# Requires native backend (BLE doesn't work in Docker).
+
+scenario:
+  name: "ble-smoke"
+  seed: 42
+  duration_secs: 30
+
+topology:
+  algorithm: explicit
+  num_nodes: 2
+  backend: native
+  params:
+    adjacency:
+      - [n01, n02, ble]
+  subnet: "172.20.0.0/24"
+  ip_start: 10
+
+netem:
+  enabled: false
+
+link_flaps:
+  enabled: false
+
+traffic:
+  enabled: false
+
+logging:
+  rust_log: "info"
+  output_dir: "./sim-results"

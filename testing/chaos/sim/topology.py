@@ -50,6 +50,26 @@ class SimTopology:
         """Check if any edges use TCP transport."""
         return any(t == "tcp" for t in self.edge_transport.values())
 
+    def ble_edges(self) -> list[tuple[str, str]]:
+        """Return all edges using BLE transport."""
+        return [e for e, t in self.edge_transport.items() if t == "ble"]
+
+    def has_ble(self) -> bool:
+        """Check if any edges use BLE transport."""
+        return any(t == "ble" for t in self.edge_transport.values())
+
+    def ble_peers(self, node_id: str) -> list[str]:
+        """Return peer IDs connected to this node via BLE."""
+        peers = []
+        for (a, b), transport in self.edge_transport.items():
+            if transport != "ble":
+                continue
+            if a == node_id:
+                peers.append(b)
+            elif b == node_id:
+                peers.append(a)
+        return sorted(peers)
+
     def tcp_peers(self, node_id: str) -> list[str]:
         """Return peer IDs connected to this node via TCP."""
         peers = []
@@ -117,17 +137,17 @@ class SimTopology:
         one direction, ensuring auto-reconnect is testable — if B goes
         down, only A (the outbound owner) will attempt to reconnect.
 
-        Ethernet edges are excluded — they use beacon discovery instead
-        of static peer configuration. UDP and TCP edges use static config.
+        Ethernet and BLE edges are excluded — they use beacon/scan discovery
+        instead of static peer configuration. UDP and TCP edges use static config.
 
         Strategy: BFS spanning tree edges go parent→child. Non-tree
         edges go from the lower node ID to the higher. This guarantees
         every node is reachable via at least one inbound connection.
         """
-        # Consider all edges that use static peer config (not Ethernet/discovery)
+        # Consider all edges that use static peer config (not Ethernet/BLE discovery)
         static_edges = {
             e for e in self.edges
-            if self.edge_transport.get(e, "udp") != "ethernet"
+            if self.edge_transport.get(e, "udp") not in ("ethernet", "ble")
         }
 
         outbound: dict[str, list[str]] = {nid: [] for nid in self.nodes}

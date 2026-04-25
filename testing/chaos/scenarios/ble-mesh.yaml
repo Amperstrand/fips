@@ -1,0 +1,55 @@
+# Mixed transport mesh: 6 nodes, UDP + BLE edges
+#
+# Tests spanning tree convergence across UDP and BLE transports.
+# BLE edges use beacon/scan discovery; UDP edges use static peer config.
+# Requires native backend for BLE nodes.
+#
+# Topology:
+#
+#   n01 ---udp--- n02 ---udp--- n03
+#    |             |              |
+#   ble           ble            udp
+#    |             |              |
+#   n04 ---ble--- n05 ---udp--- n06
+
+scenario:
+  name: "ble-mesh"
+  seed: 42
+  duration_secs: 90
+
+topology:
+  algorithm: explicit
+  num_nodes: 6
+  backend: native
+  params:
+    adjacency:
+      - [n01, n02, udp]
+      - [n02, n03, udp]
+      - [n03, n06, udp]
+      - [n05, n06, udp]
+      - [n01, n04, ble]
+      - [n02, n05, ble]
+      - [n04, n05, ble]
+
+netem:
+  enabled: true
+  default_policy:
+    delay_ms: [1, 10]
+    jitter_ms: [0, 2]
+    loss_pct: [0, 1]
+  link_policies:
+    - edges: ["n01-n04", "n02-n05", "n04-n05"]
+      policy:
+        delay_ms: [15, 40]
+        jitter_ms: [5, 15]
+        loss_pct: [2, 8]
+
+link_flaps:
+  enabled: false
+
+traffic:
+  enabled: false
+
+logging:
+  rust_log: "info"
+  output_dir: "./sim-results"

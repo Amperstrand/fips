@@ -45,14 +45,18 @@ def generate_peers_block(
     Only includes peers that this node is responsible for connecting to
     (outbound direction). The link is still bidirectional once established.
     Transport type and port are determined per-edge from the topology.
+
+    BLE and Ethernet peers are excluded — they use discovery, not static config.
     """
     if not outbound_peers:
         return "  []"
 
     lines = []
     for peer_id in sorted(outbound_peers):
-        peer = topology.nodes[peer_id]
         transport = topology.transport_for_edge(node_id, peer_id)
+        if transport in ("ethernet", "ble"):
+            continue
+        peer = topology.nodes[peer_id]
         port = _TRANSPORT_PORTS.get(transport, 2121)
         lines.append(f'  - npub: "{peer.npub}"')
         lines.append(f'    alias: "{peer_id}"')
@@ -60,7 +64,7 @@ def generate_peers_block(
         lines.append(f"      - transport: {transport}")
         lines.append(f'        addr: "{peer.docker_ip}:{port}"')
         lines.append(f"    connect_policy: auto_connect")
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "  []"
 
 
 def _build_ethernet_config(iface: str) -> dict:
@@ -102,12 +106,25 @@ def _inject_tcp_transport(parsed: dict):
     }
 
 
+def _inject_ble_transport(parsed: dict, interface: str = "hci0"):
+    """Inject BLE transport config into a parsed FIPS config."""
+    transports = parsed.setdefault("transports", {})
+    transports["ble"] = {
+        "interface": interface,
+        "discovery": True,
+        "announce": True,
+        "auto_connect": True,
+        "accept_connections": True,
+    }
+
+
 def generate_node_config(
     topology: SimTopology,
     node_id: str,
     outbound_peers: list[str],
     fips_overrides: dict | None = None,
     ephemeral: bool = False,
+    ble_interface: str = "hci0",
 ) -> str:
     """Generate a complete FIPS config YAML for one node.
 
@@ -135,10 +152,13 @@ def generate_node_config(
     # Determine which transports this node participates in
     eth_ifaces = topology.ethernet_interfaces(node_id)
     has_tcp = bool(topology.tcp_peers(node_id))
+    has_ble = bool(topology.ble_peers(node_id))
     has_udp = _has_transport_peers(topology, node_id, "udp")
 
     # Inject non-UDP transport configs and handle pure-transport nodes
-    needs_yaml_rewrite = eth_ifaces or has_tcp or not has_udp or fips_overrides
+    needs_yaml_rewrite = (
+        eth_ifaces or has_tcp or has_ble or not has_udp or fips_overrides
+    )
 
     if needs_yaml_rewrite:
         parsed = yaml.safe_load(config)
@@ -148,6 +168,8 @@ def generate_node_config(
             _inject_ethernet_transports(parsed, eth_ifaces)
         if has_tcp:
             _inject_tcp_transport(parsed)
+        if has_ble:
+            _inject_ble_transport(parsed, ble_interface)
         if not has_udp:
             # No UDP edges: remove UDP transport
             transports = parsed.get("transports", {})
@@ -181,6 +203,7 @@ def write_configs(
     output_dir: str,
     fips_overrides: dict | None = None,
     ephemeral_nodes: set[str] | None = None,
+    ble_interface: str = "hci0",
 ):
     """Write all node configs and npubs.env to the output directory."""
     os.makedirs(output_dir, exist_ok=True)
@@ -191,6 +214,7 @@ def write_configs(
         config = generate_node_config(
             topology, node_id, outbound[node_id], fips_overrides,
             ephemeral=(node_id in ephemeral_nodes),
+            ble_interface=ble_interface,
         )
         path = os.path.join(output_dir, f"{node_id}.yaml")
         with open(path, "w") as f:

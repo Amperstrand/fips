@@ -1,0 +1,63 @@
+# BLE Cost-Based Parent Selection Test
+#
+# Topology (4-node diamond):
+#
+#    n01 (root)
+#    /       \
+#   fiber    fiber
+#   /         \
+#  n02        n03
+#   \        /
+#    BLE   fiber
+#     \   /
+#      n04  (test subject)
+#
+# n04 has two candidate parents at depth 1: n02 (via BLE L2CAP)
+# and n03 (via fiber). Cost-based selection should pick n03 because:
+#   effective_depth(n02) = 1 + ~1.4 (BLE) = ~2.4
+#   effective_depth(n03) = 1 + ~1.01 (fiber) = ~2.01
+#
+# Validation: tree snapshot shows n04's parent is n03.
+
+scenario:
+  name: "ble-cost"
+  seed: 42
+  duration_secs: 60
+
+topology:
+  algorithm: explicit
+  num_nodes: 4
+  backend: native
+  params:
+    adjacency:
+      - [n01, n02, udp]
+      - [n01, n03, udp]
+      - [n02, n04, ble]
+      - [n03, n04, udp]
+
+netem:
+  enabled: true
+  default_policy:
+    delay_ms: [1, 5]
+    jitter_ms: [0, 1]
+    loss_pct: [0, 0.5]
+  link_policies:
+    - edges: ["n02-n04"]
+      policy:
+        delay_ms: [15, 40]
+        jitter_ms: [5, 15]
+        loss_pct: [2, 8]
+
+link_flaps:
+  enabled: false
+
+traffic:
+  enabled: true
+  max_concurrent: 2
+  interval_secs: {min: 15, max: 30}
+  duration_secs: {min: 5, max: 10}
+  parallel_streams: 2
+
+logging:
+  rust_log: "info"
+  output_dir: "./sim-results"

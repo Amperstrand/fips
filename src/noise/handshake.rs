@@ -862,12 +862,33 @@ impl HandshakeState {
             .remote_static
             .expect("remote static must be known after handshake");
 
-        // Initiator sends with c1, receives with c2
-        // Responder sends with c2, receives with c1
         let (send_cipher, recv_cipher) = match self.role {
             HandshakeRole::Initiator => (c1, c2),
             HandshakeRole::Responder => (c2, c1),
         };
+
+        let local_xonly = self.static_keypair.public_key().x_only_public_key().0;
+        let remote_xonly = remote_static.x_only_public_key().0;
+        let local_npub = hex::encode(local_xonly.serialize());
+        let peer_npub = hex::encode(remote_xonly.serialize());
+
+        let send_key = *send_cipher.key_bytes();
+        let recv_key = *recv_cipher.key_bytes();
+
+        match self.pattern {
+            NoisePattern::Ik => super::keylog::log_link_keys(
+                &local_npub,
+                &peer_npub,
+                &send_key,
+                &recv_key,
+            ),
+            NoisePattern::Xk => super::keylog::log_session_keys(
+                &local_npub,
+                &peer_npub,
+                &send_key,
+                &recv_key,
+            ),
+        }
 
         Ok(NoiseSession::from_handshake(
             self.role,
