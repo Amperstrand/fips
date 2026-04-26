@@ -833,7 +833,7 @@ impl Node {
                 match crate::transport::ble::io::BluerIo::new(
                     &adapter,
                     mtu,
-                    ble_config.effective_send_rate_bps(),
+                    ble_config.initial_stream_rate_bps(),
                     ble_config.send_burst_bytes(),
                 )
                 .await
@@ -871,7 +871,7 @@ impl Node {
                 match crate::transport::ble::io::BluestIo::new(
                     &adapter,
                     mtu,
-                    ble_config.send_rate_bps(),
+                    ble_config.initial_stream_rate_bps(),
                     ble_config.send_burst_bytes(),
                 )
                 .await
@@ -1071,12 +1071,23 @@ impl Node {
 
     /// Get the transport MTU for a specific transport.
     ///
-    /// When called without a specific transport context, returns the MTU
-    /// of the first operational transport, or 1280 (IPv6 minimum) as
-    /// fallback. This is used for initial TUN configuration where a
-    /// specific transport isn't yet known.
+    /// Prefers the minimum MTU across all operational links, which avoids
+    /// PMTU blackholes when BLE links (low MTU) coexist with higher-MTU
+    /// transports. Falls back to the first operational transport's MTU,
+    /// then to config, and finally to 1280 (IPv6 minimum).
     pub fn transport_mtu(&self) -> u16 {
-        // Prefer the MTU from the first operational transport
+        let min_link_mtu = self.links.values()
+            .filter(|link| link.state().is_operational())
+            .filter_map(|link| {
+                let transport = self.transports.get(&link.transport_id())?;
+                Some(transport.link_mtu(link.remote_addr()))
+            })
+            .min();
+
+        if let Some(mtu) = min_link_mtu {
+            return mtu;
+        }
+
         for handle in self.transports.values() {
             if handle.is_operational() {
                 return handle.mtu();

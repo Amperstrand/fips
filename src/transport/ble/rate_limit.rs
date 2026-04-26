@@ -123,7 +123,7 @@ const MIN_RATE_BPS: u64 = 15_000;
 /// adapter probe safely without overshooting into link-death territory.
 /// The adapter will increase from MIN up to this cap; adjust down if links
 /// still drop.
-const MAX_RATE_BPS: u64 = 80_000;
+pub const MAX_RATE_BPS: u64 = 80_000;
 
 /// On congestion: `rate *= MD_FACTOR` (0.7 = 30% reduction).
 const MD_FACTOR: f64 = 0.7;

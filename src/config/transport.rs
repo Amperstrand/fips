@@ -654,6 +654,14 @@ impl BleConfig {
         }
     }
 
+    /// Initial send rate for BLE streams, clamped to MAX_RATE_BPS.
+    ///
+    /// The rate adapter will adjust from here based on MMP SRTT feedback,
+    /// but the initial rate must not exceed what BLE can sustain.
+    pub fn initial_stream_rate_bps(&self) -> u64 {
+        self.effective_send_rate_bps().min(crate::transport::ble::rate_limit::MAX_RATE_BPS)
+    }
+
     /// Get the send burst size in bytes. Default: 2048.
     pub fn send_burst_bytes(&self) -> u32 {
         self.send_burst_bytes.unwrap_or(2048)
