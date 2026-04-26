@@ -67,7 +67,7 @@ usage() {
 }
 
 log()  { echo "[$(date -u +%H:%M:%SZ)] $*"; }
-vlog() { [ -n "$VERBOSE" ] && echo "[$(date -u +%H:%M:%SZ)] [debug] $*"; }
+vlog() { [ -n "$VERBOSE" ] && echo "[$(date -u +%H:%M:%SZ)] [debug] $*" || true; }
 warn() { echo "[$(date -u +%H:%M:%SZ)] [WARN] $*" >&2; }
 fail() { echo "[$(date -u +%H:%M:%SZ)] [FAIL] $*" >&2; exit 1; }
 
@@ -159,7 +159,7 @@ for host_check in "mac" "linux"; do
             sleep 2
         fi
     else
-        stale=$($LINUX_SSH pgrep -c fips 2>/dev/null || echo 0)
+        stale=$($LINUX_SSH "pgrep -c fips 2>/dev/null | head -1" || echo 0)
         if [ "$stale" -gt 0 ]; then
             warn "Killing $stale stale Linux FIPS processes"
             $LINUX_SSH sudo killall -9 fips 2>/dev/null || true
@@ -281,22 +281,22 @@ while [ "$(date -u +%s)" -lt "$TEST_END" ]; do
     CHECK_NUM=$((CHECK_NUM + 1))
 
     # Read macOS log
-    MAC_REKEYS=$(grep -c 'Rekey cutover complete' "$LOG_MAC" 2>/dev/null || echo 0)
-    MAC_PROMOTIONS=$(grep -c 'promoted to active' "$LOG_MAC" 2>/dev/null || echo 0)
-    MAC_ERRORS=$(grep -ciE 'panic|fatal' "$LOG_MAC" 2>/dev/null || echo 0)
-    MAC_WRITE_ERRS=$(grep -c 'Write Loop Error' "$LOG_MAC" 2>/dev/null || echo 0)
+    MAC_REKEYS=$(grep -c 'Rekey cutover complete' "$LOG_MAC" 2>/dev/null || true)
+    MAC_PROMOTIONS=$(grep -c 'promoted to active' "$LOG_MAC" 2>/dev/null || true)
+    MAC_ERRORS=$(grep -ciE 'panic|fatal' "$LOG_MAC" 2>/dev/null || true)
+    MAC_WRITE_ERRS=$(grep -c 'Write Loop Error' "$LOG_MAC" 2>/dev/null || true)
 
     # Latest MMP from macOS
-    MAC_MMP=$(grep 'MMP link metrics' "$LOG_MAC" 2>/dev/null | grep -v 'n/a.*n/a.*n/a' | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
-    MAC_LOSS=$(echo "$MAC_MMP" | grep -oE 'loss=[0-9.]+%' | head -1 | sed 's/loss=//')
-    MAC_RTT=$(echo "$MAC_MMP" | grep -oE 'rtt=[0-9.]+ms' | head -1 | sed 's/rtt=//')
-    MAC_GOODPUT=$(echo "$MAC_MMP" | grep -oE 'goodput=[0-9]+B/s' | head -1 | sed 's/goodput=//')
+    MAC_MMP=$(grep 'MMP link metrics' "$LOG_MAC" 2>/dev/null | grep -v 'n/a.*n/a.*n/a' | tail -1 | sed 's/\x1b\[[0-9;]*m//g' || true)
+    MAC_LOSS=$(echo "$MAC_MMP" | grep -oE 'loss=[0-9.]+%' | head -1 | sed 's/loss=//' || true)
+    MAC_RTT=$(echo "$MAC_MMP" | grep -oE 'rtt=[0-9.]+ms' | head -1 | sed 's/rtt=//' || true)
+    MAC_GOODPUT=$(echo "$MAC_MMP" | grep -oE 'goodput=[0-9]+B/s' | head -1 | sed 's/goodput=//' || true)
 
     # Read Linux log
     LINUX_REKEYS=$($LINUX_SSH "grep -c 'Rekey cutover complete' $LOG_LINUX" 2>/dev/null || echo "?")
-    LINUX_MMP=$($LINUX_SSH "grep 'MMP link metrics' $LOG_LINUX | grep -v 'n/a.*n/a.*n/a' | tail -1" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
-    LINUX_LOSS=$(echo "$LINUX_MMP" | grep -oE 'loss=[0-9.]+%' | head -1 | sed 's/loss=//')
-    LINUX_GOODPUT=$(echo "$LINUX_MMP" | grep -oE 'goodput=[0-9]+B/s' | head -1 | sed 's/goodput=//')
+    LINUX_MMP=$($LINUX_SSH "grep 'MMP link metrics' $LOG_LINUX | grep -v 'n/a.*n/a.*n/a' | tail -1" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)
+    LINUX_LOSS=$(echo "$LINUX_MMP" | grep -oE 'loss=[0-9.]+%' | head -1 | sed 's/loss=//' || true)
+    LINUX_GOODPUT=$(echo "$LINUX_MMP" | grep -oE 'goodput=[0-9]+B/s' | head -1 | sed 's/goodput=//' || true)
 
     # Check macOS process alive
     if ! kill -0 "$MAC_PID" 2>/dev/null; then
@@ -314,12 +314,15 @@ while [ "$(date -u +%s)" -lt "$TEST_END" ]; do
     LINUX_RSS=$($LINUX_SSH "ps -o rss= -p \$(pgrep fips)" 2>/dev/null | tr -d ' ' || echo "?")
 
     # Delta rekeys
+    MAC_REKEYS=${MAC_REKEYS:-0}
+    MAC_ERRORS=${MAC_ERRORS:-0}
+    MAC_WRITE_ERRS=${MAC_WRITE_ERRS:-0}
     DELTA_REKEYS=$((MAC_REKEYS - PREV_REKEYS))
     PREV_REKEYS=$MAC_REKEYS
 
     # Loss check
-    LOSS_NUM=$(echo "${MAC_LOSS%)}" | sed 's/%//' 2>/dev/null || echo "0")
-    if [ "$(echo "$LOSS_NUM > 5.0" | bc 2>/dev/null || echo 0)" -eq 1 ]; then
+    LOSS_NUM=$(echo "${MAC_LOSS:-0}" | sed 's/%//' 2>/dev/null || echo "0")
+    if [ "$(echo "${LOSS_NUM:-0} > 5.0" | bc 2>/dev/null || echo 0)" -eq 1 ]; then
         CONSECUTIVE_LOSS=$((CONSECUTIVE_LOSS + 1))
         warn "High loss detected: $MAC_LOSS (consecutive: $CONSECUTIVE_LOSS)"
     else
@@ -360,11 +363,11 @@ echo "Start:    $(date -u -r $TEST_START +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date
 echo "End:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 
-MAC_FINAL_REKEYS=$(grep -c 'Rekey cutover complete' "$LOG_MAC" 2>/dev/null || echo 0)
-MAC_FINAL_PROMOTIONS=$(grep -c 'promoted to active' "$LOG_MAC" 2>/dev/null || echo 0)
-MAC_FINAL_ERRORS=$(grep -ciE 'panic|fatal' "$LOG_MAC" 2>/dev/null || echo 0)
-MAC_FINAL_WRITE_ERRS=$(grep -c 'Write Loop Error' "$LOG_MAC" 2>/dev/null || echo 0)
-MAC_DISCONNECTS=$(grep -c 'Disconnect' "$LOG_MAC" 2>/dev/null || echo 0)
+MAC_FINAL_REKEYS=$(grep -c 'Rekey cutover complete' "$LOG_MAC" 2>/dev/null || true)
+MAC_FINAL_PROMOTIONS=$(grep -c 'promoted to active' "$LOG_MAC" 2>/dev/null || true)
+MAC_FINAL_ERRORS=$(grep -ciE 'panic|fatal' "$LOG_MAC" 2>/dev/null || true)
+MAC_FINAL_WRITE_ERRS=$(grep -c 'Write Loop Error' "$LOG_MAC" 2>/dev/null || true)
+MAC_DISCONNECTS=$(grep -c 'Disconnect' "$LOG_MAC" 2>/dev/null || true)
 
 LINUX_FINAL_REKEYS=$($LINUX_SSH "grep -c 'Rekey cutover complete' $LOG_LINUX" 2>/dev/null || echo "?")
 
@@ -408,6 +411,7 @@ echo ""
 
 # --- Verdict ---
 VERDICT="PASS"
+MAC_FINAL_ERRORS=${MAC_FINAL_ERRORS:-0}
 if [ "$MAC_FINAL_ERRORS" -gt 0 ]; then
     VERDICT="FAIL (panics/fatal errors)"
 elif [ "$FAILED_CHECKS" -gt 0 ]; then
@@ -458,36 +462,47 @@ if [ -n "$DO_IPERF" ]; then
     log ""
     log "=== iperf3 throughput test ==="
 
-    LINUX_IPV6=$($LINUX_SSH "ip -6 addr show fips0 scope global 2>/dev/null | grep -oP 'inet6 \K[^/]+'" 2>/dev/null || echo "")
-    if [ -z "$LINUX_IPV6" ]; then
-        warn "Cannot find Linux IPv6 on fips0, trying control socket..."
-        LINUX_IPV6=$(sudo cat /tmp/fips-control.sock 2>/dev/null | head -1 || echo "")
-    fi
+            LINUX_IPV6_RAW=$($LINUX_SSH "ip -6 addr show fips0 scope global 2>/dev/null | grep -oP 'inet6 \K[^/]+'" 2>/dev/null || echo "")
+            if [ -z "$LINUX_IPV6_RAW" ]; then
+                warn "Cannot find Linux IPv6 on fips0, trying control socket..."
+                LINUX_IPV6_RAW=$(sudo cat /tmp/fips-control.sock 2>/dev/null | head -1 || echo "")
+            fi
 
-    if [ -n "$LINUX_IPV6" ]; then
-        log "Linux IPv6: $LINUX_IPV6"
+            if [ -n "$LINUX_IPV6_RAW" ]; then
+                LINUX_IPV6=$(echo "$LINUX_IPV6_RAW" | tr -d '[:space:]')
+                log "Linux IPv6: $LINUX_IPV6"
 
-        $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 || warn "iperf3 not found on Linux"
-        command -v iperf3 >/dev/null 2>&1 || warn "iperf3 not found on macOS"
+                $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 || warn "iperf3 not found on Linux"
+                command -v iperf3 >/dev/null 2>&1 || warn "iperf3 not found on macOS"
 
-        if $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 && command -v iperf3 >/dev/null 2>&1; then
-            log "Starting iperf3 server on Linux..."
-            $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null; iperf3 -s --daemon"
+                if $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 && command -v iperf3 >/dev/null 2>&1; then
+                    log "Starting iperf3 server on Linux..."
+                    $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null; iperf3 -s --daemon"
 
-            sleep 2
+                    sleep 2
 
-            log "Running iperf3 client (10s, TCP)..."
-            iperf3 -c "$LINUX_IPV6%fips0" -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp.txt" || warn "iperf3 TCP failed"
+                    MAC_IPV6=$(ifconfig fips0 2>/dev/null | grep 'inet6 fd' | awk '{print $2}' | head -1 || true)
 
-            for rate in 100K 150K 200K; do
-                log "Running iperf3 client (10s, UDP, ${rate}bps)..."
-                iperf3 -c "$LINUX_IPV6%fips0" -t 10 -u -b "${rate}" -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-${rate}.txt" || warn "iperf3 UDP ${rate}bps failed"
-            done
+                    log "Running iperf3 client (10s, TCP)..."
+                    if [ -n "$MAC_IPV6" ]; then
+                        iperf3 -c "$LINUX_IPV6" -B "$MAC_IPV6" -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp.txt" || warn "iperf3 TCP failed"
+                    else
+                        iperf3 -c "$LINUX_IPV6" -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp.txt" || warn "iperf3 TCP failed"
+                    fi
 
-            $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null" || true
-        else
-            warn "iperf3 not available on both hosts, skipping"
-        fi
+                    for rate in 100K 150K 200K; do
+                        log "Running iperf3 client (10s, UDP, ${rate}bps)..."
+                        if [ -n "$MAC_IPV6" ]; then
+                            iperf3 -c "$LINUX_IPV6" -B "$MAC_IPV6" -t 10 -u -b "${rate}" -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-${rate}.txt" || warn "iperf3 UDP ${rate}bps failed"
+                        else
+                            iperf3 -c "$LINUX_IPV6" -t 10 -u -b "${rate}" -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-${rate}.txt" || warn "iperf3 UDP ${rate}bps failed"
+                        fi
+                    done
+
+                    $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null" || true
+                else
+                    warn "iperf3 not available on both hosts, skipping"
+                fi
     else
         warn "Could not determine Linux IPv6 address, skipping iperf3"
     fi
