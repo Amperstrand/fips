@@ -1168,7 +1168,31 @@ impl TransportHandle {
             TransportHandle::Tcp(_) => TransportCongestion::default(),
             TransportHandle::Tor(_) => TransportCongestion::default(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
-            TransportHandle::Ble(_) => TransportCongestion::default(),
+            TransportHandle::Ble(t) => t.congestion(),
+        }
+    }
+
+    /// Send data with priority (bypasses rate limiter for BLE).
+    ///
+    /// Non-BLE transports fall through to normal [`send`](Self::send).
+    pub async fn send_urgent(&self, addr: &TransportAddr, data: &[u8]) -> Result<usize, TransportError> {
+        match self {
+            #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+            TransportHandle::Ble(t) => t.send_urgent_async(addr, data).await,
+            _ => self.send(addr, data).await,
+        }
+    }
+
+    /// Feed SRTT measurement back to the transport for adaptive rate control.
+    ///
+    /// BLE uses this for AIMD rate adaptation. Other transports ignore it.
+    pub async fn update_rate_from_srtt(&self, addr: &TransportAddr, srtt_ms: f64) {
+        match self {
+            #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+            TransportHandle::Ble(t) => {
+                t.update_rate_from_srtt(addr, srtt_ms).await;
+            }
+            _ => {}
         }
     }
 

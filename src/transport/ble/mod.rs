@@ -355,6 +355,55 @@ impl<I: BleIo> BleTransport<I> {
         }
     }
 
+    /// Send data with priority, bypassing the rate limiter.
+    ///
+    /// Used for control-plane traffic (handshake, rekey) that must not be
+    /// delayed by the token bucket. Falls through to [`send_async`] for
+    /// non-rate-limited transports.
+    pub async fn send_urgent_async(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        let stream = {
+            let pool = self.pool.lock().await;
+            let conn = match pool.get(addr) {
+                Some(c) => c,
+                None => return Err(TransportError::SendFailed("not connected".into())),
+            };
+
+            let mtu = conn.effective_mtu() as usize;
+            if data.len() > mtu {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: data.len(),
+                    mtu: mtu as u16,
+                });
+            }
+
+            Arc::clone(&conn.stream)
+        };
+
+        match stream.send_urgent(data).await {
+            Ok(()) => {
+                self.stats.record_send(data.len());
+                Ok(data.len())
+            }
+            Err(e) => {
+                self.stats.record_send_error();
+                let mut pool = self.pool.lock().await;
+                pool.remove(addr);
+                drop(pool);
+                if let Some(tx) = &self.disconnect_tx {
+                    let _ = tx.try_send(TransportDisconnect {
+                        transport_id: self.transport_id,
+                        remote_addr: addr.clone(),
+                    });
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Connect to a remote BLE device inline (blocking the caller).
     #[allow(dead_code)]
     async fn connect_inline(&self, addr: &TransportAddr) -> Result<(), TransportError> {
@@ -624,6 +673,18 @@ impl<I: BleIo> BleTransport<I> {
         if let Some(conn) = pool.remove(addr) {
             debug!(addr = %addr, "BLE connection closed");
             drop(conn);
+        }
+    }
+
+    /// Query transport-local congestion indicators.
+    pub fn congestion(&self) -> super::TransportCongestion {
+        let snap = self.stats.snapshot();
+        super::TransportCongestion {
+            recv_drops: if snap.recv_errors > 0 {
+                Some(snap.recv_errors)
+            } else {
+                None
+            },
         }
     }
 

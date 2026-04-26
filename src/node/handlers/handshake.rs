@@ -72,7 +72,7 @@ impl Node {
                     let msg2_bytes = self.find_stored_msg2(existing_link_id);
                     if let Some(msg2) = msg2_bytes {
                         if let Some(transport) = self.transports.get(&packet.transport_id) {
-                            match transport.send(&packet.remote_addr, &msg2).await {
+                            match transport.send_urgent(&packet.remote_addr, &msg2).await {
                                 Ok(_) => debug!(
                                     remote_addr = %packet.remote_addr,
                                     "Resent msg2 for duplicate msg1"
@@ -273,7 +273,7 @@ impl Node {
                         let wire_msg2 =
                             build_msg2(our_new_index, header.sender_idx, &msg2_response);
                         if let Some(transport) = self.transports.get(&packet.transport_id) {
-                            match transport.send(&packet.remote_addr, &wire_msg2).await {
+                            match transport.send_urgent(&packet.remote_addr, &wire_msg2).await {
                                 Ok(_) => {
                                     debug!(
                                         peer = %self.peer_display_name(&peer_node_addr),
@@ -325,7 +325,7 @@ impl Node {
                     if let Some(msg2) = existing_peer.handshake_msg2().map(|m| m.to_vec())
                         && let Some(transport) = self.transports.get(&packet.transport_id)
                     {
-                        match transport.send(&packet.remote_addr, &msg2).await {
+                        match transport.send_urgent(&packet.remote_addr, &msg2).await {
                             Ok(_) => debug!(
                                 peer = %self.peer_display_name(&peer_node_addr),
                                 "Resent msg2 for duplicate msg1 (same epoch)"
@@ -394,7 +394,7 @@ impl Node {
         }
 
         if let Some(transport) = self.transports.get(&packet.transport_id) {
-            match transport.send(&packet.remote_addr, &wire_msg2).await {
+            match transport.send_urgent(&packet.remote_addr, &wire_msg2).await {
                 Ok(bytes) => {
                     debug!(
                         link_id = %link_id,
