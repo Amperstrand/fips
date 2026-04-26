@@ -771,7 +771,14 @@ impl PeripheralStream {
         let pacer_notify = queue_space_notify.clone();
         let pacer_remote = remote.clone();
 
-        tokio::spawn(async move {
+        let handle = {
+            static HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+            match tokio::runtime::Handle::try_current() {
+                Ok(h) => { let _ = HANDLE.set(h.clone()); h }
+                Err(_) => HANDLE.get().expect("no tokio runtime handle available").clone(),
+            }
+        };
+        handle.spawn(async move {
             while let Some(frame) = pacer_rx.recv().await {
                 pacer_limiter.lock().await.acquire(frame.len()).await;
 
