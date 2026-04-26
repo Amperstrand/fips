@@ -415,14 +415,16 @@ impl<I: BleIo> BleTransport<I> {
 
         let recv_task = tokio::spawn(receive_loop(
             Arc::clone(&stream),
-            addr.clone(),
             Arc::clone(&self.pool),
             self.packet_tx.clone(),
             self.disconnect_tx.clone(),
-            self.transport_id,
-            Arc::clone(&self.stats),
-            recv_mtu,
-            RECV_TIMEOUT_SECS,
+            ReceiveLoopArgs {
+                addr: addr.clone(),
+                transport_id: self.transport_id,
+                stats: Arc::clone(&self.stats),
+                recv_mtu,
+                recv_timeout_secs: RECV_TIMEOUT_SECS,
+            },
         ));
 
         let io = Arc::clone(&self.io);
@@ -528,14 +530,16 @@ impl<I: BleIo> BleTransport<I> {
 
                     let recv_task = tokio::spawn(receive_loop(
                         Arc::clone(&stream),
-                        addr_clone.clone(),
                         Arc::clone(&pool),
                         packet_tx.clone(),
                         disconnect_tx.clone(),
-                        transport_id,
-                        Arc::clone(&stats),
-                        recv_mtu,
-                        RECV_TIMEOUT_SECS,
+                        ReceiveLoopArgs {
+                            addr: addr_clone.clone(),
+                            transport_id,
+                            stats: Arc::clone(&stats),
+                            recv_mtu,
+                            recv_timeout_secs: RECV_TIMEOUT_SECS,
+                        },
                     ));
 
                     let drop_addr = ble_addr.clone();
@@ -877,14 +881,16 @@ async fn accept_loop<A>(
 
                 let recv_task = tokio::spawn(receive_loop(
                     Arc::clone(&stream),
-                    ta.clone(),
                     Arc::clone(&pool),
                     packet_tx.clone(),
                     disconnect_tx.clone(),
-                    transport_id,
-                    Arc::clone(&stats),
-                    recv_mtu,
-                    RECV_TIMEOUT_SECS,
+                    ReceiveLoopArgs {
+                        addr: ta.clone(),
+                        transport_id,
+                        stats: Arc::clone(&stats),
+                        recv_mtu,
+                        recv_timeout_secs: RECV_TIMEOUT_SECS,
+                    },
                 ));
 
                 let backoff_addr = addr.clone();
@@ -925,37 +931,41 @@ async fn accept_loop<A>(
     }
 }
 
+struct ReceiveLoopArgs {
+    addr: TransportAddr,
+    transport_id: TransportId,
+    stats: Arc<BleStats>,
+    recv_mtu: u16,
+    recv_timeout_secs: u64,
+}
+
 /// Receive loop: reads packets from a BLE stream and delivers to node.
 ///
 /// Each recv returns one complete FIPS packet.
 async fn receive_loop<S: BleStream>(
     stream: Arc<S>,
-    addr: TransportAddr,
     pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
     packet_tx: PacketTx,
     disconnect_tx: Option<DisconnectTx>,
-    transport_id: TransportId,
-    stats: Arc<BleStats>,
-    recv_mtu: u16,
-    recv_timeout_secs: u64,
+    args: ReceiveLoopArgs,
 ) {
-    let mut buf = vec![0u8; recv_mtu as usize];
+    let mut buf = vec![0u8; args.recv_mtu as usize];
     loop {
         let recv_result = tokio::time::timeout(
-            std::time::Duration::from_secs(recv_timeout_secs),
+            std::time::Duration::from_secs(args.recv_timeout_secs),
             stream.recv(&mut buf),
         )
         .await;
 
         match recv_result {
             Ok(Ok(0)) => {
-                debug!(addr = %addr, "BLE connection closed by peer");
+                debug!(addr = %args.addr, "BLE connection closed by peer");
                 break;
             }
             Ok(Ok(n)) => {
-                stats.record_recv(n);
+                args.stats.record_recv(n);
                 let frame_data = buf[..n].to_vec();
-                let packet = ReceivedPacket::new(transport_id, addr.clone(), frame_data);
+                let packet = ReceivedPacket::new(args.transport_id, args.addr.clone(), frame_data);
                 if packet_tx.send(packet).await.is_err() {
                     trace!("BLE packet_tx closed, stopping receive loop");
                     break;
@@ -964,16 +974,16 @@ async fn receive_loop<S: BleStream>(
             Ok(Err(e)) => {
                 let err_str = format!("{e}");
                 if err_str.contains("framed message too short") {
-                    stats.record_recv_error();
+                    args.stats.record_recv_error();
                     continue;
                 }
-                debug!(addr = %addr, error = %e, "BLE receive error");
-                stats.record_recv_error();
+                debug!(addr = %args.addr, error = %e, "BLE receive error");
+                args.stats.record_recv_error();
                 break;
             }
             Err(_) => {
-                debug!(addr = %addr, timeout_secs = recv_timeout_secs, "BLE recv timeout — link may be silently dead");
-                stats.record_recv_error();
+                debug!(addr = %args.addr, timeout_secs = args.recv_timeout_secs, "BLE recv timeout — link may be silently dead");
+                args.stats.record_recv_error();
                 break;
             }
         }
@@ -981,106 +991,13 @@ async fn receive_loop<S: BleStream>(
 
     if let Some(tx) = disconnect_tx {
         let _ = tx.try_send(TransportDisconnect {
-            transport_id,
-            remote_addr: addr.clone(),
+            transport_id: args.transport_id,
+            remote_addr: args.addr.clone(),
         });
     }
 
     let mut pool = pool.lock().await;
-    pool.remove(&addr);
-}
-
-/// macOS byte-stream receive loop — uses the FMP common header to
-/// reassemble complete packets from CoreBluetooth's L2CAP byte stream.
-///
-/// FMP prefix: `[ver+phase:1][flags:1][payload_len:2 LE]`
-/// Phase determines remaining byte count after the 4-byte prefix.
-#[cfg(target_os = "macos")]
-async fn receive_loop_fmp<S: BleStream>(
-    stream: &S,
-    addr: &TransportAddr,
-    packet_tx: &PacketTx,
-    transport_id: TransportId,
-    stats: &BleStats,
-    recv_mtu: u16,
-) {
-    const FMP_PREFIX: usize = 4;
-    const PHASE_ESTABLISHED: u8 = 0x0;
-    const PHASE_MSG1: u8 = 0x1;
-    const PHASE_MSG2: u8 = 0x2;
-    const MSG1_WIRE_SIZE: usize = 114;
-    const MSG2_WIRE_SIZE: usize = 69;
-    const ESTABLISHED_REMAINING_HEADER: usize = 12;
-    const AEAD_TAG_SIZE: usize = 16;
-
-    let mut accum: Vec<u8> = Vec::with_capacity(recv_mtu as usize);
-    let mut tmp = vec![0u8; recv_mtu as usize];
-
-    async fn fill<S: BleStream>(
-        stream: &S,
-        accum: &mut Vec<u8>,
-        need: usize,
-        tmp: &mut [u8],
-        addr: &TransportAddr,
-        stats: &BleStats,
-    ) -> bool {
-        while accum.len() < need {
-            match stream.recv(tmp).await {
-                Ok(0) => {
-                    debug!(addr = %addr, "BLE connection closed by peer");
-                    return false;
-                }
-                Ok(n) => accum.extend_from_slice(&tmp[..n]),
-                Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE receive error");
-                    stats.record_recv_error();
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    loop {
-        if !fill(stream, &mut accum, FMP_PREFIX, &mut tmp, addr, stats).await {
-            return;
-        }
-
-        let version = accum[0] >> 4;
-        let phase = accum[0] & 0x0F;
-        let payload_len = u16::from_le_bytes([accum[2], accum[3]]) as usize;
-
-        if version != 0 {
-            debug!(addr = %addr, version, "BLE FMP unknown version, dropping");
-            stats.record_recv_error();
-            return;
-        }
-
-        let total = match phase {
-            PHASE_MSG1 => MSG1_WIRE_SIZE,
-            PHASE_MSG2 => MSG2_WIRE_SIZE,
-            PHASE_ESTABLISHED => {
-                FMP_PREFIX + ESTABLISHED_REMAINING_HEADER + payload_len + AEAD_TAG_SIZE
-            }
-            _ => {
-                debug!(addr = %addr, phase, "BLE FMP unknown phase, dropping");
-                stats.record_recv_error();
-                return;
-            }
-        };
-
-        if !fill(stream, &mut accum, total, &mut tmp, addr, stats).await {
-            return;
-        }
-
-        let packet_data: Vec<u8> = accum.drain(..total).collect();
-        stats.record_recv(packet_data.len());
-        let packet = ReceivedPacket::new(transport_id, addr.clone(), packet_data);
-        if packet_tx.send(packet).await.is_err() {
-            trace!("BLE packet_tx closed, stopping receive loop");
-            return;
-        }
-    }
+    pool.remove(&args.addr);
 }
 
 /// Scanner supervisor: wraps scan_probe_loop and auto-restarts on
@@ -1313,14 +1230,16 @@ async fn scan_probe_loop<I: io::BleIo>(
 
                 let recv_task = tokio::spawn(receive_loop(
                     Arc::clone(&stream),
-                    ta.clone(),
                     Arc::clone(&pool),
                     packet_tx.clone(),
                     disconnect_tx.clone(),
-                    transport_id,
-                    Arc::clone(&stats),
-                    recv_mtu,
-                    recv_timeout_secs,
+                    ReceiveLoopArgs {
+                        addr: ta.clone(),
+                        transport_id,
+                        stats: Arc::clone(&stats),
+                        recv_mtu,
+                        recv_timeout_secs,
+                    },
                 ));
 
                 let drop_addr = addr.clone();
@@ -1524,14 +1443,16 @@ mod tests {
 
         let task = tokio::spawn(receive_loop(
             Arc::new(stream_a),
-            remote_addr.clone(),
             Arc::clone(&pool),
             packet_tx,
             Some(disconnect_tx),
-            TransportId::new(1),
-            stats,
-            2048,
-            30,
+            ReceiveLoopArgs {
+                addr: remote_addr.clone(),
+                transport_id: TransportId::new(1),
+                stats,
+                recv_mtu: 2048,
+                recv_timeout_secs: 30,
+            },
         ));
 
         drop(stream_b);

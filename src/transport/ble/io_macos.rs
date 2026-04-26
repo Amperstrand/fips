@@ -1741,6 +1741,7 @@ impl BleIo for BluestIo {
             };
 
             futures::pin_mut!(scan_stream);
+            #[allow(clippy::mutable_key_type)]
             let mut seen: HashMap<Device, [u8; 6]> = HashMap::new();
             while let Some(discovered) = scan_stream.next().await {
                 let device = discovered.device;
