@@ -183,6 +183,18 @@ node reads the PSM from GATT during discovery.
 - Symptom: intermittent corruption in Noise handshake or AEAD decryption
   failures under sustained traffic.
 
+### TCP connections (SSH, iperf3 TCP mode) fail over BLE
+
+- BLE's ~200 Kbps throughput with rate limiting (`send_rate_bps`) does not
+  reliably support TCP's retransmission and congestion control overhead.
+- **Observed**: iperf3 TCP bursts 128KB in the first second then stalls;
+  TCP control connections die after ~9 seconds, killing the BLE link.
+- **UDP and ICMPv6** (ping6, iperf3 UDP mode) work reliably at up to
+  200 Kbps with zero loss. SSH over the FIPS mesh works on UDP, Ethernet,
+  and TCP transports — just not over BLE.
+- This is a fundamental BLE bandwidth constraint, not a bug.
+- **Workaround**: Use UDP-based tools for BLE throughput testing.
+
 ### Connection keeps dropping
 
 - BLE connection interval may be too aggressive. Default is 30ms; some

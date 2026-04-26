@@ -1,0 +1,55 @@
+# BLE stability test: 2 nodes, macOS-Linux cross-platform, 20 minutes.
+#
+# Same as ble-stability but with macOS BLE adapter config ("default").
+# Requires a macOS host with built-in Bluetooth and a Linux host within
+# BLE range, both running FIPS with native backend.
+#
+# Run on macOS:
+#   ./testing/chaos/scripts/ble-test.sh ble-stability-mac --capture
+#
+# Note: This scenario assumes the macOS machine runs the sim orchestrator.
+# The second node (n02) must be reachable — for cross-machine testing,
+# use testing/ble/ble-stability-test.sh with --ssh instead.
+
+scenario:
+  name: "ble-stability-mac"
+  seed: 42
+  duration_secs: 1200
+
+topology:
+  algorithm: explicit
+  num_nodes: 2
+  backend: native
+  params:
+    adjacency:
+      - [n01, n02, ble]
+  subnet: "172.20.0.0/24"
+  ip_start: 10
+  ble_interface: "default"
+
+netem:
+  enabled: false
+
+link_flaps:
+  enabled: false
+
+traffic:
+  enabled: false
+
+logging:
+  rust_log: "debug"
+  output_dir: "./sim-results"
+
+fips_overrides:
+  node:
+    rekey:
+      after_secs: 60
+  transports:
+    ble:
+      mtu: 2048
+      advertise: true
+      scan: true
+      auto_connect: true
+      accept_connections: true
+      send_rate_bps: 200000
+      send_burst_bytes: 2048

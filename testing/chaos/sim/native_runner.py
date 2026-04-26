@@ -267,6 +267,8 @@ class NativeSimRunner:
             log.info("Stopping BLE capture...")
             self.ble_capture.stop()
 
+            self._decrypt_capture()
+
         # Stop all processes
         mgr = getattr(self, "_startup_mgr", None) or self.node_mgr
         if mgr:
@@ -274,6 +276,39 @@ class NativeSimRunner:
             mgr.stop_all()
 
         return result
+
+    def _decrypt_capture(self):
+        """Attempt post-run decryption of BLE capture using keylog files."""
+        from pathlib import Path
+
+        pcap_path = self.ble_capture.pcap_path if self.ble_capture else None
+        if not pcap_path or not os.path.exists(pcap_path):
+            log.info("No BLE capture to decrypt")
+            return
+
+        keylog_paths = sorted(
+            str(p) for p in Path(self.output_dir).glob("keys-*.log")
+        )
+        if not keylog_paths:
+            log.info("No keylog files found — skipping decryption")
+            return
+
+        log.info(
+            "Decrypting capture with %d keylog files...", len(keylog_paths)
+        )
+        try:
+            from .decrypt_capture import decrypt_capture
+            dec_result = decrypt_capture(pcap_path, keylog_paths)
+            dec_path = os.path.join(self.output_dir, "decryption-analysis.txt")
+            with open(dec_path, "w") as f:
+                f.write(dec_result.summary())
+            log.info(
+                "Decryption: %d/%d frames decrypted",
+                dec_result.decrypted_frames,
+                dec_result.total_frames,
+            )
+        except Exception:
+            log.warning("Capture decryption failed", exc_info=True)
 
     def _collect_native_logs(self) -> dict[str, str]:
         """Read per-node log files from the output directory."""

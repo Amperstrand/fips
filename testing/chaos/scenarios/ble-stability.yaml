@@ -1,0 +1,53 @@
+# BLE stability test: 2 nodes, 1 BLE edge, 20 minutes.
+#
+# Sustained connectivity validation with aggressive rekey (60s).
+# Measures MMP loss, rekey success, goodput, and memory stability
+# over a long duration. Requires BLE hardware (Linux-only scenario).
+#
+# Run:
+#   ./testing/chaos/scripts/ble-test.sh ble-stability
+#   ./testing/chaos/scripts/ble-test.sh ble-stability --duration 600  # 10 min override
+#   ./testing/chaos/scripts/ble-test.sh ble-stability --capture       # with btmon
+
+scenario:
+  name: "ble-stability"
+  seed: 42
+  duration_secs: 1200
+
+topology:
+  algorithm: explicit
+  num_nodes: 2
+  backend: native
+  params:
+    adjacency:
+      - [n01, n02, ble]
+  subnet: "172.20.0.0/24"
+  ip_start: 10
+  ble_interface: "hci0"
+
+netem:
+  enabled: false
+
+link_flaps:
+  enabled: false
+
+traffic:
+  enabled: false
+
+logging:
+  rust_log: "debug"
+  output_dir: "./sim-results"
+
+fips_overrides:
+  node:
+    rekey:
+      after_secs: 60
+  transports:
+    ble:
+      mtu: 2048
+      advertise: true
+      scan: true
+      auto_connect: true
+      accept_connections: true
+      send_rate_bps: 200000
+      send_burst_bytes: 2048

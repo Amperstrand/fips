@@ -46,7 +46,22 @@ cargo test --lib --features ble-macos
 
 See `testing/ble/README.md` for two-box BLE test setup (macOS ↔ Linux).
 
-Key config fields for BLE transport:
+### Stability test (automated)
+
+```bash
+# 20-minute default
+./testing/ble/ble-stability-test.sh
+
+# Custom duration + iperf3 throughput test
+./testing/ble/ble-stability-test.sh -d 60 --iperf
+
+# With BLE traffic capture
+./testing/ble/ble-stability-test.sh --capture -v
+```
+
+Results are saved to `testing/ble/results/<timestamp>/`.
+
+### Key config fields for BLE transport
 ```yaml
 transports:
   ble:

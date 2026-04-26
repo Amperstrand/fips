@@ -73,11 +73,16 @@ class NativeNodeManager:
         config_path = os.path.join(config_dir, f"{node_id}.yaml")
         log_path = os.path.join(self.output_dir, f"fips-{node_id}.log")
 
+        env = os.environ.copy()
+        keylog_path = os.path.join(self.output_dir, f"keys-{node_id}.log")
+        env["FIPS_NOISE_KEYLOG"] = keylog_path
+
         log_fh = open(log_path, "w")
         process = subprocess.Popen(
             [self.fips_binary, "-c", config_path],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
+            env=env,
         )
 
         state.process = process
