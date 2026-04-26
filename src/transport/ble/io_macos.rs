@@ -67,8 +67,9 @@ impl<T> Unpoison<T> for Result<T, std::sync::PoisonError<T>> {
 const BLE_CENTRAL_QUEUE_DEPTH: usize = 32;
 
 /// Timeout for enqueuing a framed message when the bounded queue is full.
-/// Matches Linux BLE send timeout; 4× safety margin over expected drain time.
-const BLE_CENTRAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Short enough to avoid stalling the Node event loop; long enough for a
+/// single frame to drain at MIN_RATE (1400B @ 15Kbps ≈ 750ms).
+const BLE_CENTRAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Bounded queue depth for peripheral-role BLE sends.
 /// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
@@ -78,8 +79,8 @@ const BLE_PERIPHERAL_QUEUE_DEPTH: usize = 32;
 const BLE_PERIPHERAL_QUEUE_BYTE_CAP: usize = 65536;
 
 /// Timeout for enqueuing when the peripheral write queue is full.
-/// 4× safety margin over expected drain time (~3.4s at 150kbps).
-const BLE_PERIPHERAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Short enough to avoid stalling the Node event loop.
+const BLE_PERIPHERAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ============================================================================
 // Dispatch helpers
@@ -180,19 +181,16 @@ impl<T: Message + 'static> Clone for RunLoopDispatched<T> {
 pub struct BluestStream {
     reader: Mutex<bluest::L2capChannelReader>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    urgent_writer: Arc<tokio::sync::Mutex<bluest::L2capChannelWriter>>,
+    rate_limiter: Arc<Mutex<SendRateLimiter>>,
     remote: BleAddr,
     mtu: u16,
     recv_buf: Mutex<Vec<u8>>,
-    rate_limiter: Option<Mutex<SendRateLimiter>>,
 }
 
 impl BleStream for BluestStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed_len = 2 + data.len();
-        if let Some(ref limiter) = self.rate_limiter {
-            limiter.lock().await.acquire(framed_len).await;
-        }
-
         let mut framed = Vec::with_capacity(framed_len);
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
@@ -217,27 +215,21 @@ impl BleStream for BluestStream {
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-        let mut framed = Vec::with_capacity(2 + data.len());
+        let framed_len = 2 + data.len();
+        let mut framed = Vec::with_capacity(framed_len);
         framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
         framed.extend_from_slice(data);
-        trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent");
+        trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent (direct L2CAP)");
 
-        match self.tx.try_send(framed) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
-                trace!(addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full (urgent), waiting with timeout");
-                tokio::time::timeout(BLE_CENTRAL_SEND_TIMEOUT, self.tx.send(framed))
-                    .await
-                    .map_err(|_| {
-                        warn!(addr = %self.remote, timeout_secs = BLE_CENTRAL_SEND_TIMEOUT.as_secs(), "BLE central send_urgent timeout (queue full)");
-                        TransportError::Timeout
-                    })?
-                    .map_err(|_| TransportError::Io(std::io::Error::other("BLE central send channel closed")))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
-                std::io::Error::other("BLE central send channel closed"),
-            )),
-        }
+        let mut writer = self.urgent_writer.lock().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer.write_all(&framed))
+            .await
+            .map_err(|_| {
+                warn!(addr = %self.remote, "BLE central send_urgent timeout");
+                TransportError::Timeout
+            })?
+            .map(|_| ())
+            .map_err(|e| TransportError::Io(std::io::Error::other(format!("send_urgent write: {e}"))))
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -285,9 +277,7 @@ impl BleStream for BluestStream {
     }
 
     async fn set_rate_bps(&self, rate_bps: u64) {
-        if let Some(ref limiter) = self.rate_limiter {
-            limiter.lock().await.set_rate_bps(rate_bps);
-        }
+        self.rate_limiter.lock().await.set_rate_bps(rate_bps);
     }
 
     fn supports_bidirectional_pubkey_exchange(&self) -> bool {
@@ -643,10 +633,11 @@ pub struct PeripheralStream {
     closer: Arc<PeripheralCloser>,
     read_notify: Arc<tokio::sync::Notify>,
     queue_space_notify: Arc<tokio::sync::Notify>,
+    pacer_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    rate_limiter: Arc<Mutex<SendRateLimiter>>,
     remote: BleAddr,
     mtu: u16,
     recv_buf: Mutex<Vec<u8>>,
-    rate_limiter: Option<Mutex<SendRateLimiter>>,
 }
 
 impl PeripheralStream {
@@ -769,6 +760,44 @@ impl PeripheralStream {
             _center_observer: output_delegate.clone(),
         });
 
+        let (pacer_tx, mut pacer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BLE_PERIPHERAL_QUEUE_DEPTH);
+
+        let rate_limiter = Arc::new(Mutex::new(SendRateLimiter::new(
+            send_rate_bps,
+            send_burst_bytes,
+        )));
+        let pacer_limiter = rate_limiter.clone();
+        let pacer_delegate = output_delegate.clone();
+        let pacer_notify = queue_space_notify.clone();
+        let pacer_remote = remote.clone();
+
+        tokio::spawn(async move {
+            while let Some(frame) = pacer_rx.recv().await {
+                pacer_limiter.lock().await.acquire(frame.len()).await;
+
+                loop {
+                    if pacer_delegate.try_enqueue(&frame) {
+                        unsafe {
+                            let name = NSString::from_str(WRITE_NOTIFY_NAME);
+                            NSNotificationCenter::defaultCenter()
+                                .postNotificationName_object(&name, None);
+                        }
+                        break;
+                    }
+                    let notified = pacer_notify.notified();
+                    trace!(addr = %pacer_remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer queue full, waiting");
+                    match tokio::time::timeout(BLE_PERIPHERAL_SEND_TIMEOUT, notified).await {
+                        Ok(()) => continue,
+                        Err(_) => {
+                            warn!(addr = %pacer_remote, "BLE peripheral pacer timeout, dropping frame");
+                            break;
+                        }
+                    }
+                }
+            }
+            debug!(addr = %pacer_remote, "BLE peripheral pacer task stopped");
+        });
+
         PeripheralStream {
             _channel: channel,
             _input_delegate: input_delegate,
@@ -776,17 +805,11 @@ impl PeripheralStream {
             closer,
             read_notify,
             queue_space_notify,
+            pacer_tx,
+            rate_limiter,
             remote,
             mtu,
             recv_buf: Mutex::new(Vec::new()),
-            rate_limiter: if send_rate_bps > 0 {
-                Some(Mutex::new(SendRateLimiter::new(
-                    send_rate_bps,
-                    send_burst_bytes,
-                )))
-            } else {
-                None
-            },
         }
     }
 
@@ -823,17 +846,27 @@ impl PeripheralStream {
 impl BleStream for PeripheralStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed_len = 2 + data.len();
-        if let Some(ref limiter) = self.rate_limiter {
-            limiter.lock().await.acquire(framed_len).await;
-        }
-        let framed = {
-            let mut f = Vec::with_capacity(framed_len);
-            f.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            f.extend_from_slice(data);
-            f
-        };
+        let mut framed = Vec::with_capacity(framed_len);
+        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        framed.extend_from_slice(data);
         trace!(len = data.len(), addr = %self.remote, "BLE peripheral send");
-        self.enqueue_with_backpressure(&framed, "send").await
+
+        match self.pacer_tx.try_send(framed) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
+                trace!(addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, waiting");
+                tokio::time::timeout(BLE_PERIPHERAL_SEND_TIMEOUT, self.pacer_tx.send(framed))
+                    .await
+                    .map_err(|_| {
+                        warn!(addr = %self.remote, timeout_secs = BLE_PERIPHERAL_SEND_TIMEOUT.as_secs(), "BLE peripheral send timeout (pacer full)");
+                        TransportError::Timeout
+                    })?
+                    .map_err(|_| TransportError::Io(std::io::Error::other("BLE peripheral pacer channel closed")))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
+                std::io::Error::other("BLE peripheral pacer channel closed"),
+            )),
+        }
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
@@ -843,7 +876,7 @@ impl BleStream for PeripheralStream {
             f.extend_from_slice(data);
             f
         };
-        trace!(len = data.len(), addr = %self.remote, "BLE peripheral send_urgent");
+        trace!(len = data.len(), addr = %self.remote, "BLE peripheral send_urgent (direct enqueue)");
         self.enqueue_with_backpressure(&framed, "send_urgent").await
     }
 
@@ -892,9 +925,7 @@ impl BleStream for PeripheralStream {
         &self.remote
     }
     async fn set_rate_bps(&self, rate_bps: u64) {
-        if let Some(ref limiter) = self.rate_limiter {
-            limiter.lock().await.set_rate_bps(rate_bps);
-        }
+        self.rate_limiter.lock().await.set_rate_bps(rate_bps);
     }
 
     fn supports_bidirectional_pubkey_exchange(&self) -> bool {
@@ -1645,14 +1676,26 @@ impl BleIo for BluestIo {
                     "L2CAP open {addr} PSM {effective_psm}: {e}"
                 )))
             })?;
-        let (reader, mut writer) = channel.split();
+        let (reader, writer) = channel.split();
         debug!(addr = %addr, psm = effective_psm, "L2CAP channel open");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BLE_CENTRAL_QUEUE_DEPTH);
+
+        let shared_writer = Arc::new(tokio::sync::Mutex::new(writer));
+        let drain_writer = shared_writer.clone();
+
+        let rate_limiter = Arc::new(Mutex::new(SendRateLimiter::new(
+            self.send_rate_bps,
+            self.send_burst_bytes,
+        )));
+        let drain_limiter = rate_limiter.clone();
+
         let drain_addr = addr.clone();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
-                if let Err(e) = writer.write(&frame).await {
+                drain_limiter.lock().await.acquire(frame.len()).await;
+                let mut writer = drain_writer.lock().await;
+                if let Err(e) = writer.write_all(&frame).await {
                     warn!(addr = %drain_addr, error = %e, "BLE central drain task write error, stopping");
                     break;
                 }
@@ -1663,17 +1706,11 @@ impl BleIo for BluestIo {
         Ok(AnyStream::Central(BluestStream {
             reader: Mutex::new(reader),
             tx,
+            urgent_writer: shared_writer,
+            rate_limiter,
             remote: addr.clone(),
             mtu: self.mtu,
             recv_buf: Mutex::new(Vec::new()),
-            rate_limiter: if self.send_rate_bps > 0 {
-                Some(Mutex::new(SendRateLimiter::new(
-                    self.send_rate_bps,
-                    self.send_burst_bytes,
-                )))
-            } else {
-                None
-            },
         }))
     }
 

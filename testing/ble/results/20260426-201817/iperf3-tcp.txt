@@ -1,0 +1,18 @@
+Connecting to host fd47:2b8d:16e3:74e8:8e26:cd17:4270:e9dc, port 5201
+[  5] local fd96:ecab:194d:719d:6af0:93be:3307:8d99 port 58904 connected to fd47:2b8d:16e3:74e8:8e26:cd17:4270:e9dc port 5201
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec                  
+[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   5.00-6.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   6.00-7.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   8.00-9.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   9.00-10.00  sec  0.00 Bytes  0.00 bits/sec                  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-10.00  sec   128 KBytes   105 Kbits/sec                  sender
+[  5]   0.00-10.00  sec  0.00 Bytes  0.00 bits/sec                  receiver
+iperf3: error - control socket has closed unexpectedly

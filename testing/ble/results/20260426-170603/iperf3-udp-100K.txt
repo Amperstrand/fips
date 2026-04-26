@@ -1,0 +1,4 @@
+iperf3: parameter error - `<ip>%<dev>` is not supported as system does not support bind to device
+
+Usage: iperf3 [-s|-c host] [options]
+Try `iperf3 --help' for more information.
