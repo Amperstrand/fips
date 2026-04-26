@@ -52,6 +52,12 @@ const MACOS_ADAPTER_NAME: &str = "default";
 
 const WRITE_NOTIFY_NAME: &str = "FIPSPeripheralWrite";
 
+static TOKIO_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+fn tokio_handle() -> &'static tokio::runtime::Handle {
+    TOKIO_HANDLE.get().expect("tokio runtime handle not initialized")
+}
+
 trait Unpoison<T> {
     fn unpoison(self) -> T;
 }
@@ -771,14 +777,7 @@ impl PeripheralStream {
         let pacer_notify = queue_space_notify.clone();
         let pacer_remote = remote.clone();
 
-        let handle = {
-            static HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
-            match tokio::runtime::Handle::try_current() {
-                Ok(h) => { let _ = HANDLE.set(h.clone()); h }
-                Err(_) => HANDLE.get().expect("no tokio runtime handle available").clone(),
-            }
-        };
-        handle.spawn(async move {
+        tokio_handle().spawn(async move {
             while let Some(frame) = pacer_rx.recv().await {
                 pacer_limiter.lock().await.acquire(frame.len()).await;
 
@@ -1205,6 +1204,7 @@ impl BluestIo {
             .await
             .map_err(|e| TransportError::StartFailed(format!("Bluetooth not available: {e}")))?;
         debug!("CoreBluetooth adapter ready");
+        let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
         Ok(Self {
             adapter,
