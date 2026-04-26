@@ -128,14 +128,28 @@ The most common setup is a Mac and a Linux box within BLE range:
 
 For the `ble-smoke` scenario (2 nodes):
 
-| Metric | Expected |
+| Metric | Observed |
 | ------ | -------- |
-| Connection setup | 2–5 seconds (scan + connect + Noise IK) |
-| L2CAP connect | ~0.5–1 second |
-| Noise handshake | ~0.5–1 second (2 round trips) |
+| BLE scan to discovery | ~200–500ms |
+| GATT PSM read | ~286ms |
+| L2CAP channel open | ~29ms |
+| Noise handshake | ~50ms |
+| **Total connect** | **~2300ms** |
+| MTU | 2048/2048 (both directions) |
 | Spanning tree convergence | < 5 seconds total |
-| RTT (ping6) | 15–80ms depending on connection interval |
 | Throughput | 50–250 Kbps (limited by BLE link) |
+
+### Hardware-validated setup
+
+| Box | Role | Adapter | MAC |
+| --- | ---- | -------- | --- |
+| macOS (arm64) | Central + Peripheral | Built-in (`default`) | — |
+| Linux 218 | Central + Peripheral | `hci0` | `14:5A:FC:49:C2:24` |
+
+BLE PSM: dynamic (GATT-advertised by macOS via UUID `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c`).
+The default PSM in FIPS config is `0x0085` (133), but macOS CoreBluetooth
+allocates the actual PSM dynamically and publishes it via GATT. The Linux
+node reads the PSM from GATT during discovery.
 
 ## Troubleshooting
 
@@ -148,9 +162,26 @@ For the `ble-smoke` scenario (2 nodes):
 ### "L2CAP connect failed"
 
 - Linux: Ensure `bluetoothd` is running (`sudo systemctl status bluetooth`).
-- Check PSM 0x0085 is not in use: `sudo sdptool browse local`.
+- Check PSM 0x00C0 (192) is not in use: `sudo sdptool browse local`.
 - BLE devices must be paired or have BLE enabled (different from classic
   Bluetooth pairing).
+
+### macOS central role receives no data
+
+- This was a bluest bug: L2CAP `NSInputStream` was scheduled on
+  `mainRunLoop()` which is never pumped in CLI/tokio apps.
+- **Fixed** in our bluest fork (Amperstrand/bluest#3).
+- If using upstream bluest (not our fork), the peripheral path works
+  (uses its own dispatch queue) but the central path cannot receive.
+- The fork is pinned in `Cargo.toml` via `rev = "f3c8d09"`.
+
+### macOS L2CAP sends silently lose bytes
+
+- This was a bluest bug: `OutputStreamDelegate::send_packet` discarded
+  bytes on partial `NSOutputStream.write(maxLength:)`.
+- **Fixed** in our bluest fork (Amperstrand/bluest#2).
+- Symptom: intermittent corruption in Noise handshake or AEAD decryption
+  failures under sustained traffic.
 
 ### Connection keeps dropping
 

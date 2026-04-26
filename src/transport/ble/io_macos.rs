@@ -52,6 +52,16 @@ const MACOS_ADAPTER_NAME: &str = "default";
 
 const WRITE_NOTIFY_NAME: &str = "FIPSPeripheralWrite";
 
+trait Unpoison<T> {
+    fn unpoison(self) -> T;
+}
+
+impl<T> Unpoison<T> for Result<T, std::sync::PoisonError<T>> {
+    fn unpoison(self) -> T {
+        self.unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Bounded queue depth for central-role BLE sends.
 /// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
 const BLE_CENTRAL_QUEUE_DEPTH: usize = 32;
@@ -1402,7 +1412,7 @@ impl BleIo for BluestIo {
     type Scanner = BluestScanner;
 
     async fn listen(&self, _psm: u16) -> Result<BluestAcceptor, TransportError> {
-        if self.peripheral_manager.lock().unwrap().is_some() {
+        if self.peripheral_manager.lock().unpoison().is_some() {
             let (_, inbound_rx) = tokio::sync::mpsc::channel(8);
             return Ok(BluestAcceptor {
                 rx: tokio::sync::Mutex::new(inbound_rx),
@@ -1432,9 +1442,9 @@ impl BleIo for BluestIo {
             };
             let mgr = unsafe { Dispatched::new(mgr) };
 
-            *self.peripheral_manager.lock().unwrap() = Some(mgr.clone());
-            *self.peripheral_delegate.lock().unwrap() = Some(SendableDelegate(delegate));
-            *self.inbound_tx.lock().unwrap() = Some(inbound_tx.clone());
+            *self.peripheral_manager.lock().unpoison() = Some(mgr.clone());
+            *self.peripheral_delegate.lock().unpoison() = Some(SendableDelegate(delegate));
+            *self.inbound_tx.lock().unpoison() = Some(inbound_tx.clone());
             mgr
         };
 
@@ -1478,7 +1488,7 @@ impl BleIo for BluestIo {
         }
 
         if *self.was_powered_off.lock().await {
-            let advertising_enabled = *self.advertising_enabled.lock().unwrap();
+            let advertising_enabled = *self.advertising_enabled.lock().unpoison();
             Self::recover_peripheral_manager(&manager, &self.event_rx, advertising_enabled).await?;
             *self.was_powered_off.lock().await = false;
         }
@@ -1545,7 +1555,7 @@ impl BleIo for BluestIo {
         let delegate_arc = self.peripheral_delegate.clone();
         let manager_for_bridge = manager.clone();
         let was_powered_off = Arc::clone(&self.was_powered_off);
-        let advertising_enabled = *self.advertising_enabled.lock().unwrap();
+        let advertising_enabled = *self.advertising_enabled.lock().unpoison();
         tokio::spawn(async move {
             loop {
                 let event = {
@@ -1577,9 +1587,9 @@ impl BleIo for BluestIo {
                     }
                     Some(PeripheralManagerEvent::L2CAPChannelOpened) => {
                         let streams: Vec<SendablePeripheralStream> = {
-                            let guard = delegate_arc.lock().unwrap();
+                            let guard = delegate_arc.lock().unpoison();
                             let Some(d) = guard.as_ref() else { return };
-                            let mut pending = d.0.ivars().pending_streams.lock().unwrap();
+                            let mut pending = d.0.ivars().pending_streams.lock().unpoison();
                             std::mem::take(&mut *pending)
                         };
                         for stream in streams {
@@ -1668,8 +1678,8 @@ impl BleIo for BluestIo {
     }
 
     async fn start_advertising(&self) -> Result<(), TransportError> {
-        *self.advertising_enabled.lock().unwrap() = true;
-        let guard = self.peripheral_manager.lock().unwrap();
+        *self.advertising_enabled.lock().unpoison() = true;
+        let guard = self.peripheral_manager.lock().unpoison();
         let manager = match guard.as_ref() {
             Some(m) => m.clone(),
             None => {
@@ -1695,8 +1705,8 @@ impl BleIo for BluestIo {
     }
 
     async fn stop_advertising(&self) -> Result<(), TransportError> {
-        *self.advertising_enabled.lock().unwrap() = false;
-        let guard = self.peripheral_manager.lock().unwrap();
+        *self.advertising_enabled.lock().unpoison() = false;
+        let guard = self.peripheral_manager.lock().unpoison();
         if let Some(manager) = guard.as_ref() {
             manager.dispatch(|m: &CBPeripheralManager| unsafe {
                 m.stopAdvertising();
