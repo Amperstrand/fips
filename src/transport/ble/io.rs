@@ -233,7 +233,7 @@ mod bluer_impl {
     // ----------------------------------------------------------------
 
     pub struct BluerStream {
-        conn: tokio::sync::Mutex<SeqPacket>,
+        conn: Arc<tokio::sync::Mutex<SeqPacket>>,
         tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         rate_limiter: Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
         remote: BleAddr,
@@ -279,7 +279,7 @@ mod bluer_impl {
                     drain_limiter.lock().await.acquire(frame.len()).await;
                     let conn = drain_conn.lock().await;
                     match tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&frame)).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(_)) => {}
                         Ok(Err(e)) => {
                             warn!(addr = %drain_remote, error = %e, "BLE Linux drain task write error, stopping");
                             break;
