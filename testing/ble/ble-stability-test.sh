@@ -479,8 +479,10 @@ if [ -n "$DO_IPERF" ]; then
             log "Running iperf3 client (10s, TCP)..."
             iperf3 -c "$LINUX_IPV6%fips0" -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp.txt" || warn "iperf3 TCP failed"
 
-            log "Running iperf3 client (10s, UDP, 200Kbps)..."
-            iperf3 -c "$LINUX_IPV6%fips0" -t 10 -u -b 200K -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp.txt" || warn "iperf3 UDP failed"
+            for rate in 100K 150K 200K; do
+                log "Running iperf3 client (10s, UDP, ${rate}bps)..."
+                iperf3 -c "$LINUX_IPV6%fips0" -t 10 -u -b "${rate}" -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-${rate}.txt" || warn "iperf3 UDP ${rate}bps failed"
+            done
 
             $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null" || true
         else

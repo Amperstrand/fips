@@ -1111,8 +1111,11 @@ impl MockBleStream {
 
 impl BleStream for MockBleStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+        let len = data.len() as u16;
+        let mut framed = len.to_be_bytes().to_vec();
+        framed.extend_from_slice(data);
         self.tx
-            .send(data.to_vec())
+            .send(framed)
             .await
             .map_err(|_| TransportError::SendFailed("channel closed".into()))
     }

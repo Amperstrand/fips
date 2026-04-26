@@ -276,18 +276,23 @@ impl TunWriter {
     /// to the TUN device. Returns when the channel is closed (all senders dropped).
     #[cfg_attr(target_os = "macos", allow(unused_mut))]
     pub fn run(mut self) {
-        use super::tcp_mss::clamp_tcp_mss;
+        use super::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
         debug!(name = %self.name, max_mss = self.max_mss.load(Ordering::Relaxed), "TUN writer starting");
 
         for mut packet in self.rx {
-            // Clamp TCP MSS on inbound SYN-ACK packets
             let mss = self.max_mss.load(Ordering::Relaxed);
             if clamp_tcp_mss(&mut packet, mss) {
                 trace!(
                     name = %self.name,
                     max_mss = mss,
                     "Clamped TCP MSS in inbound SYN-ACK packet"
+                );
+            }
+            if clamp_tcp_window(&mut packet) {
+                trace!(
+                    name = %self.name,
+                    "Clamped TCP receive window on constrained link"
                 );
             }
 
@@ -512,7 +517,7 @@ fn handle_tun_packet(
     outbound_tx: &TunOutboundTx,
 ) -> bool {
     use super::icmp::{DestUnreachableCode, build_dest_unreachable, should_send_icmp_error};
-    use super::tcp_mss::clamp_tcp_mss;
+    use super::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
     log_ipv6_packet(packet);
 
@@ -526,6 +531,9 @@ fn handle_tun_packet(
         let mss = max_mss.load(Ordering::Relaxed);
         if clamp_tcp_mss(packet, mss) {
             trace!(name = %name, max_mss = mss, "Clamped TCP MSS in SYN packet");
+        }
+        if clamp_tcp_window(packet) {
+            trace!(name = %name, "Clamped TCP receive window on constrained link");
         }
         if outbound_tx.blocking_send(packet.to_vec()).is_err() {
             return false; // Channel closed, shutdown
@@ -799,18 +807,23 @@ mod windows_tun {
         /// Blocks forever, reading packets from the channel and writing them
         /// to the wintun session. Returns when the channel is closed.
         pub fn run(self) {
-            use crate::upper::tcp_mss::clamp_tcp_mss;
+            use crate::upper::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
             debug!(name = %self.name, max_mss = self.max_mss.load(Ordering::Relaxed), "TUN writer starting");
 
             for mut packet in self.rx {
-                // Clamp TCP MSS on inbound SYN-ACK packets
                 let mss = self.max_mss.load(Ordering::Relaxed);
                 if clamp_tcp_mss(&mut packet, mss) {
                     trace!(
                         name = %self.name,
                         max_mss = mss,
                         "Clamped TCP MSS in inbound SYN-ACK packet"
+                    );
+                }
+                if clamp_tcp_window(&mut packet) {
+                    trace!(
+                        name = %self.name,
+                        "Clamped TCP receive window on constrained link"
                     );
                 }
 
