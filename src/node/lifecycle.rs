@@ -8,7 +8,7 @@ use crate::protocol::{Disconnect, DisconnectReason};
 use crate::transport::{
     Link, LinkDirection, LinkId, TransportAddr, TransportId, disconnect_channel, packet_channel,
 };
-use crate::upper::tun::{TunDevice, TunPacer, TunState, run_tun_reader, shutdown_tun_interface};
+use crate::upper::tun::{TunDevice, TunPacer, TunShaping, TunState, run_tun_reader, shutdown_tun_interface};
 use crate::{NodeAddr, PeerIdentity};
 use std::thread;
 use std::time::Duration;
@@ -656,10 +656,20 @@ impl Node {
 
                     let tun_pacer = self.config.transports.ble.iter().next().map(
                         |(_, ble_config)| {
-                            std::sync::Arc::new(TunPacer::new(
-                                ble_config.initial_stream_rate_bps(),
-                                ble_config.send_burst_bytes(),
-                            ))
+                            let rate = ble_config.initial_stream_rate_bps();
+                            let burst = ble_config.send_burst_bytes();
+                            let pacer = std::sync::Arc::new(TunPacer::new(rate, burst));
+
+                            // Apply kernel-level traffic shaping to complement the
+                            // userspace pacer. On Linux: tc qdisc tbf. On macOS: sysctl
+                            // TCP send buffer reduction.
+                            let shaping = TunShaping { rate_bps: rate, burst_bytes: burst };
+                            let if_name = name.to_string();
+                            tokio::spawn(async move {
+                                crate::upper::tun::platform::configure_traffic_shaping(&if_name, &shaping).await;
+                            });
+
+                            pacer
                         },
                     );
 
