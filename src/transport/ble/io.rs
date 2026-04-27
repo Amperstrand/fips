@@ -7,6 +7,7 @@
 use crate::transport::TransportError;
 
 use super::addr::BleAddr;
+use crate::transport::ble::Unpoison;
 
 // ============================================================================
 // BLE I/O Traits
@@ -1252,7 +1253,7 @@ impl MockBleIo {
     where
         F: Fn(&BleAddr, u16) -> Result<MockBleStream, TransportError> + Send + Sync + 'static,
     {
-        *self.connect_handler.lock().unwrap() = Some(Box::new(handler));
+        *self.connect_handler.lock().unpoison() = Some(Box::new(handler));
     }
 }
 
@@ -1265,14 +1266,14 @@ impl BleIo for MockBleIo {
         let rx = self
             .accept_rx
             .lock()
-            .unwrap()
+            .unpoison()
             .take()
             .ok_or_else(|| TransportError::NotSupported("acceptor already taken".into()))?;
         Ok(MockBleAcceptor { rx })
     }
 
     async fn connect(&self, addr: &BleAddr, psm: u16) -> Result<Self::Stream, TransportError> {
-        let handler = self.connect_handler.lock().unwrap();
+        let handler = self.connect_handler.lock().unpoison();
         match handler.as_ref() {
             Some(f) => f(addr, psm),
             None => Err(TransportError::ConnectionRefused),
@@ -1293,7 +1294,7 @@ impl BleIo for MockBleIo {
         let rx = self
             .scan_rx
             .lock()
-            .unwrap()
+            .unpoison()
             .take()
             .ok_or_else(|| TransportError::NotSupported("scanner already taken".into()))?;
         Ok(MockBleScanner { rx })

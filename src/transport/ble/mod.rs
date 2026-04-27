@@ -27,6 +27,16 @@ pub mod pool;
 pub mod rate_limit;
 pub mod stats;
 
+trait Unpoison<T> {
+    fn unpoison(self) -> T;
+}
+
+impl<T> Unpoison<T> for Result<T, std::sync::PoisonError<T>> {
+    fn unpoison(self) -> T {
+        self.unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 use super::{
     ConnectionState, DisconnectTx, DiscoveredPeer, PacketTx, ReceivedPacket, Transport,
     TransportAddr, TransportDisconnect, TransportError, TransportId, TransportState, TransportType,

@@ -58,15 +58,7 @@ fn tokio_handle() -> &'static tokio::runtime::Handle {
     TOKIO_HANDLE.get().expect("tokio runtime handle not initialized")
 }
 
-trait Unpoison<T> {
-    fn unpoison(self) -> T;
-}
-
-impl<T> Unpoison<T> for Result<T, std::sync::PoisonError<T>> {
-    fn unpoison(self) -> T {
-        self.unwrap_or_else(|e| e.into_inner())
-    }
-}
+use crate::transport::ble::Unpoison;
 
 /// Bounded queue depth for central-role BLE sends.
 /// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
