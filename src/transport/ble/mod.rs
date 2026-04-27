@@ -364,6 +364,8 @@ impl<I: BleIo> BleTransport<I> {
                 self.stats.record_send_error();
                 if matches!(e, TransportError::SendFailed(_)) {
                     self.congested.store(true, Ordering::Relaxed);
+                    debug!(addr = %addr, "BLE send dropped (congested), packet discarded");
+                    return Err(e);
                 }
                 drop(pool);
                 let mut pool = self.pool.lock().await;
@@ -415,6 +417,10 @@ impl<I: BleIo> BleTransport<I> {
             }
             Err(e) => {
                 self.stats.record_send_error();
+                if matches!(e, TransportError::SendFailed(_)) {
+                    debug!(addr = %addr, "BLE urgent send dropped (congested)");
+                    return Err(e);
+                }
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 drop(pool);

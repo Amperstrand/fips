@@ -31,15 +31,17 @@ const TCP_FLAG_SYN: u8 = 0x02;
 
 /// Maximum TCP receive window for constrained BLE links.
 ///
-/// BDP at 80 Kbps (AIMD ceiling) × 200ms RTT = 2000 bytes; with 400ms
-/// RTT the BDP reaches 4000 bytes. Setting this to 4× BDP ensures the
-/// rate limiter (not the TCP window) is always the throughput bottleneck.
-/// With scale=0, the field directly represents bytes (no shift).
+/// At 80 Kbps BLE capacity and 100ms RTT, the BDP is 1000 bytes.
+/// 2 MSS (2920 bytes) provides ~3× BDP headroom so the rate limiter
+/// (not the TCP window) is the throughput bottleneck at typical RTTs,
+/// while keeping bursts small enough that the BLE mpsc(32) queue drains
+/// before filling. With scale=0, the field directly represents bytes.
 ///
-/// Previous value of 1500 was below the BDP at the AIMD ceiling, causing
-/// TCP to be the bottleneck and producing pathological burst-stall
-/// behavior: 128KB bursts followed by 20-43 second gaps.
-const MAX_BLE_TCP_WINDOW: u16 = 8192;
+/// Previous 8192 (4× BDP at 200ms RTT) allowed 128KB/s bursts at low
+/// RTT, overwhelming the BLE queue in <1s and triggering RTO storms.
+/// The 2920 value allows ~29 KB/s at 100ms RTT — the queue fills in
+/// ~3s instead of ~0.6s, giving TCP congestion control time to react.
+const MAX_BLE_TCP_WINDOW: u16 = 2920;
 
 /// Check if a TCP packet is a SYN packet (has SYN flag set).
 fn is_tcp_syn(tcp_header: &[u8]) -> bool {
