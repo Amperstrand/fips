@@ -1,0 +1,126 @@
+[2m2026-04-27T07:50:59.942242Z[0m [32m INFO[0m [2mfips[0m[2m:[0m FIPS 0.3.0-dev (rev cb299a6396-dirty) starting
+[2m2026-04-27T07:50:59.942372Z[0m [32m INFO[0m [2mfips[0m[2m:[0m Loaded config file [3mpath[0m[2m=[0m/tmp/fips-stability-sdeLpx/node-macos.yaml
+[2m2026-04-27T07:50:59.943554Z[0m [32m INFO[0m [2mfips[0m[2m:[0m Generated persistent identity, saved to key file [3mpath[0m[2m=[0m/tmp/fips-stability-sdeLpx/fips.key
+[2m2026-04-27T07:50:59.943586Z[0m [34mDEBUG[0m [2mfips[0m[2m:[0m Creating node
+[2m2026-04-27T07:50:59.944078Z[0m [34mDEBUG[0m [2mfips::upper::hosts[0m[2m:[0m No hosts file found, skipping [3mpath[0m[2m=[0m/etc/fips/hosts
+[2m2026-04-27T07:50:59.944154Z[0m [34mDEBUG[0m [2mfips::upper::hosts[0m[2m:[0m No hosts file found, skipping [3mpath[0m[2m=[0m/etc/fips/hosts
+[2m2026-04-27T07:50:59.944191Z[0m [34mDEBUG[0m [2mfips::node::acl[0m[2m:[0m No ACL file found, skipping [3mpath[0m[2m=[0m/etc/fips/peers.allow
+[2m2026-04-27T07:50:59.944220Z[0m [34mDEBUG[0m [2mfips::node::acl[0m[2m:[0m No ACL file found, skipping [3mpath[0m[2m=[0m/etc/fips/peers.deny
+[2m2026-04-27T07:50:59.944274Z[0m [32m INFO[0m [2mfips[0m[2m:[0m Node created:
+[2m2026-04-27T07:50:59.944305Z[0m [32m INFO[0m [2mfips[0m[2m:[0m       npub: npub1ml2sa448gwc9hl68a9fpmeuf4srekz30c7g38jts54mfas6dahqsycfeq8
+[2m2026-04-27T07:50:59.944328Z[0m [32m INFO[0m [2mfips[0m[2m:[0m    node_addr: 8943b20119db89a3c6f1db4d9a472afa
+[2m2026-04-27T07:50:59.944347Z[0m [32m INFO[0m [2mfips[0m[2m:[0m    address: fd89:43b2:119:db89:a3c6:f1db:4d9a:472a
+[2m2026-04-27T07:50:59.944373Z[0m [32m INFO[0m [2mfips[0m[2m:[0m      state: created
+[2m2026-04-27T07:50:59.944396Z[0m [32m INFO[0m [2mfips[0m[2m:[0m  leaf_only: false
+[2m2026-04-27T07:50:59.975511Z[0m [32m INFO[0m [2mbluest::corebluetooth::adapter[0m[2m:[0m Bluetooth authorization is allowed
+[2m2026-04-27T07:51:00.049827Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::adapter[0m[2m:[0m Central state is now CBManagerState(5)
+[2m2026-04-27T07:51:00.049916Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m CoreBluetooth adapter ready
+[2m2026-04-27T07:51:00.114433Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m Peripheral manager state changed: CBManagerState(5)
+[2m2026-04-27T07:51:00.114558Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m Peripheral manager powered on
+[2m2026-04-27T07:51:00.115732Z[0m [32m INFO[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m L2CAP channel published with PSM: 192
+[2m2026-04-27T07:51:00.115804Z[0m [32m INFO[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m L2CAP published with PSM 192
+[2m2026-04-27T07:51:00.120178Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m GATT service added
+[2m2026-04-27T07:51:00.120317Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m BLE listen: macOS peripheral acceptor ready
+[2m2026-04-27T07:51:00.120370Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE accept loop started [3madapter[0m[2m=[0mdefault [3mpsm[0m[2m=[0m133
+[2m2026-04-27T07:51:00.120482Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m BLE advertising: started
+[2m2026-04-27T07:51:00.120502Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE advertising started (continuous) [3madapter[0m[2m=[0mdefault
+[2m2026-04-27T07:51:00.120538Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE scan+probe supervisor started [3madapter[0m[2m=[0mdefault
+[2m2026-04-27T07:51:00.120553Z[0m [32m INFO[0m [2mfips::transport::ble[0m[2m:[0m BLE transport started [3madapter[0m[2m=[0mdefault [3mpsm[0m[2m=[0m133
+[2m2026-04-27T07:51:00.120575Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m Transports initialized [3mcount[0m[2m=[0m1
+[2m2026-04-27T07:51:00.120591Z[0m [34mDEBUG[0m [2mfips::node::lifecycle[0m[2m:[0m No static peers configured
+[2m2026-04-27T07:51:00.120768Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m Advertising started
+[2m2026-04-27T07:51:00.186016Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m TUN device active:
+[2m2026-04-27T07:51:00.186057Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m      name: utun4
+[2m2026-04-27T07:51:00.186071Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m   address: fd89:43b2:119:db89:a3c6:f1db:4d9a:472a
+[2m2026-04-27T07:51:00.186083Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m       mtu: 1280
+[2m2026-04-27T07:51:00.186099Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m effective MTU: 1969 bytes
+[2m2026-04-27T07:51:00.186111Z[0m [34mDEBUG[0m [2mfips::node::lifecycle[0m[2m:[0m    max TCP MSS: 1909 bytes
+[2m2026-04-27T07:51:00.186202Z[0m [34mDEBUG[0m [2mfips::upper::tun[0m[2m:[0m TUN writer starting [3mname[0m[2m=[0mutun4 [3mmax_mss[0m[2m=[0m1909
+[2m2026-04-27T07:51:00.186260Z[0m [34mDEBUG[0m [2mfips::upper::hosts[0m[2m:[0m No hosts file found, skipping [3mpath[0m[2m=[0m/etc/fips/hosts
+[2m2026-04-27T07:51:00.186390Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m DNS responder started for .fips domain (auto-reload enabled) [3mbind[0m[2m=[0m127.0.0.1:5354 [3mhosts[0m[2m=[0m0 [3mmesh_ifindex[0m[2m=[0mNone
+[2m2026-04-27T07:51:00.186416Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m Node started:
+[2m2026-04-27T07:51:00.186427Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m        state: running
+[2m2026-04-27T07:51:00.186437Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m   transports: 1
+[2m2026-04-27T07:51:00.186447Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m  connections: 0
+[2m2026-04-27T07:51:00.186461Z[0m [32m INFO[0m [2mfips[0m[2m:[0m FIPS running
+[2m2026-04-27T07:51:00.186488Z[0m [32m INFO[0m [2mfips::node::handlers::rx_loop[0m[2m:[0m RX event loop started
+[2m2026-04-27T07:51:00.189183Z[0m [34mDEBUG[0m [2mfips::control::unix_impl[0m[2m:[0m 'fips' group not found, skipping chown for /tmp/fips-control.sock
+[2m2026-04-27T07:51:00.189760Z[0m [34mDEBUG[0m [2mfips::control::unix_impl[0m[2m:[0m 'fips' group not found, skipping chown for /tmp
+[2m2026-04-27T07:51:00.189798Z[0m [32m INFO[0m [2mfips::control::unix_impl[0m[2m:[0m Control socket listening [3mpath[0m[2m=[0m/tmp/fips-control.sock
+[2m2026-04-27T07:51:31.765103Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::delegates[0m[2m:[0m CentralDelegate received Discovered { peripheral: Dispatched(UnsafeCell { .. }), rssi: -63 }
+[2m2026-04-27T07:51:31.765255Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::delegates[0m[2m:[0m CentralDelegate received Discovered { peripheral: Dispatched(UnsafeCell { .. }), rssi: -66 }
+[2m2026-04-27T07:51:31.765436Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m Discovered FIPS BLE device [3mname[0m[2m=[0m"unknown" [3maddr[0m[2m=[0m"B7:E8:F3:3F:D2:BB"
+[2m2026-04-27T07:51:31.765506Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::adapter[0m[2m:[0m Connecting to Device(Device(Dispatched(UnsafeCell { .. })))
+[2m2026-04-27T07:51:35.683812Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::delegates[0m[2m:[0m CentralDelegate received Discovered { peripheral: Dispatched(UnsafeCell { .. }), rssi: -62 }
+[2m2026-04-27T07:51:35.771326Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::delegates[0m[2m:[0m CentralDelegate received Connect { peripheral: Dispatched(UnsafeCell { .. }) }
+[2m2026-04-27T07:51:35.771472Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m GATT PSM discovery: enumerating services [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:36.155403Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m GATT PSM discovery: enumerated services [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mcount[0m[2m=[0m1
+[2m2026-04-27T07:51:36.155546Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m BLE connect: GATT PSM discovery unavailable, using configured PSM [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mconfigured_psm[0m[2m=[0m133 [3merror[0m[2m=[0mio error: discover_gatt_psm: FIPS GATT PSM service not found on default/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:36.155673Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m Opening L2CAP channel [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mpsm[0m[2m=[0m133
+[2m2026-04-27T07:51:36.155700Z[0m [32m INFO[0m [2mbluest::corebluetooth::device[0m[2m:[0m starting open_l2cap_channel on 133
+[2m2026-04-27T07:51:36.222067Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::device[0m[2m:[0m open_l2cap_channel success Dispatched(UnsafeCell { .. })
+[2m2026-04-27T07:51:36.223460Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::l2cap_channel[0m[2m:[0m ble_runloop: ready after 1ms
+[2m2026-04-27T07:51:36.225207Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m L2CAP channel open [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mpsm[0m[2m=[0m133
+[2m2026-04-27T07:51:36.476481Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE probe complete [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:36.476534Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE probe tie-breaker: yielding to peer's outbound [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:36.476692Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::l2cap_channel[0m[2m:[0m Write Loop Error: Stream write failed
+[2m2026-04-27T07:51:36.476739Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m BLE central drain task stopped [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:37.188636Z[0m [32m INFO[0m [2mfips::node::lifecycle[0m[2m:[0m Auto-connecting to discovered peer [3mpeer[0m[2m=[0m4db19d96... [3mtransport_id[0m[2m=[0mtransport:1 [3mremote_addr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:37.188757Z[0m [34mDEBUG[0m [2mfips::node::lifecycle[0m[2m:[0m Transport connect initiated (non-blocking) [3mpeer[0m[2m=[0m4db19d96... [3mtransport_id[0m[2m=[0mtransport:1 [3mremote_addr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mlink_id[0m[2m=[0mlink:1
+[2m2026-04-27T07:51:37.188814Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::adapter[0m[2m:[0m Connecting to Device(Device(Dispatched(UnsafeCell { .. })))
+[2m2026-04-27T07:51:37.189231Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::delegates[0m[2m:[0m CentralDelegate received Connect { peripheral: Dispatched(UnsafeCell { .. }) }
+[2m2026-04-27T07:51:37.189311Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m GATT PSM discovery: enumerating services [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:37.189343Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m GATT PSM discovery: enumerated services [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mcount[0m[2m=[0m1
+[2m2026-04-27T07:51:37.189365Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m BLE connect: GATT PSM discovery unavailable, using configured PSM [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mconfigured_psm[0m[2m=[0m133 [3merror[0m[2m=[0mio error: discover_gatt_psm: FIPS GATT PSM service not found on default/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:37.189381Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m Opening L2CAP channel [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mpsm[0m[2m=[0m133
+[2m2026-04-27T07:51:37.189395Z[0m [32m INFO[0m [2mbluest::corebluetooth::device[0m[2m:[0m starting open_l2cap_channel on 133
+[2m2026-04-27T07:51:37.235514Z[0m [34mDEBUG[0m [2mbluest::corebluetooth::device[0m[2m:[0m open_l2cap_channel success Dispatched(UnsafeCell { .. })
+[2m2026-04-27T07:51:37.235738Z[0m [34mDEBUG[0m [2mfips::transport::ble::io::bluest_impl[0m[2m:[0m L2CAP channel open [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mpsm[0m[2m=[0m133
+[2m2026-04-27T07:51:37.236255Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE outbound pubkey exchange complete [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:37.236308Z[0m [34mDEBUG[0m [2mfips::transport::ble[0m[2m:[0m BLE connection established [3maddr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB
+[2m2026-04-27T07:51:38.187967Z[0m [34mDEBUG[0m [2mfips::node::lifecycle[0m[2m:[0m Transport connected, starting handshake [3mpeer[0m[2m=[0m4db19d96... [3mtransport_id[0m[2m=[0mtransport:1 [3mremote_addr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mlink_id[0m[2m=[0mlink:1
+[2m2026-04-27T07:51:38.188329Z[0m [34mDEBUG[0m [2mfips::node::lifecycle[0m[2m:[0m Connection initiated [3mpeer[0m[2m=[0m4db19d96... [3mtransport_id[0m[2m=[0mtransport:1 [3mremote_addr[0m[2m=[0mdefault/B7:E8:F3:3F:D2:BB [3mlink_id[0m[2m=[0mlink:1 [3mour_index[0m[2m=[0m23660ada
+[2m2026-04-27T07:51:38.188373Z[0m [34mDEBUG[0m [2mfips::node::lifecycle[0m[2m:[0m Sent Noise handshake message 1 (wire format) [3mlink_id[0m[2m=[0mlink:1 [3mour_index[0m[2m=[0m23660ada [3mbytes[0m[2m=[0m114
+[2m2026-04-27T07:51:38.227297Z[0m [34mDEBUG[0m [2mfips::node::handlers::handshake[0m[2m:[0m Outbound handshake completed [3mpeer[0m[2m=[0m4db19d96... [3mlink_id[0m[2m=[0mlink:1 [3mtheir_index[0m[2m=[0mc4ccf034
+[2m2026-04-27T07:51:38.227371Z[0m [32m INFO[0m [2mfips::node::handlers::handshake[0m[2m:[0m Connection promoted to active peer [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mlink_id[0m[2m=[0mlink:1 [3mour_index[0m[2m=[0m23660ada [3mtheir_index[0m[2m=[0mc4ccf034
+[2m2026-04-27T07:51:38.227394Z[0m [32m INFO[0m [2mfips::node::handlers::handshake[0m[2m:[0m Peer promoted to active [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:51:38.229164Z[0m [34mDEBUG[0m [2mfips::node::tree[0m[2m:[0m Processed TreeAnnounce [3mfrom[0m[2m=[0mnpub1u2vh...kwj3 [3mseq[0m[2m=[0m1 [3mdepth[0m[2m=[0m0 [3mroot[0m[2m=[0m4db19d966766c2f6b4dc92d671c37f66
+[2m2026-04-27T07:51:38.229303Z[0m [32m INFO[0m [2mfips::node::tree[0m[2m:[0m Parent switched, flushed coord cache, announcing to all peers [3mnew_parent[0m[2m=[0mnpub1u2vh...kwj3 [3mnew_seq[0m[2m=[0m2 [3mnew_root[0m[2m=[0m4db19d966766c2f6b4dc92d671c37f66 [3mdepth[0m[2m=[0m1
+[2m2026-04-27T07:51:38.229328Z[0m [34mDEBUG[0m [2mfips::node::tree[0m[2m:[0m TreeAnnounce rate-limited, marking pending [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:51:38.393622Z[0m [34mDEBUG[0m [2mfips::node::bloom[0m[2m:[0m Received FilterAnnounce [3mfrom[0m[2m=[0mnpub1u2vh...kwj3 [3mseq[0m[2m=[0m1 [3mest_entries[0m[2m=[0m"1" [3mset_bits[0m[2m=[0m5 [3mfill[0m[2m=[0m0.1% [3mtree_peer[0m[2m=[0mtrue
+[2m2026-04-27T07:51:39.188145Z[0m [34mDEBUG[0m [2mfips::node::bloom[0m[2m:[0m Sent FilterAnnounce [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mseq[0m[2m=[0m1 [3mest_entries[0m[2m=[0m"1" [3mset_bits[0m[2m=[0m5 [3mfill[0m[2m=[0m0.1% [3mtree_peer[0m[2m=[0mtrue
+[2m2026-04-27T07:51:39.188198Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:51:39.188246Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0mn/a [3mloss[0m[2m=[0mn/a [3mjitter[0m[2m=[0m4.3ms [3mgoodput[0m[2m=[0mn/a [3mtx_pkts[0m[2m=[0m3 [3mrx_pkts[0m[2m=[0m5
+[2m2026-04-27T07:51:39.386616Z[0m [34mDEBUG[0m [2mfips::node::bloom[0m[2m:[0m Received FilterAnnounce [3mfrom[0m[2m=[0mnpub1u2vh...kwj3 [3mseq[0m[2m=[0m2 [3mest_entries[0m[2m=[0m"1" [3mset_bits[0m[2m=[0m5 [3mfill[0m[2m=[0m0.1% [3mtree_peer[0m[2m=[0mtrue
+[2m2026-04-27T07:52:09.188128Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:52:09.188257Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m122.3ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m8.0ms [3mgoodput[0m[2m=[0m121B/s [3mtx_pkts[0m[2m=[0m47 [3mrx_pkts[0m[2m=[0m48
+[2m2026-04-27T07:52:38.364715Z[0m [34mDEBUG[0m [2mfips::node::handlers::handshake[0m[2m:[0m Sent rekey msg2 response [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mnew_our_index[0m[2m=[0m9f4d2963
+[2m2026-04-27T07:52:39.188540Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:52:39.188636Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m86.7ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m8.0ms [3mgoodput[0m[2m=[0m140B/s [3mtx_pkts[0m[2m=[0m89 [3mrx_pkts[0m[2m=[0m87
+[2m2026-04-27T07:52:39.188702Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey cutover complete (initiator), K-bit flipped [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:53:10.187686Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:53:10.187755Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m76.5ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m9.0ms [3mgoodput[0m[2m=[0m124B/s [3mtx_pkts[0m[2m=[0m130 [3mrx_pkts[0m[2m=[0m125
+[2m2026-04-27T07:53:39.368511Z[0m [34mDEBUG[0m [2mfips::node::handlers::handshake[0m[2m:[0m Sent rekey msg2 response [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mnew_our_index[0m[2m=[0m5f4a5e9d
+[2m2026-04-27T07:53:40.188083Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:53:40.188149Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m64.5ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m6.8ms [3mgoodput[0m[2m=[0m146B/s [3mtx_pkts[0m[2m=[0m173 [3mrx_pkts[0m[2m=[0m169
+[2m2026-04-27T07:53:40.188189Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey cutover complete (initiator), K-bit flipped [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:54:11.187248Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:54:11.187362Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m56.4ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m5.6ms [3mgoodput[0m[2m=[0m112B/s [3mtx_pkts[0m[2m=[0m211 [3mrx_pkts[0m[2m=[0m207
+[2m2026-04-27T07:54:40.343464Z[0m [34mDEBUG[0m [2mfips::node::handlers::handshake[0m[2m:[0m Sent rekey msg2 response [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mnew_our_index[0m[2m=[0mff616b7e
+[2m2026-04-27T07:54:41.186068Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey cutover complete (initiator), K-bit flipped [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:54:42.187504Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:54:42.192570Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m52.3ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m0.0ms [3mgoodput[0m[2m=[0m124B/s [3mtx_pkts[0m[2m=[0m251 [3mrx_pkts[0m[2m=[0m249
+[2m2026-04-27T07:55:13.186705Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:55:13.186815Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m51.8ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m5.7ms [3mgoodput[0m[2m=[0m137B/s [3mtx_pkts[0m[2m=[0m290 [3mrx_pkts[0m[2m=[0m290
+[2m2026-04-27T07:55:41.186146Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey initiated, sent msg1 on existing link [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mour_index[0m[2m=[0me1c7459d
+[2m2026-04-27T07:55:41.211230Z[0m [34mDEBUG[0m [2mfips::node::handlers::handshake[0m[2m:[0m Rekey completed (initiator), pending K-bit cutover [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mnew_our_index[0m[2m=[0me1c7459d [3mnew_their_index[0m[2m=[0m53b01e39
+[2m2026-04-27T07:55:42.186980Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey cutover complete (initiator), K-bit flipped [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:55:44.186520Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:55:44.186608Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m50.0ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m0.0ms [3mgoodput[0m[2m=[0m122B/s [3mtx_pkts[0m[2m=[0m332 [3mrx_pkts[0m[2m=[0m332
+[2m2026-04-27T07:56:15.185793Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:56:15.185868Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m49.8ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m9.0ms [3mgoodput[0m[2m=[0m133B/s [3mtx_pkts[0m[2m=[0m372 [3mrx_pkts[0m[2m=[0m376
+[2m2026-04-27T07:56:42.186905Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey initiated, sent msg1 on existing link [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mour_index[0m[2m=[0ma89c717e
+[2m2026-04-27T07:56:42.239113Z[0m [34mDEBUG[0m [2mfips::node::handlers::handshake[0m[2m:[0m Rekey completed (initiator), pending K-bit cutover [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mnew_our_index[0m[2m=[0ma89c717e [3mnew_their_index[0m[2m=[0ma8b4ae2b
+[2m2026-04-27T07:56:43.185495Z[0m [34mDEBUG[0m [2mfips::node::handlers::rekey[0m[2m:[0m Rekey cutover complete (initiator), K-bit flipped [3mpeer[0m[2m=[0mnpub1u2vh...kwj3
+[2m2026-04-27T07:56:45.185674Z[0m [34mDEBUG[0m [2mfips::node[0m[2m:[0m Mesh size estimate [3mestimated_mesh_size[0m[2m=[0m2 [3mpeers[0m[2m=[0m1 [3mchildren[0m[2m=[0m0
+[2m2026-04-27T07:56:45.185762Z[0m [34mDEBUG[0m [2mfips::node::handlers::mmp[0m[2m:[0m MMP link metrics [3mpeer[0m[2m=[0mnpub1u2vh...kwj3 [3mrtt[0m[2m=[0m48.6ms [3mloss[0m[2m=[0m0.0% [3mjitter[0m[2m=[0m0.0ms [3mgoodput[0m[2m=[0m146B/s [3mtx_pkts[0m[2m=[0m413 [3mrx_pkts[0m[2m=[0m419

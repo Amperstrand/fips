@@ -1,0 +1,19 @@
+Connecting to host fd4d:b19d:9667:66c2:f6b4:dc92:d671:c37f, port 5201
+[  5] local fd89:43b2:119:db89:a3c6:f1db:4d9a:472a port 65352 connected to fd4d:b19d:9667:66c2:f6b4:dc92:d671:c37f port 5201
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec                  
+[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   5.00-6.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   6.00-7.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   8.00-9.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   9.00-10.00  sec  0.00 Bytes  0.00 bits/sec                  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-10.00  sec   128 KBytes   105 Kbits/sec                  sender
+[  5]   0.00-10.80  sec  82.6 KBytes  62.6 Kbits/sec                  receiver
+
+iperf Done.
