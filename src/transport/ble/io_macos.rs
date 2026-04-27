@@ -108,6 +108,11 @@ fn peripheral_queue() -> &'static DispatchQueue {
 
 fn ble_runloop() -> &'static NSRunLoop {
     static MAIN_PTR: OnceLock<usize> = OnceLock::new();
+    // SAFETY: NSRunLoop::mainRunLoop() returns a singleton that lives
+    // for the entire process lifetime. We store the raw pointer as
+    // usize in a OnceLock and reconstitute it on each call. The
+    // reference is valid for the static lifetime because the main run
+    // loop is never deallocated by CoreFoundation.
     unsafe {
         let ptr = *MAIN_PTR.get_or_init(|| {
             let rl = NSRunLoop::mainRunLoop();
@@ -126,6 +131,10 @@ where
 
 struct Dispatched<T>(UnsafeCell<Retained<T>>);
 
+// SAFETY: Dispatched wraps an ObjC object accessed only via dispatch_sync
+// on a GCD serial queue (peripheral_queue), providing mutual exclusion.
+// The UnsafeCell is never read outside the dispatch closure, and the
+// Retained<T> is ARC-managed with thread-safe retain/release.
 unsafe impl<T> Send for Dispatched<T> {}
 unsafe impl<T> Sync for Dispatched<T> {}
 
@@ -143,6 +152,11 @@ impl<T: Message> Dispatched<T> {
         peripheral_queue().exec_sync(|| {
             ret.write(f(unsafe { &*self.0.get() }));
         });
+        // SAFETY: exec_sync runs the closure synchronously on the GCD
+        // serial queue. If the closure panics, exec_sync propagates the
+        // panic (which unwinds through the Objective-C exception handler).
+        // If it completes, ret.write() was called exactly once, so
+        // assume_init is sound.
         unsafe { ret.assume_init() }
     }
 }
@@ -155,6 +169,11 @@ impl<T: Message> Clone for Dispatched<T> {
 
 struct RunLoopDispatched<T>(UnsafeCell<Retained<T>>);
 
+// SAFETY: RunLoopDispatched wraps an ObjC object accessed only via
+// performSelector:onThread:withObject:waitUntilDone: on the main
+// NSRunLoop thread, providing serial access. The UnsafeCell is never
+// accessed outside the run loop callback. ARC retain/release is
+// thread-safe.
 unsafe impl<T> Send for RunLoopDispatched<T> {}
 unsafe impl<T> Sync for RunLoopDispatched<T> {}
 
@@ -354,6 +373,9 @@ struct PeripheralInputDelegateIvars {
 }
 
 struct SendableInputStream(Retained<NSInputStream>);
+// SAFETY: NSInputStream is an ARC-managed ObjC object. Access is
+// serialized via SendableInputStream::with() which is called only from
+// the dedicated reader thread. ARC retain/release is thread-safe.
 unsafe impl Send for SendableInputStream {}
 
 impl Clone for SendableInputStream {
@@ -373,6 +395,9 @@ impl SendableInputStream {
 }
 
 struct SendableOutputStream(Retained<NSOutputStream>);
+// SAFETY: NSOutputStream is an ARC-managed ObjC object. Access is
+// serialized by the StdMutex in PeripheralOutputDelegate. ARC
+// retain/release is thread-safe.
 unsafe impl Send for SendableOutputStream {}
 
 impl Clone for SendableOutputStream {
@@ -392,6 +417,9 @@ impl SendableOutputStream {
 }
 
 struct SendableInputDelegate(Retained<PeripheralInputDelegate>);
+// SAFETY: PeripheralInputDelegate is an ARC-managed ObjC object. Access
+// to its mutable state (buffer) is serialized by StdMutex. ARC
+// retain/release is thread-safe.
 unsafe impl Send for SendableInputDelegate {}
 
 impl SendableInputDelegate {
@@ -401,6 +429,9 @@ impl SendableInputDelegate {
 }
 
 struct SendableOutputDelegate(Retained<PeripheralOutputDelegate>);
+// SAFETY: PeripheralOutputDelegate is an ARC-managed ObjC object. Access
+// to its mutable state (queue, sender) is serialized by StdMutex. ARC
+// retain/release is thread-safe.
 unsafe impl Send for SendableOutputDelegate {}
 
 impl SendableOutputDelegate {
@@ -570,7 +601,13 @@ impl PeripheralOutputDelegate {
             while offset < data.len() {
                 let res = unsafe {
                     output_stream.write_maxLength(
-                        NonNull::new_unchecked(data[offset..].as_ptr() as *mut u8),
+                        // SAFETY: data[offset..] is a non-empty subslice
+                        // (offset < data.len()), so as_ptr() is non-null.
+                        // The const-to-mut cast is necessary because
+                        // NSOutputStream.write(maxLength:) takes a mutable
+                        // pointer but only reads from it (does not mutate).
+                        NonNull::new(data[offset..].as_ptr() as *mut u8)
+                            .expect("non-null pointer from non-empty slice"),
                         data.len() - offset,
                     )
                 };
@@ -719,7 +756,13 @@ impl PeripheralStream {
             loop {
                 let res = unsafe {
                     input_stream_for_reader.with(|stream| {
-                        stream.read_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len())
+                        // SAFETY: buf is a stack-allocated [u8; 4096],
+                        // always non-null. NonNull::new is infallible here.
+                        stream.read_maxLength(
+                            NonNull::new(buf.as_mut_ptr())
+                                .expect("non-null pointer from stack array"),
+                            buf.len(),
+                        )
                     })
                 };
 
@@ -938,14 +981,23 @@ enum PeripheralManagerEvent {
 }
 
 struct SendableChannel(Retained<CBL2CAPChannel>);
+// SAFETY: CBL2CAPChannel is an ARC-managed ObjC object. Access is
+// serialized via dispatch_sync on the peripheral GCD queue. ARC
+// retain/release is thread-safe.
 unsafe impl Send for SendableChannel {}
 unsafe impl Sync for SendableChannel {}
 
 struct SendablePeripheralStream(PeripheralStream);
+// SAFETY: PeripheralStream's internal state uses tokio::sync::Mutex and
+// Arc for thread-safe access. The ARC-managed ObjC delegates are accessed
+// only from their respective threads (NSRunLoop for input, GCD queue for
+// output).
 unsafe impl Send for SendablePeripheralStream {}
 unsafe impl Sync for SendablePeripheralStream {}
 
 struct SendableDelegate(Retained<FipsPeripheralDelegate>);
+// SAFETY: FipsPeripheralDelegate is an ARC-managed ObjC object. Its ivars
+// use StdMutex for synchronization. ARC retain/release is thread-safe.
 unsafe impl Send for SendableDelegate {}
 unsafe impl Sync for SendableDelegate {}
 
@@ -1172,6 +1224,11 @@ pub struct BluestIo {
     was_powered_off: Arc<tokio::sync::Mutex<bool>>,
 }
 
+// SAFETY: BluestIo's fields use interior mutability patterns
+// (StdMutex, Arc<tokio::sync::Mutex>, Arc<AtomicBool>) for thread-safe
+// access. The ARC-managed ObjC objects (adapter, peripheral_manager)
+// are accessed only via Dispatched/RunLoopDispatched which serialize
+// access through GCD serial queues and the main NSRunLoop.
 unsafe impl Sync for BluestIo {}
 unsafe impl Send for BluestIo {}
 
