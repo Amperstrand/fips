@@ -1,0 +1,19 @@
+Connecting to host fd9b:b991:2fb1:34af:f47c:ea3f:971d:ff0a, port 5201
+[  5] local fda2:1211:872e:7ddc:fa0e:6b4d:893d:6fb2 port 58266 connected to fd9b:b991:2fb1:34af:f47c:ea3f:971d:ff0a port 5201
+[ ID] Interval           Transfer     Bitrate         Total Datagrams
+[  5]   0.00-1.00   sec  7.08 KBytes  57.9 Kbits/sec  6  
+[  5]   1.00-2.00   sec  5.90 KBytes  48.4 Kbits/sec  5  
+[  5]   2.00-3.00   sec  5.90 KBytes  48.3 Kbits/sec  5  
+[  5]   3.00-4.01   sec  5.90 KBytes  48.0 Kbits/sec  5  
+[  5]   4.01-5.00   sec  5.90 KBytes  48.7 Kbits/sec  5  
+[  5]   5.00-6.01   sec  7.08 KBytes  57.7 Kbits/sec  6  
+[  5]   6.01-7.01   sec  5.90 KBytes  48.1 Kbits/sec  5  
+[  5]   7.01-8.00   sec  5.90 KBytes  48.6 Kbits/sec  5  
+[  5]   8.00-9.01   sec  5.90 KBytes  48.0 Kbits/sec  5  
+[  5]   9.01-10.00  sec  5.90 KBytes  48.5 Kbits/sec  5  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
+[  5]   0.00-10.00  sec  61.3 KBytes  50.2 Kbits/sec  0.000 ms  0/52 (0%)  sender
+[  5]   0.00-10.04  sec  61.3 KBytes  50.1 Kbits/sec  4.493 ms  0/52 (0%)  receiver
+
+iperf Done.

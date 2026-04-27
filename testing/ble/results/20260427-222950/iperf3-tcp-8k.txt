@@ -1,0 +1,39 @@
+Connecting to host fd9b:b991:2fb1:34af:f47c:ea3f:971d:ff0a, port 5201
+[  5] local fda2:1211:872e:7ddc:fa0e:6b4d:893d:6fb2 port 61194 connected to fd9b:b991:2fb1:34af:f47c:ea3f:971d:ff0a port 5201
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   1.00-2.01   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   2.01-3.01   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   3.01-4.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   5.00-6.01   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   6.01-7.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   8.00-9.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   9.00-10.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  10.01-11.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  11.01-12.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  12.01-13.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  13.00-14.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  14.00-15.01  sec   128 KBytes  1.04 Mbits/sec                  
+[  5]  15.01-16.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  16.00-17.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  17.01-18.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  18.00-19.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  19.01-20.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  20.00-21.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  21.00-22.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  22.01-23.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  23.00-24.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  24.00-25.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  25.00-26.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  26.00-27.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  27.01-28.01  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  28.01-29.00  sec  0.00 Bytes  0.00 bits/sec                  
+[  5]  29.00-30.00  sec   128 KBytes  1.05 Mbits/sec                  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-30.00  sec   256 KBytes  69.9 Kbits/sec                  sender
+[  5]   0.00-30.22  sec   249 KBytes  67.5 Kbits/sec                  receiver
+
+iperf Done.

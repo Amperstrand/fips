@@ -1,0 +1,28 @@
+node:
+  identity:
+    persistent: true
+  rekey:
+    after_secs: 60
+
+tun:
+  enabled: true
+  name: fips0
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+
+transports:
+  ble:
+    adapter: "default"
+    mtu: 2048
+    advertise: true
+    scan: true
+    auto_connect: true
+    accept_connections: true
+    send_rate_bps: 200000
+    send_burst_bytes: 2048
+
+logging:
+  level: debug
