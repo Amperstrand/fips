@@ -183,7 +183,6 @@ mod bluer_impl {
     use futures::StreamExt;
     use std::collections::{BTreeSet, HashSet};
     use std::pin::Pin;
-    use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
     use tracing::{debug, trace, warn};
@@ -215,8 +214,7 @@ mod bluer_impl {
 
     const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
     const STARTUP_RETRY_ATTEMPTS: usize = 3;
-    const BLE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-    const BLE_QUEUE_DEPTH: usize = 32;
+    const BLE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
     fn is_transient_startup_error(error: &bluer::Error) -> bool {
         matches!(
@@ -233,12 +231,11 @@ mod bluer_impl {
     // ----------------------------------------------------------------
 
     pub struct BluerStream {
-        conn: Arc<tokio::sync::Mutex<SeqPacket>>,
-        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-        rate_limiter: Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
+        conn: SeqPacket,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
+        rate_limiter: Option<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
         recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
 
@@ -261,45 +258,21 @@ mod bluer_impl {
                 }
             }
 
-            let rate_limiter = Arc::new(tokio::sync::Mutex::new(
-                super::super::rate_limit::SendRateLimiter::new(
-                    send_rate_bps,
-                    send_burst_bytes,
-                ),
-            ));
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BLE_QUEUE_DEPTH);
-            let drain_conn = Arc::new(tokio::sync::Mutex::new(conn));
-            let drain_limiter = rate_limiter.clone();
-            let drain_remote = remote.clone();
-
-            let send_conn = drain_conn.clone();
-            tokio::spawn(async move {
-                while let Some(frame) = rx.recv().await {
-                    drain_limiter.lock().await.acquire(frame.len()).await;
-                    let conn = drain_conn.lock().await;
-                    match tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&frame)).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => {
-                            warn!(addr = %drain_remote, error = %e, "BLE Linux drain task write error, stopping");
-                            break;
-                        }
-                        Err(_) => {
-                            warn!(addr = %drain_remote, "BLE Linux drain task write timeout, stopping");
-                            break;
-                        }
-                    }
-                }
-                debug!(addr = %drain_remote, "BLE Linux drain task stopped");
-            });
-
             Ok(Self {
-                conn: send_conn,
-                tx,
-                rate_limiter,
+                conn,
                 remote,
                 send_mtu,
                 recv_mtu,
+                rate_limiter: if send_rate_bps > 0 {
+                    Some(tokio::sync::Mutex::new(
+                        super::super::rate_limit::SendRateLimiter::new(
+                            send_rate_bps,
+                            send_burst_bytes,
+                        ),
+                    ))
+                } else {
+                    None
+                },
                 recv_buf: tokio::sync::Mutex::new(Vec::new()),
             })
         }
@@ -314,48 +287,21 @@ mod bluer_impl {
                     mtu: self.send_mtu,
                 });
             }
-
-            let mut framed = Vec::with_capacity(framed_len);
-            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            framed.extend_from_slice(data);
-
-            match self.tx.try_send(framed) {
-                Ok(()) => Ok(()),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
-                    trace!(addr = %self.remote, queue_depth = BLE_QUEUE_DEPTH, "BLE Linux queue full, waiting");
-                    tokio::time::timeout(Duration::from_secs(2), self.tx.send(framed))
-                        .await
-                        .map_err(|_| {
-                            warn!(addr = %self.remote, "BLE Linux send timeout (queue full)");
-                            TransportError::Timeout
-                        })?
-                        .map_err(|_| TransportError::Io(std::io::Error::other("BLE Linux send channel closed")))
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
-                    std::io::Error::other("BLE Linux send channel closed"),
-                )),
-            }
-        }
-
-        async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-            let framed_len = 2 + data.len();
-            if framed_len > self.send_mtu as usize {
-                return Err(TransportError::MtuExceeded {
-                    packet_size: framed_len,
-                    mtu: self.send_mtu,
-                });
+            if let Some(ref limiter) = self.rate_limiter {
+                limiter.lock().await.acquire(framed_len).await;
             }
 
             let mut framed = Vec::with_capacity(framed_len);
             framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
             framed.extend_from_slice(data);
-            trace!(len = data.len(), addr = %self.remote, "BLE Linux send_urgent (direct)");
-
-            let conn = self.conn.lock().await;
-            tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&framed))
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
                 .await
                 .map_err(|_| {
-                    warn!(addr = %self.remote, "BLE Linux send_urgent timeout");
+                    warn!(
+                        len = framed.len(),
+                        timeout_secs = BLE_SEND_TIMEOUT.as_secs(),
+                        "BLE write timeout"
+                    );
                     TransportError::Timeout
                 })?
                 .map(|_| ())
@@ -382,8 +328,8 @@ mod bluer_impl {
                 }
 
                 let mut chunk = vec![0u8; self.recv_mtu as usize];
-                let conn = self.conn.lock().await;
-                let n = conn
+                let n = self
+                    .conn
                     .recv(&mut chunk)
                     .await
                     .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
@@ -410,7 +356,9 @@ mod bluer_impl {
         }
 
         async fn set_rate_bps(&self, rate_bps: u64) {
-            self.rate_limiter.lock().await.set_rate_bps(rate_bps);
+            if let Some(ref limiter) = self.rate_limiter {
+                limiter.lock().await.set_rate_bps(rate_bps);
+            }
         }
 
         fn supports_bidirectional_pubkey_exchange(&self) -> bool {
