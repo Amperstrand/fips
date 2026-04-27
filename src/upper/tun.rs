@@ -348,6 +348,55 @@ impl TunWriter {
 
 /// TUN packet reader loop (Linux).
 ///
+/// Reduce the TUN socket receive buffer to limit kernel-level burst.
+///
+/// When a TCP connection starts (or does slow-start), the kernel can write many
+/// segments into the TUN device's receive buffer before the application reader
+/// drains them. On macOS, the default utun buffer is ~128 KB, which absorbs the
+/// entire initial TCP congestion window without backpressure.
+///
+/// By setting `SO_RCVBUF` to a small value (e.g., the BLE burst size), the
+/// kernel can only buffer a few packets. Once full, TCP writes block, the TCP
+/// send buffer fills, and the TCP stack sees backpressure — preventing bursts.
+///
+/// Note: the kernel may silently round up the value to its minimum
+/// (`net.core.rmem_min` on Linux; ~256 bytes doubled on macOS). The actual
+/// buffer may be 2× the requested value (kernel doubles `SO_RCVBUF`).
+#[cfg(unix)]
+fn reduce_tun_socket_buffer(fd: std::os::unix::io::RawFd, target_bytes: usize) {
+    unsafe {
+        let val = target_bytes as libc::c_int;
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            debug!(
+                target_bytes,
+                error = %err,
+                "Failed to reduce TUN SO_RCVBUF (non-fatal, burst limiting may be less effective)"
+            );
+        } else {
+            let mut actual: libc::c_int = 0;
+            let mut optlen: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let query_ret = libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &mut actual as *mut libc::c_int as *mut libc::c_void,
+                &mut optlen,
+            );
+            if query_ret >= 0 {
+                debug!(target_bytes, actual_bytes = actual, "Set TUN SO_RCVBUF");
+            }
+        }
+    }
+}
+
 /// Reads IPv6 packets from the TUN device. Packets destined for FIPS addresses
 /// (fd::/8) are forwarded to the Node via the outbound channel for session
 /// encapsulation and routing. Non-FIPS packets receive ICMPv6 Destination
@@ -371,6 +420,13 @@ pub fn run_tun_reader(
 ) {
     let name = device.name().to_string();
     let mut buf = vec![0u8; mtu as usize + 100];
+
+    // Reduce kernel socket buffer to prevent TCP burst from filling
+    // the TUN buffer before the pacer can drain it.
+    if let Some(ref p) = pacer {
+        let tun_fd = device.device().as_raw_fd();
+        reduce_tun_socket_buffer(tun_fd, p.burst_bytes());
+    }
 
     loop {
         match device.read_packet(&mut buf) {
@@ -444,6 +500,15 @@ pub fn run_tun_reader(
         if flags >= 0 {
             libc::fcntl(tun_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+    }
+
+    // Reduce kernel socket buffer to prevent TCP burst from filling
+    // the TUN buffer before the pacer can drain it. Use the pacer's
+    // burst_bytes as the target — when a pacer is configured, this
+    // limits the buffer to ~2 packets, forcing kernel backpressure.
+    if let Some(ref p) = pacer {
+        let burst = p.burst_bytes();
+        reduce_tun_socket_buffer(tun_fd, burst);
     }
 
     let nfds = tun_fd.max(shutdown_fd) + 1;
@@ -544,6 +609,11 @@ impl TunPacer {
                 last_refill: std::time::Instant::now(),
             }),
         }
+    }
+
+    pub fn burst_bytes(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.burst_bytes as usize
     }
 
     pub fn acquire(&self, bytes: usize) {

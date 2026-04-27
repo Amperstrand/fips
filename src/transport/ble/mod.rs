@@ -1592,17 +1592,24 @@ mod tests {
             .expect_err("send should fail when peer side is gone");
         assert!(matches!(err, TransportError::SendFailed(_)));
 
-        let disconnect = disconnect_rx
-            .try_recv()
-            .expect("disconnect event should be emitted on send failure");
-        assert_eq!(disconnect.transport_id, TransportId::new(1));
-        assert_eq!(disconnect.remote_addr, remote_addr);
+        // SendFailed is now treated as congestion, not a dead connection.
+        // No disconnect event should be emitted for SendFailed — the connection
+        // stays alive so it can recover when the queue drains.
+        let result = disconnect_rx.try_recv();
         assert!(
-            !transport
+            result.is_err(),
+            "SendFailed should NOT emit disconnect event (treated as congestion), got: {:?}",
+            result
+        );
+        // Connection should still be in the pool
+        assert!(
+            transport
                 .pool
                 .lock()
                 .await
-                .contains(&disconnect.remote_addr)
+                .get(&remote_addr)
+                .is_some(),
+            "connection should remain in pool after SendFailed (congestion)"
         );
     }
 }
