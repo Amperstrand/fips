@@ -304,7 +304,10 @@ mod bluer_impl {
                 });
             }
             if let Some(ref limiter) = self.rate_limiter {
-                limiter.lock().await.acquire(framed.len()).await;
+                if !limiter.lock().await.try_acquire(framed.len()) {
+                    trace!(len = framed.len(), addr = %self.remote, "BLE linux rate limiter full, dropping");
+                    return Err(TransportError::SendFailed("BLE rate limited".into()));
+                }
             }
 
             tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))

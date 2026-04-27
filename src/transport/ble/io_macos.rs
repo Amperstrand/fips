@@ -61,13 +61,8 @@ fn tokio_handle() -> &'static tokio::runtime::Handle {
 use crate::transport::ble::Unpoison;
 
 /// Bounded queue depth for central-role BLE sends.
-/// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
+/// 32 frames ≈ 44KB at average frame size (~1400B); drains in ~4.4s at 80Kbps.
 const BLE_CENTRAL_QUEUE_DEPTH: usize = 32;
-
-/// Timeout for enqueuing a framed message when the bounded queue is full.
-/// Short enough to avoid stalling the Node event loop; long enough for a
-/// single frame to drain at MIN_RATE (1400B @ 15Kbps ≈ 750ms).
-const BLE_CENTRAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Bounded queue depth for peripheral-role BLE sends.
 /// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
@@ -75,10 +70,6 @@ const BLE_PERIPHERAL_QUEUE_DEPTH: usize = 32;
 
 /// Maximum total bytes allowed in the peripheral write queue.
 const BLE_PERIPHERAL_QUEUE_BYTE_CAP: usize = 65536;
-
-/// Timeout for enqueuing when the peripheral write queue is full.
-/// Short enough to avoid stalling the Node event loop.
-const BLE_PERIPHERAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ============================================================================
 // Dispatch helpers
@@ -212,15 +203,9 @@ impl BleStream for BluestStream {
 
         match self.tx.try_send(framed) {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
-                trace!(addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, waiting with timeout");
-                tokio::time::timeout(BLE_CENTRAL_SEND_TIMEOUT, self.tx.send(framed))
-                    .await
-                    .map_err(|_| {
-                        warn!(addr = %self.remote, timeout_secs = BLE_CENTRAL_SEND_TIMEOUT.as_secs(), "BLE central send timeout (queue full)");
-                        TransportError::Timeout
-                    })?
-                    .map_err(|_| TransportError::Io(std::io::Error::other("BLE central send channel closed")))
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                trace!(addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, dropping");
+                Err(TransportError::SendFailed("BLE central queue full".into()))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
                 std::io::Error::other("BLE central send channel closed"),
@@ -824,7 +809,7 @@ impl PeripheralStream {
                     }
                     let notified = pacer_notify.notified();
                     trace!(addr = %pacer_remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer queue full, waiting");
-                    match tokio::time::timeout(BLE_PERIPHERAL_SEND_TIMEOUT, notified).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), notified).await {
                         Ok(()) => continue,
                         Err(_) => {
                             warn!(addr = %pacer_remote, "BLE peripheral pacer timeout, dropping frame");
@@ -863,21 +848,20 @@ impl PeripheralStream {
         framed: &[u8],
         label: &str,
     ) -> Result<(), TransportError> {
-        loop {
-            let notified = self.queue_space_notify.notified();
-            if self.output_delegate.try_enqueue(framed) {
-                self.notify_write();
-                return Ok(());
-            }
-            trace!(addr = %self.remote, %label, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral queue full, waiting for space");
-            match tokio::time::timeout(BLE_PERIPHERAL_SEND_TIMEOUT, notified).await {
-                Ok(()) => continue,
-                Err(_) => {
-                    warn!(addr = %self.remote, %label, timeout_secs = BLE_PERIPHERAL_SEND_TIMEOUT.as_secs(), "BLE peripheral timeout (queue full)");
-                    return Err(TransportError::Timeout);
-                }
-            }
+        if self.output_delegate.try_enqueue(framed) {
+            self.notify_write();
+            return Ok(());
         }
+        trace!(addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
+        let notified = self.queue_space_notify.notified();
+        if tokio::time::timeout(std::time::Duration::from_secs(2), notified).await.is_ok()
+            && self.output_delegate.try_enqueue(framed)
+        {
+            self.notify_write();
+            return Ok(());
+        }
+        warn!(addr = %self.remote, %label, "BLE peripheral timeout (queue full)");
+        Err(TransportError::Timeout)
     }
 }
 
@@ -888,15 +872,9 @@ impl BleStream for PeripheralStream {
 
         match self.pacer_tx.try_send(framed) {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(framed)) => {
-                trace!(addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, waiting");
-                tokio::time::timeout(BLE_PERIPHERAL_SEND_TIMEOUT, self.pacer_tx.send(framed))
-                    .await
-                    .map_err(|_| {
-                        warn!(addr = %self.remote, timeout_secs = BLE_PERIPHERAL_SEND_TIMEOUT.as_secs(), "BLE peripheral send timeout (pacer full)");
-                        TransportError::Timeout
-                    })?
-                    .map_err(|_| TransportError::Io(std::io::Error::other("BLE peripheral pacer channel closed")))
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                trace!(addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, dropping");
+                Err(TransportError::SendFailed("BLE peripheral pacer queue full".into()))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
                 std::io::Error::other("BLE peripheral pacer channel closed"),

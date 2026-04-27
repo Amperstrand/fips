@@ -36,6 +36,20 @@ impl SendRateLimiter {
         }
     }
 
+    /// Try to acquire `bytes` tokens without waiting.
+    /// Returns `true` if tokens were available and consumed, `false` if not.
+    pub fn try_acquire(&mut self, bytes: usize) -> bool {
+        if self.rate_bytes_per_sec <= 0.0 {
+            return true;
+        }
+        self.refill();
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            return true;
+        }
+        false
+    }
+
     /// Acquire `bytes` tokens, waiting if necessary.
     pub async fn acquire(&mut self, bytes: usize) {
         if self.rate_bytes_per_sec <= 0.0 {
