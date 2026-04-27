@@ -1,0 +1,18 @@
+Connecting to host fd66:9d59:5ca6:7cd9:ed9c:77c9:319d:50e5, port 5201
+[  5] local fdff:ef4b:458a:29ba:2ae0:cc3a:20bd:ff83 port 52496 connected to fd66:9d59:5ca6:7cd9:ed9c:77c9:319d:50e5 port 5201
+[ ID] Interval           Transfer     Bitrate         Total Datagrams
+[  5]   0.00-1.00   sec  7.08 KBytes  57.9 Kbits/sec  6  
+[  5]   1.00-2.00   sec  5.90 KBytes  48.3 Kbits/sec  5  
+[  5]   2.00-3.00   sec  5.90 KBytes  48.3 Kbits/sec  5  
+[  5]   3.00-4.00   sec  5.90 KBytes  48.2 Kbits/sec  5  
+[  5]   4.00-5.00   sec  5.90 KBytes  48.4 Kbits/sec  5  
+[  5]   5.00-6.00   sec  7.08 KBytes  57.9 Kbits/sec  6  
+[  5]   6.00-7.00   sec  5.90 KBytes  48.3 Kbits/sec  5  
+[  5]   7.00-8.00   sec  5.90 KBytes  48.5 Kbits/sec  5  
+[  5]   8.00-9.00   sec  5.90 KBytes  48.2 Kbits/sec  5  
+[  5]   9.00-10.00  sec  5.90 KBytes  48.2 Kbits/sec  5  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
+[  5]   0.00-10.00  sec  61.3 KBytes  50.2 Kbits/sec  0.000 ms  0/52 (0%)  sender
+[  5]   0.00-10.00  sec  0.00 Bytes  0.00 bits/sec  0.000 ms  0/0 (0%)  receiver
+iperf3: error - control socket has closed unexpectedly
