@@ -1,0 +1,19 @@
+Connecting to host fdba:9a1a:1aa9:8ac4:3bd1:932:5c1:dab0, port 5201
+[  5] local fd21:af51:92b9:bfd:9b7f:b1fc:5dac:ea16 port 59998 connected to fdba:9a1a:1aa9:8ac4:3bd1:932:5c1:dab0 port 5201
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec                  
+[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   5.00-6.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   6.00-7.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   8.00-9.00   sec  0.00 Bytes  0.00 bits/sec                  
+[  5]   9.00-10.00  sec  0.00 Bytes  0.00 bits/sec                  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-10.00  sec   128 KBytes   105 Kbits/sec                  sender
+[  5]   0.00-10.33  sec  82.6 KBytes  65.5 Kbits/sec                  receiver
+
+iperf Done.
