@@ -1044,6 +1044,15 @@ mod bluer_impl {
             )))
         }
 
+        /// Returns the local BLE adapter address.
+        ///
+        /// # Panics
+        ///
+        /// Panics if called from within a tokio runtime, because
+        /// `futures::executor::block_on` cannot nest inside an existing
+        /// runtime. This is a sync trait method; call it from a non-async
+        /// context only.
+        // TODO: make BleIo::local_addr() async to remove block_on
         fn local_addr(&self) -> Result<BleAddr, TransportError> {
             let addr = futures::executor::block_on(self.adapter.address())
                 .map_err(|e| map_err("address", e))?;
