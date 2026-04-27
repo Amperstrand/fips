@@ -131,7 +131,22 @@ pub trait BleIo: Send + Sync + 'static {
     }
 }
 
-#[cfg(all(bluer_available, target_os = "linux"))]
+fn frame_payload(data: &[u8]) -> Result<Vec<u8>, TransportError> {
+    if data.len() > u16::MAX as usize - 2 {
+        return Err(TransportError::SendFailed(format!(
+            "payload too large for framing: {} bytes (max {})",
+            data.len(),
+            u16::MAX as usize - 2
+        )));
+    }
+    let framed_len = 2 + data.len();
+    let mut framed = Vec::with_capacity(framed_len);
+    framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    framed.extend_from_slice(data);
+    Ok(framed)
+}
+
+#[cfg(any(test, feature = "ble-macos", all(bluer_available, target_os = "linux")))]
 fn try_take_framed_payload(
     recv_buf: &mut Vec<u8>,
     buf: &mut [u8],
@@ -280,20 +295,17 @@ mod bluer_impl {
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-            let framed_len = 2 + data.len();
-            if framed_len > self.send_mtu as usize {
+            let framed = frame_payload(data)?;
+            if framed.len() > self.send_mtu as usize {
                 return Err(TransportError::MtuExceeded {
-                    packet_size: framed_len,
+                    packet_size: framed.len(),
                     mtu: self.send_mtu,
                 });
             }
             if let Some(ref limiter) = self.rate_limiter {
-                limiter.lock().await.acquire(framed_len).await;
+                limiter.lock().await.acquire(framed.len()).await;
             }
 
-            let mut framed = Vec::with_capacity(framed_len);
-            framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            framed.extend_from_slice(data);
             tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
                 .await
                 .map_err(|_| {
@@ -1111,9 +1123,7 @@ impl MockBleStream {
 
 impl BleStream for MockBleStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        let len = data.len() as u16;
-        let mut framed = len.to_be_bytes().to_vec();
-        framed.extend_from_slice(data);
+        let framed = frame_payload(data)?;
         self.tx
             .send(framed)
             .await
@@ -1121,6 +1131,7 @@ impl BleStream for MockBleStream {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        let max_payload_len = self.recv_mtu.saturating_sub(2) as usize;
         let mut rx = self.rx.lock().await;
         match rx.recv().await {
             Some(data) => {
@@ -1132,6 +1143,12 @@ impl BleStream for MockBleStream {
                     return Err(TransportError::RecvFailed(
                         "BLE recv: framed message too short (0 bytes)".into(),
                     ));
+                }
+                if payload_len > max_payload_len {
+                    return Err(TransportError::RecvFailed(format!(
+                        "BLE recv: invalid frame header {} exceeds max payload {}",
+                        payload_len, max_payload_len
+                    )));
                 }
                 let payload = &data[2..];
                 let len = payload_len.min(payload.len()).min(buf.len());

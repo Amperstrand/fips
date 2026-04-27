@@ -196,10 +196,7 @@ pub struct BluestStream {
 
 impl BleStream for BluestStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        let framed_len = 2 + data.len();
-        let mut framed = Vec::with_capacity(framed_len);
-        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        framed.extend_from_slice(data);
+        let framed = frame_payload(data)?;
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send");
 
         match self.tx.try_send(framed) {
@@ -221,10 +218,7 @@ impl BleStream for BluestStream {
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-        let framed_len = 2 + data.len();
-        let mut framed = Vec::with_capacity(framed_len);
-        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        framed.extend_from_slice(data);
+        let framed = frame_payload(data)?;
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent (direct L2CAP)");
 
         let mut writer = self.urgent_writer.lock().await;
@@ -239,23 +233,20 @@ impl BleStream for BluestStream {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        let max_payload_len = self.recv_mtu().saturating_sub(2) as usize;
         loop {
             {
                 let mut recv_buf = self.recv_buf.lock().await;
-                if recv_buf.len() >= 2 {
-                    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
-                    if recv_buf.len() >= 2 + payload_len {
-                        let copy_len = payload_len.min(buf.len());
-                        buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
-                        recv_buf.drain(..2 + payload_len);
-                        trace!(
-                            len = copy_len,
-                            buf_remaining = recv_buf.len(),
-                            addr = %self.remote,
-                            "BLE macOS recv frame"
-                        );
-                        return Ok(copy_len);
-                    }
+                if let Some(copy_len) =
+                    try_take_framed_payload(&mut recv_buf, buf, max_payload_len)?
+                {
+                    trace!(
+                        len = copy_len,
+                        buf_remaining = recv_buf.len(),
+                        addr = %self.remote,
+                        "BLE macOS recv frame"
+                    );
+                    return Ok(copy_len);
                 }
             }
 
@@ -851,10 +842,7 @@ impl PeripheralStream {
 
 impl BleStream for PeripheralStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        let framed_len = 2 + data.len();
-        let mut framed = Vec::with_capacity(framed_len);
-        framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        framed.extend_from_slice(data);
+        let framed = frame_payload(data)?;
         trace!(len = data.len(), addr = %self.remote, "BLE peripheral send");
 
         match self.pacer_tx.try_send(framed) {
@@ -876,32 +864,24 @@ impl BleStream for PeripheralStream {
     }
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-        let framed = {
-            let mut f = Vec::with_capacity(2 + data.len());
-            f.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            f.extend_from_slice(data);
-            f
-        };
+        let framed = frame_payload(data)?;
         trace!(len = data.len(), addr = %self.remote, "BLE peripheral send_urgent (direct enqueue)");
         self.enqueue_with_backpressure(&framed, "send_urgent").await
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        let max_payload_len = self.recv_mtu().saturating_sub(2) as usize;
         loop {
             {
                 let mut recv_buf = self.recv_buf.lock().await;
-                if recv_buf.len() >= 2 {
-                    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
-                    if recv_buf.len() >= 2 + payload_len {
-                        let copy_len = payload_len.min(buf.len());
-                        buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
-                        recv_buf.drain(..2 + payload_len);
-                        trace!(
-                            "BLE peripheral recv: returned {} bytes from recv_buf",
-                            copy_len
-                        );
-                        return Ok(copy_len);
-                    }
+                if let Some(copy_len) =
+                    try_take_framed_payload(&mut recv_buf, buf, max_payload_len)?
+                {
+                    trace!(
+                        "BLE peripheral recv: returned {} bytes from recv_buf",
+                        copy_len
+                    );
+                    return Ok(copy_len);
                 }
             }
 
