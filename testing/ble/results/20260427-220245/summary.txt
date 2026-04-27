@@ -1,0 +1,14 @@
+BLE Stability Test — 2026-04-27T20:23:54Z
+Duration: 20 min | Rekey: 60s | Check interval: 60s
+macOS: x86_64 | Linux: ubuntu@218
+Verdict: PASS
+
+MMP loss range: 0.0% – 0.0% (39 samples)
+RTT range: 44.8ms – 86.2ms
+Goodput range: 102B/s – 149B/s
+Rekeys: macOS=19 linux=19
+Promotions: 4
+Disconnects: 2
+Write Loop Errors: 1
+Panics/Fatals: 0
+Memory: macOS=2424KB Linux=12904KB

@@ -1402,10 +1402,15 @@ pub(crate) mod platform {
         _name: &str,
         shaping: &super::TunShaping,
     ) {
-        let send_buf = shaping.burst_bytes;
+        // Reduce TCP send buffer to limit unacknowledged data in flight.
+        // Use 4× the BLE burst size to allow TCP slow-start while still
+        // preventing the full 128 KB burst. With 8 KB send buffer and
+        // ~50ms RTT over BLE, TCP can have ~8 KB in flight — enough for
+        // slow-start to work but prevents the initial cwnd flood.
+        let send_buf = (shaping.burst_bytes * 4).max(8192) as u64;
         let rate_kbps = shaping.rate_bps / 1000;
 
-        // Reduce TCP send buffer to burst_bytes (e.g., 2048 = 2 KB)
+        // Reduce TCP send buffer to 8KB (e.g., 8192 = 8 KB)
         let output = Command::new("sysctl")
             .args([
                 "-w",
@@ -1438,7 +1443,7 @@ pub(crate) mod platform {
         }
     }
 
-    /// Restore default TCP send buffer.
+    /// Restore default TCP send buffer (128 KB).
     #[allow(dead_code)]
     pub async fn remove_traffic_shaping() {
         let _ = Command::new("sysctl")
