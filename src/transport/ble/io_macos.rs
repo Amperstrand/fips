@@ -482,7 +482,13 @@ define_class!(
             if event_code != NSStreamEvent::HasSpaceAvailable {
                 return;
             }
-            let output_stream = stream.downcast_ref::<NSOutputStream>().unwrap();
+            let output_stream = match stream.downcast_ref::<NSOutputStream>() {
+                Some(s) => s,
+                None => {
+                    warn!("PeripheralOutputDelegate: expected NSOutputStream, got unknown stream type");
+                    return;
+                }
+            };
             if self
                 .ivars()
                 .output_stream
