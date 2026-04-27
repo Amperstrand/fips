@@ -462,49 +462,107 @@ if [ -n "$DO_IPERF" ]; then
     log ""
     log "=== iperf3 throughput test ==="
 
-            LINUX_IPV6_RAW=$($LINUX_SSH "ip -6 addr show fips0 scope global 2>/dev/null | grep -oP 'inet6 \K[^/]+'" 2>/dev/null || echo "")
-            if [ -z "$LINUX_IPV6_RAW" ]; then
-                warn "Cannot find Linux IPv6 on fips0, trying control socket..."
-                LINUX_IPV6_RAW=$(sudo cat /tmp/fips-control.sock 2>/dev/null | head -1 || echo "")
-            fi
+    LINUX_IPV6_RAW=$($LINUX_SSH "ip -6 addr show fips0 scope global 2>/dev/null | grep -oP 'inet6 \K[^/]+'" 2>/dev/null || echo "")
+    if [ -z "$LINUX_IPV6_RAW" ]; then
+        warn "Cannot find Linux IPv6 on fips0, trying control socket..."
+        LINUX_IPV6_RAW=$(sudo cat /tmp/fips-control.sock 2>/dev/null | head -1 || echo "")
+    fi
 
-            if [ -n "$LINUX_IPV6_RAW" ]; then
-                LINUX_IPV6=$(echo "$LINUX_IPV6_RAW" | tr -d '[:space:]')
-                log "Linux IPv6: $LINUX_IPV6"
+    if [ -n "$LINUX_IPV6_RAW" ]; then
+        LINUX_IPV6=$(echo "$LINUX_IPV6_RAW" | tr -d '[:space:]')
+        log "Linux IPv6: $LINUX_IPV6"
 
-                $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 || warn "iperf3 not found on Linux"
-                command -v iperf3 >/dev/null 2>&1 || warn "iperf3 not found on macOS"
+        $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 || warn "iperf3 not found on Linux"
+        command -v iperf3 >/dev/null 2>&1 || warn "iperf3 not found on macOS"
 
-                if $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 && command -v iperf3 >/dev/null 2>&1; then
-                    log "Starting iperf3 server on Linux..."
-                    $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null; iperf3 -s --daemon"
+        if $LINUX_SSH "command -v iperf3" >/dev/null 2>&1 && command -v iperf3 >/dev/null 2>&1; then
+            log "Starting iperf3 server on Linux..."
+            $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null; iperf3 -s --daemon"
 
-                    sleep 2
+            sleep 2
 
-                    MAC_IPV6=$(ifconfig fips0 2>/dev/null | grep 'inet6 fd' | awk '{print $2}' | head -1 || true)
+            MAC_IPV6=$(ifconfig fips0 2>/dev/null | grep 'inet6 fd' | awk '{print $2}' | head -1 || true)
 
-                    log "Running iperf3 client (10s, TCP)..."
-                    if [ -n "$MAC_IPV6" ]; then
-                        iperf3 -c "$LINUX_IPV6" -B "$MAC_IPV6" -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp.txt" || warn "iperf3 TCP failed"
-                    else
-                        iperf3 -c "$LINUX_IPV6" -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp.txt" || warn "iperf3 TCP failed"
-                    fi
+            IPERF_BIND=""
+            [ -n "$MAC_IPV6" ] && IPERF_BIND="-B $MAC_IPV6"
 
-                    for rate in 100K 150K 200K; do
-                        log "Running iperf3 client (10s, UDP, ${rate}bps)..."
-                        if [ -n "$MAC_IPV6" ]; then
-                            iperf3 -c "$LINUX_IPV6" -B "$MAC_IPV6" -t 10 -u -b "${rate}" -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-${rate}.txt" || warn "iperf3 UDP ${rate}bps failed"
-                        else
-                            iperf3 -c "$LINUX_IPV6" -t 10 -u -b "${rate}" -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-${rate}.txt" || warn "iperf3 UDP ${rate}bps failed"
-                        fi
-                    done
+            # TCP default (10s) — expected burst-stall over BLE
+            log "Running iperf3 TCP (default socket buffer, 10s)..."
+            iperf3 -c "$LINUX_IPV6" $IPERF_BIND -t 10 -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp-default.txt" || warn "iperf3 TCP default failed"
 
-                    $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null" || true
-                else
-                    warn "iperf3 not available on both hosts, skipping"
-                fi
+            sleep 2
+
+            # TCP with 8KB socket buffer (30s) — matches TCP window clamp, should sustain
+            log "Running iperf3 TCP (-w 8K socket buffer, 30s)..."
+            iperf3 -c "$LINUX_IPV6" $IPERF_BIND -t 30 -w 8K -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-tcp-8k.txt" || warn "iperf3 TCP -w 8K failed"
+
+            sleep 2
+
+            # UDP at BLE-appropriate rate (50 Kbps, below 80 Kbps AIMD ceiling)
+            log "Running iperf3 UDP (50 Kbps, 10s)..."
+            iperf3 -c "$LINUX_IPV6" $IPERF_BIND -t 10 -u -b 50K -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-50K.txt" || warn "iperf3 UDP 50K failed"
+
+            sleep 2
+
+            # UDP above BLE ceiling (100 Kbps)
+            log "Running iperf3 UDP (100 Kbps, 10s)..."
+            iperf3 -c "$LINUX_IPV6" $IPERF_BIND -t 10 -u -b 100K -P 1 2>&1 | tee "$RESULTS_DIR/iperf3-udp-100K.txt" || warn "iperf3 UDP 100K failed"
+
+            $LINUX_SSH "sudo killall -9 iperf3 2>/dev/null" || true
+        else
+            warn "iperf3 not available on both hosts, skipping"
+        fi
     else
         warn "Could not determine Linux IPv6 address, skipping iperf3"
+    fi
+
+    # --- SSH over FIPS mesh ---
+    log ""
+    log "=== SSH over FIPS mesh ==="
+
+    if [ -n "$LINUX_IPV6" ]; then
+        # Re-read IPv6 in case iperf3 section was skipped
+        if [ -z "$LINUX_IPV6_RAW" ]; then
+            LINUX_IPV6=$($LINUX_SSH "ip -6 addr show fips0 scope global 2>/dev/null | grep -oP 'inet6 \K[^/]+'" 2>/dev/null | tr -d '[:space:]' || echo "")
+        fi
+
+        if [ -n "$LINUX_IPV6" ]; then
+            log "Testing SSH to ${LINUX_USER}@${LINUX_IPV6}..."
+            SSH_START=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time()*1e9))")
+            SSH_OUTPUT=$(ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                "${LINUX_USER}@${LINUX_IPV6}" "uname -a && uptime" 2>&1)
+            SSH_RC=$?
+            SSH_END=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time()*1e9))")
+            SSH_MS=$(( (SSH_END - SSH_START) / 1000000 ))
+
+            if [ $SSH_RC -eq 0 ]; then
+                log "SSH OK (${SSH_MS}ms): $(echo "$SSH_OUTPUT" | head -1)"
+                echo "SSH: OK (${SSH_MS}ms)" >> "$RESULTS_DIR/summary.txt"
+                echo "$SSH_OUTPUT" > "$RESULTS_DIR/ssh-test.txt"
+
+                # Small data transfer via SSH
+                log "Testing data transfer via SSH (5KB)..."
+                DD_OUTPUT=$(ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                    "${LINUX_USER}@${LINUX_IPV6}" "dd if=/dev/urandom bs=1024 count=5 2>/dev/null | wc -c" 2>&1)
+                DD_RC=$?
+                if [ $DD_RC -eq 0 ]; then
+                    log "SSH data transfer OK: ${DD_OUTPUT} bytes received"
+                    echo "SSH data transfer: OK (${DD_OUTPUT} bytes)" >> "$RESULTS_DIR/summary.txt"
+                else
+                    warn "SSH data transfer failed: $DD_OUTPUT"
+                    echo "SSH data transfer: FAILED" >> "$RESULTS_DIR/summary.txt"
+                fi
+            else
+                warn "SSH failed (${SSH_MS}ms): $SSH_OUTPUT"
+                echo "SSH: FAILED (${SSH_MS}ms)" >> "$RESULTS_DIR/summary.txt"
+            fi
+        else
+            warn "Cannot determine Linux IPv6 for SSH test"
+            echo "SSH: SKIPPED (no IPv6)" >> "$RESULTS_DIR/summary.txt"
+        fi
+    else
+        warn "Linux IPv6 not available for SSH test"
+        echo "SSH: SKIPPED (no IPv6)" >> "$RESULTS_DIR/summary.txt"
     fi
 fi
 
