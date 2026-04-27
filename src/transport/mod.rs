@@ -1175,7 +1175,11 @@ impl TransportHandle {
     /// Send data with priority (bypasses rate limiter for BLE).
     ///
     /// Non-BLE transports fall through to normal [`send`](Self::send).
-    pub async fn send_urgent(&self, addr: &TransportAddr, data: &[u8]) -> Result<usize, TransportError> {
+    pub async fn send_urgent(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
         match self {
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.send_urgent_async(addr, data).await,
@@ -1186,6 +1190,7 @@ impl TransportHandle {
     /// Feed SRTT measurement back to the transport for adaptive rate control.
     ///
     /// BLE uses this for AIMD rate adaptation. Other transports ignore it.
+    #[allow(unused_variables)]
     pub async fn update_rate_from_srtt(&self, addr: &TransportAddr, srtt_ms: f64) {
         match self {
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
@@ -1193,6 +1198,19 @@ impl TransportHandle {
                 t.update_rate_from_srtt(addr, srtt_ms).await;
             }
             _ => {}
+        }
+    }
+
+    /// Check if the transport's outbound queue is congested.
+    ///
+    /// Returns `true` when the transport cannot accept more data at the
+    /// current rate (e.g., BLE send queue full or rate limiter exhausted).
+    /// Non-BLE transports never report congestion.
+    pub fn is_congested(&self) -> bool {
+        match self {
+            #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+            TransportHandle::Ble(t) => t.is_congested(),
+            _ => false,
         }
     }
 

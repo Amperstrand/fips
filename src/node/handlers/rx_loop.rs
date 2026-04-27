@@ -91,14 +91,20 @@ impl Node {
         info!("RX event loop started");
 
         loop {
+            let ble_congested = self
+                .ble_congested
+                .as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+
             tokio::select! {
                 packet = packet_rx.recv() => {
                     match packet {
                         Some(p) => self.process_packet(p).await,
-                        None => break, // channel closed
+                        None => break,
                     }
                 }
-                Some(ipv6_packet) = tun_outbound_rx.recv() => {
+                Some(ipv6_packet) = tun_outbound_rx.recv(), if !ble_congested => {
                     self.handle_tun_outbound(ipv6_packet).await;
                 }
                 Some(identity) = dns_identity_rx.recv() => {

@@ -138,8 +138,8 @@ impl Node {
 
         if let Some(srtt_ms) = ble_srtt_ms
             && let Some(tid) = peer_transport_id
-                && let Some(taddr) = peer_transport_addr
-                    && let Some(transport) = self.transports.get(&tid)
+            && let Some(taddr) = peer_transport_addr
+            && let Some(transport) = self.transports.get(&tid)
         {
             transport.update_rate_from_srtt(&taddr, srtt_ms).await;
         }
@@ -207,7 +207,7 @@ impl Node {
                 .cloned()
                 .unwrap_or_else(|| peer.identity().short_npub());
 
-        let Some(mmp) = peer.mmp_mut() else {
+            let Some(mmp) = peer.mmp_mut() else {
                 continue;
             };
 

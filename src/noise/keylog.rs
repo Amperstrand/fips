@@ -30,16 +30,17 @@ fn keylog_enabled() -> Option<&'static str> {
 /// Log link-layer (FMP) Noise keys after IK handshake completion.
 pub fn log_link_keys(local_npub: &str, peer_npub: &str, send_key: &[u8; 32], recv_key: &[u8; 32]) {
     if let Some(path) = keylog_enabled()
-        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(
-                f,
-                "FIPS_LINK {} {} {} {}",
-                local_npub,
-                peer_npub,
-                hex::encode(send_key),
-                hex::encode(recv_key),
-            );
-        }
+        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(
+            f,
+            "FIPS_LINK {} {} {} {}",
+            local_npub,
+            peer_npub,
+            hex::encode(send_key),
+            hex::encode(recv_key),
+        );
+    }
 }
 
 /// Log session-layer (FSP) Noise keys after XK handshake completion.
@@ -50,16 +51,17 @@ pub fn log_session_keys(
     recv_key: &[u8; 32],
 ) {
     if let Some(path) = keylog_enabled()
-        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(
-                f,
-                "FIPS_SESSION {} {} {} {}",
-                local_npub,
-                peer_npub,
-                hex::encode(send_key),
-                hex::encode(recv_key),
-            );
-        }
+        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(
+            f,
+            "FIPS_SESSION {} {} {} {}",
+            local_npub,
+            peer_npub,
+            hex::encode(send_key),
+            hex::encode(recv_key),
+        );
+    }
 }
 
 #[cfg(test)]

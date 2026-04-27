@@ -54,6 +54,7 @@ use stats::BleStats;
 use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
@@ -106,6 +107,7 @@ pub struct BleTransport<I: BleIo> {
     rate_adapter: Arc<Mutex<BleRateAdapter>>,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
     disconnect_tx: Option<DisconnectTx>,
+    congested: Arc<AtomicBool>,
 }
 
 const RECV_TIMEOUT_SECS: u64 = 30;
@@ -143,6 +145,7 @@ impl<I: BleIo> BleTransport<I> {
             rate_adapter: Arc::new(Mutex::new(BleRateAdapter::new(initial_rate_bps))),
             backoff: Arc::new(Mutex::new(backoff::PeerBackoff::with_defaults())),
             disconnect_tx: None,
+            congested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -156,6 +159,14 @@ impl<I: BleIo> BleTransport<I> {
 
     pub fn io(&self) -> &Arc<I> {
         &self.io
+    }
+
+    pub fn is_congested(&self) -> bool {
+        self.congested.load(Ordering::Relaxed)
+    }
+
+    pub fn congestion_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.congested)
     }
 
     pub fn set_local_pubkey(&mut self, pubkey: [u8; 32]) {
@@ -345,11 +356,15 @@ impl<I: BleIo> BleTransport<I> {
 
         match conn.stream.send(data).await {
             Ok(()) => {
+                self.congested.store(false, Ordering::Relaxed);
                 self.stats.record_send(data.len());
                 Ok(data.len())
             }
             Err(e) => {
                 self.stats.record_send_error();
+                if matches!(e, TransportError::SendFailed(_)) {
+                    self.congested.store(true, Ordering::Relaxed);
+                }
                 drop(pool);
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);

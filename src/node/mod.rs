@@ -305,6 +305,9 @@ pub struct Node {
     transports: HashMap<TransportId, TransportHandle>,
     /// Per-transport kernel drop tracking for congestion detection.
     transport_drops: HashMap<TransportId, TransportDropState>,
+    /// BLE outbound congestion flag (shared with drain/pacer tasks).
+    /// When true, the RX loop skips TUN dequeue to apply backpressure.
+    ble_congested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Active links.
     links: HashMap<LinkId, Link>,
     /// Reverse lookup: (transport_id, remote_addr) -> link_id.
@@ -550,6 +553,7 @@ impl Node {
             recent_requests: HashMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
+            ble_congested: None,
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
             packet_tx: None,
@@ -675,6 +679,7 @@ impl Node {
             recent_requests: HashMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
+            ble_congested: None,
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
             packet_tx: None,
@@ -853,6 +858,7 @@ impl Node {
                                 crate::transport::ble::PeerCapabilities::central_only(),
                             );
                         }
+                        self.ble_congested = Some(ble.congestion_flag());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -899,6 +905,7 @@ impl Node {
                                 crate::transport::ble::PeerCapabilities::macos_default(),
                             );
                         }
+                        self.ble_congested = Some(ble.congestion_flag());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -1076,7 +1083,9 @@ impl Node {
     /// transports. Falls back to the first operational transport's MTU,
     /// then to config, and finally to 1280 (IPv6 minimum).
     pub fn transport_mtu(&self) -> u16 {
-        let min_link_mtu = self.links.values()
+        let min_link_mtu = self
+            .links
+            .values()
             .filter(|link| link.state().is_operational())
             .filter_map(|link| {
                 let transport = self.transports.get(&link.transport_id())?;

@@ -55,7 +55,9 @@ const WRITE_NOTIFY_NAME: &str = "FIPSPeripheralWrite";
 static TOKIO_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
 
 fn tokio_handle() -> &'static tokio::runtime::Handle {
-    TOKIO_HANDLE.get().expect("tokio runtime handle not initialized")
+    TOKIO_HANDLE
+        .get()
+        .expect("tokio runtime handle not initialized")
 }
 
 use crate::transport::ble::Unpoison;
@@ -225,7 +227,9 @@ impl BleStream for BluestStream {
                 TransportError::Timeout
             })?
             .map(|_| ())
-            .map_err(|e| TransportError::Io(std::io::Error::other(format!("send_urgent write: {e}"))))
+            .map_err(|e| {
+                TransportError::Io(std::io::Error::other(format!("send_urgent write: {e}")))
+            })
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -493,7 +497,9 @@ define_class!(
             let output_stream = match stream.downcast_ref::<NSOutputStream>() {
                 Some(s) => s,
                 None => {
-                    warn!("PeripheralOutputDelegate: expected NSOutputStream, got unknown stream type");
+                    warn!(
+                        "PeripheralOutputDelegate: expected NSOutputStream, got unknown stream type"
+                    );
                     return;
                 }
             };
@@ -545,10 +551,11 @@ impl PeripheralOutputDelegate {
     /// to drain the queue.
     fn set_output_stream(&self, stream: SendableOutputStream) {
         if let Ok(mut guard) = self.ivars().output_stream.lock()
-            && guard.is_none() {
-                debug!("BLE peripheral: eagerly storing output stream reference");
-                *guard = Some(stream);
-            }
+            && guard.is_none()
+        {
+            debug!("BLE peripheral: eagerly storing output stream reference");
+            *guard = Some(stream);
+        }
     }
 
     fn try_enqueue(&self, data: &[u8]) -> bool {
@@ -783,7 +790,8 @@ impl PeripheralStream {
             _center_observer: output_delegate.clone(),
         });
 
-        let (pacer_tx, mut pacer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BLE_PERIPHERAL_QUEUE_DEPTH);
+        let (pacer_tx, mut pacer_rx) =
+            tokio::sync::mpsc::channel::<Vec<u8>>(BLE_PERIPHERAL_QUEUE_DEPTH);
 
         let rate_limiter = Arc::new(Mutex::new(SendRateLimiter::new(
             send_rate_bps,
@@ -854,7 +862,9 @@ impl PeripheralStream {
         }
         trace!(addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
         let notified = self.queue_space_notify.notified();
-        if tokio::time::timeout(std::time::Duration::from_secs(2), notified).await.is_ok()
+        if tokio::time::timeout(std::time::Duration::from_secs(2), notified)
+            .await
+            .is_ok()
             && self.output_delegate.try_enqueue(framed)
         {
             self.notify_write();
@@ -874,7 +884,9 @@ impl BleStream for PeripheralStream {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 trace!(addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, dropping");
-                Err(TransportError::SendFailed("BLE peripheral pacer queue full".into()))
+                Err(TransportError::SendFailed(
+                    "BLE peripheral pacer queue full".into(),
+                ))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
                 std::io::Error::other("BLE peripheral pacer channel closed"),

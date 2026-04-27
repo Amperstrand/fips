@@ -64,9 +64,10 @@ impl PeerBackoff {
     /// Whether the address is currently auto-denied.
     pub fn is_denied(&self, addr: &BleAddr) -> bool {
         if let Some(d) = self.denied.get(addr)
-            && Instant::now() < d.until {
-                return true;
-            }
+            && Instant::now() < d.until
+        {
+            return true;
+        }
         false
     }
 
