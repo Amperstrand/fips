@@ -367,6 +367,7 @@ pub fn run_tun_reader(
     tun_tx: TunTx,
     outbound_tx: TunOutboundTx,
     max_mss: Arc<AtomicU16>,
+    pacer: Option<std::sync::Arc<TunPacer>>,
 ) {
     let name = device.name().to_string();
     let mut buf = vec![0u8; mtu as usize + 100];
@@ -378,6 +379,7 @@ pub fn run_tun_reader(
                     &mut buf[..n],
                     &max_mss,
                     &name,
+                    &pacer,
                     our_addr,
                     &tun_tx,
                     &outbound_tx,
@@ -419,6 +421,7 @@ impl Drop for ShutdownFd {
 /// avoiding the need to close the TUN fd externally (which would cause a
 /// double-close when `TunDevice` drops).
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub fn run_tun_reader(
     mut device: TunDevice,
     mtu: u16,
@@ -427,6 +430,7 @@ pub fn run_tun_reader(
     outbound_tx: TunOutboundTx,
     max_mss: Arc<AtomicU16>,
     shutdown_fd: std::os::unix::io::RawFd,
+    pacer: Option<std::sync::Arc<TunPacer>>,
 ) {
     let _shutdown_fd = ShutdownFd(shutdown_fd);
     let tun_fd = device.device().as_raw_fd();
@@ -483,6 +487,7 @@ pub fn run_tun_reader(
                         &mut buf[..n],
                         &max_mss,
                         &name,
+                        &pacer,
                         our_addr,
                         &tun_tx,
                         &outbound_tx,
@@ -507,11 +512,83 @@ pub fn run_tun_reader(
     // _shutdown_fd closes on drop
 }
 
+/// Token-bucket pacer for TUN outbound traffic on constrained transports (e.g. BLE).
+///
+/// Rate-limits FIPS-destined packets read from the TUN device to match the
+/// transport's send capacity. When the pacer sleeps, the kernel's TUN write
+/// buffer fills, causing TCP to slow down naturally (backpressure).
+///
+/// Uses `std::sync::Mutex` (no tokio) because the TUN reader runs in a plain
+/// std thread. Rate and burst are configured from the BLE transport config.
+///
+/// Equivalent to OpenVPN's `--shaper` or Linux `tc qdisc tbf`.
+pub struct TunPacer {
+    inner: std::sync::Mutex<PacerInner>,
+}
+
+struct PacerInner {
+    rate_bytes_per_sec: f64,
+    burst_bytes: f64,
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TunPacer {
+    pub fn new(rate_bps: u64, burst_bytes: u32) -> Self {
+        let rate_bytes_per_sec = rate_bps as f64 / 8.0;
+        Self {
+            inner: std::sync::Mutex::new(PacerInner {
+                rate_bytes_per_sec,
+                burst_bytes: burst_bytes as f64,
+                tokens: burst_bytes as f64,
+                last_refill: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    pub fn acquire(&self, bytes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.rate_bytes_per_sec <= 0.0 {
+            return;
+        }
+        inner.refill();
+        if inner.tokens >= bytes as f64 {
+            inner.tokens -= bytes as f64;
+            return;
+        }
+        let deficit = bytes as f64 - inner.tokens;
+        let wait_secs = deficit / inner.rate_bytes_per_sec;
+        let wait =
+            std::time::Duration::from_secs_f64(wait_secs).max(std::time::Duration::from_millis(1));
+        drop(inner);
+        std::thread::sleep(wait);
+        let mut inner = self.inner.lock().unwrap();
+        inner.refill();
+        inner.tokens -= bytes as f64;
+        if inner.tokens < 0.0 {
+            inner.tokens = 0.0;
+        }
+    }
+}
+
+impl PacerInner {
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens += elapsed * self.rate_bytes_per_sec;
+        if self.tokens > self.burst_bytes {
+            self.tokens = self.burst_bytes;
+        }
+        self.last_refill = now;
+    }
+}
+
 /// Process a single TUN packet. Returns `false` if the reader should exit.
 fn handle_tun_packet(
     packet: &mut [u8],
     max_mss: &AtomicU16,
     name: &str,
+    pacer: &Option<std::sync::Arc<TunPacer>>,
     our_addr: FipsAddress,
     tun_tx: &TunTx,
     outbound_tx: &TunOutboundTx,
@@ -534,6 +611,9 @@ fn handle_tun_packet(
         }
         if clamp_tcp_window(packet) {
             trace!(name = %name, "Clamped TCP receive window on constrained link");
+        }
+        if let Some(pacer) = pacer {
+            pacer.acquire(packet.len());
         }
         if outbound_tx.blocking_send(packet.to_vec()).is_err() {
             return false; // Channel closed, shutdown
@@ -866,6 +946,7 @@ mod windows_tun {
         tun_tx: TunTx,
         outbound_tx: TunOutboundTx,
         max_mss: Arc<AtomicU16>,
+        pacer: Option<std::sync::Arc<super::TunPacer>>,
     ) {
         let name = device.name().to_string();
         let mut buf = vec![0u8; mtu as usize + 100];
@@ -877,6 +958,7 @@ mod windows_tun {
                         &mut buf[..n],
                         &max_mss,
                         &name,
+                        &pacer,
                         our_addr,
                         &tun_tx,
                         &outbound_tx,

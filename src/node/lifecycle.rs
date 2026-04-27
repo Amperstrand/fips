@@ -8,7 +8,7 @@ use crate::protocol::{Disconnect, DisconnectReason};
 use crate::transport::{
     Link, LinkDirection, LinkId, TransportAddr, TransportId, disconnect_channel, packet_channel,
 };
-use crate::upper::tun::{TunDevice, TunState, run_tun_reader, shutdown_tun_interface};
+use crate::upper::tun::{TunDevice, TunPacer, TunState, run_tun_reader, shutdown_tun_interface};
 use crate::{NodeAddr, PeerIdentity};
 use std::thread;
 use std::time::Duration;
@@ -654,6 +654,15 @@ impl Node {
 
                     self.tun_max_mss = Some(max_mss.clone());
 
+                    let tun_pacer = self.config.transports.ble.iter().next().map(
+                        |(_, ble_config)| {
+                            std::sync::Arc::new(TunPacer::new(
+                                ble_config.initial_stream_rate_bps(),
+                                ble_config.send_burst_bytes(),
+                            ))
+                        },
+                    );
+
                     // Spawn reader thread
                     #[cfg(target_os = "macos")]
                     let reader_handle = thread::spawn(move || {
@@ -665,11 +674,20 @@ impl Node {
                             outbound_tx,
                             max_mss,
                             shutdown_read_fd,
+                            tun_pacer,
                         );
                     });
                     #[cfg(not(target_os = "macos"))]
                     let reader_handle = thread::spawn(move || {
-                        run_tun_reader(device, mtu, our_addr, reader_tun_tx, outbound_tx, max_mss);
+                        run_tun_reader(
+                            device,
+                            mtu,
+                            our_addr,
+                            reader_tun_tx,
+                            outbound_tx,
+                            max_mss,
+                            tun_pacer,
+                        );
                     });
 
                     self.tun_state = TunState::Active;
