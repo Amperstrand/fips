@@ -1603,12 +1603,7 @@ mod tests {
         );
         // Connection should still be in the pool
         assert!(
-            transport
-                .pool
-                .lock()
-                .await
-                .get(&remote_addr)
-                .is_some(),
+            transport.pool.lock().await.get(&remote_addr).is_some(),
             "connection should remain in pool after SendFailed (congestion)"
         );
     }

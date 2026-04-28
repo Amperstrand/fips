@@ -654,14 +654,18 @@ impl Node {
 
                     self.tun_max_mss = Some(max_mss.clone());
 
-                    let tun_pacer = self.config.transports.ble.iter().next().map(
-                        |(_, ble_config)| {
-                            std::sync::Arc::new(TunPacer::new(
-                                ble_config.initial_stream_rate_bps(),
-                                ble_config.send_burst_bytes(),
-                            ))
-                        },
-                    );
+                    let tun_pacer =
+                        self.config
+                            .transports
+                            .ble
+                            .iter()
+                            .next()
+                            .map(|(_, ble_config)| {
+                                std::sync::Arc::new(TunPacer::new(
+                                    ble_config.initial_stream_rate_bps(),
+                                    ble_config.send_burst_bytes(),
+                                ))
+                            });
 
                     // Spawn reader thread
                     #[cfg(target_os = "macos")]
