@@ -102,20 +102,6 @@ impl std::fmt::Display for TunState {
 // Unix (Linux + macOS) TUN implementation
 // ============================================================================
 
-/// Kernel-level traffic shaping parameters for the TUN interface.
-///
-/// When present, FIPS applies platform-specific kernel traffic shaping
-/// to the TUN interface to prevent TCP bursts from overwhelming the
-/// slow BLE link. This complements the userspace `TunPacer` by
-/// catching bursts at the kernel level before they reach the TUN buffer.
-#[cfg(unix)]
-pub struct TunShaping {
-    /// Shaping rate in bits per second (e.g., 80_000 for 80 Kbps).
-    pub rate_bps: u64,
-    /// Burst tolerance in bytes (e.g., 2048 for 2 KB).
-    pub burst_bytes: u32,
-}
-
 /// FIPS TUN device wrapper.
 #[cfg(unix)]
 pub struct TunDevice {
@@ -1115,13 +1101,11 @@ mod windows_tun {
 pub use windows_tun::{TunDevice, TunWriter, run_tun_reader, shutdown_tun_interface};
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
-pub(crate) mod platform {
+mod platform {
     use super::TunError;
     use futures::TryStreamExt;
     use rtnetlink::{Handle, LinkUnspec, RouteMessageBuilder, new_connection};
     use std::net::Ipv6Addr;
-    use tokio::process::Command;
     use tracing::debug;
 
     /// Check if IPv6 is disabled system-wide.
@@ -1223,81 +1207,13 @@ pub(crate) mod platform {
             Err(TunError::InterfaceNotFound(name.to_string()))
         }
     }
-
-    /// Apply kernel-level traffic shaping to the TUN interface using `tc qdisc tbf`.
-    ///
-    /// This shapes ALL outbound traffic on the TUN interface at the kernel level,
-    /// preventing TCP from writing bursts that exceed the BLE link capacity.
-    /// The TBF (Token Bucket Filter) queueing discipline limits the rate at which
-    /// packets leave the interface's queue.
-    ///
-    /// Requires `CAP_NET_ADMIN` (typically running as root).
-    /// Non-fatal if it fails — the userspace TunPacer provides a fallback.
-    pub async fn configure_traffic_shaping(
-        name: &str,
-        shaping: &super::TunShaping,
-    ) {
-        let rate_kbit = shaping.rate_bps / 1000;
-        let burst_kb = shaping.burst_bytes / 1024;
-        let latency_ms = 100;
-
-        // Remove existing qdisc (in case of reconfiguration)
-        let _ = Command::new("tc")
-            .args(["qdisc", "del", "dev", name, "root"])
-            .output()
-            .await;
-
-        let output = Command::new("tc")
-            .args([
-                "qdisc", "add", "dev", name, "root",
-                "tbf",
-                "rate", &format!("{}kbit", rate_kbit),
-                "burst", &format!("{}k", burst_kb.max(1)),
-                "latency", &format!("{}ms", latency_ms),
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => {
-                debug!(
-                    name,
-                    rate_kbit,
-                    burst_kb,
-                    "Applied tc qdisc tbf to TUN interface"
-                );
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                debug!(
-                    name,
-                    rate_kbit,
-                    error = stderr.trim(),
-                    "Failed to apply tc qdisc tbf (non-fatal)"
-                );
-            }
-            Err(e) => {
-                debug!(name, error = %e, "tc command not found (non-fatal)");
-            }
-        }
-    }
-
-    /// Remove kernel-level traffic shaping from the TUN interface.
-    #[allow(dead_code)]
-    pub async fn remove_traffic_shaping(name: &str) {
-        let _ = Command::new("tc")
-            .args(["qdisc", "del", "dev", name, "root"])
-            .output()
-            .await;
-    }
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) mod platform {
+mod platform {
     use super::TunError;
     use std::net::Ipv6Addr;
     use tokio::process::Command;
-    use tracing::debug;
 
     /// Check if IPv6 is disabled system-wide.
     pub fn is_ipv6_disabled() -> bool {
@@ -1381,75 +1297,6 @@ pub(crate) mod platform {
             )));
         }
         Ok(())
-    }
-
-    /// Reduce the default TCP send buffer size via sysctl.
-    ///
-    /// On macOS, the default TCP send buffer is ~128 KB (`net.inet.tcp.sendspace`).
-    /// This allows a single TCP connection to buffer 128 KB of data before the
-    /// kernel applies backpressure. Over a slow BLE link (80 Kbps), this creates
-    /// a 12+ second burst/stall cycle.
-    ///
-    /// Reducing `sendspace` limits how much unacknowledged data TCP can have in
-    /// flight, forcing the sender to wait for ACKs sooner. This directly prevents
-    /// the initial cwnd burst from overwhelming the BLE link.
-    ///
-    /// **WARNING**: This is a GLOBAL setting that affects all TCP connections on
-    /// the system, not just FIPS. Use with caution in production.
-    ///
-    /// Non-fatal if it fails — the userspace TunPacer provides a fallback.
-    pub async fn configure_traffic_shaping(
-        _name: &str,
-        shaping: &super::TunShaping,
-    ) {
-        // Reduce TCP send buffer to limit unacknowledged data in flight.
-        // Use 4× the BLE burst size to allow TCP slow-start while still
-        // preventing the full 128 KB burst. With 8 KB send buffer and
-        // ~50ms RTT over BLE, TCP can have ~8 KB in flight — enough for
-        // slow-start to work but prevents the initial cwnd flood.
-        let send_buf = (shaping.burst_bytes * 4).max(8192) as u64;
-        let rate_kbps = shaping.rate_bps / 1000;
-
-        // Reduce TCP send buffer to 8KB (e.g., 8192 = 8 KB)
-        let output = Command::new("sysctl")
-            .args([
-                "-w",
-                &format!("net.inet.tcp.sendspace={}", send_buf),
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                debug!(
-                    send_buf,
-                    rate_kbps,
-                    stdout = stdout.trim(),
-                    "Reduced TCP send buffer via sysctl"
-                );
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                debug!(
-                    send_buf,
-                    error = stderr.trim(),
-                    "Failed to reduce TCP send buffer (non-fatal)"
-                );
-            }
-            Err(e) => {
-                debug!(error = %e, "sysctl command failed (non-fatal)");
-            }
-        }
-    }
-
-    /// Restore default TCP send buffer (128 KB).
-    #[allow(dead_code)]
-    pub async fn remove_traffic_shaping() {
-        let _ = Command::new("sysctl")
-            .args(["-w", "net.inet.tcp.sendspace=131072"])
-            .output()
-            .await;
     }
 }
 
