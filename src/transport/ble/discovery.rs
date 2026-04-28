@@ -9,6 +9,7 @@ use secp256k1::XOnlyPublicKey;
 use std::sync::Mutex;
 
 use super::addr::BleAddr;
+use crate::transport::ble::Unpoison;
 
 /// Buffer for discovered BLE peers, drained by `discover()`.
 ///
@@ -34,7 +35,7 @@ impl DiscoveryBuffer {
     pub fn add_peer(&self, addr: &BleAddr) {
         let ta = addr.to_transport_addr();
         let peer = DiscoveredPeer::new(self.transport_id, ta.clone());
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock().unpoison();
         // Deduplicate by address string
         let addr_str = addr.to_string_repr();
         peers.retain(|p| p.addr.as_str() != Some(addr_str.as_str()));
@@ -49,7 +50,7 @@ impl DiscoveryBuffer {
     pub fn add_peer_with_pubkey(&self, addr: &BleAddr, pubkey: XOnlyPublicKey) {
         let ta = addr.to_transport_addr();
         let peer = DiscoveredPeer::with_hint(self.transport_id, ta.clone(), pubkey);
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock().unpoison();
         let addr_str = addr.to_string_repr();
         peers.retain(|p| p.addr.as_str() != Some(addr_str.as_str()));
         peers.push(peer);
@@ -57,7 +58,7 @@ impl DiscoveryBuffer {
 
     /// Drain all discovered peers since the last call.
     pub fn take(&self) -> Vec<DiscoveredPeer> {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock().unpoison();
         std::mem::take(&mut *peers)
     }
 }

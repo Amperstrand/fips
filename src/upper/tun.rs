@@ -23,6 +23,8 @@ use std::io::Write;
 use std::net::Ipv6Addr;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use thiserror::Error;
 #[cfg(unix)]
@@ -225,7 +227,7 @@ impl TunDevice {
     /// a channel sender for submitting packets to be written.
     ///
     /// The max_mss parameter is used for TCP MSS clamping on inbound packets.
-    pub fn create_writer(&self, max_mss: u16) -> Result<(TunWriter, TunTx), TunError> {
+    pub fn create_writer(&self, max_mss: Arc<AtomicU16>) -> Result<(TunWriter, TunTx), TunError> {
         let fd = self.device.as_raw_fd();
 
         // Duplicate the file descriptor for writing
@@ -263,7 +265,7 @@ pub struct TunWriter {
     file: File,
     rx: mpsc::Receiver<Vec<u8>>,
     name: String,
-    max_mss: u16,
+    max_mss: Arc<AtomicU16>,
 }
 
 #[cfg(unix)]
@@ -274,17 +276,23 @@ impl TunWriter {
     /// to the TUN device. Returns when the channel is closed (all senders dropped).
     #[cfg_attr(target_os = "macos", allow(unused_mut))]
     pub fn run(mut self) {
-        use super::tcp_mss::clamp_tcp_mss;
+        use super::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
-        debug!(name = %self.name, max_mss = self.max_mss, "TUN writer starting");
+        debug!(name = %self.name, max_mss = self.max_mss.load(Ordering::Relaxed), "TUN writer starting");
 
         for mut packet in self.rx {
-            // Clamp TCP MSS on inbound SYN-ACK packets
-            if clamp_tcp_mss(&mut packet, self.max_mss) {
+            let mss = self.max_mss.load(Ordering::Relaxed);
+            if clamp_tcp_mss(&mut packet, mss) {
                 trace!(
                     name = %self.name,
-                    max_mss = self.max_mss,
+                    max_mss = mss,
                     "Clamped TCP MSS in inbound SYN-ACK packet"
+                );
+            }
+            if clamp_tcp_window(&mut packet) {
+                trace!(
+                    name = %self.name,
+                    "Clamped TCP receive window on constrained link"
                 );
             }
 
@@ -358,17 +366,20 @@ pub fn run_tun_reader(
     our_addr: FipsAddress,
     tun_tx: TunTx,
     outbound_tx: TunOutboundTx,
-    transport_mtu: u16,
+    max_mss: Arc<AtomicU16>,
+    pacer: Option<std::sync::Arc<TunPacer>>,
 ) {
-    let (name, mut buf, max_mss) = tun_reader_setup(device.name(), mtu, transport_mtu);
+    let name = device.name().to_string();
+    let mut buf = vec![0u8; mtu as usize + 100];
 
     loop {
         match device.read_packet(&mut buf) {
             Ok(n) if n > 0 => {
                 if !handle_tun_packet(
                     &mut buf[..n],
-                    max_mss,
+                    &max_mss,
                     &name,
+                    &pacer,
                     our_addr,
                     &tun_tx,
                     &outbound_tx,
@@ -410,18 +421,21 @@ impl Drop for ShutdownFd {
 /// avoiding the need to close the TUN fd externally (which would cause a
 /// double-close when `TunDevice` drops).
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub fn run_tun_reader(
     mut device: TunDevice,
     mtu: u16,
     our_addr: FipsAddress,
     tun_tx: TunTx,
     outbound_tx: TunOutboundTx,
-    transport_mtu: u16,
+    max_mss: Arc<AtomicU16>,
     shutdown_fd: std::os::unix::io::RawFd,
+    pacer: Option<std::sync::Arc<TunPacer>>,
 ) {
     let _shutdown_fd = ShutdownFd(shutdown_fd);
     let tun_fd = device.device().as_raw_fd();
-    let (name, mut buf, max_mss) = tun_reader_setup(device.name(), mtu, transport_mtu);
+    let name = device.name().to_string();
+    let mut buf = vec![0u8; mtu as usize + 100];
 
     // Set TUN fd to non-blocking so we can use select + read without blocking
     // past the point where select returns readable.
@@ -471,8 +485,9 @@ pub fn run_tun_reader(
                 Ok(n) if n > 0 => {
                     if !handle_tun_packet(
                         &mut buf[..n],
-                        max_mss,
+                        &max_mss,
                         &name,
+                        &pacer,
                         our_addr,
                         &tun_tx,
                         &outbound_tx,
@@ -497,43 +512,89 @@ pub fn run_tun_reader(
     // _shutdown_fd closes on drop
 }
 
-/// Common setup for TUN reader: allocates buffer, computes max MSS.
-fn tun_reader_setup(device_name: &str, mtu: u16, transport_mtu: u16) -> (String, Vec<u8>, u16) {
-    use super::icmp::effective_ipv6_mtu;
+/// Token-bucket pacer for TUN outbound traffic on constrained transports (e.g. BLE).
+///
+/// Rate-limits FIPS-destined packets read from the TUN device to match the
+/// transport's send capacity. When the pacer sleeps, the kernel's TUN write
+/// buffer fills, causing TCP to slow down naturally (backpressure).
+///
+/// Uses `std::sync::Mutex` (no tokio) because the TUN reader runs in a plain
+/// std thread. Rate and burst are configured from the BLE transport config.
+///
+/// Equivalent to OpenVPN's `--shaper` or Linux `tc qdisc tbf`.
+pub struct TunPacer {
+    inner: std::sync::Mutex<PacerInner>,
+}
 
-    let name = device_name.to_string();
-    let buf = vec![0u8; mtu as usize + 100];
+struct PacerInner {
+    rate_bytes_per_sec: f64,
+    burst_bytes: f64,
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
 
-    const IPV6_HEADER: u16 = 40;
-    const TCP_HEADER: u16 = 20;
-    let effective_mtu = effective_ipv6_mtu(transport_mtu);
-    let max_mss = effective_mtu
-        .saturating_sub(IPV6_HEADER)
-        .saturating_sub(TCP_HEADER);
+impl TunPacer {
+    pub fn new(rate_bps: u64, burst_bytes: u32) -> Self {
+        let rate_bytes_per_sec = rate_bps as f64 / 8.0;
+        Self {
+            inner: std::sync::Mutex::new(PacerInner {
+                rate_bytes_per_sec,
+                burst_bytes: burst_bytes as f64,
+                tokens: burst_bytes as f64,
+                last_refill: std::time::Instant::now(),
+            }),
+        }
+    }
 
-    debug!(
-        name = %name,
-        tun_mtu = mtu,
-        transport_mtu = transport_mtu,
-        effective_mtu = effective_mtu,
-        max_mss = max_mss,
-        "TUN reader starting"
-    );
+    pub fn acquire(&self, bytes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.rate_bytes_per_sec <= 0.0 {
+            return;
+        }
+        inner.refill();
+        if inner.tokens >= bytes as f64 {
+            inner.tokens -= bytes as f64;
+            return;
+        }
+        let deficit = bytes as f64 - inner.tokens;
+        let wait_secs = deficit / inner.rate_bytes_per_sec;
+        let wait =
+            std::time::Duration::from_secs_f64(wait_secs).max(std::time::Duration::from_millis(1));
+        drop(inner);
+        std::thread::sleep(wait);
+        let mut inner = self.inner.lock().unwrap();
+        inner.refill();
+        inner.tokens -= bytes as f64;
+        if inner.tokens < 0.0 {
+            inner.tokens = 0.0;
+        }
+    }
+}
 
-    (name, buf, max_mss)
+impl PacerInner {
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens += elapsed * self.rate_bytes_per_sec;
+        if self.tokens > self.burst_bytes {
+            self.tokens = self.burst_bytes;
+        }
+        self.last_refill = now;
+    }
 }
 
 /// Process a single TUN packet. Returns `false` if the reader should exit.
 fn handle_tun_packet(
     packet: &mut [u8],
-    max_mss: u16,
+    max_mss: &AtomicU16,
     name: &str,
+    pacer: &Option<std::sync::Arc<TunPacer>>,
     our_addr: FipsAddress,
     tun_tx: &TunTx,
     outbound_tx: &TunOutboundTx,
 ) -> bool {
     use super::icmp::{DestUnreachableCode, build_dest_unreachable, should_send_icmp_error};
-    use super::tcp_mss::clamp_tcp_mss;
+    use super::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
     log_ipv6_packet(packet);
 
@@ -544,8 +605,15 @@ fn handle_tun_packet(
 
     // Check if destination is a FIPS address (fd::/8 prefix)
     if packet[24] == crate::identity::FIPS_ADDRESS_PREFIX {
-        if clamp_tcp_mss(packet, max_mss) {
-            trace!(name = %name, max_mss = max_mss, "Clamped TCP MSS in SYN packet");
+        let mss = max_mss.load(Ordering::Relaxed);
+        if clamp_tcp_mss(packet, mss) {
+            trace!(name = %name, max_mss = mss, "Clamped TCP MSS in SYN packet");
+        }
+        if clamp_tcp_window(packet) {
+            trace!(name = %name, "Clamped TCP receive window on constrained link");
+        }
+        if let Some(pacer) = pacer {
+            pacer.acquire(packet.len());
         }
         if outbound_tx.blocking_send(packet.to_vec()).is_err() {
             return false; // Channel closed, shutdown
@@ -772,7 +840,10 @@ mod windows_tun {
         /// submitting packets to be written.
         ///
         /// The `max_mss` parameter is used for TCP MSS clamping on inbound packets.
-        pub fn create_writer(&self, max_mss: u16) -> Result<(TunWriter, TunTx), TunError> {
+        pub fn create_writer(
+            &self,
+            max_mss: Arc<AtomicU16>,
+        ) -> Result<(TunWriter, TunTx), TunError> {
             let (tx, rx) = mpsc::channel();
             Ok((
                 TunWriter {
@@ -807,7 +878,7 @@ mod windows_tun {
         session: Arc<wintun::Session>,
         rx: mpsc::Receiver<Vec<u8>>,
         name: String,
-        max_mss: u16,
+        max_mss: Arc<AtomicU16>,
     }
 
     impl TunWriter {
@@ -816,17 +887,23 @@ mod windows_tun {
         /// Blocks forever, reading packets from the channel and writing them
         /// to the wintun session. Returns when the channel is closed.
         pub fn run(self) {
-            use crate::upper::tcp_mss::clamp_tcp_mss;
+            use crate::upper::tcp_mss::{clamp_tcp_mss, clamp_tcp_window};
 
-            debug!(name = %self.name, max_mss = self.max_mss, "TUN writer starting");
+            debug!(name = %self.name, max_mss = self.max_mss.load(Ordering::Relaxed), "TUN writer starting");
 
             for mut packet in self.rx {
-                // Clamp TCP MSS on inbound SYN-ACK packets
-                if clamp_tcp_mss(&mut packet, self.max_mss) {
+                let mss = self.max_mss.load(Ordering::Relaxed);
+                if clamp_tcp_mss(&mut packet, mss) {
                     trace!(
                         name = %self.name,
-                        max_mss = self.max_mss,
+                        max_mss = mss,
                         "Clamped TCP MSS in inbound SYN-ACK packet"
+                    );
+                }
+                if clamp_tcp_window(&mut packet) {
+                    trace!(
+                        name = %self.name,
+                        "Clamped TCP receive window on constrained link"
                     );
                 }
 
@@ -868,17 +945,20 @@ mod windows_tun {
         our_addr: FipsAddress,
         tun_tx: TunTx,
         outbound_tx: TunOutboundTx,
-        transport_mtu: u16,
+        max_mss: Arc<AtomicU16>,
+        pacer: Option<std::sync::Arc<super::TunPacer>>,
     ) {
-        let (name, mut buf, max_mss) = super::tun_reader_setup(device.name(), mtu, transport_mtu);
+        let name = device.name().to_string();
+        let mut buf = vec![0u8; mtu as usize + 100];
 
         loop {
             match device.read_packet(&mut buf) {
                 Ok(n) if n > 0 => {
                     if !super::handle_tun_packet(
                         &mut buf[..n],
-                        max_mss,
+                        &max_mss,
                         &name,
+                        &pacer,
                         our_addr,
                         &tun_tx,
                         &outbound_tx,

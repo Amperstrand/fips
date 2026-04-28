@@ -576,6 +576,14 @@ pub struct BleConfig {
     /// this long before probing the same address again. Default: 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_cooldown_secs: Option<u64>,
+
+    /// Send rate limit in bits per second. 0 = unlimited. Default: 100_000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_rate_bps: Option<u64>,
+
+    /// Send burst size in bytes. Default: 2048.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_burst_bytes: Option<u32>,
 }
 
 impl BleConfig {
@@ -629,6 +637,35 @@ impl BleConfig {
     pub fn probe_cooldown_secs(&self) -> u64 {
         self.probe_cooldown_secs
             .unwrap_or(DEFAULT_BLE_PROBE_COOLDOWN_SECS)
+    }
+
+    /// Get the send rate limit in bits per second. Default: 100_000.
+    pub fn send_rate_bps(&self) -> u64 {
+        self.send_rate_bps.unwrap_or(100_000)
+    }
+
+    /// Get the effective send rate for the AIMD adapter.
+    /// Maps explicit `0` (unlimited) to a high ceiling so the adapter
+    /// can still probe, while using the configured rate otherwise.
+    pub fn effective_send_rate_bps(&self) -> u64 {
+        match self.send_rate_bps {
+            Some(0) => 150_000,
+            _ => self.send_rate_bps(),
+        }
+    }
+
+    /// Initial send rate for BLE streams, clamped to MAX_RATE_BPS (80 Kbps).
+    ///
+    /// The rate adapter will adjust from here based on MMP SRTT feedback,
+    /// but the initial rate must not exceed what BLE can sustain.
+    pub fn initial_stream_rate_bps(&self) -> u64 {
+        const BLE_MAX_RATE_BPS: u64 = 80_000;
+        self.effective_send_rate_bps().min(BLE_MAX_RATE_BPS)
+    }
+
+    /// Get the send burst size in bytes. Default: 2048.
+    pub fn send_burst_bytes(&self) -> u32 {
+        self.send_burst_bytes.unwrap_or(2048)
     }
 }
 

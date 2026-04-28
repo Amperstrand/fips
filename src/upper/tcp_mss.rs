@@ -1,7 +1,9 @@
-//! TCP MSS (Maximum Segment Size) clamping for MTU handling.
+//! TCP MSS clamping and receive window clamping for constrained transports.
 //!
-//! Intercepts TCP SYN packets and reduces the MSS option to ensure
-//! TCP segments fit within the FIPS effective MTU after encapsulation.
+//! Intercepts TCP packets to:
+//! - Reduce MSS option in SYN packets to fit FIPS effective MTU
+//! - Strip Window Scale option from SYN/SYN-ACK and clamp receive window
+//!   to a small value appropriate for low-bandwidth links (e.g., BLE)
 
 /// TCP header minimum length (without options).
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -12,11 +14,39 @@ const TCP_OPT_MSS: u8 = 2;
 /// TCP option length for MSS (kind + length + value).
 const TCP_OPT_MSS_LEN: u8 = 4;
 
+/// TCP option kind for Window Scale.
+const TCP_OPT_WSCALE: u8 = 3;
+
+/// TCP option kind for NOP (used as padding when stripping options).
+const TCP_OPT_NOP: u8 = 1;
+
 /// TCP flags offset in header.
 const TCP_FLAGS_OFFSET: usize = 13;
 
+/// TCP window field offset (relative to TCP header start).
+const TCP_WINDOW_OFFSET: usize = 14;
+
 /// TCP SYN flag bit.
 const TCP_FLAG_SYN: u8 = 0x02;
+
+/// Maximum TCP receive window for constrained BLE links.
+///
+/// At 80 Kbps BLE capacity and ~50ms RTT, the BDP is ~500 bytes.
+/// 2 MSS (2920 bytes) provides ~6× BDP headroom so the rate limiter
+/// (not the TCP window) is the throughput bottleneck at typical RTTs,
+/// while keeping bursts small enough that the BLE mpsc(32) queue drains
+/// before filling. With scale=0, the field directly represents bytes.
+///
+/// Tested alternatives:
+/// - 8192 (~5.6 MSS): Allows more segments in flight, but floods the
+///   BLE pipeline. UDP 50K loss went from 0% → 15%, UDP 100K 0% → 27%.
+///   With BBR, losses were even worse (42%/27%). The larger pipeline
+///   leaves no headroom for competing traffic.
+/// - 2920 (2 MSS, current): Best overall. 0% UDP loss at 100K, TCP
+///   throughput matches or exceeds 8192. The TUN pacer (80 Kbps token
+///   bucket) is the primary rate limiter; this window is a secondary
+///   safeguard.
+const MAX_BLE_TCP_WINDOW: u16 = 2920;
 
 /// Check if a TCP packet is a SYN packet (has SYN flag set).
 fn is_tcp_syn(tcp_header: &[u8]) -> bool {
@@ -124,6 +154,94 @@ pub fn clamp_tcp_mss(ipv6_packet: &mut [u8], max_mss: u16) -> bool {
         }
 
         i += length;
+    }
+
+    modified
+}
+
+/// Clamp TCP receive window and strip Window Scale option on constrained links.
+///
+/// For SYN/SYN-ACK packets: removes the Window Scale option (replaces with NOPs)
+/// so both sides negotiate scale=0, meaning the raw window field = actual window.
+///
+/// For ALL TCP packets: clamps the window field to `min(current, MAX_BLE_TCP_WINDOW)`.
+/// This is necessary because TCP updates its receive window on every ACK — clamping
+/// only SYN-ACK would be bypassed within the first RTT.
+///
+/// Returns true if the packet was modified.
+pub fn clamp_tcp_window(ipv6_packet: &mut [u8]) -> bool {
+    if ipv6_packet.len() < 40 || ipv6_packet[0] >> 4 != 6 {
+        return false;
+    }
+
+    if ipv6_packet[6] != 6 {
+        return false;
+    }
+
+    let tcp_start = 40;
+    if ipv6_packet.len() < tcp_start + TCP_HEADER_MIN_LEN {
+        return false;
+    }
+
+    let tcp_header = &ipv6_packet[tcp_start..];
+    let tcp_header_len = get_tcp_data_offset(tcp_header);
+    if tcp_header_len < TCP_HEADER_MIN_LEN || tcp_header_len > tcp_header.len() {
+        return false;
+    }
+
+    let flags = tcp_header[TCP_FLAGS_OFFSET];
+    let is_syn = (flags & TCP_FLAG_SYN) != 0;
+    let mut modified = false;
+
+    if is_syn {
+        let options_start = tcp_start + TCP_HEADER_MIN_LEN;
+        let options_end = tcp_start + tcp_header_len;
+
+        if options_end <= ipv6_packet.len() {
+            let mut i = options_start;
+            while i < options_end {
+                let kind = ipv6_packet[i];
+                if kind == 0 {
+                    break;
+                }
+                if kind == TCP_OPT_NOP {
+                    i += 1;
+                    continue;
+                }
+                if i + 1 >= options_end {
+                    break;
+                }
+                let length = ipv6_packet[i + 1] as usize;
+                if length < 2 || i + length > options_end {
+                    break;
+                }
+
+                if kind == TCP_OPT_WSCALE && length == 3 {
+                    for j in 0..3 {
+                        ipv6_packet[i + j] = TCP_OPT_NOP;
+                    }
+                    modified = true;
+                    break;
+                }
+                i += length;
+            }
+        }
+    }
+
+    let window_offset = tcp_start + TCP_WINDOW_OFFSET;
+    if window_offset + 2 <= ipv6_packet.len() {
+        let current_window =
+            u16::from_be_bytes([ipv6_packet[window_offset], ipv6_packet[window_offset + 1]]);
+
+        if current_window > MAX_BLE_TCP_WINDOW {
+            ipv6_packet[window_offset..window_offset + 2]
+                .copy_from_slice(&MAX_BLE_TCP_WINDOW.to_be_bytes());
+            modified = true;
+        }
+    }
+
+    if modified {
+        recalculate_tcp_checksum(ipv6_packet, tcp_start);
     }
 
     modified
@@ -276,5 +394,57 @@ mod tests {
         let modified = clamp_tcp_mss(&mut packet, 1200);
 
         assert!(!modified);
+    }
+
+    #[test]
+    fn test_clamp_tcp_window_large_window_clamped() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        let window_offset = 40 + TCP_WINDOW_OFFSET;
+        packet[window_offset..window_offset + 2].copy_from_slice(&65535u16.to_be_bytes());
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        let modified = clamp_tcp_window(&mut packet);
+
+        assert!(modified);
+        let clamped_window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
+        assert_eq!(clamped_window, MAX_BLE_TCP_WINDOW);
+    }
+
+    #[test]
+    fn test_clamp_tcp_window_at_limit_unchanged() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        let window_offset = 40 + TCP_WINDOW_OFFSET;
+        packet[window_offset..window_offset + 2]
+            .copy_from_slice(&(MAX_BLE_TCP_WINDOW).to_be_bytes());
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        let modified = clamp_tcp_window(&mut packet);
+
+        assert!(!modified);
+        let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
+        assert_eq!(window, MAX_BLE_TCP_WINDOW);
+    }
+
+    #[test]
+    fn test_clamp_tcp_window_below_limit_unchanged() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        let window_offset = 40 + TCP_WINDOW_OFFSET;
+        packet[window_offset..window_offset + 2].copy_from_slice(&100u16.to_be_bytes());
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        let modified = clamp_tcp_window(&mut packet);
+
+        assert!(!modified);
+        let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
+        assert_eq!(window, 100);
     }
 }

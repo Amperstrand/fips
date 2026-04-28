@@ -22,7 +22,10 @@ packet boundaries and require no additional framing. Stream-oriented
 transports (TCP, WebSocket, Tor) must delineate FIPS packets within the
 byte stream; the common prefix `payload_len` field provides this
 framing directly. TCP and Tor share a common stream reader
-(`tcp/stream.rs`) that implements this framing.
+(`tcp/stream.rs`) that implements this framing. BLE L2CAP CoC is
+message-oriented on Linux (SeqPacket sockets) but byte-stream-oriented on
+macOS (CoreBluetooth); the macOS backend uses the FMP prefix for
+reassembly.
 
 **Ethernet data frame header.** The Ethernet transport prepends a 3-byte
 header before the FMP payload on data frames: a 1-byte frame type
@@ -32,6 +35,28 @@ would otherwise corrupt AEAD verification. Beacon frames (`0x01`) have
 no length field (fixed 34-byte payload). These bytes are consumed by the
 transport layer and are not visible to FMP. The effective MTU for FMP is
 the interface MTU minus three bytes (typically 1497).
+
+**BLE L2CAP framing.** BLE L2CAP Connection-Oriented Channels (CoC) operate as
+reliable, sequenced byte streams. On Linux, BlueZ exposes L2CAP as SeqPacket
+sockets that preserve message boundaries — each `recv()` returns exactly one
+complete FIPS packet, and no additional framing is needed.
+
+On macOS, CoreBluetooth provides L2CAP as a raw byte stream (`NSInputStream`/
+`NSOutputStream`) that coalesces multiple L2CAP SDUs into a single `read()`
+call. To reassemble complete FIPS packets, the macOS BLE transport uses the
+4-byte FMP common prefix (`[ver+phase:1][flags:1][payload_len:2 LE]`) to
+determine total packet size per phase:
+
+| Phase | Total packet size |
+| ----- | ----------------- |
+| 0x1 (Noise msg1) | 114 bytes (fixed wire size) |
+| 0x2 (Noise msg2) | 69 bytes (fixed wire size) |
+| 0x0 (Established) | 4 + 12 + payload_len + 16 (prefix + header + payload + AEAD tag) |
+
+The reader accumulates bytes until the expected packet size is reached, then
+delivers the complete packet to FMP. No additional framing bytes are added
+beyond what FMP already defines. The effective MTU for FMP over BLE is the
+negotiated L2CAP channel MTU (typically 2048 on Linux, up to 4096 on macOS).
 
 ## Link-Layer Formats
 

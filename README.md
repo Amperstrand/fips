@@ -67,7 +67,7 @@ cd fips
 cargo build --release
 ```
 
-Requires Rust 1.85+ (edition 2024). Linux, macOS, and Windows are
+Requires Rust 1.94+ (edition 2024). Linux and macOS are
 supported (see transport matrix below).
 
 ### Transport support by platform
@@ -78,11 +78,14 @@ supported (see transport matrix below).
 | TCP       |  ✅   |  ✅   |   ✅    |   ✅    |
 | Ethernet  |  ✅   |  ✅   |   ❌    |   ✅    |
 | Tor       |  ✅   |  ✅   |   ✅    |   ✅    |
-| BLE       |  ✅   |  ❌   |   ❌    |   ❌    |
+| BLE       |  ✅   |  ✅   |   ❌    |   ❌    |
 
 On **Linux**, the BLE transport requires BlueZ and libdbus. On
-Debian/Ubuntu: `sudo apt install bluez libdbus-1-dev`. Then build with
-BLE enabled: `cargo build --release --features ble`.
+Debian/Ubuntu: `sudo apt install bluez libdbus-1-dev`. BLE is enabled
+automatically when the dependencies are detected at build time.
+
+On **macOS**, build with BLE enabled: `cargo build --release --features ble-macos`
+(requires Xcode Command Line Tools).
 
 On **OpenWrt**, BLE is disabled because libdbus is not available on
 the target. All other transports work and ship in the default ipk.
@@ -168,7 +171,7 @@ sudo tail -f /usr/local/var/log/fips/fips.log
 
 ### Windows
 
-Build without BLE (requires Linux-only libdbus):
+Build without BLE (no Linux-specific dependencies needed):
 
 ```powershell
 cargo build --release --no-default-features --features tui

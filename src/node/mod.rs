@@ -38,7 +38,8 @@ use crate::transport::tcp::TcpTransport;
 use crate::transport::tor::TorTransport;
 use crate::transport::udp::UdpTransport;
 use crate::transport::{
-    Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError, TransportHandle, TransportId,
+    DisconnectRx, DisconnectTx, Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError,
+    TransportHandle, TransportId,
 };
 use crate::tree::TreeState;
 use crate::upper::hosts::HostMap;
@@ -304,6 +305,9 @@ pub struct Node {
     transports: HashMap<TransportId, TransportHandle>,
     /// Per-transport kernel drop tracking for congestion detection.
     transport_drops: HashMap<TransportId, TransportDropState>,
+    /// BLE outbound congestion flag (shared with drain/pacer tasks).
+    /// When true, the RX loop skips TUN dequeue to apply backpressure.
+    ble_congested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Active links.
     links: HashMap<LinkId, Link>,
     /// Reverse lookup: (transport_id, remote_addr) -> link_id.
@@ -314,6 +318,8 @@ pub struct Node {
     packet_tx: Option<PacketTx>,
     /// Packet receiver (for event loop).
     packet_rx: Option<PacketRx>,
+    /// Disconnect receiver for connection-oriented transports.
+    disconnect_rx: Option<DisconnectRx>,
 
     // === Connections (Handshake Phase) ===
     /// Pending connections (handshake in progress).
@@ -383,6 +389,8 @@ pub struct Node {
     /// On Linux, deleting the interface via netlink serves the same purpose.
     #[cfg(target_os = "macos")]
     tun_shutdown_fd: Option<std::os::unix::io::RawFd>,
+    /// Shared TCP MSS clamp value, updated dynamically when transport MTU changes.
+    tun_max_mss: Option<std::sync::Arc<std::sync::atomic::AtomicU16>>,
 
     // === DNS Responder ===
     /// Receiver for resolved identities from the DNS responder.
@@ -545,10 +553,12 @@ impl Node {
             recent_requests: HashMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
+            ble_congested: None,
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -570,6 +580,7 @@ impl Node {
             tun_writer_handle: None,
             #[cfg(target_os = "macos")]
             tun_shutdown_fd: None,
+            tun_max_mss: None,
             dns_identity_rx: None,
             dns_task: None,
             index_allocator: IndexAllocator::new(),
@@ -668,10 +679,12 @@ impl Node {
             recent_requests: HashMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
+            ble_congested: None,
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -693,6 +706,7 @@ impl Node {
             tun_writer_handle: None,
             #[cfg(target_os = "macos")]
             tun_shutdown_fd: None,
+            tun_max_mss: None,
             dns_identity_rx: None,
             dns_task: None,
             index_allocator: IndexAllocator::new(),
@@ -730,7 +744,12 @@ impl Node {
     /// Create transport instances from configuration.
     ///
     /// Returns a vector of TransportHandles for all configured transports.
-    async fn create_transports(&mut self, packet_tx: &PacketTx) -> Vec<TransportHandle> {
+    #[allow(unused_variables)]
+    async fn create_transports(
+        &mut self,
+        packet_tx: &PacketTx,
+        disconnect_tx: &DisconnectTx,
+    ) -> Vec<TransportHandle> {
         let mut transports = Vec::new();
 
         // Collect UDP configs with optional names to avoid borrow conflicts
@@ -800,7 +819,7 @@ impl Node {
         }
 
         // Create BLE transport instances
-        #[cfg(bluer_available)]
+        #[cfg(any(bluer_available, feature = "ble-macos"))]
         {
             let ble_instances: Vec<_> = self
                 .config
@@ -815,7 +834,15 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
-                match crate::transport::ble::io::BluerIo::new(&adapter, mtu).await {
+                let accept_connections = ble_config.accept_connections();
+                match crate::transport::ble::io::BluerIo::new(
+                    &adapter,
+                    mtu,
+                    ble_config.initial_stream_rate_bps(),
+                    ble_config.send_burst_bytes(),
+                )
+                .await
+                {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,
@@ -825,6 +852,13 @@ impl Node {
                             packet_tx.clone(),
                         );
                         ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
+                        if !accept_connections {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        }
+                        self.ble_congested = Some(ble.congestion_flag());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -833,10 +867,57 @@ impl Node {
                 }
             }
 
-            #[cfg(any(not(bluer_available), test))]
+            #[cfg(all(feature = "ble-macos", not(test)))]
+            for (name, ble_config) in ble_instances {
+                let transport_id = self.allocate_transport_id();
+                let adapter = ble_config.adapter().to_string();
+                let mtu = ble_config.mtu();
+                let accept_connections = ble_config.accept_connections();
+                let scan_enabled = ble_config.scan();
+                match crate::transport::ble::io::BluestIo::new(
+                    &adapter,
+                    mtu,
+                    ble_config.initial_stream_rate_bps(),
+                    ble_config.send_burst_bytes(),
+                )
+                .await
+                {
+                    Ok(io) => {
+                        let mut ble = crate::transport::ble::BleTransport::new(
+                            transport_id,
+                            name,
+                            ble_config,
+                            io,
+                            packet_tx.clone(),
+                        );
+                        ble.set_local_pubkey(self.identity.pubkey().serialize());
+                        ble.set_disconnect_tx(disconnect_tx.clone());
+                        if !accept_connections {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        } else if !scan_enabled {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::peripheral_only(),
+                            );
+                        } else {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::macos_default(),
+                            );
+                        }
+                        self.ble_congested = Some(ble.congestion_flag());
+                        transports.push(TransportHandle::Ble(ble));
+                    }
+                    Err(e) => {
+                        tracing::warn!(adapter = %adapter, error = %e, "failed to initialize BLE adapter");
+                    }
+                }
+            }
+
+            #[cfg(any(not(any(bluer_available, feature = "ble-macos")), test,))]
             if !ble_instances.is_empty() {
                 #[cfg(not(test))]
-                tracing::warn!("BLE transport configured but this build lacks BlueZ support");
+                tracing::warn!("BLE transport configured but this build lacks BLE support");
             }
         }
 
@@ -997,12 +1078,25 @@ impl Node {
 
     /// Get the transport MTU for a specific transport.
     ///
-    /// When called without a specific transport context, returns the MTU
-    /// of the first operational transport, or 1280 (IPv6 minimum) as
-    /// fallback. This is used for initial TUN configuration where a
-    /// specific transport isn't yet known.
+    /// Prefers the minimum MTU across all operational links, which avoids
+    /// PMTU blackholes when BLE links (low MTU) coexist with higher-MTU
+    /// transports. Falls back to the first operational transport's MTU,
+    /// then to config, and finally to 1280 (IPv6 minimum).
     pub fn transport_mtu(&self) -> u16 {
-        // Prefer the MTU from the first operational transport
+        let min_link_mtu = self
+            .links
+            .values()
+            .filter(|link| link.state().is_operational())
+            .filter_map(|link| {
+                let transport = self.transports.get(&link.transport_id())?;
+                Some(transport.link_mtu(link.remote_addr()))
+            })
+            .min();
+
+        if let Some(mtu) = min_link_mtu {
+            return mtu;
+        }
+
         for handle in self.transports.values() {
             if handle.is_operational() {
                 return handle.mtu();
@@ -1251,6 +1345,23 @@ impl Node {
     /// Get the TUN interface name, if active.
     pub fn tun_name(&self) -> Option<&str> {
         self.tun_name.as_deref()
+    }
+
+    pub fn refresh_tun_mss(&self) {
+        use std::sync::atomic::Ordering;
+        if let Some(shared) = &self.tun_max_mss {
+            let effective_mtu = self.effective_ipv6_mtu();
+            let new_mss = effective_mtu.saturating_sub(40).saturating_sub(20);
+            let old_mss = shared.swap(new_mss, Ordering::Relaxed);
+            if old_mss != new_mss {
+                tracing::info!(
+                    old_mss = old_mss,
+                    new_mss = new_mss,
+                    effective_mtu = effective_mtu,
+                    "Updated TUN TCP MSS clamp"
+                );
+            }
+        }
     }
 
     // === Resource Limits ===

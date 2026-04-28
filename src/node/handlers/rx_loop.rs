@@ -54,6 +54,16 @@ impl Node {
             }
         };
 
+        // Take the disconnect receiver, or create a dummy channel (when no
+        // connection-oriented transports are configured).
+        let (mut disconnect_rx, _disconnect_guard) = match self.disconnect_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
         let mut tick =
             tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
 
@@ -81,14 +91,20 @@ impl Node {
         info!("RX event loop started");
 
         loop {
+            let ble_congested = self
+                .ble_congested
+                .as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+
             tokio::select! {
                 packet = packet_rx.recv() => {
                     match packet {
                         Some(p) => self.process_packet(p).await,
-                        None => break, // channel closed
+                        None => break,
                     }
                 }
-                Some(ipv6_packet) = tun_outbound_rx.recv() => {
+                Some(ipv6_packet) = tun_outbound_rx.recv(), if !ble_congested => {
                     self.handle_tun_outbound(ipv6_packet).await;
                 }
                 Some(identity) = dns_identity_rx.recv() => {
@@ -97,6 +113,12 @@ impl Node {
                         "Registering identity from DNS resolution"
                     );
                     self.register_identity(identity.node_addr, identity.pubkey);
+                }
+                disconnect = disconnect_rx.recv() => {
+                    match disconnect {
+                        Some(d) => self.handle_transport_disconnect(d),
+                        None => break,
+                    }
                 }
                 Some((request, response_tx)) = control_rx.recv() => {
                     let response = if request.command.starts_with("show_") {

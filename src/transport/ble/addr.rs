@@ -75,7 +75,7 @@ impl BleAddr {
 
     /// Convert to a bluer L2CAP `SocketAddr` with the given PSM.
     pub fn to_socket_addr(&self, psm: u16) -> bluer::l2cap::SocketAddr {
-        bluer::l2cap::SocketAddr::new(self.to_bluer_address(), bluer::AddressType::LePublic, psm)
+        bluer::l2cap::SocketAddr::new(self.to_bluer_address(), bluer::AddressType::LeRandom, psm)
     }
 }
 

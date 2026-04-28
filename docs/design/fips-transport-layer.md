@@ -127,8 +127,8 @@ media:
 | --------- | ---------- | --- | ----------- | ----- |
 | Ethernet | MAC | 1500 | Unreliable | Raw AF_PACKET frames |
 | WiFi | MAC | 1500 | Unreliable | Infrastructure mode = Ethernet |
-| Bluetooth | BD_ADDR | 672–64K | Reliable | L2CAP |
-| BLE | BD_ADDR | 23–517 | Reliable | Negotiated ATT_MTU |
+| Bluetooth | BD_ADDR | 672–64K | Reliable | L2CAP (classic, future direction) |
+| BLE | BD_ADDR | 23–2048 | Reliable | L2CAP CoC, per-link MTU negotiation |
 | Radio | Device addr | 51–222 | Unreliable | Low bandwidth, long range |
 
 **Point-to-point transports** connect exactly two endpoints:
@@ -192,7 +192,7 @@ proceed.
 | WebSocket | HTTP upgrade + TCP |
 | Tor | Circuit establishment (500ms–5s) |
 | Bluetooth | L2CAP connection |
-| BLE | L2CAP CoC or GATT connection |
+| BLE | L2CAP CoC (PSM 0x0085), GATT PSM exchange on macOS |
 | Serial | Physical connection (static) |
 
 ### Implications
@@ -661,6 +661,154 @@ The transport tracks per-instance statistics:
 | `connections_rejected` | Rejected inbound connections (limit exceeded) |
 | `control_errors` | Tor control port errors |
 
+## BLE: The Constrained Radio Transport
+
+For nodes within Bluetooth Low Energy radio range, BLE L2CAP provides a
+direct mesh transport without IP infrastructure — ideal for ad-hoc and
+constrained environments where WiFi or Ethernet is unavailable.
+
+- **No IP dependency**: Operates over BLE L2CAP Connection-Oriented Channels
+  (CoC), below the IP layer. Nodes within radio range (~10–100m) communicate
+  without IP addresses, routers, or internet connectivity.
+- **Reliable delivery**: L2CAP CoC provides in-order, reliable delivery with
+  retransmission and flow control. FIPS does not need its own retransmission
+  layer on BLE links.
+- **Advertising/scan discovery**: Nodes discover each other via BLE advertising
+  and scanning — no static peer configuration required. A GATT service UUID
+  identifies FIPS-capable peripherals.
+- **Per-link MTU**: Each L2CAP connection negotiates its own MTU independently
+  (23–2048 bytes). The transport reports per-link MTU to FMP for path MTU
+  calculation.
+- **Dual-platform**: Linux uses BlueZ via the `bluer` crate. macOS uses
+  CoreBluetooth via the `bluest` crate. Both implement the same `BleIo` trait,
+  providing a unified transport layer.
+
+### Implementation
+
+The BLE transport is organized around the `BleIo` trait, which abstracts the
+platform-specific Bluetooth stack behind a common async interface:
+
+```rust
+trait BleIo: Send + Sync + 'static {
+    type Stream: BleStream;
+    type Scanner;
+    fn listen(&self, psm: u16) -> Result<()>;
+    fn accept(&self) -> Result<(Self::Stream, TransportAddr)>;
+    fn connect(&self, addr: &BleAddr, psm: u16) -> Result<Self::Stream>;
+    fn start_scanning(&self) -> Result<Self::Scanner>;
+    fn start_advertising(&self, psm: u16) -> Result<()>;
+    fn local_addr(&self) -> Result<BleAddr>;
+}
+```
+
+Two production implementations exist:
+
+| Platform | Crate | Backend | Role |
+| -------- | ----- | ------- | ---- |
+| Linux (glibc) | `bluer` | BlueZ D-Bus API | Central + Peripheral |
+| macOS | `bluest` | CoreBluetooth (objc2) | Central + Peripheral |
+
+A `MockBleIo` implementation uses in-memory channels for testing, enabling all
+BLE transport tests to run without hardware in CI.
+
+#### L2CAP Channel
+
+FIPS registers on L2CAP PSM `0x0085` (133 decimal). All BLE data flows through
+L2CAP CoC channels, which provide:
+- Reliable, in-order byte-stream delivery
+- Credit-based flow control
+- Per-channel MTU negotiation
+
+On Linux, BlueZ exposes L2CAP as SeqPacket sockets that preserve message
+boundaries — each `recv()` returns exactly one FIPS packet.
+
+On macOS, CoreBluetooth provides L2CAP as a byte stream (NSInputStream/
+NSOutputStream) that does not preserve message boundaries. FIPS uses the
+4-byte FMP common prefix (`[ver+phase:1][flags:1][payload_len:2 LE]`) to
+reassemble complete packets from the byte stream.
+
+#### GATT PSM Exchange (macOS)
+
+macOS CoreBluetooth does not support static L2CAP PSM registration — PSM values
+are assigned dynamically by the OS at publish time. To interoperate with Linux
+(which listens on the fixed PSM 0x0085), the macOS peripheral advertises a GATT
+service containing the dynamically-assigned PSM as a characteristic value:
+
+1. macOS peripheral publishes an L2CAP service → OS assigns dynamic PSM
+2. macOS peripheral advertises GATT service UUID `9c90b790-...` with PSM characteristic
+3. Linux central discovers the GATT service during BLE scan
+4. Linux central reads the PSM characteristic → connects L2CAP CoC to that PSM
+
+For macOS-to-macOS connections, both sides use the GATT exchange. For
+Linux-to-Linux connections, both sides use the fixed PSM 0x0085 directly.
+
+#### Role Negotiation
+
+BLE defines two roles: Central (initiates connections, scans) and Peripheral
+(advertises, accepts connections). When two FIPS nodes both support both roles,
+the tiebreaker is the node address — the numerically larger address assumes the
+Central role, the smaller assumes Peripheral. This deterministic role selection
+prevents both nodes from simultaneously attempting to connect to each other.
+
+Configuration controls role behavior:
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `discovery` | true | Scan for BLE advertising from other nodes |
+| `announce` | false | Advertise FIPS presence via BLE |
+| `auto_connect` | false | Initiate connections to discovered peers |
+| `accept_connections` | false | Accept inbound L2CAP connections |
+
+A typical BLE node sets all four flags to `true`.
+
+#### Connection Pool
+
+The BLE transport maintains a connection pool with per-destination limits.
+Pool capacity is bounded to prevent resource exhaustion on constrained devices.
+When the pool is full, new connections evict the lowest-priority existing
+connection based on a static/dynamic priority scheme:
+
+- **Static connections** (configured peers) have higher priority than dynamic
+  connections (discovered peers).
+- Among same-priority connections, the least-recently-used is evicted first.
+
+#### Adaptive Rate Control
+
+BLE links have constrained bandwidth (typically 100–250 Kbps). An adaptive
+rate limiter prevents the transport from overwhelming the BLE link:
+
+- Token bucket with configurable burst and sustained rate
+- Additive-increase, multiplicative-decrease (AIMD) rate adaptation
+- Rate feedback from MMP congestion signals (ECN, queue depth)
+- Graceful degradation under load: rate decreases exponentially when
+  congestion is detected, recovers linearly when conditions improve
+
+| Property | Value |
+| -------- | ----- |
+| L2CAP PSM | 0x0085 (133 decimal) |
+| GATT Service UUID | `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c` |
+| Default MTU | 2048 (Linux), negotiated (macOS) |
+| Addressing | BLE address (`XX:XX:XX:XX:XX:XX`) |
+| Linux platform | BlueZ via `bluer` (glibc, not musl) |
+| macOS platform | CoreBluetooth via `bluest` (`--features ble-macos`) |
+| Framing | FMP common prefix (macOS byte-stream reassembly) |
+
+### BLE Statistics
+
+| Counter | Description |
+| ------- | ----------- |
+| `packets_sent` / `bytes_sent` | Successful sends |
+| `packets_recv` / `bytes_recv` | Successful receives |
+| `send_errors` / `recv_errors` | Send/receive failures |
+| `connections_established` | Outbound connections completed |
+| `connections_accepted` | Inbound connections accepted |
+| `connections_rejected` | Rejected connections (pool full) |
+| `scan_results` | BLE scan results received |
+| `scan_errors` | Scan failures |
+| `mtu_exceeded` | Packets rejected for MTU violation |
+| `rate_limit_dropped` | Packets dropped by rate limiter |
+| `pool_evictions` | Connection pool evictions |
+
 ## Discovery
 
 Discovery determines that a FIPS-capable endpoint is reachable at a given
@@ -693,7 +841,7 @@ X." FMP does not need to distinguish beacons from query responses.
 | UDP (LAN) | Broadcast/multicast | On local network segment |
 | Ethernet | Broadcast | Custom EtherType, ff:ff:ff:ff:ff:ff |
 | Radio | Beacon | Shared RF channel, natural fit |
-| BLE | Advertising | GATT service UUID |
+| BLE | Advertising + scan | GATT service UUID `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c`, PSM characteristic |
 
 ### Nostr Relay Discovery *(future direction)*
 
@@ -832,7 +980,7 @@ transitions through `Starting` to `Up` (operational). `stop()` moves to
 | Ethernet | **Implemented** | AF_PACKET SOCK_DGRAM, EtherType 0x2121, beacon discovery, Linux only |
 | WiFi | Future direction | Infrastructure mode = Ethernet driver |
 | Tor | **Implemented** | Outbound SOCKS5, inbound via onion service, .onion and clearnet addressing |
-| BLE | Future direction | ATT_MTU negotiation, per-link MTU |
+| BLE | **Implemented** | L2CAP CoC (PSM 0x0085), GATT PSM discovery on macOS, adaptive rate control |
 | Radio | Future direction | Constrained MTU (51–222 bytes) |
 | Serial | Future direction | SLIP/COBS framing, point-to-point |
 

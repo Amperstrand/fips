@@ -5,8 +5,10 @@ use crate::node::acl::PeerAclContext;
 use crate::node::wire::build_msg1;
 use crate::peer::PeerConnection;
 use crate::protocol::{Disconnect, DisconnectReason};
-use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId, packet_channel};
-use crate::upper::tun::{TunDevice, TunState, run_tun_reader, shutdown_tun_interface};
+use crate::transport::{
+    Link, LinkDirection, LinkId, TransportAddr, TransportId, disconnect_channel, packet_channel,
+};
+use crate::upper::tun::{TunDevice, TunPacer, TunState, run_tun_reader, shutdown_tun_interface};
 use crate::{NodeAddr, PeerIdentity};
 use std::thread;
 use std::time::Duration;
@@ -561,11 +563,13 @@ impl Node {
         // Create packet channel for transport -> Node communication
         let packet_buffer_size = self.config.node.buffers.packet_channel;
         let (packet_tx, packet_rx) = packet_channel(packet_buffer_size);
+        let (disconnect_tx, disconnect_rx) = disconnect_channel(packet_buffer_size);
         self.packet_tx = Some(packet_tx.clone());
         self.packet_rx = Some(packet_rx);
+        self.disconnect_rx = Some(disconnect_rx);
 
         // Initialize transports first (before TUN)
-        let transport_handles = self.create_transports(&packet_tx).await;
+        let transport_handles = self.create_transports(&packet_tx, &disconnect_tx).await;
 
         for mut handle in transport_handles {
             let transport_id = handle.transport_id();
@@ -611,9 +615,13 @@ impl Node {
                     // Calculate max MSS for TCP clamping
                     let effective_mtu = self.effective_ipv6_mtu();
                     let max_mss = effective_mtu.saturating_sub(40).saturating_sub(20); // IPv6 + TCP headers
+                    let max_mss = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(max_mss));
 
                     info!("effective MTU: {} bytes", effective_mtu);
-                    debug!("   max TCP MSS: {} bytes", max_mss);
+                    debug!(
+                        "   max TCP MSS: {} bytes",
+                        max_mss.load(std::sync::atomic::Ordering::Relaxed)
+                    );
 
                     // On macOS, create a shutdown pipe. Writing to it unblocks the
                     // reader thread's select() loop without closing the TUN fd
@@ -630,7 +638,7 @@ impl Node {
                     };
 
                     // Create writer (dups the fd for independent write access)
-                    let (writer, tun_tx) = device.create_writer(max_mss)?;
+                    let (writer, tun_tx) = device.create_writer(max_mss.clone())?;
 
                     // Spawn writer thread
                     let writer_handle = thread::spawn(move || {
@@ -644,8 +652,18 @@ impl Node {
                     let tun_channel_size = self.config.node.buffers.tun_channel;
                     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(tun_channel_size);
 
+                    self.tun_max_mss = Some(max_mss.clone());
+
+                    let tun_pacer = self.config.transports.ble.iter().next().map(
+                        |(_, ble_config)| {
+                            std::sync::Arc::new(TunPacer::new(
+                                ble_config.initial_stream_rate_bps(),
+                                ble_config.send_burst_bytes(),
+                            ))
+                        },
+                    );
+
                     // Spawn reader thread
-                    let transport_mtu = self.transport_mtu();
                     #[cfg(target_os = "macos")]
                     let reader_handle = thread::spawn(move || {
                         run_tun_reader(
@@ -654,8 +672,9 @@ impl Node {
                             our_addr,
                             reader_tun_tx,
                             outbound_tx,
-                            transport_mtu,
+                            max_mss,
                             shutdown_read_fd,
+                            tun_pacer,
                         );
                     });
                     #[cfg(not(target_os = "macos"))]
@@ -666,7 +685,8 @@ impl Node {
                             our_addr,
                             reader_tun_tx,
                             outbound_tx,
-                            transport_mtu,
+                            max_mss,
+                            tun_pacer,
                         );
                     });
 

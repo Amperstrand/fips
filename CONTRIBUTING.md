@@ -17,10 +17,12 @@ Before changing code, read the protocol docs in this order:
 
 ## Prerequisites
 
-- Rust 1.94.0 and Linux with TUN support
+- Rust 1.94.1 and Linux or macOS with TUN support
 - Use the pinned toolchain from [rust-toolchain.toml](rust-toolchain.toml) for deterministic builds
 - For the default BLE-enabled build on Debian/Ubuntu:
   `sudo apt install bluez libdbus-1-dev pkg-config`
+- For macOS BLE support: `cargo build --release --features ble-macos`
+  (requires Xcode Command Line Tools)
 - Docker is required for the integration harnesses under [testing/](testing/)
 
 If you do not want BLE locally, build and test without default features:
