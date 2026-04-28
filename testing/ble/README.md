@@ -1,0 +1,225 @@
+# BLE Transport Testing
+
+Hardware-in-the-loop BLE transport testing for FIPS. These tests require
+physical Bluetooth Low Energy adapters and cannot run in CI (no Bluetooth
+hardware in GitHub Actions). All BLE transport logic is tested via
+`MockBleIo` unit tests that run in CI without hardware — this directory is
+for **validation against real BLE radios**.
+
+## Prerequisites
+
+### Linux
+
+- BLE adapter (built-in or USB dongle, e.g., CSR8510, Intel AX200)
+- BlueZ stack: `sudo apt install bluetooth bluez`
+- Verify adapter: `hciconfig hci0` or `btmgmt info`
+- The FIPS binary must be built with BlueZ support (automatic on glibc):
+  ```
+  cargo build --release
+  ```
+
+### macOS
+
+- Built-in Bluetooth (all Macs since 2012)
+- Build with the `ble-macos` feature:
+  ```
+  cargo build --release --features ble-macos
+  ```
+
+### Wireshark (optional, for protocol analysis)
+
+- Install Wireshark with BLE capture support
+- Copy `testing/chaos/wireshark/fips-dissector.lua` to your Wireshark
+  plugins directory (`~/.local/lib/wireshark/plugins/` on Linux,
+  `~/.config/wireshark/plugins/` on macOS)
+- Capture BLE traffic: `sudo btmon -i hci0 -w capture.log` (Linux)
+
+## Test Scenarios
+
+BLE test scenarios are in `testing/chaos/scenarios/` and use the native
+process runner (no Docker — BLE requires direct hardware access):
+
+| Scenario | Nodes | Description |
+| -------- | ----- | ----------- |
+| `ble-smoke` | 2 | Basic BLE connectivity: 2 nodes, 1 BLE edge, 30s |
+| `ble-only` | 4 | BLE-only ring topology, 60s with light traffic |
+| `ble-cost` | 4 | Diamond topology testing cost-based parent selection |
+| `ble-mesh` | 6 | Mixed UDP + BLE mesh, heterogeneous transports |
+
+## Running Tests
+
+### Quick smoke test
+
+```bash
+# Build FIPS
+cargo build --release           # Linux
+cargo build --release --features ble-macos  # macOS
+
+# Run the 2-node smoke test
+./testing/chaos/scripts/ble-test.sh ble-smoke
+```
+
+### Run a specific scenario
+
+```bash
+./testing/chaos/scripts/ble-test.sh ble-only
+./testing/chaos/scripts/ble-test.sh ble-cost
+./testing/chaos/scripts/ble-test.sh ble-mesh
+```
+
+### List available BLE scenarios
+
+```bash
+./testing/chaos/scripts/ble-test.sh --list
+```
+
+### Capture BLE traffic during test
+
+```bash
+./testing/chaos/scripts/ble-test.sh --capture ble-smoke
+```
+
+This starts `btmon` in the background to capture raw BLE traffic to
+`ble-capture-hci0.log` in the results directory. Load the capture in
+Wireshark with the FIPS dissector for protocol-level analysis.
+
+## Two-Box Testing (macOS ↔ Linux)
+
+The most common setup is a Mac and a Linux box within BLE range:
+
+1. **Build on both machines** (see Prerequisites above)
+2. **Start the Linux node**:
+   ```bash
+   fips -c linux-node.yaml
+   ```
+   Where `linux-node.yaml` contains:
+   ```yaml
+   transports:
+     ble:
+       adapter: "hci0"
+       advertise: true
+       scan: true
+       auto_connect: true
+       accept_connections: true
+   ```
+3. **Start the macOS node**:
+   ```bash
+   fips -c macos-node.yaml
+   ```
+   Where `macos-node.yaml` contains:
+   ```yaml
+   transports:
+     ble:
+       adapter: "default"
+       advertise: true
+       scan: true
+       auto_connect: true
+       accept_connections: true
+   ```
+4. **Wait for convergence** — typically 3–5 seconds. Check logs for:
+   ```
+  BLE transport started adapter=hci0 mtu=2048
+  BLE peer discovered addr=AA:BB:CC:DD:EE:FF
+  FMP handshake completed peer=<npub>
+  Tree converged root=<npub> depth=0 peers=1
+   ```
+
+## Expected Results
+
+For the `ble-smoke` scenario (2 nodes):
+
+| Metric | Observed |
+| ------ | -------- |
+| BLE scan to discovery | ~200–500ms |
+| GATT PSM read | ~286ms |
+| L2CAP channel open | ~29ms |
+| Noise handshake | ~50ms |
+| **Total connect** | **~2300ms** |
+| MTU | 2048/2048 (both directions) |
+| Spanning tree convergence | < 5 seconds total |
+| Throughput | 50–250 Kbps (limited by BLE link) |
+
+### Hardware-validated setup
+
+| Box | Role | Adapter | MAC |
+| --- | ---- | -------- | --- |
+| macOS (arm64) | Central + Peripheral | Built-in (`default`) | — |
+| Linux 218 | Central + Peripheral | `hci0` | `14:5A:FC:49:C2:24` |
+
+BLE PSM: dynamic (GATT-advertised by macOS via UUID `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c`).
+The default PSM in FIPS config is `0x0085` (133), but macOS CoreBluetooth
+allocates the actual PSM dynamically and publishes it via GATT. The Linux
+node reads the PSM from GATT during discovery.
+
+## Troubleshooting
+
+### "No BLE adapter found"
+
+- Linux: Check `hciconfig hci0` — adapter may be blocked. Run
+  `sudo rfkill unblock bluetooth` and `sudo hciconfig hci0 up`.
+- macOS: Check System Preferences → Bluetooth is enabled.
+
+### "L2CAP connect failed"
+
+- Linux: Ensure `bluetoothd` is running (`sudo systemctl status bluetooth`).
+- Check PSM 0x00C0 (192) is not in use: `sudo sdptool browse local`.
+- BLE devices must be paired or have BLE enabled (different from classic
+  Bluetooth pairing).
+
+### macOS central role receives no data
+
+- This was a bluest bug: L2CAP `NSInputStream` was scheduled on
+  `mainRunLoop()` which is never pumped in CLI/tokio apps.
+- **Fixed** in our bluest fork (Amperstrand/bluest#3).
+- If using upstream bluest (not our fork), the peripheral path works
+  (uses its own dispatch queue) but the central path cannot receive.
+- The fork is pinned in `Cargo.toml` via `rev = "f3c8d09"`.
+
+### macOS L2CAP sends silently lose bytes
+
+- This was a bluest bug: `OutputStreamDelegate::send_packet` discarded
+  bytes on partial `NSOutputStream.write(maxLength:)`.
+- **Fixed** in our bluest fork (Amperstrand/bluest#2).
+- Symptom: intermittent corruption in Noise handshake or AEAD decryption
+  failures under sustained traffic.
+
+### TCP connections (SSH, iperf3 TCP mode) fail over BLE
+
+- BLE's ~200 Kbps throughput with rate limiting (`send_rate_bps`) does not
+  reliably support TCP's retransmission and congestion control overhead.
+- **Observed**: iperf3 TCP bursts 128KB in the first second then stalls;
+  TCP control connections die after ~9 seconds, killing the BLE link.
+- **UDP and ICMPv6** (ping6, iperf3 UDP mode) work reliably at up to
+  200 Kbps with zero loss. SSH over the FIPS mesh works on UDP, Ethernet,
+  and TCP transports — just not over BLE.
+- This is a fundamental BLE bandwidth constraint, not a bug.
+- **Workaround**: Use UDP-based tools for BLE throughput testing.
+
+### Connection keeps dropping
+
+- BLE connection interval may be too aggressive. Default is 30ms; some
+  adapters prefer 100ms+.
+- Check distance — BLE range is typically 10m (line of sight).
+- USB BLE dongles may have power issues — try a powered USB hub.
+
+### "MockBleIo" in logs
+
+This means the transport compiled with the mock backend instead of the real
+one. Ensure:
+- Linux: Building with glibc (not musl) so `bluer_available` is set
+- macOS: `--features ble-macos` is specified
+
+## ble_spike.rs
+
+`ble_spike.rs` is a standalone hardware validation tool that exercises
+the `bluer` crate's L2CAP CoC directly (outside of the FIPS transport
+layer). It is useful for verifying that BLE hardware and BlueZ are
+working correctly before running the full FIPS BLE stack.
+
+```bash
+cd testing/ble
+cargo run --bin ble_spike
+```
+
+This is a development spike — the production BLE transport in `src/transport/ble/`
+uses the `BleIo` trait abstraction with platform-specific backends.
