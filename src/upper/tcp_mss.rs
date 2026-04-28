@@ -32,19 +32,21 @@ const TCP_FLAG_SYN: u8 = 0x02;
 /// Maximum TCP receive window for constrained BLE links.
 ///
 /// At 80 Kbps BLE capacity and ~50ms RTT, the BDP is ~500 bytes.
-/// 8192 bytes (~5.6 MSS, ~16× BDP) allows TCP slow-start to open
-/// the congestion window gradually while the userspace TUN pacer
-/// (token bucket at BLE rate) prevents bursts from overwhelming
-/// the BLE link. The window clamp is a secondary safeguard — the
-/// pacer is the primary rate limiter.
+/// 2 MSS (2920 bytes) provides ~6× BDP headroom so the rate limiter
+/// (not the TCP window) is the throughput bottleneck at typical RTTs,
+/// while keeping bursts small enough that the BLE mpsc(32) queue drains
+/// before filling. With scale=0, the field directly represents bytes.
 ///
-/// Previous values:
-/// - 2920 (2 MSS): Too tight for Linux→macOS TCP. cwnd stuck at
-///   ~1.2 KB with constant retransmissions. Only 2 segments in
-///   flight at 50ms RTT → one delayed ACK halves throughput.
-/// - 8192 (current): Allows ~5-6 segments in flight. With TUN
-///   pacer at 80 Kbps, the pacer — not the window — limits bursts.
-const MAX_BLE_TCP_WINDOW: u16 = 8192;
+/// Tested alternatives:
+/// - 8192 (~5.6 MSS): Allows more segments in flight, but floods the
+///   BLE pipeline. UDP 50K loss went from 0% → 15%, UDP 100K 0% → 27%.
+///   With BBR, losses were even worse (42%/27%). The larger pipeline
+///   leaves no headroom for competing traffic.
+/// - 2920 (2 MSS, current): Best overall. 0% UDP loss at 100K, TCP
+///   throughput matches or exceeds 8192. The TUN pacer (80 Kbps token
+///   bucket) is the primary rate limiter; this window is a secondary
+///   safeguard.
+const MAX_BLE_TCP_WINDOW: u16 = 2920;
 
 /// Check if a TCP packet is a SYN packet (has SYN flag set).
 fn is_tcp_syn(tcp_header: &[u8]) -> bool {
