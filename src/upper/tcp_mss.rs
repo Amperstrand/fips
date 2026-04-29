@@ -159,13 +159,10 @@ pub fn clamp_tcp_mss(ipv6_packet: &mut [u8], max_mss: u16) -> bool {
     modified
 }
 
-/// Clamp TCP receive window and set Window Scale to 0 on constrained links.
+/// Clamp TCP receive window and strip Window Scale option on constrained links.
 ///
-/// For SYN/SYN-ACK packets: sets the Window Scale shift count to 0 instead of
-/// stripping the option entirely. Replacing with NOPs can cause macOS to
-/// internally retain its original wscale (e.g. 6) and misinterpret the peer's
-/// advertised window. With wscale=0 explicitly present, both sides negotiate
-/// scale=0 unambiguously — the raw 16-bit window field IS the actual window.
+/// For SYN/SYN-ACK packets: removes the Window Scale option (replaces with NOPs)
+/// so both sides negotiate scale=0, meaning the raw window field = actual window.
 ///
 /// For ALL TCP packets: clamps the window field to `min(current, MAX_BLE_TCP_WINDOW)`.
 /// This is necessary because TCP updates its receive window on every ACK — clamping
@@ -220,7 +217,9 @@ pub fn clamp_tcp_window(ipv6_packet: &mut [u8]) -> bool {
                 }
 
                 if kind == TCP_OPT_WSCALE && length == 3 {
-                    ipv6_packet[i + 2] = 0; // shift count = 0
+                    for j in 0..3 {
+                        ipv6_packet[i + j] = TCP_OPT_NOP;
+                    }
                     modified = true;
                     break;
                 }
@@ -447,114 +446,5 @@ mod tests {
         assert!(!modified);
         let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
         assert_eq!(window, 100);
-    }
-
-    fn make_tcp_syn_with_wscale(src: [u8; 16], dst: [u8; 16], mss: u16, wscale: u8) -> Vec<u8> {
-        let mut packet = vec![0u8; 40 + 48]; // IPv6 + TCP with options (12 bytes extra)
-
-        packet[0] = 0x60;
-        packet[4..6].copy_from_slice(&48u16.to_be_bytes());
-        packet[6] = 6;
-        packet[7] = 64;
-        packet[8..24].copy_from_slice(&src);
-        packet[24..40].copy_from_slice(&dst);
-
-        let tcp_start = 40;
-        packet[tcp_start..tcp_start + 2].copy_from_slice(&12345u16.to_be_bytes());
-        packet[tcp_start + 2..tcp_start + 4].copy_from_slice(&80u16.to_be_bytes());
-        packet[tcp_start + 4..tcp_start + 8].copy_from_slice(&1000u32.to_be_bytes());
-        packet[tcp_start + 8..tcp_start + 12].copy_from_slice(&0u32.to_be_bytes());
-        packet[tcp_start + 12] = 0xc0; // Data offset = 12 (48 bytes header)
-        packet[tcp_start + 13] = TCP_FLAG_SYN;
-        packet[tcp_start + 14..tcp_start + 16].copy_from_slice(&65535u16.to_be_bytes());
-
-        // MSS option
-        packet[tcp_start + 20] = TCP_OPT_MSS;
-        packet[tcp_start + 21] = TCP_OPT_MSS_LEN;
-        packet[tcp_start + 22..tcp_start + 24].copy_from_slice(&mss.to_be_bytes());
-
-        // Window Scale option (kind=3, len=3, shift=wscale)
-        packet[tcp_start + 24] = TCP_OPT_WSCALE;
-        packet[tcp_start + 25] = 3;
-        packet[tcp_start + 26] = wscale;
-
-        // SACK permitted
-        packet[tcp_start + 27] = 4; // SACK kind
-        packet[tcp_start + 28] = 2; // SACK len
-
-        // Timestamps
-        packet[tcp_start + 29] = 8; // TS kind
-        packet[tcp_start + 30] = 10; // TS len
-        packet[tcp_start + 31..tcp_start + 45].copy_from_slice(&[0u8; 14]);
-
-        // End of options
-        packet[tcp_start + 45] = 1; // NOP padding
-        packet[tcp_start + 46] = 0; // EOL
-
-        recalculate_tcp_checksum(&mut packet, tcp_start);
-
-        packet
-    }
-
-    #[test]
-    fn test_wscale_set_to_zero_not_stripped() {
-        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-        let mut packet = make_tcp_syn_with_wscale(src, dst, 1460, 6);
-
-        let tcp_start = 40;
-        // Verify wscale=6 before clamping
-        assert_eq!(packet[tcp_start + 24], TCP_OPT_WSCALE, "wscale option kind");
-        assert_eq!(packet[tcp_start + 26], 6, "wscale shift before clamp");
-
-        let modified = clamp_tcp_window(&mut packet);
-
-        assert!(modified);
-        // Option should still be present (not NOP'd)
-        assert_eq!(packet[tcp_start + 24], TCP_OPT_WSCALE, "wscale option kind preserved");
-        assert_eq!(packet[tcp_start + 25], 3, "wscale option length preserved");
-        assert_eq!(packet[tcp_start + 26], 0, "wscale shift set to 0");
-    }
-
-    #[test]
-    fn test_wscale_zero_unchanged() {
-        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-        let mut packet = make_tcp_syn_with_wscale(src, dst, 1460, 0);
-
-        let tcp_start = 40;
-        let window_offset = tcp_start + TCP_WINDOW_OFFSET;
-        packet[window_offset..window_offset + 2]
-            .copy_from_slice(&(MAX_BLE_TCP_WINDOW).to_be_bytes());
-        recalculate_tcp_checksum(&mut packet, tcp_start);
-
-        assert_eq!(packet[tcp_start + 26], 0, "wscale already 0");
-        assert_eq!(packet[tcp_start + 24], TCP_OPT_WSCALE, "wscale option present");
-
-        let modified = clamp_tcp_window(&mut packet);
-
-        assert_eq!(packet[tcp_start + 26], 0, "wscale shift still 0 after clamp");
-        assert_eq!(packet[tcp_start + 24], TCP_OPT_WSCALE, "wscale option still present");
-        let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
-        assert_eq!(window, MAX_BLE_TCP_WINDOW);
-    }
-
-    #[test]
-    fn test_wscale_clamped_and_window_clamped_together() {
-        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-        let mut packet = make_tcp_syn_with_wscale(src, dst, 1460, 8);
-
-        let tcp_start = 40;
-        let window_offset = tcp_start + TCP_WINDOW_OFFSET;
-        packet[window_offset..window_offset + 2].copy_from_slice(&65535u16.to_be_bytes());
-        recalculate_tcp_checksum(&mut packet, tcp_start);
-
-        let modified = clamp_tcp_window(&mut packet);
-
-        assert!(modified);
-        assert_eq!(packet[tcp_start + 26], 0, "wscale set to 0");
-        let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
-        assert_eq!(window, MAX_BLE_TCP_WINDOW);
     }
 }
