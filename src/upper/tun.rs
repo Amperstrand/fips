@@ -227,7 +227,7 @@ impl TunDevice {
     /// a channel sender for submitting packets to be written.
     ///
     /// The max_mss parameter is used for TCP MSS clamping on inbound packets.
-    pub fn create_writer(&self, max_mss: Arc<AtomicU16>) -> Result<(TunWriter, TunTx), TunError> {
+    pub fn create_writer(&self, max_mss: Arc<AtomicU16>, clamp_window: bool) -> Result<(TunWriter, TunTx), TunError> {
         let fd = self.device.as_raw_fd();
 
         // Duplicate the file descriptor for writing
@@ -248,6 +248,7 @@ impl TunDevice {
                 rx,
                 name: self.name.clone(),
                 max_mss,
+                clamp_window,
             },
             tx,
         ))
@@ -266,6 +267,7 @@ pub struct TunWriter {
     rx: mpsc::Receiver<Vec<u8>>,
     name: String,
     max_mss: Arc<AtomicU16>,
+    clamp_window: bool,
 }
 
 #[cfg(unix)]
@@ -289,7 +291,7 @@ impl TunWriter {
                     "Clamped TCP MSS in inbound SYN-ACK packet"
                 );
             }
-            if clamp_tcp_window(&mut packet) {
+            if self.clamp_window && clamp_tcp_window(&mut packet) {
                 trace!(
                     name = %self.name,
                     "Clamped TCP receive window on constrained link"
@@ -609,7 +611,7 @@ fn handle_tun_packet(
         if clamp_tcp_mss(packet, mss) {
             trace!(name = %name, max_mss = mss, "Clamped TCP MSS in SYN packet");
         }
-        if clamp_tcp_window(packet) {
+        if pacer.is_some() && clamp_tcp_window(packet) {
             trace!(name = %name, "Clamped TCP receive window on constrained link");
         }
         if let Some(pacer) = pacer {
@@ -843,6 +845,7 @@ mod windows_tun {
         pub fn create_writer(
             &self,
             max_mss: Arc<AtomicU16>,
+            clamp_window: bool,
         ) -> Result<(TunWriter, TunTx), TunError> {
             let (tx, rx) = mpsc::channel();
             Ok((
@@ -851,6 +854,7 @@ mod windows_tun {
                     rx,
                     name: self.name.clone(),
                     max_mss,
+                    clamp_window,
                 },
                 tx,
             ))
@@ -879,6 +883,7 @@ mod windows_tun {
         rx: mpsc::Receiver<Vec<u8>>,
         name: String,
         max_mss: Arc<AtomicU16>,
+        clamp_window: bool,
     }
 
     impl TunWriter {
@@ -900,7 +905,7 @@ mod windows_tun {
                         "Clamped TCP MSS in inbound SYN-ACK packet"
                     );
                 }
-                if clamp_tcp_window(&mut packet) {
+                if self.clamp_window && clamp_tcp_window(&mut packet) {
                     trace!(
                         name = %self.name,
                         "Clamped TCP receive window on constrained link"

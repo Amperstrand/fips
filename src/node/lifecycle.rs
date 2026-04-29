@@ -638,7 +638,9 @@ impl Node {
                     };
 
                     // Create writer (dups the fd for independent write access)
-                    let (writer, tun_tx) = device.create_writer(max_mss.clone())?;
+                    let ble_configured = self.config.transports.ble.iter().next().is_some();
+
+                    let (writer, tun_tx) = device.create_writer(max_mss.clone(), ble_configured)?;
 
                     // Spawn writer thread
                     let writer_handle = thread::spawn(move || {
