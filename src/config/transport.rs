@@ -668,21 +668,110 @@ impl BleConfig {
         self.send_burst_bytes.unwrap_or(2048)
     }
 
-    /// Validate BLE configuration values, returning an error for invalid settings.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.mtu() == 0 {
-            return Err("transports.ble.mtu must be > 0".into());
+    /// Validate and fix BLE configuration values.
+    ///
+    /// Resets invalid fields to `None` (so accessors return defaults) and
+    /// returns a list of warnings describing what was fixed. Returns an empty
+    /// list if all values are valid.
+    pub fn validate(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.mtu == Some(0) {
+            self.mtu = None;
+            warnings.push("transports.ble.mtu was 0, reset to default 2048".into());
         }
-        if self.max_connections() == 0 {
-            return Err("transports.ble.max_connections must be > 0".into());
+        if self.max_connections == Some(0) {
+            self.max_connections = None;
+            warnings.push("transports.ble.max_connections was 0, reset to default 7".into());
         }
-        if self.connect_timeout_ms() == 0 {
-            return Err("transports.ble.connect_timeout_ms must be > 0".into());
+        if self.connect_timeout_ms == Some(0) {
+            self.connect_timeout_ms = None;
+            warnings.push("transports.ble.connect_timeout_ms was 0, reset to default 10000".into());
         }
-        if self.send_burst_bytes() == 0 {
-            return Err("transports.ble.send_burst_bytes must be > 0".into());
+        if self.send_burst_bytes == Some(0) {
+            self.send_burst_bytes = None;
+            warnings.push("transports.ble.send_burst_bytes was 0, reset to default 2048".into());
         }
-        Ok(())
+
+        warnings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ble_config() -> BleConfig {
+        BleConfig {
+            mtu: Some(2048),
+            max_connections: Some(7),
+            connect_timeout_ms: Some(10_000),
+            send_burst_bytes: Some(2048),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_default_is_ok() {
+        let mut config = BleConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_resets_zero_mtu() {
+        let mut config = make_ble_config();
+        config.mtu = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("mtu"));
+        assert_eq!(config.mtu(), 2048);
+    }
+
+    #[test]
+    fn validate_resets_zero_max_connections() {
+        let mut config = make_ble_config();
+        config.max_connections = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("max_connections"));
+        assert_eq!(config.max_connections(), 7);
+    }
+
+    #[test]
+    fn validate_resets_zero_connect_timeout() {
+        let mut config = make_ble_config();
+        config.connect_timeout_ms = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("connect_timeout_ms"));
+        assert_eq!(config.connect_timeout_ms(), 10_000);
+    }
+
+    #[test]
+    fn validate_resets_zero_send_burst_bytes() {
+        let mut config = make_ble_config();
+        config.send_burst_bytes = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("send_burst_bytes"));
+        assert_eq!(config.send_burst_bytes(), 2048);
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let mut config = make_ble_config();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_multiple_fixes() {
+        let mut config = make_ble_config();
+        config.mtu = Some(0);
+        config.max_connections = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(config.mtu(), 2048);
+        assert_eq!(config.max_connections(), 7);
     }
 }
 

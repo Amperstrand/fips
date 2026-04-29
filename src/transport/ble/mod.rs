@@ -121,12 +121,13 @@ impl<I: BleIo> BleTransport<I> {
     pub fn new(
         transport_id: TransportId,
         name: Option<String>,
-        config: BleConfig,
+        mut config: BleConfig,
         io: I,
         packet_tx: PacketTx,
     ) -> Self {
-        if let Err(e) = config.validate() {
-            tracing::warn!(error = %e, "BLE config validation failed, using defaults where possible");
+        let warnings = config.validate();
+        for w in &warnings {
+            tracing::warn!(warning = %w, "BLE config validation: invalid value reset to default");
         }
         let max_conns = config.max_connections();
         let initial_rate_bps = config.effective_send_rate_bps();
