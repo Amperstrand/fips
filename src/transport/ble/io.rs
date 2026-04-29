@@ -249,7 +249,7 @@ mod bluer_impl {
     // ----------------------------------------------------------------
 
     pub struct BluerStream {
-        conn: Arc<SeqPacket>,
+        conn: Arc<tokio::sync::Mutex<Arc<SeqPacket>>>,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
@@ -290,7 +290,7 @@ mod bluer_impl {
             };
 
             let drain_limiter = rate_limiter.clone();
-            let shared_conn = Arc::new(conn);
+            let shared_conn = Arc::new(tokio::sync::Mutex::new(Arc::new(conn)));
             let drain_conn = shared_conn.clone();
             let drain_remote = remote.clone();
 
@@ -306,8 +306,8 @@ mod bluer_impl {
                     if let Some(ref limiter) = drain_limiter {
                         limiter.lock().await.acquire(frame.len()).await;
                     }
-                    match tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame)).await
-                    {
+                    let conn_guard = drain_conn.lock().await;
+                    match tokio::time::timeout(BLE_SEND_TIMEOUT, conn_guard.send(&frame)).await {
                         Ok(Ok(_n)) => {}
                         Ok(Err(e)) => {
                             warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
@@ -318,6 +318,7 @@ mod bluer_impl {
                             warn!(addr = %drain_remote, "BLE linux drain task write timeout (congestion, not fatal)");
                         }
                     }
+                    drop(conn_guard);
                 }
                 debug!(addr = %drain_remote, "BLE linux drain task stopped");
             });
@@ -363,6 +364,37 @@ mod bluer_impl {
                     std::io::Error::other("BLE linux drain channel closed"),
                 )),
             }
+        }
+
+        async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
+            if !self.alive.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(TransportError::Io(std::io::Error::other(
+                    "BLE connection dead (drain task error)",
+                )));
+            }
+
+            let framed = frame_payload(data)?;
+            if framed.len() > self.send_mtu as usize {
+                return Err(TransportError::MtuExceeded {
+                    packet_size: framed.len(),
+                    mtu: self.send_mtu,
+                });
+            }
+
+            trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE linux send_urgent (direct, bypasses rate limiter)");
+
+            let conn = self.conn.lock().await;
+            tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&framed))
+                .await
+                .map_err(|_| {
+                    warn!(addr = %self.remote, "BLE linux send_urgent timeout");
+                    TransportError::Timeout
+                })?
+                .map_err(|e| {
+                    warn!(addr = %self.remote, error = %e, "BLE linux send_urgent error, marking connection dead");
+                    self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                    TransportError::Io(std::io::Error::other(format!("send_urgent: {e}")))
+                })
         }
 
         async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -1471,5 +1503,16 @@ mod tests {
         let io = MockBleIo::new("hci0", test_addr(1));
         let _acceptor = io.listen(0x0085).await.unwrap();
         assert!(io.listen(0x0085).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mock_send_urgent_bypasses_queue() {
+        let (tx, rx) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
+
+        tx.send_urgent(b"urgent data").await.unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let n = rx.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"urgent data");
     }
 }
