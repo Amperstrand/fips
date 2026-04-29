@@ -71,7 +71,7 @@ transports:
     scan: true
     auto_connect: true
     accept_connections: true
-    send_rate_bps: 200000
+    send_rate_bps: 80000     # Initial rate; AIMD adapter probes within MAX_RATE_BPS (80 Kbps)
     send_burst_bytes: 2048
 ```
 
@@ -81,6 +81,8 @@ transports:
 - `src/transport/ble/io.rs` — Linux BLE (bluer/BlueZ) with drain task send architecture
 - `src/transport/ble/io_macos.rs` — macOS BLE, dual role: central (bluest) + peripheral (objc2-core-bluetooth)
 - `src/transport/ble/rate_limit.rs` — `SendRateLimiter` (token bucket) + `BleRateAdapter` (AIMD)
+- `src/transport/ble/backoff.rs` — `PeerBackoff` exponential backoff + auto-deny of failing peers
+- `src/transport/ble/capabilities.rs` — `PeerCapabilities` for BLE role negotiation
 - `src/upper/tun.rs` — `TunPacer` (token bucket), blocks TUN reader at configured rate
 - `src/upper/tcp_mss.rs` — `MAX_BLE_TCP_WINDOW = 2920` (2 MSS), strips Window Scale for BLE links
 - `src/noise/` — Noise protocol (IK for link, XK for session, ChaCha20-Poly1305)
@@ -105,6 +107,12 @@ with a dedicated spawned task doing blocking `acquire()` + `conn.send()`.
 
 If the channel is full, `try_send()` returns `TrySendError::Full` → `TransportError::SendFailed`.
 This is congestion, not a dead connection — the connection stays in the pool.
+
+### Urgent sends (`send_urgent_async`)
+Control-plane traffic (Noise handshake, rekey) bypasses the rate-limited drain queue.
+On Linux, sends directly via the L2CAP socket. On macOS central, uses the urgent
+writer directly. On macOS peripheral, enqueues with backpressure (best-effort).
+This prevents control-plane stalls when the data plane is congested.
 
 ### Layer 3: Backpressure flag (`src/node/handlers/rx_loop.rs`)
 `Arc<AtomicBool>` on `BleTransport`, set on `SendFailed`, cleared on send success.
@@ -140,6 +148,6 @@ TCP -w 8K: delivers in ~15s retransmission bursts, sustained over 30s. Functiona
 
 ## Key Dependencies
 
-- `bluest` (macOS BLE): pinned to Amperstrand fork, rev `f3c8d09` — fixes NSOutputStream partial write and NSRunLoop scheduling
+- `bluest` (macOS BLE): pinned to Amperstrand/bluest, rev `f3c8d09` — fixes NSOutputStream partial write and NSRunLoop scheduling
 - `bluer` (Linux BLE): upstream, auto-detected by build.rs on glibc Linux
 - Rust toolchain: 1.94.1 (pinned in rust-toolchain.toml)

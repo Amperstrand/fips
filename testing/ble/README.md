@@ -34,56 +34,20 @@ for **validation against real BLE radios**.
   `~/.config/wireshark/plugins/` on macOS)
 - Capture BLE traffic: `sudo btmon -i hci0 -w capture.log` (Linux)
 
-## Test Scenarios
-
-BLE test scenarios are in `testing/chaos/scenarios/` and use the native
-process runner (no Docker — BLE requires direct hardware access):
-
-| Scenario | Nodes | Description |
-| -------- | ----- | ----------- |
-| `ble-smoke` | 2 | Basic BLE connectivity: 2 nodes, 1 BLE edge, 30s |
-| `ble-only` | 4 | BLE-only ring topology, 60s with light traffic |
-| `ble-cost` | 4 | Diamond topology testing cost-based parent selection |
-| `ble-mesh` | 6 | Mixed UDP + BLE mesh, heterogeneous transports |
-
 ## Running Tests
 
-### Quick smoke test
+### Unit tests (no hardware required)
+
+BLE transport logic is tested via `MockBleIo` in-memory channel doubles
+that run in CI without Bluetooth hardware:
 
 ```bash
-# Build FIPS
-cargo build --release           # Linux
-cargo build --release --features ble-macos  # macOS
-
-# Run the 2-node smoke test
-./testing/chaos/scripts/ble-test.sh ble-smoke
+cargo test --lib                  # All unit tests (includes 65 BLE tests)
+cargo test --lib -- transport::ble  # BLE-specific tests only
+cargo test --lib -- transport::ble::backoff  # Single module
 ```
 
-### Run a specific scenario
-
-```bash
-./testing/chaos/scripts/ble-test.sh ble-only
-./testing/chaos/scripts/ble-test.sh ble-cost
-./testing/chaos/scripts/ble-test.sh ble-mesh
-```
-
-### List available BLE scenarios
-
-```bash
-./testing/chaos/scripts/ble-test.sh --list
-```
-
-### Capture BLE traffic during test
-
-```bash
-./testing/chaos/scripts/ble-test.sh --capture ble-smoke
-```
-
-This starts `btmon` in the background to capture raw BLE traffic to
-`ble-capture-hci0.log` in the results directory. Load the capture in
-Wireshark with the FIPS dissector for protocol-level analysis.
-
-## Two-Box Testing (macOS ↔ Linux)
+### Two-box stability test (requires hardware)
 
 The most common setup is a Mac and a Linux box within BLE range:
 
@@ -118,11 +82,26 @@ The most common setup is a Mac and a Linux box within BLE range:
    ```
 4. **Wait for convergence** — typically 3–5 seconds. Check logs for:
    ```
-  BLE transport started adapter=hci0 mtu=2048
-  BLE peer discovered addr=AA:BB:CC:DD:EE:FF
-  FMP handshake completed peer=<npub>
-  Tree converged root=<npub> depth=0 peers=1
+   BLE transport started adapter=hci0 mtu=2048
+   BLE peer discovered addr=AA:BB:CC:DD:EE:FF
+   FMP handshake completed peer=<npub>
+   Tree converged root=<npub> depth=0 peers=1
    ```
+
+### Automated stability test
+
+```bash
+# 20-minute default
+./testing/ble/ble-stability-test.sh
+
+# Custom duration + iperf3 throughput test
+./testing/ble/ble-stability-test.sh -d 60 --iperf
+
+# With BLE traffic capture
+./testing/ble/ble-stability-test.sh --capture -v
+```
+
+Results are saved to `testing/ble/results/<timestamp>/`.
 
 ## Expected Results
 
@@ -141,10 +120,10 @@ For the `ble-smoke` scenario (2 nodes):
 
 ### Hardware-validated setup
 
-| Box | Role | Adapter | MAC |
-| --- | ---- | -------- | --- |
-| macOS (arm64) | Central + Peripheral | Built-in (`default`) | — |
-| Linux 218 | Central + Peripheral | `hci0` | `14:5A:FC:49:C2:24` |
+| Box | Role | Adapter |
+| --- | ---- | -------- |
+| macOS (arm64) | Central + Peripheral | Built-in (`default`) |
+| Linux (x86_64) | Central + Peripheral | `hci0` |
 
 BLE PSM: dynamic (GATT-advertised by macOS via UUID `9c90b790-2cc5-42c0-9f87-c9cc40648f4c`).
 The default PSM in FIPS config is `0x0085` (133), but macOS CoreBluetooth
@@ -170,8 +149,8 @@ node reads the PSM from GATT during discovery.
 
 - This was a bluest bug: L2CAP `NSInputStream` was scheduled on
   `mainRunLoop()` which is never pumped in CLI/tokio apps.
-- **Fixed** in our bluest fork (Amperstrand/bluest#3).
-- If using upstream bluest (not our fork), the peripheral path works
+- **Fixed** in the Amperstrand/bluest fork (Amperstrand/bluest#3).
+- If using upstream bluest, the peripheral path works
   (uses its own dispatch queue) but the central path cannot receive.
 - The fork is pinned in `Cargo.toml` via `rev = "f3c8d09"`.
 
@@ -179,7 +158,7 @@ node reads the PSM from GATT during discovery.
 
 - This was a bluest bug: `OutputStreamDelegate::send_packet` discarded
   bytes on partial `NSOutputStream.write(maxLength:)`.
-- **Fixed** in our bluest fork (Amperstrand/bluest#2).
+- **Fixed** in the Amperstrand/bluest fork (Amperstrand/bluest#2).
 - Symptom: intermittent corruption in Noise handshake or AEAD decryption
   failures under sustained traffic.
 

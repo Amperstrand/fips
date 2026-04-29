@@ -870,8 +870,10 @@ impl PeripheralStream {
             self.notify_write();
             return Ok(());
         }
-        warn!(addr = %self.remote, %label, "BLE peripheral timeout (queue full)");
-        Err(TransportError::Timeout)
+        warn!(addr = %self.remote, %label, "BLE peripheral send_urgent timeout (queue full)");
+        Err(TransportError::SendFailed(format!(
+            "BLE peripheral {label} queue full"
+        )))
     }
 }
 

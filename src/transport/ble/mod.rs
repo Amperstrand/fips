@@ -234,6 +234,7 @@ impl<I: BleIo> BleTransport<I> {
                     let max_conns = self.config.max_connections();
 
                     self.accept_task = Some(tokio::spawn(accept_loop(
+                        adapter.clone(),
                         acceptor,
                         pool,
                         packet_tx,
@@ -392,8 +393,9 @@ impl<I: BleIo> BleTransport<I> {
     /// Send data with priority, bypassing the rate limiter.
     ///
     /// Used for control-plane traffic (handshake, rekey) that must not be
-    /// delayed by the token bucket. Falls through to [`send_async`] for
-    /// non-rate-limited transports.
+    /// delayed by the token bucket. On Linux, sends directly via the L2CAP
+    /// socket. On macOS central, sends via the urgent writer. On macOS
+    /// peripheral, enqueues with backpressure.
     pub async fn send_urgent_async(
         &self,
         addr: &TransportAddr,
@@ -423,11 +425,7 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(data.len())
             }
             Err(e) => {
-                self.stats.record_send_error();
-                if matches!(e, TransportError::SendFailed(_)) {
-                    debug!(addr = %addr, "BLE urgent send dropped (congested)");
-                    return Err(e);
-                }
+                warn!(addr = %addr, error = %e, "BLE urgent send failed, connection removed");
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 drop(pool);
@@ -893,6 +891,7 @@ async fn pubkey_exchange<S: BleStream>(
 /// and adds to pool.
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop<A>(
+    adapter: String,
     mut acceptor: A,
     pool: Arc<Mutex<ConnectionPool<Arc<A::Stream>>>>,
     packet_tx: PacketTx,
@@ -1020,7 +1019,7 @@ async fn accept_loop<A>(
                 backoff.lock().await.clear(&backoff_addr);
             }
             Err(e) => {
-                warn!(error = %e, "BLE accept error, retrying in 2s");
+                warn!(adapter = %adapter, error = %e, "BLE accept error, retrying in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
