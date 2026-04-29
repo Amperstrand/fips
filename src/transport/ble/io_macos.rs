@@ -67,11 +67,32 @@ use crate::transport::ble::Unpoison;
 const BLE_CENTRAL_QUEUE_DEPTH: usize = 32;
 
 /// Bounded queue depth for peripheral-role BLE sends.
-/// 32 frames ≈ 64KB at average FMP frame size; drains in ~2s at 250kbps.
+/// 32 frames at typical BLE frame size (~2048B).
 const BLE_PERIPHERAL_QUEUE_DEPTH: usize = 32;
 
 /// Maximum total bytes allowed in the peripheral write queue.
 const BLE_PERIPHERAL_QUEUE_BYTE_CAP: usize = 65536;
+
+/// Timeout for urgent (control-plane) BLE sends.
+const BLE_URGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timeout for peripheral pacer backpressure enqueue.
+const BLE_PACER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Polling interval for peripheral reader thread.
+const BLE_READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Timeout for GATT service/characteristic discovery.
+const BLE_GATT_DISCOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Channel depth for peripheral manager events.
+const BLE_EVENT_CHANNEL_DEPTH: usize = 32;
+
+/// Channel depth for inbound BLE connections.
+const BLE_INBOUND_CHANNEL_DEPTH: usize = 8;
+
+/// Channel depth for BLE scan results.
+const BLE_SCAN_CHANNEL_DEPTH: usize = 64;
 
 // ============================================================================
 // Dispatch helpers
@@ -220,7 +241,7 @@ impl BleStream for BluestStream {
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent (direct L2CAP)");
 
         let mut writer = self.urgent_writer.lock().await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), writer.write_all(&framed))
+        tokio::time::timeout(BLE_URGENT_TIMEOUT, writer.write_all(&framed))
             .await
             .map_err(|_| {
                 warn!(addr = %self.remote, "BLE central send_urgent timeout");
@@ -610,15 +631,6 @@ impl PeripheralOutputDelegate {
             self.ivars().queue_space_notify.notify_waiters();
         }
     }
-
-    #[allow(dead_code)]
-    fn queue_len(&self) -> usize {
-        self.ivars()
-            .write_queue
-            .lock()
-            .map(|q| q.len())
-            .unwrap_or(0)
-    }
 }
 
 // ============================================================================
@@ -780,7 +792,7 @@ impl PeripheralStream {
                     break;
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(BLE_READER_POLL_INTERVAL);
             }
         });
 
@@ -817,7 +829,7 @@ impl PeripheralStream {
                     }
                     let notified = pacer_notify.notified();
                     trace!(addr = %pacer_remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer queue full, waiting");
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), notified).await {
+                    match tokio::time::timeout(BLE_URGENT_TIMEOUT, notified).await {
                         Ok(()) => continue,
                         Err(_) => {
                             warn!(addr = %pacer_remote, "BLE peripheral pacer timeout, dropping frame");
@@ -862,7 +874,7 @@ impl PeripheralStream {
         }
         trace!(addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
         let notified = self.queue_space_notify.notified();
-        if tokio::time::timeout(std::time::Duration::from_secs(2), notified)
+        if tokio::time::timeout(BLE_PACER_TIMEOUT, notified)
             .await
             .is_ok()
             && self.output_delegate.try_enqueue(framed)
@@ -1232,7 +1244,7 @@ impl BluestIo {
             .map_err(|e| TransportError::StartFailed(format!("Bluetooth not available: {e}")))?;
         debug!("CoreBluetooth adapter ready");
         let _ = TOKIO_HANDLE.set(tokio::runtime::Handle::current());
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(BLE_EVENT_CHANNEL_DEPTH);
         Ok(Self {
             adapter,
             mtu,
@@ -1432,7 +1444,7 @@ impl BluestIo {
             Ok(psm)
         };
 
-        tokio::time::timeout(std::time::Duration::from_secs(10), discover)
+        tokio::time::timeout(BLE_GATT_DISCOVER_TIMEOUT, discover)
             .await
             .map_err(|_| {
                 TransportError::Io(std::io::Error::other(format!(
@@ -1483,8 +1495,8 @@ impl BleIo for BluestIo {
             ));
         }
 
-        let (event_tx, new_event_rx) = tokio::sync::mpsc::channel(32);
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
+        let (event_tx, new_event_rx) = tokio::sync::mpsc::channel(BLE_EVENT_CHANNEL_DEPTH);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(BLE_INBOUND_CHANNEL_DEPTH);
 
         let manager = {
             let delegate = FipsPeripheralDelegate::new(
@@ -1797,7 +1809,7 @@ impl BleIo for BluestIo {
     }
 
     async fn start_scanning(&self) -> Result<BluestScanner, TransportError> {
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (tx, rx) = tokio::sync::mpsc::channel(BLE_SCAN_CHANNEL_DEPTH);
         let devices = self.devices.clone();
         let adapter = self.adapter.clone();
 
