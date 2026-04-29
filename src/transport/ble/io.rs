@@ -306,13 +306,17 @@ mod bluer_impl {
                     if let Some(ref limiter) = drain_limiter {
                         limiter.lock().await.acquire(frame.len()).await;
                     }
-
-                    if let Err(e) =
-                        tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame)).await
+                    match tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame)).await
                     {
-                        warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
-                        drain_alive.store(false, std::sync::atomic::Ordering::Relaxed);
-                        break;
+                        Ok(Ok(_n)) => {}
+                        Ok(Err(e)) => {
+                            warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
+                            drain_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(addr = %drain_remote, "BLE linux drain task write timeout (congestion, not fatal)");
+                        }
                     }
                 }
                 debug!(addr = %drain_remote, "BLE linux drain task stopped");
