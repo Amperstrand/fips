@@ -1476,10 +1476,9 @@ impl BleIo for BluestIo {
 
     async fn listen(&self, _psm: u16) -> Result<BluestAcceptor, TransportError> {
         if self.peripheral_manager.lock().unpoison().is_some() {
-            let (_, inbound_rx) = tokio::sync::mpsc::channel(8);
-            return Ok(BluestAcceptor {
-                rx: tokio::sync::Mutex::new(inbound_rx),
-            });
+            return Err(TransportError::StartFailed(
+                "BLE peripheral already listening".into(),
+            ));
         }
 
         let (event_tx, new_event_rx) = tokio::sync::mpsc::channel(32);

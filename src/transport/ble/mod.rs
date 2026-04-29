@@ -335,26 +335,30 @@ impl<I: BleIo> BleTransport<I> {
         addr: &TransportAddr,
         data: &[u8],
     ) -> Result<usize, TransportError> {
-        let pool = self.pool.lock().await;
-        let conn = match pool.get(addr) {
-            Some(c) => c,
-            None => {
-                drop(pool);
-                let _ = self.connect_async(addr).await;
-                return Err(TransportError::SendFailed("not connected".into()));
+        let stream = {
+            let pool = self.pool.lock().await;
+            let conn = match pool.get(addr) {
+                Some(c) => c,
+                None => {
+                    drop(pool);
+                    let _ = self.connect_async(addr).await;
+                    return Err(TransportError::SendFailed("not connected".into()));
+                }
+            };
+
+            let mtu = conn.effective_mtu() as usize;
+            if data.len() > mtu {
+                self.stats.record_mtu_exceeded();
+                return Err(TransportError::MtuExceeded {
+                    packet_size: data.len(),
+                    mtu: mtu as u16,
+                });
             }
+
+            Arc::clone(&conn.stream)
         };
 
-        let mtu = conn.effective_mtu() as usize;
-        if data.len() > mtu {
-            self.stats.record_mtu_exceeded();
-            return Err(TransportError::MtuExceeded {
-                packet_size: data.len(),
-                mtu: mtu as u16,
-            });
-        }
-
-        match conn.stream.send(data).await {
+        match stream.send(data).await {
             Ok(()) => {
                 self.congested.store(false, Ordering::Relaxed);
                 self.stats.record_send(data.len());
@@ -367,7 +371,6 @@ impl<I: BleIo> BleTransport<I> {
                     debug!(addr = %addr, "BLE send dropped (congested), packet discarded");
                     return Err(e);
                 }
-                drop(pool);
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 if let Some(tx) = &self.disconnect_tx {
@@ -554,129 +557,126 @@ impl<I: BleIo> BleTransport<I> {
             }
         }
 
-        {
-            let connecting = self.connecting.lock().await;
-            if connecting.contains_key(addr) {
-                return Ok(());
-            }
-        }
-
         let ble_addr = BleAddr::parse(
             addr.as_str()
                 .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?,
         )?;
 
-        let io = Arc::clone(&self.io);
-        let pool = Arc::clone(&self.pool);
-        let connecting = Arc::clone(&self.connecting);
-        let packet_tx = self.packet_tx.clone();
-        let transport_id = self.transport_id;
-        let stats = Arc::clone(&self.stats);
-        let psm = self.config.psm();
-        let timeout_ms = self.config.connect_timeout_ms();
-        let addr_clone = addr.clone();
-        let local_pubkey = self.local_pubkey;
-        let local_capabilities = self.local_capabilities;
-        let discovery_buffer = Arc::clone(&self.discovery_buffer);
-        let disconnect_tx = self.disconnect_tx.clone();
+        {
+            let mut connecting = self.connecting.lock().await;
+            if connecting.contains_key(addr) {
+                return Ok(());
+            }
 
-        let task = tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                io.connect(&ble_addr, psm),
-            )
-            .await;
+            let io = Arc::clone(&self.io);
+            let pool = Arc::clone(&self.pool);
+            let connecting_inner = Arc::clone(&self.connecting);
+            let packet_tx = self.packet_tx.clone();
+            let transport_id = self.transport_id;
+            let stats = Arc::clone(&self.stats);
+            let psm = self.config.psm();
+            let timeout_ms = self.config.connect_timeout_ms();
+            let addr_clone = addr.clone();
+            let local_pubkey = self.local_pubkey;
+            let local_capabilities = self.local_capabilities;
+            let discovery_buffer = Arc::clone(&self.discovery_buffer);
+            let disconnect_tx = self.disconnect_tx.clone();
 
-            match result {
-                Ok(Ok(stream)) => {
-                    if let Some(ref our_pubkey) = local_pubkey {
-                        match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
-                            Ok(result) => {
-                                debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
-                                discovery_buffer
-                                    .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
+            let task = tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    io.connect(&ble_addr, psm),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(stream)) => {
+                        if let Some(ref our_pubkey) = local_pubkey {
+                            match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
+                                Ok(result) => {
+                                    debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
+                                    discovery_buffer
+                                        .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
+                                }
+                                Err(e) => {
+                                    warn!(addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
+                                    connecting_inner.lock().await.remove(&addr_clone);
+                                    return;
+                                }
+                            }
+                        }
+
+                        let send_mtu = stream.send_mtu();
+                        let recv_mtu = stream.recv_mtu();
+                        let stream = Arc::new(stream);
+
+                        let recv_task = tokio::spawn(receive_loop(
+                            Arc::clone(&stream),
+                            Arc::clone(&pool),
+                            packet_tx.clone(),
+                            disconnect_tx.clone(),
+                            ReceiveLoopArgs {
+                                addr: addr_clone.clone(),
+                                transport_id,
+                                stats: Arc::clone(&stats),
+                                recv_mtu,
+                                recv_timeout_secs: RECV_TIMEOUT_SECS,
+                            },
+                        ));
+
+                        let drop_addr = ble_addr.clone();
+                        let conn = BleConnection {
+                            stream,
+                            recv_task: Some(recv_task),
+                            send_mtu,
+                            recv_mtu,
+                            established_at: tokio::time::Instant::now(),
+                            is_static: false,
+                            addr: ble_addr,
+                            on_drop: Some(Box::new({
+                                let io = io.clone();
+                                move || {
+                                    let io = io.clone();
+                                    tokio::spawn(async move {
+                                        io.disconnect_device(&drop_addr).await;
+                                    });
+                                }
+                            })),
+                        };
+
+                        let mut pool = pool.lock().await;
+                        match pool.insert(addr_clone.clone(), conn) {
+                            Ok(Some(evicted)) => {
+                                stats.record_pool_eviction();
+                                debug!(addr = %addr_clone, evicted = %evicted, "BLE connection established (evicted peer)");
+                            }
+                            Ok(None) => {
+                                debug!(addr = %addr_clone, "BLE connection established");
                             }
                             Err(e) => {
-                                warn!(addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
-                                connecting.lock().await.remove(&addr_clone);
+                                warn!(addr = %addr_clone, error = %e, "BLE pool full, connection dropped");
+                                stats.record_connection_rejected();
+                                connecting_inner.lock().await.remove(&addr_clone);
                                 return;
                             }
                         }
+                        connecting_inner.lock().await.remove(&addr_clone);
+                        stats.record_connection_established();
                     }
-
-                    let send_mtu = stream.send_mtu();
-                    let recv_mtu = stream.recv_mtu();
-                    let stream = Arc::new(stream);
-
-                    let recv_task = tokio::spawn(receive_loop(
-                        Arc::clone(&stream),
-                        Arc::clone(&pool),
-                        packet_tx.clone(),
-                        disconnect_tx.clone(),
-                        ReceiveLoopArgs {
-                            addr: addr_clone.clone(),
-                            transport_id,
-                            stats: Arc::clone(&stats),
-                            recv_mtu,
-                            recv_timeout_secs: RECV_TIMEOUT_SECS,
-                        },
-                    ));
-
-                    let drop_addr = ble_addr.clone();
-                    let conn = BleConnection {
-                        stream,
-                        recv_task: Some(recv_task),
-                        send_mtu,
-                        recv_mtu,
-                        established_at: tokio::time::Instant::now(),
-                        is_static: false,
-                        addr: ble_addr,
-                        on_drop: Some(Box::new({
-                            let io = io.clone();
-                            move || {
-                                let io = io.clone();
-                                tokio::spawn(async move {
-                                    io.disconnect_device(&drop_addr).await;
-                                });
-                            }
-                        })),
-                    };
-
-                    let mut pool = pool.lock().await;
-                    match pool.insert(addr_clone.clone(), conn) {
-                        Ok(Some(evicted)) => {
-                            stats.record_pool_eviction();
-                            debug!(addr = %addr_clone, evicted = %evicted, "BLE connection established (evicted peer)");
-                        }
-                        Ok(None) => {
-                            debug!(addr = %addr_clone, "BLE connection established");
-                        }
-                        Err(e) => {
-                            warn!(addr = %addr_clone, error = %e, "BLE pool full, connection dropped");
-                            stats.record_connection_rejected();
-                            connecting.lock().await.remove(&addr_clone);
-                            return;
-                        }
+                    Ok(Err(e)) => {
+                        connecting_inner.lock().await.remove(&addr_clone);
+                        debug!(addr = %addr_clone, error = %e, "BLE connect failed");
                     }
-                    connecting.lock().await.remove(&addr_clone);
-                    stats.record_connection_established();
+                    Err(_) => {
+                        stats.record_connect_timeout();
+                        connecting_inner.lock().await.remove(&addr_clone);
+                        debug!(addr = %addr_clone, "BLE connect timeout");
+                    }
                 }
-                Ok(Err(e)) => {
-                    connecting.lock().await.remove(&addr_clone);
-                    debug!(addr = %addr_clone, error = %e, "BLE connect failed");
-                }
-                Err(_) => {
-                    stats.record_connect_timeout();
-                    connecting.lock().await.remove(&addr_clone);
-                    debug!(addr = %addr_clone, "BLE connect timeout");
-                }
-            }
-        });
+            });
 
-        self.connecting
-            .lock()
-            .await
-            .insert(addr.clone(), ConnectingEntry { task });
+            connecting.insert(addr.clone(), ConnectingEntry { task });
+        }
 
         Ok(())
     }
@@ -1016,8 +1016,8 @@ async fn accept_loop<A>(
                 backoff.lock().await.clear(&backoff_addr);
             }
             Err(e) => {
-                warn!(error = %e, "BLE accept error");
-                break;
+                warn!(error = %e, "BLE accept error, retrying in 2s");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
     }

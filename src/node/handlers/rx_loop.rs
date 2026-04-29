@@ -93,9 +93,8 @@ impl Node {
         loop {
             let ble_congested = self
                 .ble_congested
-                .as_ref()
-                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(false);
+                .iter()
+                .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
 
             tokio::select! {
                 packet = packet_rx.recv() => {

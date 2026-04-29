@@ -257,9 +257,10 @@ fn recalculate_tcp_checksum(ipv6_packet: &mut [u8], tcp_start: usize) {
     let src = &ipv6_packet[8..24];
     let dst = &ipv6_packet[24..40];
 
-    // Get TCP segment length
+    // Get TCP segment length, clamped to actual buffer to prevent panic on malformed packets
     let payload_len = u16::from_be_bytes([ipv6_packet[4], ipv6_packet[5]]) as usize;
-    let tcp_segment = &ipv6_packet[tcp_start..tcp_start + payload_len];
+    let max_len = ipv6_packet.len().saturating_sub(tcp_start);
+    let tcp_segment = &ipv6_packet[tcp_start..tcp_start + payload_len.min(max_len)];
 
     // Calculate checksum with pseudo-header
     let mut sum: u32 = 0;

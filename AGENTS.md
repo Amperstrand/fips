@@ -83,7 +83,7 @@ transports:
 - `src/transport/ble/rate_limit.rs` — `SendRateLimiter` (token bucket) + `BleRateAdapter` (AIMD)
 - `src/upper/tun.rs` — `TunPacer` (token bucket), blocks TUN reader at configured rate
 - `src/upper/tcp_mss.rs` — `MAX_BLE_TCP_WINDOW = 2920` (2 MSS), strips Window Scale for BLE links
-- `src/noise/` — Noise protocol (XK pattern, ChaCha20-Poly1305)
+- `src/noise/` — Noise protocol (IK for link, XK for session, ChaCha20-Poly1305)
 - `src/node/` — Mesh node core (handshake, rekey, sessions, tree, bloom)
 
 ## BLE Reliability Architecture
@@ -91,7 +91,7 @@ transports:
 Three-layer backpressure keeps BLE alive under sustained TCP load:
 
 ### Layer 1: TUN pacer (`src/upper/tun.rs`)
-Token bucket that blocks the TUN reader at `initial_stream_rate_bps` (default 200 Kbps).
+Token bucket that blocks the TUN reader at `initial_stream_rate_bps` (clamped to 80 Kbps max).
 Prevents the kernel from flooding the mesh with packets faster than BLE can drain.
 Configured via `transports.ble.send_rate_bps` and `send_burst_bytes`.
 

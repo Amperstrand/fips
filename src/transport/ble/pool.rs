@@ -143,17 +143,14 @@ impl<S> ConnectionPool<S> {
         new_is_static: bool,
     ) -> Result<TransportAddr, TransportError> {
         if new_is_static {
-            // Static peer can evict oldest non-static
             self.connections
                 .iter()
-                .filter(|(_, c)| !c.is_static)
                 .min_by_key(|(_, c)| c.established_at)
                 .map(|(addr, _)| addr.clone())
                 .ok_or_else(|| {
-                    TransportError::NotSupported("BLE pool full: all connections are static".into())
+                    TransportError::NotSupported("BLE pool full: no connections to evict".into())
                 })
         } else {
-            // Non-static peer evicts oldest non-static
             self.connections
                 .iter()
                 .filter(|(_, c)| !c.is_static)

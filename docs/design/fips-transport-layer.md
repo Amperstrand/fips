@@ -754,10 +754,10 @@ Configuration controls role behavior:
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `discovery` | true | Scan for BLE advertising from other nodes |
-| `announce` | false | Advertise FIPS presence via BLE |
+| `scan` | true | Scan for BLE advertising from other nodes |
+| `advertise` | true | Advertise FIPS presence via BLE |
 | `auto_connect` | false | Initiate connections to discovered peers |
-| `accept_connections` | false | Accept inbound L2CAP connections |
+| `accept_connections` | true | Accept inbound L2CAP connections |
 
 A typical BLE node sets all four flags to `true`.
 

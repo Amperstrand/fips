@@ -278,17 +278,15 @@ mod bluer_impl {
                 }
             }
 
-            let rate_limiter: Option<Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>> =
-                if send_rate_bps > 0 {
-                    Some(Arc::new(tokio::sync::Mutex::new(
-                        super::super::rate_limit::SendRateLimiter::new(
-                            send_rate_bps,
-                            send_burst_bytes,
-                        ),
-                    )))
-                } else {
-                    None
-                };
+            let rate_limiter: Option<
+                Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
+            > = if send_rate_bps > 0 {
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    super::super::rate_limit::SendRateLimiter::new(send_rate_bps, send_burst_bytes),
+                )))
+            } else {
+                None
+            };
 
             let drain_limiter = rate_limiter.clone();
             let shared_conn = Arc::new(conn);
@@ -305,8 +303,7 @@ mod bluer_impl {
                     }
 
                     if let Err(e) =
-                        tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame))
-                            .await
+                        tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame)).await
                     {
                         warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error");
                     }
@@ -340,13 +337,13 @@ mod bluer_impl {
                 Ok(()) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     trace!(len = data.len(), addr = %self.remote, queue_depth = BLE_LINUX_QUEUE_DEPTH, "BLE linux drain queue full, dropping");
-                    Err(TransportError::SendFailed("BLE linux drain queue full".into()))
+                    Err(TransportError::SendFailed(
+                        "BLE linux drain queue full".into(),
+                    ))
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    Err(TransportError::Io(std::io::Error::other(
-                        "BLE linux drain channel closed",
-                    )))
-                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
+                    std::io::Error::other("BLE linux drain channel closed"),
+                )),
             }
         }
 

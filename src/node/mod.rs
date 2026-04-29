@@ -305,9 +305,9 @@ pub struct Node {
     transports: HashMap<TransportId, TransportHandle>,
     /// Per-transport kernel drop tracking for congestion detection.
     transport_drops: HashMap<TransportId, TransportDropState>,
-    /// BLE outbound congestion flag (shared with drain/pacer tasks).
-    /// When true, the RX loop skips TUN dequeue to apply backpressure.
-    ble_congested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// BLE outbound congestion flags (shared with drain/pacer tasks).
+    /// When any is true, the RX loop skips TUN dequeue to apply backpressure.
+    ble_congested: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Active links.
     links: HashMap<LinkId, Link>,
     /// Reverse lookup: (transport_id, remote_addr) -> link_id.
@@ -553,7 +553,7 @@ impl Node {
             recent_requests: HashMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
-            ble_congested: None,
+            ble_congested: Vec::new(),
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
             packet_tx: None,
@@ -612,6 +612,7 @@ impl Node {
     /// Create a node with a specific identity.
     pub fn with_identity(identity: Identity, config: Config) -> Self {
         let node_addr = *identity.node_addr();
+        let is_leaf_only = config.is_leaf_only();
 
         let mut startup_epoch = [0u8; 8];
         rand::rng().fill_bytes(&mut startup_epoch);
@@ -635,7 +636,11 @@ impl Node {
             .sign_declaration(&identity)
             .expect("signing own declaration should never fail");
 
-        let mut bloom_state = BloomState::new(node_addr);
+        let mut bloom_state = if is_leaf_only {
+            BloomState::leaf_only(node_addr)
+        } else {
+            BloomState::new(node_addr)
+        };
         bloom_state.set_update_debounce_ms(config.node.bloom.update_debounce_ms);
 
         let coord_cache = CoordCache::new(
@@ -672,14 +677,14 @@ impl Node {
             started_at: std::time::Instant::now(),
             config,
             state: NodeState::Created,
-            is_leaf_only: false,
+            is_leaf_only,
             tree_state,
             bloom_state,
             coord_cache,
             recent_requests: HashMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
-            ble_congested: None,
+            ble_congested: Vec::new(),
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
             packet_tx: None,
@@ -858,7 +863,7 @@ impl Node {
                                 crate::transport::ble::PeerCapabilities::central_only(),
                             );
                         }
-                        self.ble_congested = Some(ble.congestion_flag());
+                        self.ble_congested.push(ble.congestion_flag());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {
@@ -905,7 +910,7 @@ impl Node {
                                 crate::transport::ble::PeerCapabilities::macos_default(),
                             );
                         }
-                        self.ble_congested = Some(ble.congestion_flag());
+                        self.ble_congested.push(ble.congestion_flag());
                         transports.push(TransportHandle::Ble(ble));
                     }
                     Err(e) => {

@@ -1,5 +1,10 @@
 //! Noise key logging for traffic analysis.
 //!
+//! **WARNING:** This module is intended for debugging only. When enabled,
+//! raw ChaCha20-Poly1305 cipher keys are written to disk. These keys can
+//! decrypt all FIPS traffic. Never enable in production. Delete key log
+//! files after analysis.
+//!
 //! When the `FIPS_NOISE_KEYLOG` environment variable is set to a file path,
 //! derived cipher keys are appended after each successful Noise handshake.
 //!
@@ -17,6 +22,8 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::OnceLock;
 
 static KEYLOG_PATH: OnceLock<Option<String>> = OnceLock::new();
@@ -27,10 +34,18 @@ fn keylog_enabled() -> Option<&'static str> {
         .as_deref()
 }
 
+fn open_keylog(path: &str) -> std::io::Result<std::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path)
+}
+
 /// Log link-layer (FMP) Noise keys after IK handshake completion.
 pub fn log_link_keys(local_npub: &str, peer_npub: &str, send_key: &[u8; 32], recv_key: &[u8; 32]) {
     if let Some(path) = keylog_enabled()
-        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+        && let Ok(mut f) = open_keylog(path)
     {
         let _ = writeln!(
             f,
@@ -51,7 +66,7 @@ pub fn log_session_keys(
     recv_key: &[u8; 32],
 ) {
     if let Some(path) = keylog_enabled()
-        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+        && let Ok(mut f) = open_keylog(path)
     {
         let _ = writeln!(
             f,
