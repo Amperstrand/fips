@@ -260,7 +260,8 @@ fn recalculate_tcp_checksum(ipv6_packet: &mut [u8], tcp_start: usize) {
     // Get TCP segment length, clamped to actual buffer to prevent panic on malformed packets
     let payload_len = u16::from_be_bytes([ipv6_packet[4], ipv6_packet[5]]) as usize;
     let max_len = ipv6_packet.len().saturating_sub(tcp_start);
-    let tcp_segment = &ipv6_packet[tcp_start..tcp_start + payload_len.min(max_len)];
+    let effective_len = payload_len.min(max_len);
+    let tcp_segment = &ipv6_packet[tcp_start..tcp_start + effective_len];
 
     // Calculate checksum with pseudo-header
     let mut sum: u32 = 0;
@@ -275,8 +276,8 @@ fn recalculate_tcp_checksum(ipv6_packet: &mut [u8], tcp_start: usize) {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
 
-    // Pseudo-header: TCP length
-    sum += payload_len as u32;
+    // Pseudo-header: TCP length (use effective_len so pseudo-header matches actual data)
+    sum += effective_len as u32;
 
     // Pseudo-header: next header (TCP = 6)
     sum += 6;
@@ -447,5 +448,37 @@ mod tests {
         assert!(!modified);
         let window = u16::from_be_bytes([packet[window_offset], packet[window_offset + 1]]);
         assert_eq!(window, 100);
+    }
+
+    #[test]
+    fn test_recalculate_checksum_clamps_malformed_payload_len() {
+        let src = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut packet = make_tcp_syn_packet(src, dst, 1460);
+
+        // Set IPv6 payload length to much larger than actual buffer (malformed)
+        // This used to panic before the bounds-check fix
+        packet[4..6].copy_from_slice(&65535u16.to_be_bytes());
+
+        // Should not panic — the clamping in recalculate_tcp_checksum
+        // limits the slice to actual buffer size
+        recalculate_tcp_checksum(&mut packet, 40);
+
+        // Verify checksum was written (not zero)
+        let checksum = u16::from_be_bytes([packet[40 + 16], packet[40 + 17]]);
+        assert_ne!(checksum, 0);
+
+        // Verify checksum matches what we'd get with the correct (buffer) length
+        // by fixing the payload_len and recalculating
+        let correct_len = (packet.len() - 40) as u16;
+        packet[4..6].copy_from_slice(&correct_len.to_be_bytes());
+        let correct_checksum = {
+            recalculate_tcp_checksum(&mut packet, 40);
+            u16::from_be_bytes([packet[40 + 16], packet[40 + 17]])
+        };
+        assert_eq!(
+            checksum, correct_checksum,
+            "malformed checksum should match correct-length checksum"
+        );
     }
 }
