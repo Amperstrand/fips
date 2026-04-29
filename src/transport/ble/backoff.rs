@@ -62,12 +62,14 @@ impl PeerBackoff {
     }
 
     /// Whether the address is currently auto-denied.
-    pub fn is_denied(&self, addr: &BleAddr) -> bool {
+    /// Removes expired entries to prevent unbounded memory growth.
+    pub fn is_denied(&mut self, addr: &BleAddr) -> bool {
         if let Some(d) = self.denied.get(addr)
             && Instant::now() < d.until
         {
             return true;
         }
+        self.denied.remove(addr);
         false
     }
 

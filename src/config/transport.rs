@@ -667,6 +667,23 @@ impl BleConfig {
     pub fn send_burst_bytes(&self) -> u32 {
         self.send_burst_bytes.unwrap_or(2048)
     }
+
+    /// Validate BLE configuration values, returning an error for invalid settings.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mtu() == 0 {
+            return Err("transports.ble.mtu must be > 0".into());
+        }
+        if self.max_connections() == 0 {
+            return Err("transports.ble.max_connections must be > 0".into());
+        }
+        if self.connect_timeout_ms() == 0 {
+            return Err("transports.ble.connect_timeout_ms must be > 0".into());
+        }
+        if self.send_burst_bytes() == 0 {
+            return Err("transports.ble.send_burst_bytes must be > 0".into());
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================

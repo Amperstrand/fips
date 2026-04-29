@@ -121,6 +121,7 @@ SSH_PREFIX_LINUX="$LINUX_SSH sudo"
 cleanup() {
     local exit_code=$?
     log "Cleaning up..."
+    [ -n "$MAC_PID" ] && sudo kill -9 "$MAC_PID" 2>/dev/null || true
     $SSH_PREFIX_MAC pkill -9 -f 'target/release/fips' 2>/dev/null || true
     $SSH_PREFIX_MAC pkill -9 -f caffeinate 2>/dev/null || true
     $SSH_PREFIX_MAC pkill -9 -f 'ping6.*fips0' 2>/dev/null || true
@@ -129,7 +130,7 @@ cleanup() {
     $LINUX_SSH "rm -rf $TMPDIR_LINUX" 2>/dev/null || true
     exit $exit_code
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # --- Preflight checks ---
 log "=== BLE Stability Test ==="
@@ -320,9 +321,10 @@ while [ "$(date -u +%s)" -lt "$TEST_END" ]; do
     DELTA_REKEYS=$((MAC_REKEYS - PREV_REKEYS))
     PREV_REKEYS=$MAC_REKEYS
 
-    # Loss check
+    # Loss check (integer-only: compare loss * 10 against 50 for 5.0% threshold)
     LOSS_NUM=$(echo "${MAC_LOSS:-0}" | sed 's/%//' 2>/dev/null || echo "0")
-    if [ "$(echo "${LOSS_NUM:-0} > 5.0" | bc 2>/dev/null || echo 0)" -eq 1 ]; then
+    LOSS_INT=$(echo "$LOSS_NUM" | awk -F. '{printf "%d", $1 * 10 + ($2 + 0) / 1 + 0}' 2>/dev/null || echo "0")
+    if [ "$LOSS_INT" -gt 50 ]; then
         CONSECUTIVE_LOSS=$((CONSECUTIVE_LOSS + 1))
         warn "High loss detected: $MAC_LOSS (consecutive: $CONSECUTIVE_LOSS)"
     else

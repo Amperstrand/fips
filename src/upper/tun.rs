@@ -227,7 +227,11 @@ impl TunDevice {
     /// a channel sender for submitting packets to be written.
     ///
     /// The max_mss parameter is used for TCP MSS clamping on inbound packets.
-    pub fn create_writer(&self, max_mss: Arc<AtomicU16>, clamp_window: bool) -> Result<(TunWriter, TunTx), TunError> {
+    pub fn create_writer(
+        &self,
+        max_mss: Arc<AtomicU16>,
+        clamp_window: bool,
+    ) -> Result<(TunWriter, TunTx), TunError> {
         let fd = self.device.as_raw_fd();
 
         // Duplicate the file descriptor for writing

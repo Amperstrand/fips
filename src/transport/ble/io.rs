@@ -255,6 +255,7 @@ mod bluer_impl {
         recv_mtu: u16,
         rate_limiter: Option<Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>>,
         drain_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _drain_task: tokio::task::JoinHandle<()>,
         recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
@@ -296,6 +297,10 @@ mod bluer_impl {
             let (drain_tx, mut drain_rx) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(BLE_LINUX_QUEUE_DEPTH);
 
+            let alive: std::sync::Arc<std::sync::atomic::AtomicBool> =
+                std::sync::Arc::new(true.into());
+
+            let drain_alive = alive.clone();
             let drain_task = tokio::spawn(async move {
                 while let Some(frame) = drain_rx.recv().await {
                     if let Some(ref limiter) = drain_limiter {
@@ -305,7 +310,9 @@ mod bluer_impl {
                     if let Err(e) =
                         tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame)).await
                     {
-                        warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error");
+                        warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
+                        drain_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                        break;
                     }
                 }
                 debug!(addr = %drain_remote, "BLE linux drain task stopped");
@@ -318,6 +325,7 @@ mod bluer_impl {
                 recv_mtu,
                 rate_limiter,
                 drain_tx,
+                alive,
                 _drain_task: drain_task,
                 recv_buf: tokio::sync::Mutex::new(Vec::new()),
             })
@@ -326,6 +334,12 @@ mod bluer_impl {
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+            if !self.alive.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(TransportError::Io(std::io::Error::other(
+                    "BLE connection dead (drain task error)",
+                )));
+            }
+
             let framed = frame_payload(data)?;
             if framed.len() > self.send_mtu as usize {
                 return Err(TransportError::MtuExceeded {

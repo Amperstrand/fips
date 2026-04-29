@@ -786,7 +786,7 @@ rate limiter prevents the transport from overwhelming the BLE link:
 | Property | Value |
 | -------- | ----- |
 | L2CAP PSM | 0x0085 (133 decimal) |
-| GATT Service UUID | `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c` |
+| GATT Service UUID | `9c90b790-2cc5-42c0-9f87-c9cc40648f4c` |
 | Default MTU | 2048 (Linux), negotiated (macOS) |
 | Addressing | BLE address (`XX:XX:XX:XX:XX:XX`) |
 | Linux platform | BlueZ via `bluer` (glibc, not musl) |
@@ -841,7 +841,7 @@ X." FMP does not need to distinguish beacons from query responses.
 | UDP (LAN) | Broadcast/multicast | On local network segment |
 | Ethernet | Broadcast | Custom EtherType, ff:ff:ff:ff:ff:ff |
 | Radio | Beacon | Shared RF channel, natural fit |
-| BLE | Advertising + scan | GATT service UUID `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c`, PSM characteristic |
+| BLE | Advertising + scan | GATT service UUID `9c90b790-2cc5-42c0-9f87-c9cc40648f4c`, PSM characteristic |
 
 ### Nostr Relay Discovery *(future direction)*
 

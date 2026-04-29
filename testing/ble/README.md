@@ -146,7 +146,7 @@ For the `ble-smoke` scenario (2 nodes):
 | macOS (arm64) | Central + Peripheral | Built-in (`default`) | — |
 | Linux 218 | Central + Peripheral | `hci0` | `14:5A:FC:49:C2:24` |
 
-BLE PSM: dynamic (GATT-advertised by macOS via UUID `9c90b790-2cc5-42c0-9f87-c9cc-4064-8f4c`).
+BLE PSM: dynamic (GATT-advertised by macOS via UUID `9c90b790-2cc5-42c0-9f87-c9cc40648f4c`).
 The default PSM in FIPS config is `0x0085` (133), but macOS CoreBluetooth
 allocates the actual PSM dynamically and publishes it via GATT. The Linux
 node reads the PSM from GATT during discovery.
@@ -162,7 +162,7 @@ node reads the PSM from GATT during discovery.
 ### "L2CAP connect failed"
 
 - Linux: Ensure `bluetoothd` is running (`sudo systemctl status bluetooth`).
-- Check PSM 0x00C0 (192) is not in use: `sudo sdptool browse local`.
+- Check PSM 0x0085 (133) is not in use: `sudo sdptool browse local`.
 - BLE devices must be paired or have BLE enabled (different from classic
   Bluetooth pairing).
 
@@ -183,17 +183,18 @@ node reads the PSM from GATT during discovery.
 - Symptom: intermittent corruption in Noise handshake or AEAD decryption
   failures under sustained traffic.
 
-### TCP connections (SSH, iperf3 TCP mode) fail over BLE
+### TCP over BLE is slow and bursty
 
-- BLE's ~200 Kbps throughput with rate limiting (`send_rate_bps`) does not
-  reliably support TCP's retransmission and congestion control overhead.
-- **Observed**: iperf3 TCP bursts 128KB in the first second then stalls;
-  TCP control connections die after ~9 seconds, killing the BLE link.
-- **UDP and ICMPv6** (ping6, iperf3 UDP mode) work reliably at up to
-  200 Kbps with zero loss. SSH over the FIPS mesh works on UDP, Ethernet,
-  and TCP transports — just not over BLE.
-- This is a fundamental BLE bandwidth constraint, not a bug.
-- **Workaround**: Use UDP-based tools for BLE throughput testing.
+- TCP works over BLE but is suboptimal due to the constrained link and
+  kernel-level TCP behavior.
+- **Observed**: iperf3 TCP -w 8K delivers ~8 KB/s in 15-second retransmission
+  bursts (deterministic RTO pattern). Forward direction sends 128KB burst in
+  the first second then stalls (macOS wscale caching). Reverse direction
+  achieves ~24 KB/s (limited by 2920-byte window / 100ms RTT).
+- **UDP and ICMPv6** (ping6, iperf3 UDP mode) work reliably at up to 80 Kbps
+  with zero loss. Use UDP for BLE throughput testing.
+- This is a fundamental BLE bandwidth constraint combined with kernel TCP
+  behavior, not a FIPS bug.
 
 ### Connection keeps dropping
 
