@@ -11,7 +11,7 @@ pub mod udp;
 #[cfg(unix)]
 pub mod ethernet;
 
-#[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+#[cfg(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos"))]
 pub mod ble;
 
 #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]

@@ -73,6 +73,12 @@ impl PeerBackoff {
         false
     }
 
+    #[cfg(test)]
+    fn test_insert_denied(&mut self, addr: &BleAddr, until: Instant) {
+        self.denied
+            .insert(addr.clone(), DenyEntry { until });
+    }
+
     /// Whether the address is currently in backoff (should not be probed).
     pub fn is_in_backoff(&self, addr: &BleAddr) -> bool {
         if let Some(e) = self.entries.get(addr) {
@@ -183,5 +189,22 @@ mod tests {
         bo.clear(&addr);
         assert!(!bo.is_denied(&addr));
         assert!(!bo.is_in_backoff(&addr));
+    }
+
+    #[test]
+    fn deny_entry_removed_after_expiry() {
+        let mut bo = PeerBackoff::with_defaults();
+        let addr = test_addr(4);
+
+        // Insert a deny entry valid for 1 second from now
+        bo.test_insert_denied(&addr, Instant::now() + std::time::Duration::from_secs(1));
+        assert!(bo.is_denied(&addr));
+
+        // Wait for it to expire
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert!(!bo.is_denied(&addr));
+
+        // Calling again should still return false (entry was removed, not just expired)
+        assert!(!bo.is_denied(&addr));
     }
 }
