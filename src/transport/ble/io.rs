@@ -272,10 +272,10 @@ mod bluer_impl {
 
             match conn.as_ref().phy() {
                 Ok(phy) => {
-                    debug!(addr = %remote, phy, send_mtu, recv_mtu, "BLE connection established")
+                    debug!(remote_addr = %remote, phy, send_mtu, recv_mtu, "BLE connection established")
                 }
                 Err(_) => {
-                    debug!(addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)")
+                    debug!(remote_addr = %remote, send_mtu, recv_mtu, "BLE connection established (PHY query unsupported)")
                 }
             }
 
@@ -310,17 +310,17 @@ mod bluer_impl {
                     match tokio::time::timeout(BLE_SEND_TIMEOUT, conn_guard.send(&frame)).await {
                         Ok(Ok(_n)) => {}
                         Ok(Err(e)) => {
-                            warn!(addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
+                            warn!(remote_addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
                             drain_alive.store(false, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                         Err(_) => {
-                            warn!(addr = %drain_remote, "BLE linux drain task write timeout (congestion, not fatal)");
+                            warn!(remote_addr = %drain_remote, "BLE linux drain task write timeout (congestion, not fatal)");
                         }
                     }
                     drop(conn_guard);
                 }
-                debug!(addr = %drain_remote, "BLE linux drain task stopped");
+                debug!(remote_addr = %drain_remote, "BLE linux drain task stopped");
             });
 
             Ok(Self {
@@ -387,12 +387,12 @@ mod bluer_impl {
             tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&framed))
                 .await
                 .map_err(|_| {
-                    warn!(addr = %self.remote, "BLE linux send_urgent timeout");
+                    warn!(remote_addr = %self.remote, "BLE linux send_urgent timeout");
                     TransportError::Timeout
                 })?
                 .map(|_sent| ())
                 .map_err(|e| {
-                    warn!(addr = %self.remote, error = %e, "BLE linux send_urgent error, marking connection dead");
+                    warn!(remote_addr = %self.remote, error = %e, "BLE linux send_urgent error, marking connection dead");
                     self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
                     TransportError::Io(std::io::Error::other(format!("send_urgent: {e}")))
                 })
@@ -507,7 +507,7 @@ mod bluer_impl {
                             match device.uuids().await {
                                 Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
                                     let ble_addr = BleAddr::from_bluer(addr, &self.adapter_name);
-                                    debug!(addr = %ble_addr, "BLE scanner: cached FIPS peer found");
+                                    debug!(remote_addr = %ble_addr, "BLE scanner: cached FIPS peer found");
                                     return Some(ble_addr);
                                 }
                                 _ => continue,
@@ -524,14 +524,14 @@ mod bluer_impl {
                             match device.uuids().await {
                                 Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
                                     let ble_addr = BleAddr::from_bluer(addr, &self.adapter_name);
-                                    debug!(addr = %ble_addr, "BLE scanner: FIPS peer found");
+                                    debug!(remote_addr = %ble_addr, "BLE scanner: FIPS peer found");
                                     return Some(ble_addr);
                                 }
                                 Ok(_) => {
-                                    trace!(addr = %addr, "BLE scanner: device without FIPS UUID");
+                                    trace!(remote_addr = %addr, "BLE scanner: device without FIPS UUID");
                                 }
                                 Err(e) => {
-                                    trace!(addr = %addr, error = %e, "BLE scanner: failed to read UUIDs");
+                                    trace!(remote_addr = %addr, error = %e, "BLE scanner: failed to read UUIDs");
                                 }
                             }
                         }
@@ -637,7 +637,7 @@ mod bluer_impl {
                 return addr_type;
             }
 
-            debug!(addr = %addr, "BLE connect: device not in cache, starting discovery scan");
+            debug!(remote_addr = %addr, "BLE connect: device not in cache, starting discovery scan");
 
             let filter = DiscoveryFilter {
                 transport: DiscoveryTransport::Le,
@@ -645,7 +645,7 @@ mod bluer_impl {
             };
 
             if let Err(e) = self.adapter.set_discovery_filter(filter).await {
-                debug!(addr = %addr, error = %e, "BLE connect: failed to set discovery filter");
+                debug!(remote_addr = %addr, error = %e, "BLE connect: failed to set discovery filter");
                 return AddressType::LeRandom;
             }
 
@@ -657,7 +657,7 @@ mod bluer_impl {
                                 && found_addr == bluer_addr
                                 && let Ok(addr_type) = device.address_type().await
                             {
-                                debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
+                                debug!(remote_addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan found device addr_type");
                                 return Some(addr_type);
                             }
                         }
@@ -672,13 +672,13 @@ mod bluer_impl {
                         Ok(None) | Err(_) => {
                             let addr_type =
                                 device.address_type().await.unwrap_or(AddressType::LeRandom);
-                            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
+                            debug!(remote_addr = %addr, addr_type = ?addr_type, "BLE connect: discovery scan cached device addr_type");
                             addr_type
                         }
                     }
                 }
                 Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE connect: failed to start discovery scan");
+                    debug!(remote_addr = %addr, error = %e, "BLE connect: failed to start discovery scan");
                     AddressType::LeRandom
                 }
             }
@@ -689,7 +689,7 @@ mod bluer_impl {
                 let _ = self.resolve_addr_type(addr).await;
                 let device = self.device_handle(addr)?;
 
-                debug!(addr = %addr, "GATT PSM discovery: connecting GATT");
+                debug!(remote_addr = %addr, "GATT PSM discovery: connecting GATT");
 
                 device.connect().await.map_err(|e| {
                     TransportError::Io(std::io::Error::other(format!(
@@ -701,7 +701,7 @@ mod bluer_impl {
                 let result = self.read_psm_from_gatt(&device, addr).await;
 
                 if let Err(e) = device.disconnect().await {
-                    debug!(addr = %addr, error = %e, "GATT PSM discovery: GATT disconnect failed (non-fatal)");
+                    debug!(remote_addr = %addr, error = %e, "GATT PSM discovery: GATT disconnect failed (non-fatal)");
                 }
 
                 result
@@ -729,7 +729,7 @@ mod bluer_impl {
                 )))
             })?;
 
-            debug!(addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
+            debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
 
             let psm_service = find_service_by_uuid(&services, FIPS_GATT_PSM_SERVICE_UUID).await;
             let psm_service = match psm_service {
@@ -784,7 +784,7 @@ mod bluer_impl {
                 ))));
             }
 
-            debug!(addr = %addr, psm, "GATT PSM discovery: discovered PSM");
+            debug!(remote_addr = %addr, psm, "GATT PSM discovery: discovered PSM");
             Ok(psm)
         }
     }
@@ -864,7 +864,7 @@ mod bluer_impl {
             let bluer_addr = addr.to_bluer_address();
             let device = self.device_handle(addr)?;
 
-            debug!(addr = %addr, configured_psm = psm, addr_type = ?addr_type, "BLE connect: starting");
+            debug!(remote_addr = %addr, configured_psm = psm, addr_type = ?addr_type, "BLE connect: starting");
 
             // GATT connect with retry for transient errors
             const GATT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -877,7 +877,7 @@ mod bluer_impl {
                 match timeout(GATT_CONNECT_TIMEOUT, device.connect()).await {
                     Ok(Ok(())) => {
                         debug!(
-                            addr = %addr, attempt,
+                            remote_addr = %addr, attempt,
                             gatt_ms = gatt_start.elapsed().as_millis() as u64,
                             "BLE connect: GATT connected"
                         );
@@ -890,25 +890,25 @@ mod bluer_impl {
                             && (err_str.contains("abort-by-local") || err_str.contains("Not Ready"))
                         {
                             debug!(
-                                addr = %addr, attempt, error = %e,
+                                remote_addr = %addr, attempt, error = %e,
                                 "BLE connect: GATT connect aborted by local stack, retrying"
                             );
                             if let Err(de) = device.disconnect().await {
-                                debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect before retry (non-fatal)");
+                                debug!(remote_addr = %addr, error = %de, "BLE connect: GATT disconnect before retry (non-fatal)");
                             }
                             tokio::time::sleep(GATT_RETRY_DELAY).await;
                             continue;
                         }
-                        debug!(addr = %addr, attempt, error = %e, "BLE connect: GATT connect failed");
+                        debug!(remote_addr = %addr, attempt, error = %e, "BLE connect: GATT connect failed");
                         if let Err(de) = device.disconnect().await {
-                            debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after failure (non-fatal)");
+                            debug!(remote_addr = %addr, error = %de, "BLE connect: GATT disconnect after failure (non-fatal)");
                         }
                         break;
                     }
                     Err(_) => {
-                        debug!(addr = %addr, attempt, "BLE connect: GATT connect timed out");
+                        debug!(remote_addr = %addr, attempt, "BLE connect: GATT connect timed out");
                         if let Err(de) = device.disconnect().await {
-                            debug!(addr = %addr, error = %de, "BLE connect: GATT disconnect after timeout (non-fatal)");
+                            debug!(remote_addr = %addr, error = %de, "BLE connect: GATT disconnect after timeout (non-fatal)");
                         }
                         break;
                     }
@@ -926,20 +926,20 @@ mod bluer_impl {
                     Ok(Ok(discovered_psm)) => {
                         effective_psm = discovered_psm;
                         debug!(
-                            addr = %addr, configured_psm = psm, discovered_psm,
+                            remote_addr = %addr, configured_psm = psm, discovered_psm,
                             psm_discovery_ms = psm_start.elapsed().as_millis() as u64,
                             "BLE connect: using GATT-discovered PSM"
                         );
                     }
                     Ok(Err(e)) => {
-                        debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery failed, using configured PSM");
+                        debug!(remote_addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery failed, using configured PSM");
                     }
                     Err(_) => {
-                        debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT PSM discovery timed out, using configured PSM");
+                        debug!(remote_addr = %addr, configured_psm = psm, "BLE connect: GATT PSM discovery timed out, using configured PSM");
                     }
                 }
             } else {
-                debug!(addr = %addr, configured_psm = psm, "BLE connect: GATT connect failed, falling back to L2CAP with configured PSM");
+                debug!(remote_addr = %addr, configured_psm = psm, "BLE connect: GATT connect failed, falling back to L2CAP with configured PSM");
             }
 
             // Set trusted if not already
@@ -947,16 +947,16 @@ mod bluer_impl {
                 Ok(true) => {}
                 Ok(false) => {
                     if let Err(e) = device.set_trusted(true).await {
-                        debug!(addr = %addr, error = %e, "BLE connect: set_trusted(true) failed (non-fatal)");
+                        debug!(remote_addr = %addr, error = %e, "BLE connect: set_trusted(true) failed (non-fatal)");
                     }
                 }
                 Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE connect: failed to query trusted state");
+                    debug!(remote_addr = %addr, error = %e, "BLE connect: failed to query trusted state");
                 }
             }
 
             let addr_type = device.address_type().await.unwrap_or(addr_type);
-            debug!(addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type after GATT");
+            debug!(remote_addr = %addr, addr_type = ?addr_type, "BLE connect: resolved address type after GATT");
 
             let target_sa = SocketAddr::new(bluer_addr, addr_type, effective_psm);
 
@@ -977,13 +977,13 @@ mod bluer_impl {
                 debug!(error = %e, "BLE connect: set_power_forced_active not supported");
             }
 
-            debug!(addr = %addr, addr_type = ?addr_type, psm = effective_psm, "BLE connect: opening LE L2CAP socket");
+            debug!(remote_addr = %addr, addr_type = ?addr_type, psm = effective_psm, "BLE connect: opening LE L2CAP socket");
 
             let conn_result = socket.connect(target_sa).await;
             match conn_result {
                 Ok(conn) => {
                     debug!(
-                        addr = %addr,
+                        remote_addr = %addr,
                         l2cap_ms = l2cap_start.elapsed().as_millis() as u64,
                         total_ms = connect_start.elapsed().as_millis() as u64,
                         "BLE connect: L2CAP channel established"
@@ -993,7 +993,7 @@ mod bluer_impl {
                 }
                 Err(e) => {
                     if let Err(e) = device.disconnect().await {
-                        debug!(addr = %addr, error = %e, "BLE connect: GATT disconnect after L2CAP failure (non-fatal)");
+                        debug!(remote_addr = %addr, error = %e, "BLE connect: GATT disconnect after L2CAP failure (non-fatal)");
                     }
                     Err(map_io_err("connect", e))
                 }
@@ -1053,13 +1053,15 @@ mod bluer_impl {
             let device = match self.device_handle(addr) {
                 Ok(d) => d,
                 Err(e) => {
-                    debug!(addr = %addr, error = %e, "BLE disconnect: device not found");
+                    debug!(remote_addr = %addr, error = %e, "BLE disconnect: device not found");
                     return;
                 }
             };
             match device.disconnect().await {
-                Ok(()) => debug!(addr = %addr, "BLE device disconnected"),
-                Err(e) => debug!(addr = %addr, error = %e, "BLE disconnect failed (non-fatal)"),
+                Ok(()) => debug!(remote_addr = %addr, "BLE device disconnected"),
+                Err(e) => {
+                    debug!(remote_addr = %addr, error = %e, "BLE disconnect failed (non-fatal)")
+                }
             }
         }
 

@@ -127,7 +127,7 @@ impl<I: BleIo> BleTransport<I> {
     ) -> Self {
         let warnings = config.validate();
         for w in &warnings {
-            tracing::warn!(warning = %w, "BLE config validation: invalid value reset to default");
+            warn!(warning = %w, "BLE config validation: invalid value reset to default");
         }
         let max_conns = config.max_connections();
         let initial_rate_bps = config.effective_send_rate_bps();
@@ -373,7 +373,7 @@ impl<I: BleIo> BleTransport<I> {
                 self.stats.record_send_error();
                 if matches!(e, TransportError::SendFailed(_)) {
                     self.congested.store(true, Ordering::Relaxed);
-                    debug!(addr = %addr, "BLE send dropped (congested), packet discarded");
+                    debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE send dropped (congested), packet discarded");
                     return Err(e);
                 }
                 let mut pool = self.pool.lock().await;
@@ -384,7 +384,7 @@ impl<I: BleIo> BleTransport<I> {
                         remote_addr: addr.clone(),
                     });
                 }
-                warn!(addr = %addr, error = %e, "BLE send failed, connection removed");
+                warn!(transport_id = %self.transport_id, remote_addr = %addr, error = %e, "BLE send failed, connection removed");
                 Err(e)
             }
         }
@@ -425,7 +425,7 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(data.len())
             }
             Err(e) => {
-                warn!(addr = %addr, error = %e, "BLE urgent send failed, connection removed");
+                warn!(transport_id = %self.transport_id, remote_addr = %addr, error = %e, "BLE urgent send failed, connection removed");
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 drop(pool);
@@ -489,13 +489,13 @@ impl<I: BleIo> BleTransport<I> {
         match pool.insert(addr.clone(), conn) {
             Ok(Some(evicted)) => {
                 self.stats.record_pool_eviction();
-                debug!(addr = %addr, evicted = %evicted, "BLE connection established (evicted peer)");
+                debug!(transport_id = %self.transport_id, remote_addr = %addr, evicted = %evicted, "BLE connection established (evicted peer)");
             }
             Ok(None) => {
-                debug!(addr = %addr, "BLE connection established");
+                debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE connection established");
             }
             Err(e) => {
-                warn!(addr = %addr, error = %e, "BLE pool full, connection dropped");
+                warn!(transport_id = %self.transport_id, remote_addr = %addr, error = %e, "BLE pool full, connection dropped");
                 self.stats.record_connection_rejected();
                 return Err(TransportError::SendFailed("pool full".into()));
             }
@@ -550,12 +550,12 @@ impl<I: BleIo> BleTransport<I> {
                         if let Some(ref our_pubkey) = local_pubkey {
                             match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
                                 Ok(result) => {
-                                    debug!(addr = %addr_clone, "BLE outbound pubkey exchange complete");
+                                    debug!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound pubkey exchange complete");
                                     discovery_buffer
                                         .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
                                 }
                                 Err(e) => {
-                                    warn!(addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
+                                    warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
                                     connecting_inner.lock().await.remove(&addr_clone);
                                     return;
                                 }
@@ -604,13 +604,13 @@ impl<I: BleIo> BleTransport<I> {
                         match pool.insert(addr_clone.clone(), conn) {
                             Ok(Some(evicted)) => {
                                 stats.record_pool_eviction();
-                                debug!(addr = %addr_clone, evicted = %evicted, "BLE connection established (evicted peer)");
+                                debug!(transport_id = %transport_id, remote_addr = %addr_clone, evicted = %evicted, "BLE connection established (evicted peer)");
                             }
                             Ok(None) => {
-                                debug!(addr = %addr_clone, "BLE connection established");
+                                debug!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE connection established");
                             }
                             Err(e) => {
-                                warn!(addr = %addr_clone, error = %e, "BLE pool full, connection dropped");
+                                warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE pool full, connection dropped");
                                 stats.record_connection_rejected();
                                 connecting_inner.lock().await.remove(&addr_clone);
                                 return;
@@ -621,12 +621,12 @@ impl<I: BleIo> BleTransport<I> {
                     }
                     Ok(Err(e)) => {
                         connecting_inner.lock().await.remove(&addr_clone);
-                        debug!(addr = %addr_clone, error = %e, "BLE connect failed");
+                        debug!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE connect failed");
                     }
                     Err(_) => {
                         stats.record_connect_timeout();
                         connecting_inner.lock().await.remove(&addr_clone);
-                        debug!(addr = %addr_clone, "BLE connect timeout");
+                        debug!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE connect timeout");
                     }
                 }
             });
@@ -658,7 +658,7 @@ impl<I: BleIo> BleTransport<I> {
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            debug!(addr = %addr, "BLE connection closed");
+            debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE connection closed");
             drop(conn);
         }
     }
@@ -869,14 +869,14 @@ async fn accept_loop<A>(
                 let ta = addr.to_transport_addr();
 
                 if backoff.lock().await.is_denied(&addr) {
-                    debug!(addr = %ta, "BLE inbound: denied, dropping");
+                    debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: denied, dropping");
                     continue;
                 }
 
                 {
                     let pool_guard = pool.lock().await;
                     if pool_guard.contains(&ta) {
-                        debug!(addr = %ta, "BLE inbound: already connected, skipping");
+                        debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: already connected, skipping");
                         continue;
                     }
                 }
@@ -888,30 +888,30 @@ async fn accept_loop<A>(
                     if stream.supports_bidirectional_pubkey_exchange() {
                         match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
                             Ok(result) => {
-                                debug!(addr = %ta, "BLE inbound pubkey exchange complete");
+                                debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound pubkey exchange complete");
                                 discovery_buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
 
                                 let peer_capabilities = result.peer_capabilities;
                                 if !peer_capabilities.can_accept_inbound() {
-                                    debug!(addr = %ta, "BLE inbound: peer is central-only, accepting inbound connection anyway");
+                                    debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: peer is central-only, accepting inbound connection anyway");
                                 } else if peer_capabilities.prefers_outbound()
                                     && !local_capabilities.prefers_outbound()
                                 {
-                                    debug!(addr = %ta, "BLE inbound: peer prefers outbound, keeping connection");
+                                    debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: peer prefers outbound, keeping connection");
                                 } else if let Some(ref our_addr) = local_node_addr {
                                     let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
                                     if our_addr < &peer_addr {
-                                        debug!(addr = %ta, "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)");
+                                        debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)");
                                         backoff.lock().await.clear(&addr);
                                         continue;
                                     }
                                 }
                             }
                             Err(e) => {
-                                debug!(addr = %ta, error = %e, "BLE inbound pubkey exchange failed");
+                                debug!(transport_id = %transport_id, remote_addr = %ta, error = %e, "BLE inbound pubkey exchange failed");
                                 let denied = backoff.lock().await.record_failure(&addr);
                                 if denied {
-                                    warn!(addr = %ta, "BLE inbound: auto-denied after repeated failures");
+                                    warn!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: auto-denied after repeated failures");
                                 }
                                 continue;
                             }
@@ -919,10 +919,10 @@ async fn accept_loop<A>(
                     } else if let Err(e) =
                         send_pubkey_announcement(&stream, our_pubkey, local_capabilities).await
                     {
-                        debug!(addr = %ta, error = %e, "BLE inbound pubkey announcement failed");
+                        debug!(transport_id = %transport_id, remote_addr = %ta, error = %e, "BLE inbound pubkey announcement failed");
                         continue;
                     } else {
-                        debug!(addr = %ta, "BLE inbound pubkey announcement sent; deferring peer identity to Noise");
+                        debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound pubkey announcement sent; deferring peer identity to Noise");
                     }
                 }
 
@@ -958,13 +958,13 @@ async fn accept_loop<A>(
                 match pool_guard.insert(ta.clone(), conn) {
                     Ok(Some(evicted)) => {
                         stats.record_pool_eviction();
-                        info!(addr = %ta, evicted = %evicted, "BLE inbound accepted (evicted peer)");
+                        info!(transport_id = %transport_id, remote_addr = %ta, evicted = %evicted, "BLE inbound accepted (evicted peer)");
                     }
                     Ok(None) => {
-                        info!(addr = %ta, send_mtu, recv_mtu, "BLE inbound connection accepted");
+                        info!(transport_id = %transport_id, remote_addr = %ta, send_mtu, recv_mtu, "BLE inbound connection accepted");
                     }
                     Err(e) => {
-                        warn!(addr = %ta, error = %e, "BLE pool full, inbound connection rejected");
+                        warn!(transport_id = %transport_id, remote_addr = %ta, error = %e, "BLE pool full, inbound connection rejected");
                         stats.record_connection_rejected();
                         continue;
                     }
@@ -973,7 +973,7 @@ async fn accept_loop<A>(
                 backoff.lock().await.clear(&backoff_addr);
             }
             Err(e) => {
-                warn!(adapter = %adapter, error = %e, "BLE accept error, retrying in 2s");
+                warn!(transport_id = %transport_id, adapter = %adapter, error = %e, "BLE accept error, retrying in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
@@ -1008,7 +1008,7 @@ async fn receive_loop<S: BleStream>(
 
         match recv_result {
             Ok(Ok(0)) => {
-                debug!(addr = %args.addr, "BLE connection closed by peer");
+                debug!(transport_id = %args.transport_id, remote_addr = %args.addr, "BLE connection closed by peer");
                 break;
             }
             Ok(Ok(n)) => {
@@ -1016,7 +1016,7 @@ async fn receive_loop<S: BleStream>(
                 let frame_data = buf[..n].to_vec();
                 let packet = ReceivedPacket::new(args.transport_id, args.addr.clone(), frame_data);
                 if packet_tx.send(packet).await.is_err() {
-                    trace!("BLE packet_tx closed, stopping receive loop");
+                    trace!(transport_id = %args.transport_id, "BLE packet_tx closed, stopping receive loop");
                     break;
                 }
             }
@@ -1026,12 +1026,12 @@ async fn receive_loop<S: BleStream>(
                     args.stats.record_recv_error();
                     continue;
                 }
-                debug!(addr = %args.addr, error = %e, "BLE receive error");
+                debug!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, "BLE receive error");
                 args.stats.record_recv_error();
                 break;
             }
             Err(_) => {
-                debug!(addr = %args.addr, timeout_secs = args.recv_timeout_secs, "BLE recv timeout — link may be silently dead");
+                debug!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, "BLE recv timeout — link may be silently dead");
                 args.stats.record_recv_error();
                 break;
             }
@@ -1173,11 +1173,11 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         };
 
-        trace!(addr = %addr, "BLE scan result");
+        trace!(transport_id = %transport_id, remote_addr = %addr, "BLE scan result");
         stats.record_scan_result();
 
         if backoff.lock().await.is_denied(&addr) {
-            trace!(addr = %addr, "BLE scan result: denied, skipping");
+            trace!(transport_id = %transport_id, remote_addr = %addr, "BLE scan result: denied, skipping");
             continue;
         }
 
@@ -1223,20 +1223,20 @@ async fn scan_probe_loop<I: io::BleIo>(
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                debug!(addr = %addr, error = %e, "BLE probe connect failed");
+                debug!(transport_id = %transport_id, remote_addr = %addr, error = %e, "BLE probe connect failed");
                 let denied = backoff.lock().await.record_failure(&addr);
                 if denied {
-                    warn!(addr = %addr, "BLE probe: auto-denied after repeated connect failures");
+                    warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated connect failures");
                     pending_addrs.retain(|a| a != &addr);
                 }
                 continue;
             }
             Err(_) => {
-                debug!(addr = %addr, "BLE probe connect timeout");
+                debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe connect timeout");
                 stats.record_connect_timeout();
                 let denied = backoff.lock().await.record_failure(&addr);
                 if denied {
-                    warn!(addr = %addr, "BLE probe: auto-denied after repeated timeouts");
+                    warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated timeouts");
                     pending_addrs.retain(|a| a != &addr);
                 }
                 continue;
@@ -1247,17 +1247,17 @@ async fn scan_probe_loop<I: io::BleIo>(
         wait_before_outbound_pubkey_exchange().await;
         match pubkey_exchange(&stream, &our_pubkey, local_capabilities).await {
             Ok(result) => {
-                debug!(addr = %addr, "BLE probe complete");
+                debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe complete");
 
                 let peer_capabilities = result.peer_capabilities;
                 if !peer_capabilities.can_accept_inbound() {
-                    debug!(addr = %addr, "BLE probe: peer cannot accept inbound, yielding to peer's outbound");
+                    debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: peer cannot accept inbound, yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
                     continue;
                 }
 
                 if peer_capabilities.prefers_outbound() && !local_capabilities.prefers_outbound() {
-                    debug!(addr = %addr, "BLE probe: peer prefers outbound, yielding to peer's outbound");
+                    debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: peer prefers outbound, yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
                     continue;
                 }
@@ -1265,7 +1265,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                 if let Some(ref our_addr) = local_node_addr {
                     let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
                     if peer_capabilities.can_initiate_outbound() && our_addr >= &peer_addr {
-                        debug!(addr = %addr, "BLE probe tie-breaker: yielding to peer's outbound");
+                        debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe tie-breaker: yielding to peer's outbound");
                         buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
                         continue;
                     }
@@ -1315,13 +1315,13 @@ async fn scan_probe_loop<I: io::BleIo>(
                 match pool_guard.insert(ta.clone(), conn) {
                     Ok(Some(evicted)) => {
                         stats.record_pool_eviction();
-                        debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
+                        debug!(transport_id = %transport_id, remote_addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
                     }
                     Ok(None) => {
-                        debug!(addr = %ta, "BLE probe promoted to pool");
+                        debug!(transport_id = %transport_id, remote_addr = %ta, "BLE probe promoted to pool");
                     }
                     Err(e) => {
-                        warn!(addr = %ta, error = %e, "BLE pool full, probe connection dropped");
+                        warn!(transport_id = %transport_id, remote_addr = %ta, error = %e, "BLE pool full, probe connection dropped");
                         stats.record_connection_rejected();
                     }
                 }
@@ -1333,10 +1333,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                 buffer.add_peer_with_pubkey(&addr, peer_pubkey);
             }
             Err(e) => {
-                debug!(addr = %addr, error = %e, "BLE probe pubkey exchange failed");
+                debug!(transport_id = %transport_id, remote_addr = %addr, error = %e, "BLE probe pubkey exchange failed");
                 let denied = backoff.lock().await.record_failure(&addr);
                 if denied {
-                    warn!(addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
+                    warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
                     pending_addrs.retain(|a| a != &addr);
                 }
             }

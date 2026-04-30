@@ -9,6 +9,8 @@
 
 use std::time::{Duration, Instant};
 
+use tracing::trace;
+
 /// BLE send rate limiter using token bucket algorithm.
 ///
 /// Tokens represent bytes. The bucket refills at `rate_bytes_per_sec` and
@@ -63,7 +65,7 @@ impl SendRateLimiter {
             if self.tokens >= bytes as f64 {
                 self.tokens -= bytes as f64;
                 if waits > 0 || bytes > 512 {
-                    tracing::trace!(
+                    trace!(
                         bytes,
                         tokens_remaining = self.tokens as u32,
                         waits,
@@ -80,7 +82,7 @@ impl SendRateLimiter {
             let wait = Duration::from_secs_f64(wait_secs).max(Duration::from_millis(1));
             waits += 1;
             if waits == 1 {
-                tracing::trace!(
+                trace!(
                     bytes,
                     tokens = self.tokens as u32,
                     deficit = deficit as u32,

@@ -11,7 +11,7 @@ use futures::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
@@ -287,7 +287,7 @@ impl BleStream for BluestStream {
         match self.tx.try_send(framed) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                trace!(addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, dropping");
+                trace!(remote_addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, dropping");
                 Err(TransportError::SendFailed("BLE central queue full".into()))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
@@ -304,7 +304,7 @@ impl BleStream for BluestStream {
         tokio::time::timeout(BLE_URGENT_TIMEOUT, writer.write_all(&framed))
             .await
             .map_err(|_| {
-                warn!(addr = %self.remote, "BLE central send_urgent timeout");
+                warn!(remote_addr = %self.remote, "BLE central send_urgent timeout");
                 TransportError::Timeout
             })?
             .map(|_| ())
@@ -888,17 +888,17 @@ impl PeripheralStream {
                         break;
                     }
                     let notified = pacer_notify.notified();
-                    trace!(addr = %pacer_remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer queue full, waiting");
+                    trace!(remote_addr = %pacer_remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer queue full, waiting");
                     match tokio::time::timeout(BLE_URGENT_TIMEOUT, notified).await {
                         Ok(()) => continue,
                         Err(_) => {
-                            warn!(addr = %pacer_remote, "BLE peripheral pacer timeout, dropping frame");
+                            warn!(remote_addr = %pacer_remote, "BLE peripheral pacer timeout, dropping frame");
                             break;
                         }
                     }
                 }
             }
-            debug!(addr = %pacer_remote, "BLE peripheral pacer task stopped");
+            debug!(remote_addr = %pacer_remote, "BLE peripheral pacer task stopped");
         });
 
         PeripheralStream {
@@ -932,7 +932,7 @@ impl PeripheralStream {
             self.notify_write();
             return Ok(());
         }
-        trace!(addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
+        trace!(remote_addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
         let notified = self.queue_space_notify.notified();
         if tokio::time::timeout(BLE_URGENT_TIMEOUT, notified)
             .await
@@ -942,7 +942,7 @@ impl PeripheralStream {
             self.notify_write();
             return Ok(());
         }
-        warn!(addr = %self.remote, %label, "BLE peripheral send_urgent timeout (queue full)");
+        warn!(remote_addr = %self.remote, %label, "BLE peripheral send_urgent timeout (queue full)");
         Err(TransportError::Timeout)
     }
 }
@@ -955,7 +955,7 @@ impl BleStream for PeripheralStream {
         match self.pacer_tx.try_send(framed) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                trace!(addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, dropping");
+                trace!(remote_addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, dropping");
                 Err(TransportError::SendFailed(
                     "BLE peripheral pacer queue full".into(),
                 ))
@@ -996,7 +996,7 @@ impl BleStream for PeripheralStream {
             }
 
             if self._input_delegate.reached_eof() {
-                trace!(addr = %self.remote, "BLE peripheral recv EOF");
+                trace!(remote_addr = %self.remote, "BLE peripheral recv EOF");
                 return Ok(0);
             }
 
@@ -1075,7 +1075,7 @@ define_class!(
         #[unsafe(method(peripheralManagerDidUpdateState:))]
         fn did_update_state(&self, _peripheral: &CBPeripheralManager) {
             let state = unsafe { _peripheral.state() };
-            debug!("Peripheral manager state changed: {:?}", state);
+            debug!(?state, "Peripheral manager state changed");
             let _ = self
                 .ivars()
                 .sender
@@ -1091,10 +1091,10 @@ define_class!(
             error: Option<&NSError>,
         ) {
             if let Some(e) = error {
-                error!("L2CAP channel publish failed: {:?}", e);
+                warn!(error = %e, "L2CAP channel publish failed");
                 return;
             }
-            info!("L2CAP channel published with PSM: {}", psm);
+            info!(psm, "L2CAP channel published");
             self.ivars().published_psm.store(psm, Ordering::SeqCst);
             let _ = self
                 .ivars()
@@ -1111,7 +1111,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             if let Some(e) = error {
-                error!("GATT service add failed: {:?}", e);
+                warn!(error = %e, "GATT service add failed");
                 return;
             }
             debug!("GATT service added");
@@ -1134,7 +1134,7 @@ define_class!(
                 request.setValue(Some(&value));
                 peripheral.respondToRequest_withResult(request, CBATTError::Success);
             }
-            trace!("Responded to read request with PSM: {}", psm);
+            trace!(psm, "Responded to read request with PSM");
         }
 
         #[unsafe(method(peripheralManager:didOpenL2CAPChannel:error:))]
@@ -1145,7 +1145,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             if let Some(e) = error {
-                error!("L2CAP channel open failed: {:?}", e);
+                warn!(error = %e, "L2CAP channel open failed");
                 return;
             }
             if let Some(channel) = channel {
@@ -1190,7 +1190,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             if let Some(e) = error {
-                warn!("Advertising start failed: {:?}", e);
+                warn!(error = %e, "Advertising start failed");
             } else {
                 debug!("Advertising started");
             }
@@ -1385,7 +1385,7 @@ impl BluestIo {
                 )))
             })?;
 
-            debug!(addr = %addr, "GATT PSM discovery: enumerating services");
+            debug!(remote_addr = %addr, "GATT PSM discovery: enumerating services");
 
             let services = device.services().await.map_err(|e| {
                 TransportError::Io(std::io::Error::other(format!(
@@ -1394,7 +1394,7 @@ impl BluestIo {
                 )))
             })?;
 
-            debug!(addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
+            debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
 
             let psm_service = services
                 .iter()
@@ -1453,7 +1453,7 @@ impl BluestIo {
                 ))));
             }
 
-            debug!(addr = %addr, psm, "GATT PSM discovery: discovered PSM");
+            debug!(remote_addr = %addr, psm, "GATT PSM discovery: discovered PSM");
 
             Ok(psm)
         };
@@ -1637,7 +1637,7 @@ impl BleIo for BluestIo {
                             )
                             .await
                             {
-                                error!(error = %error, "BLE peripheral manager recovery failed");
+                                warn!(error = %error, "BLE peripheral manager recovery failed");
                                 return;
                             }
                         }
@@ -1684,15 +1684,15 @@ impl BleIo for BluestIo {
         })?;
         let effective_psm = match self.discover_gatt_psm(addr).await {
             Ok(discovered_psm) => {
-                debug!(addr = %addr, configured_psm = psm, discovered_psm, "BLE connect: using GATT-discovered PSM");
+                debug!(remote_addr = %addr, configured_psm = psm, discovered_psm, "BLE connect: using GATT-discovered PSM");
                 discovered_psm
             }
             Err(e) => {
-                debug!(addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery unavailable, using configured PSM");
+                debug!(remote_addr = %addr, configured_psm = psm, error = %e, "BLE connect: GATT PSM discovery unavailable, using configured PSM");
                 psm
             }
         };
-        debug!(addr = %addr, psm = effective_psm, "Opening L2CAP channel");
+        debug!(remote_addr = %addr, psm = effective_psm, "Opening L2CAP channel");
 
         let channel = device
             .open_l2cap_channel(effective_psm, false)
@@ -1703,7 +1703,7 @@ impl BleIo for BluestIo {
                 )))
             })?;
         let (reader, writer) = channel.split();
-        debug!(addr = %addr, psm = effective_psm, "L2CAP channel open");
+        debug!(remote_addr = %addr, psm = effective_psm, "L2CAP channel open");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BLE_CENTRAL_QUEUE_DEPTH);
 
@@ -1724,12 +1724,12 @@ impl BleIo for BluestIo {
                 drain_limiter.lock().await.acquire(frame.len()).await;
                 let mut writer = drain_writer.lock().await;
                 if let Err(e) = writer.write_all(&frame).await {
-                    warn!(addr = %drain_addr, error = %e, "BLE central drain task write error, stopping");
+                    warn!(remote_addr = %drain_addr, error = %e, "BLE central drain task write error, stopping");
                     drain_alive.store(false, Ordering::Relaxed);
                     break;
                 }
             }
-            debug!(addr = %drain_addr, "BLE central drain task stopped");
+            debug!(remote_addr = %drain_addr, "BLE central drain task stopped");
         });
 
         Ok(AnyStream::Central(BluestStream {
@@ -1786,8 +1786,10 @@ impl BleIo for BluestIo {
         let device = { self.devices.lock().await.get(&addr.device).cloned() };
         if let Some(device) = device {
             match self.adapter.disconnect_device(&device).await {
-                Ok(()) => debug!(addr = %addr, "Disconnected CoreBluetooth peripheral"),
-                Err(e) => debug!(addr = %addr, error = %e, "Failed to disconnect peripheral"),
+                Ok(()) => debug!(remote_addr = %addr, "Disconnected CoreBluetooth peripheral"),
+                Err(e) => {
+                    debug!(remote_addr = %addr, error = %e, "Failed to disconnect peripheral")
+                }
             }
         }
     }
