@@ -750,15 +750,13 @@ mod bluer_impl {
         ) -> Result<u16, TransportError> {
             let psm = Self::try_read_psm_from_gatt(device, addr).await;
             if let Err(ref e) = psm {
-                let err_str = format!("{e}");
-                if err_str.contains("service not found") {
-                    debug!(
-                        remote_addr = %addr,
-                        "GATT PSM discovery: service not found on first attempt, retrying in 200ms"
-                    );
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    return Self::try_read_psm_from_gatt(device, addr).await;
-                }
+                debug!(
+                    remote_addr = %addr,
+                    error = %e,
+                    "GATT PSM discovery: first attempt failed, retrying in 200ms"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Self::try_read_psm_from_gatt(device, addr).await;
             }
             psm
         }
