@@ -101,6 +101,10 @@ if [ -z "$FIPS_PATH" ]; then
 fi
 [ -x "$FIPS_PATH" ] || fail "FIPS binary not executable: $FIPS_PATH"
 
+if [ -z "$LINUX_PATH" ]; then
+    LINUX_PATH="/home/ubuntu/src/fips/target/release/fips"
+fi
+
 LINUX_SSH="$SSH ${LINUX_USER}@${LINUX_HOST}"
 
 TMPDIR_MAC=$(mktemp -d /tmp/fips-stability-XXXXXX)
@@ -121,7 +125,7 @@ SSH_PREFIX_LINUX="$LINUX_SSH sudo"
 cleanup() {
     local exit_code=$?
     log "Cleaning up..."
-    [ -n "$MAC_PID" ] && sudo kill -9 "$MAC_PID" 2>/dev/null || true
+    [ -n "${MAC_PID:-}" ] && sudo kill -9 "$MAC_PID" 2>/dev/null || true
     $SSH_PREFIX_MAC pkill -9 -f 'target/release/fips' 2>/dev/null || true
     $SSH_PREFIX_MAC pkill -9 -f caffeinate 2>/dev/null || true
     $SSH_PREFIX_MAC pkill -9 -f 'ping6.*fips0' 2>/dev/null || true
@@ -217,7 +221,14 @@ if [ -n "$CAPTURE" ]; then
     log "  btmon capturing to $BTMON_LOG"
 fi
 
-$LINUX_SSH "sudo bash -c 'RUST_LOG=debug FIPS_NOISE_KEYLOG=$KEYLOG_LINUX nohup $LINUX_PATH -c $CONFIG_LINUX > $LOG_LINUX 2>&1 &'"
+$LINUX_SSH "cat > $TMPDIR_LINUX/start.sh" <<REMOTE_START
+#!/bin/bash
+export RUST_LOG=debug
+export FIPS_NOISE_KEYLOG=$KEYLOG_LINUX
+nohup $LINUX_PATH -c $CONFIG_LINUX > $LOG_LINUX 2>&1 </dev/null &
+echo \$!
+REMOTE_START
+$LINUX_SSH "chmod +x $TMPDIR_LINUX/start.sh && sudo $TMPDIR_LINUX/start.sh"
 log "  Waiting for BLE transport..."
 
 for i in $(seq 1 30); do
