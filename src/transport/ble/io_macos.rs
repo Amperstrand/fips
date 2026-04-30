@@ -19,7 +19,7 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use dispatch2::{
     DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, GlobalQueueIdentifier,
@@ -76,9 +76,6 @@ const BLE_PERIPHERAL_QUEUE_BYTE_CAP: usize = 65536;
 /// Timeout for urgent (control-plane) BLE sends.
 const BLE_URGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Timeout for peripheral pacer backpressure enqueue.
-const BLE_PACER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Polling interval for peripheral reader thread.
 const BLE_READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -93,6 +90,62 @@ const BLE_INBOUND_CHANNEL_DEPTH: usize = 8;
 
 /// Channel depth for BLE scan results.
 const BLE_SCAN_CHANNEL_DEPTH: usize = 64;
+
+/// Sentinel BLE address for "unknown/unresolved" remote devices.
+const ZERO_BLE_ADDR: [u8; 6] = [0, 0, 0, 0, 0, 0];
+
+// ============================================================================
+// Peripheral manager helpers
+// ============================================================================
+
+async fn wait_for_pm_event<F>(
+    event_rx: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PeripheralManagerEvent>>>,
+    matches: F,
+    error_msg: &str,
+) -> Result<(), TransportError>
+where
+    F: Fn(&PeripheralManagerEvent) -> bool,
+{
+    let mut rx = event_rx.lock().await;
+    match rx.recv().await {
+        Some(event) if matches(&event) => Ok(()),
+        Some(_) => {
+            drop(rx);
+            Box::pin(wait_for_pm_event(event_rx, matches, error_msg)).await
+        }
+        None => Err(TransportError::StartFailed(error_msg.into())),
+    }
+}
+
+fn add_gatt_psm_service(manager: &Dispatched<CBPeripheralManager>) {
+    let svc_uuid_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
+    let char_uuid_str = format_uuid(&FIPS_GATT_PSM_CHAR_UUID);
+    manager.dispatch(move |m| unsafe {
+        let svc_uuid = CBUUID::UUIDWithString(&NSString::from_str(&svc_uuid_str));
+        let char_uuid = CBUUID::UUIDWithString(&NSString::from_str(&char_uuid_str));
+        let psm_char = CBMutableCharacteristic::initWithType_properties_value_permissions(
+            CBMutableCharacteristic::alloc(),
+            &char_uuid,
+            CBCharacteristicProperties::Read,
+            None,
+            CBAttributePermissions::Readable,
+        );
+        let service =
+            CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
+        let chars = NSArray::from_retained_slice(&[psm_char]);
+        let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
+            &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
+        service.setCharacteristics(Some(chars_ptr));
+        m.addService(&service);
+    });
+}
+
+fn build_advertising_dict() -> (String, String) {
+    (
+        format_uuid(&FIPS_SERVICE_UUID),
+        format_uuid(&FIPS_GATT_PSM_SERVICE_UUID),
+    )
+}
 
 // ============================================================================
 // Dispatch helpers
@@ -214,6 +267,7 @@ pub struct BluestStream {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     urgent_writer: Arc<tokio::sync::Mutex<bluest::L2capChannelWriter>>,
     rate_limiter: Arc<Mutex<SendRateLimiter>>,
+    alive: Arc<AtomicBool>,
     remote: BleAddr,
     mtu: u16,
     recv_buf: Mutex<Vec<u8>>,
@@ -223,6 +277,12 @@ impl BleStream for BluestStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed = frame_payload(data)?;
         trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send");
+
+        if !self.alive.load(Ordering::Relaxed) {
+            return Err(TransportError::SendFailed(
+                "BLE central connection dead".into(),
+            ));
+        }
 
         match self.tx.try_send(framed) {
             Ok(()) => Ok(()),
@@ -874,7 +934,7 @@ impl PeripheralStream {
         }
         trace!(addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
         let notified = self.queue_space_notify.notified();
-        if tokio::time::timeout(BLE_PACER_TIMEOUT, notified)
+        if tokio::time::timeout(BLE_URGENT_TIMEOUT, notified)
             .await
             .is_ok()
             && self.output_delegate.try_enqueue(framed)
@@ -883,9 +943,7 @@ impl PeripheralStream {
             return Ok(());
         }
         warn!(addr = %self.remote, %label, "BLE peripheral send_urgent timeout (queue full)");
-        Err(TransportError::SendFailed(format!(
-            "BLE peripheral {label} queue full"
-        )))
+        Err(TransportError::Timeout)
     }
 }
 
@@ -1103,7 +1161,7 @@ define_class!(
                     })
                     .unwrap_or_else(|| BleAddr {
                         adapter: MACOS_ADAPTER_NAME.to_string(),
-                        device: [0, 0, 0, 0, 0, 0],
+                        device: ZERO_BLE_ADDR,
                     });
                 let stream = unsafe {
                     PeripheralStream::setup_channel(
@@ -1272,64 +1330,28 @@ impl BluestIo {
             m.publishL2CAPChannelWithEncryption(false);
         });
 
-        loop {
-            let mut rx = event_rx.lock().await;
-            match rx.recv().await {
-                Some(PeripheralManagerEvent::L2CAPPublished { psm }) => {
-                    info!(psm, "Recovery: L2CAP published");
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    return Err(TransportError::StartFailed(
-                        "L2CAP publish event channel closed".into(),
-                    ));
-                }
-            }
-        }
+        wait_for_pm_event(
+            event_rx,
+            |e| matches!(e, PeripheralManagerEvent::L2CAPPublished { .. }),
+            "L2CAP publish event channel closed",
+        )
+        .await?;
+        info!("Recovery: L2CAP published");
 
         warn!("Recovering from sleep/wake: re-adding GATT service");
-        let svc_uuid_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
-        let char_uuid_str = format_uuid(&FIPS_GATT_PSM_CHAR_UUID);
-        manager.dispatch(move |m| unsafe {
-            let svc_uuid = CBUUID::UUIDWithString(&NSString::from_str(&svc_uuid_str));
-            let char_uuid = CBUUID::UUIDWithString(&NSString::from_str(&char_uuid_str));
-            let psm_char = CBMutableCharacteristic::initWithType_properties_value_permissions(
-                CBMutableCharacteristic::alloc(),
-                &char_uuid,
-                CBCharacteristicProperties::Read,
-                None,
-                CBAttributePermissions::Readable,
-            );
-            let service =
-                CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
-            let chars = NSArray::from_retained_slice(&[psm_char]);
-            let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
-                &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
-            service.setCharacteristics(Some(chars_ptr));
-            m.addService(&service);
-        });
+        add_gatt_psm_service(&manager);
 
-        loop {
-            let mut rx = event_rx.lock().await;
-            match rx.recv().await {
-                Some(PeripheralManagerEvent::ServiceAdded) => {
-                    info!("Recovery: GATT service re-added");
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    return Err(TransportError::StartFailed(
-                        "Service add event channel closed".into(),
-                    ));
-                }
-            }
-        }
+        wait_for_pm_event(
+            event_rx,
+            |e| matches!(e, PeripheralManagerEvent::ServiceAdded),
+            "Service add event channel closed",
+        )
+        .await?;
+        info!("Recovery: GATT service re-added");
 
         if advertising_enabled {
             warn!("Recovering from sleep/wake: restarting advertising");
-            let fips_str = format_uuid(&FIPS_SERVICE_UUID);
-            let psm_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
+            let (fips_str, psm_str) = build_advertising_dict();
             manager.dispatch(move |m: &CBPeripheralManager| unsafe {
                 let fips_uuid = CBUUID::UUIDWithString(&NSString::from_str(&fips_str));
                 let psm_uuid = CBUUID::UUIDWithString(&NSString::from_str(&psm_str));
@@ -1341,21 +1363,13 @@ impl BluestIo {
                 m.startAdvertising(Some(&ad));
             });
 
-            loop {
-                let mut rx = event_rx.lock().await;
-                match rx.recv().await {
-                    Some(PeripheralManagerEvent::AdvertisingStarted) => {
-                        info!("Recovery: advertising restarted");
-                        break;
-                    }
-                    Some(_) => {}
-                    None => {
-                        return Err(TransportError::StartFailed(
-                            "Advertising event channel closed".into(),
-                        ));
-                    }
-                }
-            }
+            wait_for_pm_event(
+                event_rx,
+                |e| matches!(e, PeripheralManagerEvent::AdvertisingStarted),
+                "Advertising event channel closed",
+            )
+            .await?;
+            info!("Recovery: advertising restarted");
         }
 
         Ok(())
@@ -1574,57 +1588,24 @@ impl BleIo for BluestIo {
         });
 
         // Wait for PSM
-        loop {
-            let mut rx = self.event_rx.lock().await;
-            match rx.recv().await {
-                Some(PeripheralManagerEvent::L2CAPPublished { psm }) => {
-                    info!("L2CAP published with PSM {}", psm);
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    return Err(TransportError::StartFailed(
-                        "L2CAP publish event channel closed".into(),
-                    ));
-                }
-            }
-        }
+        wait_for_pm_event(
+            &self.event_rx,
+            |e| matches!(e, PeripheralManagerEvent::L2CAPPublished { .. }),
+            "L2CAP publish event channel closed",
+        )
+        .await?;
+        info!("L2CAP published");
 
         // Create GATT service with PSM characteristic
-        let svc_uuid_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
-        let char_uuid_str = format_uuid(&FIPS_GATT_PSM_CHAR_UUID);
-        manager.dispatch(move |m| unsafe {
-            let svc_uuid = CBUUID::UUIDWithString(&NSString::from_str(&svc_uuid_str));
-            let char_uuid = CBUUID::UUIDWithString(&NSString::from_str(&char_uuid_str));
-            let psm_char = CBMutableCharacteristic::initWithType_properties_value_permissions(
-                CBMutableCharacteristic::alloc(),
-                &char_uuid,
-                CBCharacteristicProperties::Read,
-                None,
-                CBAttributePermissions::Readable,
-            );
-            let service =
-                CBMutableService::initWithType_primary(CBMutableService::alloc(), &svc_uuid, true);
-            let chars = NSArray::from_retained_slice(&[psm_char]);
-            let chars_ptr: &NSArray<objc2_core_bluetooth::CBCharacteristic> =
-                &*(&*chars as *const _ as *const NSArray<objc2_core_bluetooth::CBCharacteristic>);
-            service.setCharacteristics(Some(chars_ptr));
-            m.addService(&service);
-        });
+        add_gatt_psm_service(&manager);
 
         // Wait for service added
-        loop {
-            let mut rx = self.event_rx.lock().await;
-            match rx.recv().await {
-                Some(PeripheralManagerEvent::ServiceAdded) => break,
-                Some(_) => {}
-                None => {
-                    return Err(TransportError::StartFailed(
-                        "Service add event channel closed".into(),
-                    ));
-                }
-            }
-        }
+        wait_for_pm_event(
+            &self.event_rx,
+            |e| matches!(e, PeripheralManagerEvent::ServiceAdded),
+            "Service add event channel closed",
+        )
+        .await?;
 
         // Bridge incoming L2CAP channels to acceptor
         let event_rx_bridge = self.event_rx.clone();
@@ -1735,6 +1716,8 @@ impl BleIo for BluestIo {
         )));
         let drain_limiter = rate_limiter.clone();
 
+        let alive = Arc::new(AtomicBool::new(true));
+        let drain_alive = alive.clone();
         let drain_addr = addr.clone();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
@@ -1742,6 +1725,7 @@ impl BleIo for BluestIo {
                 let mut writer = drain_writer.lock().await;
                 if let Err(e) = writer.write_all(&frame).await {
                     warn!(addr = %drain_addr, error = %e, "BLE central drain task write error, stopping");
+                    drain_alive.store(false, Ordering::Relaxed);
                     break;
                 }
             }
@@ -1753,6 +1737,7 @@ impl BleIo for BluestIo {
             tx,
             urgent_writer: shared_writer,
             rate_limiter,
+            alive,
             remote: addr.clone(),
             mtu: self.mtu,
             recv_buf: Mutex::new(Vec::new()),
@@ -1770,8 +1755,7 @@ impl BleIo for BluestIo {
             }
         };
         drop(guard);
-        let fips_str = format_uuid(&FIPS_SERVICE_UUID);
-        let psm_str = format_uuid(&FIPS_GATT_PSM_SERVICE_UUID);
+        let (fips_str, psm_str) = build_advertising_dict();
         manager.dispatch(move |m: &CBPeripheralManager| unsafe {
             let fips_uuid = CBUUID::UUIDWithString(&NSString::from_str(&fips_str));
             let psm_uuid = CBUUID::UUIDWithString(&NSString::from_str(&psm_str));
@@ -1876,7 +1860,7 @@ impl BleIo for BluestIo {
     fn local_addr(&self) -> Result<BleAddr, TransportError> {
         Ok(BleAddr {
             adapter: MACOS_ADAPTER_NAME.to_string(),
-            device: [0, 0, 0, 0, 0, 0],
+            device: ZERO_BLE_ADDR,
         })
     }
 

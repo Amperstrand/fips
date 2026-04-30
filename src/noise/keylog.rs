@@ -119,4 +119,21 @@ mod tests {
         assert!(line.contains(&hex::encode([1u8; 32])));
         assert!(line.contains(&hex::encode([2u8; 32])));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn keylog_file_permissions_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secure_keys.log");
+        let path_str = path.to_str().unwrap();
+
+        // open_keylog uses OpenOptions with mode(0o600)
+        let _f = open_keylog(path_str).expect("open_keylog should succeed");
+
+        let meta = fs::metadata(path_str).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "keylog file should be 0o600 (owner-only)");
+    }
 }

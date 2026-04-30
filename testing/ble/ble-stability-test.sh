@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #   - macOS host with FIPS built (--features ble-macos)
-#   - Linux host reachable via SSH (default: alias "218", user "ubuntu")
+#   - Linux host reachable via SSH (default: localhost)
 #   - Both machines within BLE range (~10m)
 #   - Passwordless sudo on both hosts
 #
@@ -16,9 +16,9 @@
 # Options:
 #   -d, --duration <mins>   Test duration in minutes (default: 20)
 #   -r, --rekey <secs>      Rekey interval in seconds (default: 60)
-#   --linux <host>          Linux SSH host/alias (default: 218)
-#   --linux-user <user>     Linux SSH user (default: ubuntu)
-#   --linux-path <path>     Path to FIPS binary on Linux (default: /home/ubuntu/fips/target/release/fips)
+#   --linux <host>          Linux SSH host/alias (default: localhost)
+#   --linux-user <user>     Linux SSH user (default: $USER)
+#   --linux-path <path>     Path to FIPS binary on Linux (required unless --linux is omitted)
 #   --fips <path>           Path to macOS FIPS binary (default: auto-detect)
 #   --no-ping               Skip ping6 traffic
 #   --iperf                 Run iperf3 after stability test
@@ -39,9 +39,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 DEFAULT_DURATION=20
 DEFAULT_REKEY=60
-DEFAULT_LINUX_HOST="218"
-DEFAULT_LINUX_USER="ubuntu"
-DEFAULT_LINUX_PATH="/home/ubuntu/fips/target/release/fips"
+DEFAULT_LINUX_HOST="localhost"
+DEFAULT_LINUX_USER="${USER:-root}"
+DEFAULT_LINUX_PATH=""
 DEFAULT_CHECK_INTERVAL=60
 DEFAULT_RATE_BPS=200000
 DEFAULT_MTU=2048

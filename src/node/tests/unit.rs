@@ -32,6 +32,18 @@ fn test_node_leaf_only() {
     assert!(node.bloom_state().is_leaf_only());
 }
 
+#[test]
+fn test_node_with_identity_leaf_only() {
+    let identity = Identity::generate();
+    let mut config = Config::new();
+    config.node.leaf_only = true;
+
+    let node = Node::with_identity(identity, config);
+
+    assert!(node.is_leaf_only());
+    assert!(node.bloom_state().is_leaf_only());
+}
+
 #[tokio::test]
 async fn test_node_state_transitions() {
     let mut node = make_node();

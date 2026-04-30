@@ -75,8 +75,7 @@ impl PeerBackoff {
 
     #[cfg(test)]
     fn test_insert_denied(&mut self, addr: &BleAddr, until: Instant) {
-        self.denied
-            .insert(addr.clone(), DenyEntry { until });
+        self.denied.insert(addr.clone(), DenyEntry { until });
     }
 
     /// Whether the address is currently in backoff (should not be probed).
@@ -125,6 +124,7 @@ impl PeerBackoff {
     }
 
     /// Get the current failure count for an address.
+    #[cfg(test)]
     pub fn failure_count(&self, addr: &BleAddr) -> u32 {
         self.entries.get(addr).map(|e| e.failures).unwrap_or(0)
     }

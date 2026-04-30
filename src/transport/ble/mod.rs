@@ -440,54 +440,8 @@ impl<I: BleIo> BleTransport<I> {
         }
     }
 
-    /// Connect to a remote BLE device inline (blocking the caller).
-    #[allow(dead_code)]
-    async fn connect_inline(&self, addr: &TransportAddr) -> Result<(), TransportError> {
-        let ble_addr = BleAddr::parse(
-            addr.as_str()
-                .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?,
-        )?;
-
-        let psm = self.config.psm();
-        let timeout_ms = self.config.connect_timeout_ms();
-
-        let stream = match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            self.io.connect(&ble_addr, psm),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                debug!(addr = %addr, error = %e, "BLE connect-on-send failed");
-                return Err(TransportError::ConnectionRefused);
-            }
-            Err(_) => {
-                self.stats.record_connect_timeout();
-                debug!(addr = %addr, "BLE connect-on-send timeout");
-                return Err(TransportError::Timeout);
-            }
-        };
-
-        // Pre-handshake pubkey exchange
-        if let Some(ref our_pubkey) = self.local_pubkey {
-            match pubkey_exchange(&stream, our_pubkey, self.local_capabilities).await {
-                Ok(result) => {
-                    debug!(addr = %addr, "BLE outbound pubkey exchange complete");
-                    self.discovery_buffer
-                        .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
-                }
-                Err(e) => {
-                    warn!(addr = %addr, error = %e, "BLE outbound pubkey exchange failed");
-                    return Err(e);
-                }
-            }
-        }
-
-        self.promote_connection(addr, &ble_addr, stream).await
-    }
-
     /// Promote a newly established stream into the connection pool.
+    #[allow(dead_code)]
     async fn promote_connection(
         &self,
         addr: &TransportAddr,
@@ -573,16 +527,16 @@ impl<I: BleIo> BleTransport<I> {
             let io = Arc::clone(&self.io);
             let pool = Arc::clone(&self.pool);
             let connecting_inner = Arc::clone(&self.connecting);
+            let stats = Arc::clone(&self.stats);
             let packet_tx = self.packet_tx.clone();
             let transport_id = self.transport_id;
-            let stats = Arc::clone(&self.stats);
+            let disconnect_tx = self.disconnect_tx.clone();
             let psm = self.config.psm();
             let timeout_ms = self.config.connect_timeout_ms();
             let addr_clone = addr.clone();
             let local_pubkey = self.local_pubkey;
             let local_capabilities = self.local_capabilities;
             let discovery_buffer = Arc::clone(&self.discovery_buffer);
-            let disconnect_tx = self.disconnect_tx.clone();
 
             let task = tokio::spawn(async move {
                 let result = tokio::time::timeout(
