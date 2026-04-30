@@ -899,7 +899,7 @@ impl PeripheralStream {
             debug!(remote_addr = %pacer_remote, "BLE peripheral pacer task stopped");
         });
 
-        PeripheralStream {
+        Ok(PeripheralStream {
             _channel: channel,
             _input_delegate: input_delegate,
             output_delegate,
@@ -911,7 +911,7 @@ impl PeripheralStream {
             remote,
             mtu,
             recv_buf: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     fn notify_write(&self) {
@@ -1161,7 +1161,8 @@ define_class!(
                         adapter: MACOS_ADAPTER_NAME.to_string(),
                         device: ZERO_BLE_ADDR,
                     });
-                let stream = unsafe {
+                let remote_addr = remote.clone();
+                let stream = match unsafe {
                     PeripheralStream::setup_channel(
                         SendableChannel(channel.retain()),
                         remote,
@@ -1169,22 +1170,13 @@ define_class!(
                         self.ivars().send_rate_bps,
                         self.ivars().send_burst_bytes,
                     )
-                 };
-                 let stream = match unsafe {
-                     PeripheralStream::setup_channel(
-                         SendableChannel(channel.retain()),
-                         remote,
-                         self.ivars().mtu,
-                         self.ivars().send_rate_bps,
-                         self.ivars().send_burst_bytes,
-                     )
-                 } {
-                     Ok(s) => s,
-                     Err(e) => {
-                         warn!(remote_addr = %remote, error = %e, "BLE peripheral: failed to setup L2CAP channel");
-                         return;
-                     }
-                 };
+                } {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(remote_addr = %remote_addr, error = %e, "BLE peripheral: failed to setup L2CAP channel");
+                        return;
+                    }
+                };
                  if let Ok(mut pending) = self.ivars().pending_streams.lock() {
                     pending.push(SendablePeripheralStream(stream));
                 }
