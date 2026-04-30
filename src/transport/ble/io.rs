@@ -183,6 +183,33 @@ fn try_take_framed_payload(
 }
 
 // ============================================================================
+// Shared BLE Constants
+// ============================================================================
+
+pub const FIPS_SERVICE_UUID_RAW: u128 = 0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c;
+pub const FIPS_GATT_PSM_SERVICE_UUID_RAW: u128 = 0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b;
+pub const FIPS_GATT_PSM_CHAR_UUID_RAW: u128 = 0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc;
+
+#[cfg(any(test, feature = "ble-macos", all(bluer_available, target_os = "linux")))]
+fn parse_psm_value(value: &[u8], addr: &BleAddr) -> Result<u16, TransportError> {
+    if value.len() != 2 {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
+            value.len(),
+            addr
+        ))));
+    }
+    let psm = u16::from_le_bytes([value[0], value[1]]);
+    if psm == 0 {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "discover_gatt_psm: invalid PSM value 0 from {}",
+            addr
+        ))));
+    }
+    Ok(psm)
+}
+
+// ============================================================================
 // BluerIo — Production BLE I/O via BlueZ D-Bus
 // ============================================================================
 
@@ -204,14 +231,13 @@ mod bluer_impl {
     use tokio::time::{Duration, timeout};
     use tracing::{debug, trace, warn};
 
-    pub const FIPS_SERVICE_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c);
+    pub const FIPS_SERVICE_UUID: bluer::Uuid = bluer::Uuid::from_u128(FIPS_SERVICE_UUID_RAW);
 
     pub const FIPS_GATT_PSM_SERVICE_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b);
+        bluer::Uuid::from_u128(FIPS_GATT_PSM_SERVICE_UUID_RAW);
 
     pub const FIPS_GATT_PSM_CHAR_UUID: bluer::Uuid =
-        bluer::Uuid::from_u128(0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc);
+        bluer::Uuid::from_u128(FIPS_GATT_PSM_CHAR_UUID_RAW);
 
     fn map_err(context: &str, e: bluer::Error) -> TransportError {
         TransportError::Io(std::io::Error::other(format!("{}: {}", context, e)))
@@ -722,6 +748,25 @@ mod bluer_impl {
             device: &bluer::Device,
             addr: &BleAddr,
         ) -> Result<u16, TransportError> {
+            let psm = Self::try_read_psm_from_gatt(device, addr).await;
+            if let Err(ref e) = psm {
+                let err_str = format!("{e}");
+                if err_str.contains("service not found") {
+                    debug!(
+                        remote_addr = %addr,
+                        "GATT PSM discovery: service not found on first attempt, retrying in 200ms"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    return Self::try_read_psm_from_gatt(device, addr).await;
+                }
+            }
+            psm
+        }
+
+        async fn try_read_psm_from_gatt(
+            device: &bluer::Device,
+            addr: &BleAddr,
+        ) -> Result<u16, TransportError> {
             let services = device.services().await.map_err(|e| {
                 TransportError::Io(std::io::Error::other(format!(
                     "discover_gatt_psm: failed to enumerate services for {}: {}",
@@ -767,22 +812,7 @@ mod bluer_impl {
                 )))
             })?;
 
-            if value.len() != 2 {
-                return Err(TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
-                    value.len(),
-                    addr
-                ))));
-            }
-
-            let psm = u16::from_le_bytes([value[0], value[1]]);
-
-            if psm == 0 {
-                return Err(TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: invalid PSM value 0 from {}",
-                    addr
-                ))));
-            }
+            let psm = parse_psm_value(&value, addr)?;
 
             debug!(remote_addr = %addr, psm, "GATT PSM discovery: discovered PSM");
             Ok(psm)

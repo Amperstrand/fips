@@ -39,14 +39,12 @@ use objc2_foundation::{
     NSStreamDelegate, NSStreamEvent, NSStreamStatus, NSString,
 };
 
-const FIPS_SERVICE_UUID: uuid::Uuid =
-    uuid::Uuid::from_u128(0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c);
+const FIPS_SERVICE_UUID: uuid::Uuid = uuid::Uuid::from_u128(FIPS_SERVICE_UUID_RAW);
 
 const FIPS_GATT_PSM_SERVICE_UUID: uuid::Uuid =
-    uuid::Uuid::from_u128(0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b);
+    uuid::Uuid::from_u128(FIPS_GATT_PSM_SERVICE_UUID_RAW);
 
-const FIPS_GATT_PSM_CHAR_UUID: uuid::Uuid =
-    uuid::Uuid::from_u128(0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc);
+const FIPS_GATT_PSM_CHAR_UUID: uuid::Uuid = uuid::Uuid::from_u128(FIPS_GATT_PSM_CHAR_UUID_RAW);
 
 const MACOS_ADAPTER_NAME: &str = "default";
 
@@ -1028,7 +1026,7 @@ impl BleStream for PeripheralStream {
 
 enum PeripheralManagerEvent {
     StateChanged(CBManagerState),
-    L2CAPPublished { psm: u16 },
+    L2CAPPublished,
     ServiceAdded,
     L2CAPChannelOpened,
     AdvertisingStarted,
@@ -1100,7 +1098,7 @@ define_class!(
                 .ivars()
                 .sender
                 .lock()
-                .map(|s| s.try_send(PeripheralManagerEvent::L2CAPPublished { psm }));
+                .map(|s| s.try_send(PeripheralManagerEvent::L2CAPPublished));
         }
 
         #[unsafe(method(peripheralManager:didAddService:error:))]
@@ -1385,14 +1383,17 @@ impl BluestIo {
                 )))
             })?;
 
-            debug!(remote_addr = %addr, "GATT PSM discovery: enumerating services");
+            debug!(remote_addr = %addr, "GATT PSM discovery: discovering FIPS service");
 
-            let services = device.services().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to enumerate services for {}: {}",
-                    addr, e
-                )))
-            })?;
+            let services = device
+                .discover_services_with_uuid(FIPS_GATT_PSM_SERVICE_UUID)
+                .await
+                .map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "discover_gatt_psm: failed to discover services for {}: {}",
+                        addr, e
+                    )))
+                })?;
 
             debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
 
@@ -1436,22 +1437,7 @@ impl BluestIo {
                 )))
             })?;
 
-            if value.len() != 2 {
-                return Err(TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
-                    value.len(),
-                    addr
-                ))));
-            }
-
-            let psm = u16::from_le_bytes([value[0], value[1]]);
-
-            if psm == 0 {
-                return Err(TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: invalid PSM value 0 from {}",
-                    addr
-                ))));
-            }
+            let psm = parse_psm_value(&value, addr)?;
 
             debug!(remote_addr = %addr, psm, "GATT PSM discovery: discovered PSM");
 
