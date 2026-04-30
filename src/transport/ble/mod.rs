@@ -153,34 +153,42 @@ impl<I: BleIo> BleTransport<I> {
         }
     }
 
+    /// Get the instance name (if configured as a named instance).
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
+    /// Get the transport statistics.
     pub fn stats(&self) -> &Arc<BleStats> {
         &self.stats
     }
 
+    /// Get the platform-specific BLE I/O handle.
     pub fn io(&self) -> &Arc<I> {
         &self.io
     }
 
+    /// Check whether the transport is currently congested.
     pub fn is_congested(&self) -> bool {
         self.congested.load(Ordering::Relaxed)
     }
 
+    /// Get a clone of the congestion flag for external polling.
     pub fn congestion_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.congested)
     }
 
+    /// Set the local node's public key (for pubkey exchange on inbound connections).
     pub fn set_local_pubkey(&mut self, pubkey: [u8; 32]) {
         self.local_pubkey = Some(pubkey);
     }
 
+    /// Set the local node's BLE capabilities (for capability negotiation).
     pub fn set_local_capabilities(&mut self, caps: PeerCapabilities) {
         self.local_capabilities = caps;
     }
 
+    /// Set the disconnect notification channel.
     pub fn set_disconnect_tx(&mut self, tx: DisconnectTx) {
         self.disconnect_tx = Some(tx);
     }
@@ -446,8 +454,6 @@ impl<I: BleIo> BleTransport<I> {
             }
         }
     }
-
-    /// Promote a newly established stream into the connection pool.
 
     /// Initiate a non-blocking connection to a remote BLE device.
     pub async fn connect_async(&self, addr: &TransportAddr) -> Result<(), TransportError> {
@@ -729,13 +735,13 @@ async fn send_pubkey_announcement<S: BleStream>(
     stream.send(&msg).await
 }
 
-/// Exchange public keys over a newly established L2CAP connection.
-///
+/// Result of a public key exchange with a BLE peer.
 struct PubkeyExchangeResult {
     peer_pubkey: XOnlyPublicKey,
     peer_capabilities: PeerCapabilities,
 }
 
+/// Exchange public keys over a newly established L2CAP connection.
 async fn pubkey_exchange<S: BleStream>(
     stream: &S,
     local_pubkey: &[u8; 32],

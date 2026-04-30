@@ -1,7 +1,12 @@
 //! macOS BLE I/O via bluest (central role) and objc2-core-bluetooth (peripheral role).
 
-use super::*;
-use crate::transport::TransportError;
+use super::{
+    BLE_DEFAULT_QUEUE_DEPTH, frame_payload, parse_psm_value, try_take_framed_payload,
+    gatt_err, BleAcceptor, BleIo, BleScanner, BleStream, FIPS_GATT_PSM_CHAR_UUID_RAW,
+    FIPS_GATT_PSM_SERVICE_UUID_RAW, FIPS_SERVICE_UUID_RAW, GATT_PSM_DISCOVER_TIMEOUT,
+    TransportError,
+};
+use crate::transport::ble::Unpoison;
 use crate::transport::ble::addr::BleAddr;
 use crate::transport::ble::rate_limit::SendRateLimiter;
 
@@ -58,15 +63,11 @@ fn tokio_handle() -> &'static tokio::runtime::Handle {
         .expect("tokio runtime handle not initialized")
 }
 
-use crate::transport::ble::Unpoison;
-
 /// Bounded queue depth for central-role BLE sends.
-/// 32 frames ≈ 44KB at average frame size (~1400B); drains in ~4.4s at 80Kbps.
-const BLE_CENTRAL_QUEUE_DEPTH: usize = 32;
+const BLE_CENTRAL_QUEUE_DEPTH: usize = BLE_DEFAULT_QUEUE_DEPTH;
 
 /// Bounded queue depth for peripheral-role BLE sends.
-/// 32 frames at typical BLE frame size (~2048B).
-const BLE_PERIPHERAL_QUEUE_DEPTH: usize = 32;
+const BLE_PERIPHERAL_QUEUE_DEPTH: usize = BLE_DEFAULT_QUEUE_DEPTH;
 
 /// Maximum total bytes allowed in the peripheral write queue.
 const BLE_PERIPHERAL_QUEUE_BYTE_CAP: usize = 65536;
@@ -76,9 +77,6 @@ const BLE_URGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 
 /// Polling interval for peripheral reader thread.
 const BLE_READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Timeout for GATT service/characteristic discovery.
-const BLE_GATT_DISCOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Channel depth for peripheral manager events.
 const BLE_EVENT_CHANNEL_DEPTH: usize = 32;
@@ -274,7 +272,7 @@ pub struct BluestStream {
 impl BleStream for BluestStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed = frame_payload(data)?;
-        trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send");
+        trace!(len = data.len(), framed_len = framed.len(), remote_addr = %self.remote, "BLE macOS send");
 
         if !self.alive.load(Ordering::Relaxed) {
             return Err(TransportError::SendFailed(
@@ -285,7 +283,7 @@ impl BleStream for BluestStream {
         match self.tx.try_send(framed) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                trace!(remote_addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, dropping");
+                trace!(remote_remote_addr = %self.remote, queue_depth = BLE_CENTRAL_QUEUE_DEPTH, "BLE central queue full, dropping");
                 Err(TransportError::SendFailed("BLE central queue full".into()))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TransportError::Io(
@@ -296,13 +294,13 @@ impl BleStream for BluestStream {
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed = frame_payload(data)?;
-        trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE macOS send_urgent (direct L2CAP)");
+        trace!(len = data.len(), framed_len = framed.len(), remote_addr = %self.remote, "BLE macOS send_urgent (direct L2CAP)");
 
         let mut writer = self.urgent_writer.lock().await;
         tokio::time::timeout(BLE_URGENT_TIMEOUT, writer.write_all(&framed))
             .await
             .map_err(|_| {
-                warn!(remote_addr = %self.remote, "BLE central send_urgent timeout");
+                warn!(remote_remote_addr = %self.remote, "BLE central send_urgent timeout");
                 TransportError::Timeout
             })?
             .map(|_| ())
@@ -322,7 +320,7 @@ impl BleStream for BluestStream {
                     trace!(
                         len = copy_len,
                         buf_remaining = recv_buf.len(),
-                        addr = %self.remote,
+                        remote_addr = %self.remote,
                         "BLE macOS recv frame"
                     );
                     return Ok(copy_len);
@@ -337,7 +335,7 @@ impl BleStream for BluestStream {
             if n == 0 {
                 return Ok(0);
             }
-            trace!(raw_bytes = n, addr = %self.remote, "BLE macOS recv raw");
+            trace!(raw_bytes = n, remote_addr = %self.remote, "BLE macOS recv raw");
             self.recv_buf.lock().await.extend_from_slice(&tmp[..n]);
         }
     }
@@ -930,7 +928,7 @@ impl PeripheralStream {
             self.notify_write();
             return Ok(());
         }
-        trace!(remote_addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
+        trace!(remote_remote_addr = %self.remote, %label, "BLE peripheral queue full, waiting for space");
         let notified = self.queue_space_notify.notified();
         if tokio::time::timeout(BLE_URGENT_TIMEOUT, notified)
             .await
@@ -940,7 +938,7 @@ impl PeripheralStream {
             self.notify_write();
             return Ok(());
         }
-        warn!(remote_addr = %self.remote, %label, "BLE peripheral send_urgent timeout (queue full)");
+        warn!(remote_remote_addr = %self.remote, %label, "BLE peripheral send_urgent timeout (queue full)");
         Err(TransportError::Timeout)
     }
 }
@@ -948,12 +946,12 @@ impl PeripheralStream {
 impl BleStream for PeripheralStream {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed = frame_payload(data)?;
-        trace!(len = data.len(), addr = %self.remote, "BLE peripheral send");
+        trace!(len = data.len(), remote_addr = %self.remote, "BLE peripheral send");
 
         match self.pacer_tx.try_send(framed) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                trace!(remote_addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, dropping");
+                trace!(remote_remote_addr = %self.remote, queue_depth = BLE_PERIPHERAL_QUEUE_DEPTH, "BLE peripheral pacer full, dropping");
                 Err(TransportError::SendFailed(
                     "BLE peripheral pacer queue full".into(),
                 ))
@@ -966,7 +964,7 @@ impl BleStream for PeripheralStream {
 
     async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
         let framed = frame_payload(data)?;
-        trace!(len = data.len(), addr = %self.remote, "BLE peripheral send_urgent (direct enqueue)");
+        trace!(len = data.len(), remote_addr = %self.remote, "BLE peripheral send_urgent (direct enqueue)");
         self.enqueue_with_backpressure(&framed, "send_urgent").await
     }
 
@@ -988,13 +986,13 @@ impl BleStream for PeripheralStream {
 
             let bytes = self._input_delegate.take_buffer();
             if !bytes.is_empty() {
-                trace!(raw_bytes = bytes.len(), addr = %self.remote, "BLE peripheral recv raw");
+                trace!(raw_bytes = bytes.len(), remote_addr = %self.remote, "BLE peripheral recv raw");
                 self.recv_buf.lock().await.extend_from_slice(&bytes);
                 continue;
             }
 
             if self._input_delegate.reached_eof() {
-                trace!(remote_addr = %self.remote, "BLE peripheral recv EOF");
+                trace!(remote_remote_addr = %self.remote, "BLE peripheral recv EOF");
                 return Ok(0);
             }
 
@@ -1396,10 +1394,9 @@ impl BluestIo {
                 .discover_services_with_uuid(FIPS_GATT_PSM_SERVICE_UUID)
                 .await
                 .map_err(|e| {
-                    TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: failed to discover services for {}: {}",
-                        addr, e
-                    )))
+                    TransportError::Io(std::io::Error::other(
+                        gatt_err::enum_services(addr, &e),
+                    ))
                 })?;
 
             debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
@@ -1410,18 +1407,16 @@ impl BluestIo {
             let psm_service = match psm_service {
                 Some(s) => s,
                 None => {
-                    return Err(TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: FIPS GATT PSM service not found on {}",
-                        addr
-                    ))));
+                    return Err(TransportError::Io(std::io::Error::other(
+                        gatt_err::service_not_found(addr),
+                    )));
                 }
             };
 
             let characteristics = psm_service.characteristics().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
-                    addr, e
-                )))
+                TransportError::Io(std::io::Error::other(
+                    gatt_err::enum_chars(addr, &e),
+                ))
             })?;
 
             let psm_char = characteristics
@@ -1430,18 +1425,16 @@ impl BluestIo {
             let psm_char = match psm_char {
                 Some(c) => c,
                 None => {
-                    return Err(TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: PSM characteristic not found on {}",
-                        addr
-                    ))));
+                    return Err(TransportError::Io(std::io::Error::other(
+                        gatt_err::char_not_found(addr),
+                    )));
                 }
             };
 
             let value = psm_char.read().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
-                    addr, e
-                )))
+                TransportError::Io(std::io::Error::other(
+                    gatt_err::read_psm(addr, &e),
+                ))
             })?;
 
             let psm = parse_psm_value(&value, addr)?;
@@ -1451,13 +1444,12 @@ impl BluestIo {
             Ok(psm)
         };
 
-        tokio::time::timeout(BLE_GATT_DISCOVER_TIMEOUT, discover)
+        tokio::time::timeout(GATT_PSM_DISCOVER_TIMEOUT, discover)
             .await
             .map_err(|_| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: timed out discovering PSM for {}",
-                    addr
-                )))
+                TransportError::Io(std::io::Error::other(
+                    gatt_err::timeout(addr),
+                ))
             })?
     }
 }

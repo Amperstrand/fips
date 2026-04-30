@@ -1,3 +1,6 @@
+//! BLE peer capability negotiation. Capabilities are exchanged during the
+//! initial connection handshake (pubkey announcement) as a single byte.
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerCapabilities(u8);
 
@@ -14,10 +17,12 @@ impl PeerCapabilities {
     /// Informational flag only — not checked at runtime.
     const GATT_SUPPORTED: u8 = 0x40;
 
+    /// No capabilities set (legacy unrestricted mode).
     pub fn none() -> Self {
         Self(0)
     }
 
+    /// Default capabilities for Linux (dual-role, prefers L2CAP, no outbound preference).
     pub fn linux_default() -> Self {
         Self(
             Self::L2CAP_SUPPORTED
@@ -28,14 +33,17 @@ impl PeerCapabilities {
         )
     }
 
+    /// Central-only mode (outbound connections only, no inbound).
     pub fn central_only() -> Self {
         Self(Self::L2CAP_SUPPORTED | Self::CAN_CENTRAL | Self::PREFER_OUTBOUND)
     }
 
+    /// Peripheral-only mode (inbound connections only, no outbound).
     pub fn peripheral_only() -> Self {
         Self(Self::L2CAP_SUPPORTED | Self::CAN_PERIPHERAL | Self::GATT_SUPPORTED)
     }
 
+    /// Default capabilities for macOS (dual-role, prefers outbound).
     pub fn macos_default() -> Self {
         Self(
             Self::L2CAP_SUPPORTED
@@ -46,26 +54,32 @@ impl PeerCapabilities {
         )
     }
 
+    /// Returns `true` if this peer can only initiate outbound connections.
     pub fn is_central_only(&self) -> bool {
         self.can_initiate_outbound() && !self.can_accept_inbound()
     }
 
+    /// Returns `true` if this peer can accept inbound connections.
     pub fn can_accept_inbound(&self) -> bool {
         self.is_legacy_unrestricted() || (self.0 & Self::CAN_PERIPHERAL != 0)
     }
 
+    /// Returns `true` if this peer can initiate outbound connections.
     pub fn can_initiate_outbound(&self) -> bool {
         self.is_legacy_unrestricted() || (self.0 & Self::CAN_CENTRAL != 0)
     }
 
+    /// Returns `true` if this peer prefers to be the outbound side of a connection.
     pub fn prefers_outbound(&self) -> bool {
         self.0 & Self::PREFER_OUTBOUND != 0
     }
 
+    /// Serialize to wire byte.
     pub fn to_byte(self) -> u8 {
         self.0
     }
 
+    /// Deserialize from wire byte. Handles legacy `0x01` central-only flag.
     pub fn from_byte(byte: u8) -> Self {
         if byte == Self::LEGACY_CENTRAL_ONLY {
             return Self::central_only();

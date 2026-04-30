@@ -186,9 +186,39 @@ fn try_take_framed_payload(
 // Shared BLE Constants
 // ============================================================================
 
-pub const FIPS_SERVICE_UUID_RAW: u128 = 0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c;
-pub const FIPS_GATT_PSM_SERVICE_UUID_RAW: u128 = 0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b;
-pub const FIPS_GATT_PSM_CHAR_UUID_RAW: u128 = 0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc;
+pub(super) const FIPS_SERVICE_UUID_RAW: u128 = 0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c;
+pub(super) const FIPS_GATT_PSM_SERVICE_UUID_RAW: u128 = 0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b;
+pub(super) const FIPS_GATT_PSM_CHAR_UUID_RAW: u128 = 0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc;
+
+/// Default queue depth for BLE send channels (32 frames ≈ 44KB at ~1400B/frame).
+pub(super) const BLE_DEFAULT_QUEUE_DEPTH: usize = 32;
+
+/// Timeout for GATT PSM discovery operations.
+pub(super) const GATT_PSM_DISCOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Error message helpers for GATT PSM discovery (shared across platforms).
+pub(super) mod gatt_err {
+    use super::super::addr::BleAddr;
+
+    pub fn enum_services(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
+        format!("discover_gatt_psm: failed to enumerate services for {}: {}", addr, e)
+    }
+    pub fn service_not_found(addr: &BleAddr) -> String {
+        format!("discover_gatt_psm: FIPS GATT PSM service not found on {}", addr)
+    }
+    pub fn enum_chars(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
+        format!("discover_gatt_psm: failed to enumerate characteristics for {}: {}", addr, e)
+    }
+    pub fn char_not_found(addr: &BleAddr) -> String {
+        format!("discover_gatt_psm: PSM characteristic not found on {}", addr)
+    }
+    pub fn read_psm(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
+        format!("discover_gatt_psm: failed to read PSM characteristic on {}: {}", addr, e)
+    }
+    pub fn timeout(addr: &BleAddr) -> String {
+        format!("discover_gatt_psm: timed out discovering PSM for {}", addr)
+    }
+}
 
 #[cfg(any(test, feature = "ble-macos", all(bluer_available, target_os = "linux")))]
 fn parse_psm_value(value: &[u8], addr: &BleAddr) -> Result<u16, TransportError> {
@@ -218,6 +248,7 @@ mod bluer_impl {
     use super::*;
     use crate::transport::TransportError;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use bluer::Address;
     use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
@@ -229,14 +260,15 @@ mod bluer_impl {
     use std::pin::Pin;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
+    use crate::transport::ble::rate_limit::SendRateLimiter;
     use tracing::{debug, trace, warn};
 
-    pub const FIPS_SERVICE_UUID: bluer::Uuid = bluer::Uuid::from_u128(FIPS_SERVICE_UUID_RAW);
+    pub(super) const FIPS_SERVICE_UUID: bluer::Uuid = bluer::Uuid::from_u128(FIPS_SERVICE_UUID_RAW);
 
-    pub const FIPS_GATT_PSM_SERVICE_UUID: bluer::Uuid =
+    pub(super) const FIPS_GATT_PSM_SERVICE_UUID: bluer::Uuid =
         bluer::Uuid::from_u128(FIPS_GATT_PSM_SERVICE_UUID_RAW);
 
-    pub const FIPS_GATT_PSM_CHAR_UUID: bluer::Uuid =
+    pub(super) const FIPS_GATT_PSM_CHAR_UUID: bluer::Uuid =
         bluer::Uuid::from_u128(FIPS_GATT_PSM_CHAR_UUID_RAW);
 
     fn map_err(context: &str, e: bluer::Error) -> TransportError {
@@ -258,7 +290,7 @@ mod bluer_impl {
     const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(750);
     const STARTUP_RETRY_ATTEMPTS: usize = 3;
     const BLE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
-    const BLE_LINUX_QUEUE_DEPTH: usize = 32;
+    const BLE_LINUX_QUEUE_DEPTH: usize = BLE_DEFAULT_QUEUE_DEPTH;
 
     fn is_transient_startup_error(error: &bluer::Error) -> bool {
         matches!(
@@ -275,13 +307,13 @@ mod bluer_impl {
     // ----------------------------------------------------------------
 
     pub struct BluerStream {
-        conn: Arc<tokio::sync::Mutex<Arc<SeqPacket>>>,
+        conn: Arc<Mutex<Arc<SeqPacket>>>,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
-        rate_limiter: Option<Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>>,
+        rate_limiter: Option<Arc<Mutex<SendRateLimiter>>>,
         drain_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-        alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        alive: Arc<AtomicBool>,
         _drain_task: tokio::task::JoinHandle<()>,
         recv_buf: tokio::sync::Mutex<Vec<u8>>,
     }
@@ -306,10 +338,10 @@ mod bluer_impl {
             }
 
             let rate_limiter: Option<
-                Arc<tokio::sync::Mutex<super::super::rate_limit::SendRateLimiter>>,
+                Arc<Mutex<SendRateLimiter>>,
             > = if send_rate_bps > 0 {
                 Some(Arc::new(tokio::sync::Mutex::new(
-                    super::super::rate_limit::SendRateLimiter::new(send_rate_bps, send_burst_bytes),
+                    SendRateLimiter::new(send_rate_bps, send_burst_bytes),
                 )))
             } else {
                 None
@@ -323,8 +355,7 @@ mod bluer_impl {
             let (drain_tx, mut drain_rx) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(BLE_LINUX_QUEUE_DEPTH);
 
-            let alive: std::sync::Arc<std::sync::atomic::AtomicBool> =
-                std::sync::Arc::new(true.into());
+            let alive: Arc<AtomicBool> = Arc::new(true.into());
 
             let drain_alive = alive.clone();
             let drain_task = tokio::spawn(async move {
@@ -337,7 +368,7 @@ mod bluer_impl {
                         Ok(Ok(_n)) => {}
                         Ok(Err(e)) => {
                             warn!(remote_addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
-                            drain_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                            drain_alive.store(false, Ordering::Relaxed);
                             break;
                         }
                         Err(_) => {
@@ -365,7 +396,7 @@ mod bluer_impl {
 
     impl BleStream for BluerStream {
         async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-            if !self.alive.load(std::sync::atomic::Ordering::Relaxed) {
+            if !self.alive.load(Ordering::Relaxed) {
                 return Err(TransportError::Io(std::io::Error::other(
                     "BLE connection dead (drain task error)",
                 )));
@@ -381,7 +412,7 @@ mod bluer_impl {
             match self.drain_tx.try_send(framed) {
                 Ok(()) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    trace!(len = data.len(), addr = %self.remote, queue_depth = BLE_LINUX_QUEUE_DEPTH, "BLE linux drain queue full, dropping");
+                    trace!(len = data.len(), remote_addr = %self.remote, queue_depth = BLE_LINUX_QUEUE_DEPTH, "BLE linux drain queue full, dropping");
                     Err(TransportError::SendFailed(
                         "BLE linux drain queue full".into(),
                     ))
@@ -393,7 +424,7 @@ mod bluer_impl {
         }
 
         async fn send_urgent(&self, data: &[u8]) -> Result<(), TransportError> {
-            if !self.alive.load(std::sync::atomic::Ordering::Relaxed) {
+            if !self.alive.load(Ordering::Relaxed) {
                 return Err(TransportError::Io(std::io::Error::other(
                     "BLE connection dead (drain task error)",
                 )));
@@ -407,19 +438,19 @@ mod bluer_impl {
                 });
             }
 
-            trace!(len = data.len(), framed_len = framed.len(), addr = %self.remote, "BLE linux send_urgent (direct, bypasses rate limiter)");
+            trace!(len = data.len(), framed_len = framed.len(), remote_addr = %self.remote, "BLE linux send_urgent (direct, bypasses rate limiter)");
 
             let conn = self.conn.lock().await;
             tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&framed))
                 .await
                 .map_err(|_| {
-                    warn!(remote_addr = %self.remote, "BLE linux send_urgent timeout");
+                    warn!(remote_remote_addr = %self.remote, "BLE linux send_urgent timeout");
                     TransportError::Timeout
                 })?
                 .map(|_sent| ())
                 .map_err(|e| {
-                    warn!(remote_addr = %self.remote, error = %e, "BLE linux send_urgent error, marking connection dead");
-                    self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                    warn!(remote_remote_addr = %self.remote, error = %e, "BLE linux send_urgent error, marking connection dead");
+                    self.alive.store(false, Ordering::Relaxed);
                     TransportError::Io(std::io::Error::other(format!("send_urgent: {e}")))
                 })
         }
@@ -436,7 +467,7 @@ mod bluer_impl {
                         trace!(
                             len = copy_len,
                             buf_remaining = recv_buf.len(),
-                            addr = %self.remote,
+                            remote_addr = %self.remote,
                             "BLE linux recv frame"
                         );
                         return Ok(copy_len);
@@ -455,7 +486,7 @@ mod bluer_impl {
                     return Ok(0);
                 }
 
-                trace!(raw_bytes = n, addr = %self.remote, "BLE linux recv raw");
+                trace!(raw_bytes = n, remote_addr = %self.remote, "BLE linux recv raw");
                 self.recv_buf.lock().await.extend_from_slice(&chunk[..n]);
             }
         }
@@ -733,13 +764,12 @@ mod bluer_impl {
                 result
             };
 
-            timeout(Duration::from_secs(10), discover)
+            timeout(GATT_PSM_DISCOVER_TIMEOUT, discover)
                 .await
                 .map_err(|_| {
-                    TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: timed out discovering PSM for {}",
-                        addr
-                    )))
+                    TransportError::Io(std::io::Error::other(
+                        gatt_err::timeout(addr),
+                    ))
                 })?
         }
 
@@ -767,10 +797,9 @@ mod bluer_impl {
             addr: &BleAddr,
         ) -> Result<u16, TransportError> {
             let services = device.services().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to enumerate services for {}: {}",
-                    addr, e
-                )))
+                TransportError::Io(std::io::Error::other(
+                    gatt_err::enum_services(addr, &e),
+                ))
             })?;
 
             debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
@@ -779,36 +808,32 @@ mod bluer_impl {
             let psm_service = match psm_service {
                 Some(s) => s,
                 None => {
-                    return Err(TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: FIPS GATT PSM service not found on {}",
-                        addr
-                    ))));
+                    return Err(TransportError::Io(std::io::Error::other(
+                        gatt_err::service_not_found(addr),
+                    )));
                 }
             };
 
             let characteristics = psm_service.characteristics().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
-                    addr, e
-                )))
+                TransportError::Io(std::io::Error::other(
+                    gatt_err::enum_chars(addr, &e),
+                ))
             })?;
 
             let psm_char = find_char_by_uuid(&characteristics, FIPS_GATT_PSM_CHAR_UUID).await;
             let psm_char = match psm_char {
                 Some(c) => c,
                 None => {
-                    return Err(TransportError::Io(std::io::Error::other(format!(
-                        "discover_gatt_psm: PSM characteristic not found on {}",
-                        addr
-                    ))));
+                    return Err(TransportError::Io(std::io::Error::other(
+                        gatt_err::char_not_found(addr),
+                    )));
                 }
             };
 
             let value = psm_char.read().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(format!(
-                    "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
-                    addr, e
-                )))
+                TransportError::Io(std::io::Error::other(
+                    gatt_err::read_psm(addr, &e),
+                ))
             })?;
 
             let psm = parse_psm_value(&value, addr)?;
@@ -1058,7 +1083,7 @@ mod bluer_impl {
                             attempt,
                             retry_in_ms = STARTUP_RETRY_DELAY.as_millis(),
                             kind = ?error.kind,
-                            message = %error.message,
+                            error = %error.message,
                             "BLE advertising start hit transient controller state; retrying"
                         );
                         tokio::time::sleep(STARTUP_RETRY_DELAY).await;
@@ -1139,7 +1164,7 @@ mod bluer_impl {
                             attempt,
                             retry_in_ms = STARTUP_RETRY_DELAY.as_millis(),
                             kind = ?error.kind,
-                            message = %error.message,
+                            error = %error.message,
                             "BLE scanning start hit transient controller state; retrying"
                         );
                         tokio::time::sleep(STARTUP_RETRY_DELAY).await;
