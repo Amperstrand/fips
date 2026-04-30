@@ -390,6 +390,7 @@ mod bluer_impl {
                     warn!(addr = %self.remote, "BLE linux send_urgent timeout");
                     TransportError::Timeout
                 })?
+                .map(|_sent| ())
                 .map_err(|e| {
                     warn!(addr = %self.remote, error = %e, "BLE linux send_urgent error, marking connection dead");
                     self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -417,11 +418,12 @@ mod bluer_impl {
                 }
 
                 let mut chunk = vec![0u8; self.recv_mtu as usize];
-                let n = self
-                    .conn
-                    .recv(&mut chunk)
-                    .await
-                    .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?;
+                let n = {
+                    let conn = self.conn.lock().await;
+                    conn.recv(&mut chunk)
+                        .await
+                        .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?
+                };
 
                 if n == 0 {
                     return Ok(0);
