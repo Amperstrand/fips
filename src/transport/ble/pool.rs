@@ -105,9 +105,10 @@ impl<S> ConnectionPool<S> {
     ) -> Result<Option<TransportAddr>, TransportError> {
         use std::collections::hash_map::Entry;
 
-        // Already connected — replace
+        // Already connected — replace (suppress on_drop: same BLE device)
         if let Entry::Occupied(mut e) = self.connections.entry(addr.clone()) {
-            e.insert(conn);
+            let mut old = e.insert(conn);
+            old.on_drop.take();
             return Ok(None);
         }
 
