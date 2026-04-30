@@ -7,7 +7,11 @@ impl PeerCapabilities {
     const PREFER_L2CAP: u8 = 0x04;
     const CAN_CENTRAL: u8 = 0x08;
     const CAN_PERIPHERAL: u8 = 0x10;
+    /// L2CAP transport supported. Set on all BLE-capable platforms.
+    /// Informational flag only — not checked at runtime.
     const L2CAP_SUPPORTED: u8 = 0x20;
+    /// GATT service available. Set on platforms that register GATT services.
+    /// Informational flag only — not checked at runtime.
     const GATT_SUPPORTED: u8 = 0x40;
 
     pub fn none() -> Self {

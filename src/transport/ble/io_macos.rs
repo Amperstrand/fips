@@ -741,11 +741,11 @@ impl PeripheralStream {
         mtu: u16,
         send_rate_bps: u64,
         send_burst_bytes: u32,
-    ) -> Self {
-        let input_stream =
-            unsafe { channel.0.inputStream() }.expect("CBL2CAPChannel has no input stream");
-        let output_stream =
-            unsafe { channel.0.outputStream() }.expect("CBL2CAPChannel has no output stream");
+    ) -> Result<Self, TransportError> {
+        let input_stream = unsafe { channel.0.inputStream() }
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("CBL2CAPChannel has no input stream")))?;
+        let output_stream = unsafe { channel.0.outputStream() }
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("CBL2CAPChannel has no output stream")))?;
 
         let read_notify = Arc::new(tokio::sync::Notify::new());
         let input_delegate = PeripheralInputDelegate::new(read_notify.clone());
@@ -1169,8 +1169,23 @@ define_class!(
                         self.ivars().send_rate_bps,
                         self.ivars().send_burst_bytes,
                     )
-                };
-                if let Ok(mut pending) = self.ivars().pending_streams.lock() {
+                 };
+                 let stream = match unsafe {
+                     PeripheralStream::setup_channel(
+                         SendableChannel(channel.retain()),
+                         remote,
+                         self.ivars().mtu,
+                         self.ivars().send_rate_bps,
+                         self.ivars().send_burst_bytes,
+                     )
+                 } {
+                     Ok(s) => s,
+                     Err(e) => {
+                         warn!(remote_addr = %remote, error = %e, "BLE peripheral: failed to setup L2CAP channel");
+                         return;
+                     }
+                 };
+                 if let Ok(mut pending) = self.ivars().pending_streams.lock() {
                     pending.push(SendablePeripheralStream(stream));
                 }
                 let _ = self

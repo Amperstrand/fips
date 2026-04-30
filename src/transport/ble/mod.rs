@@ -234,6 +234,7 @@ impl<I: BleIo> BleTransport<I> {
                     let max_conns = self.config.max_connections();
 
                     self.accept_task = Some(tokio::spawn(accept_loop(
+                        Arc::clone(&self.io),
                         adapter.clone(),
                         acceptor,
                         pool,
@@ -425,6 +426,12 @@ impl<I: BleIo> BleTransport<I> {
                 Ok(data.len())
             }
             Err(e) => {
+                let is_congestion = matches!(e, TransportError::SendFailed(_));
+                if is_congestion {
+                    self.congested.store(true, Ordering::Relaxed);
+                    debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE urgent send dropped (congested)");
+                    return Err(e);
+                }
                 warn!(transport_id = %self.transport_id, remote_addr = %addr, error = %e, "BLE urgent send failed, connection removed");
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
@@ -441,68 +448,6 @@ impl<I: BleIo> BleTransport<I> {
     }
 
     /// Promote a newly established stream into the connection pool.
-    #[allow(dead_code)]
-    async fn promote_connection(
-        &self,
-        addr: &TransportAddr,
-        ble_addr: &BleAddr,
-        stream: I::Stream,
-    ) -> Result<(), TransportError> {
-        let send_mtu = stream.send_mtu();
-        let recv_mtu = stream.recv_mtu();
-        let stream = Arc::new(stream);
-
-        let recv_task = tokio::spawn(receive_loop(
-            Arc::clone(&stream),
-            Arc::clone(&self.pool),
-            self.packet_tx.clone(),
-            self.disconnect_tx.clone(),
-            ReceiveLoopArgs {
-                addr: addr.clone(),
-                transport_id: self.transport_id,
-                stats: Arc::clone(&self.stats),
-                recv_mtu,
-                recv_timeout_secs: RECV_TIMEOUT_SECS,
-            },
-        ));
-
-        let io = Arc::clone(&self.io);
-        let drop_addr = ble_addr.clone();
-        let conn = BleConnection {
-            stream,
-            recv_task: Some(recv_task),
-            send_mtu,
-            recv_mtu,
-            established_at: tokio::time::Instant::now(),
-            is_static: false,
-            addr: ble_addr.clone(),
-            on_drop: Some(Box::new(move || {
-                let io = io.clone();
-                let addr = drop_addr;
-                tokio::spawn(async move {
-                    io.disconnect_device(&addr).await;
-                });
-            })),
-        };
-
-        let mut pool = self.pool.lock().await;
-        match pool.insert(addr.clone(), conn) {
-            Ok(Some(evicted)) => {
-                self.stats.record_pool_eviction();
-                debug!(transport_id = %self.transport_id, remote_addr = %addr, evicted = %evicted, "BLE connection established (evicted peer)");
-            }
-            Ok(None) => {
-                debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE connection established");
-            }
-            Err(e) => {
-                warn!(transport_id = %self.transport_id, remote_addr = %addr, error = %e, "BLE pool full, connection dropped");
-                self.stats.record_connection_rejected();
-                return Err(TransportError::SendFailed("pool full".into()));
-            }
-        }
-        self.stats.record_connection_established();
-        Ok(())
-    }
 
     /// Initiate a non-blocking connection to a remote BLE device.
     pub async fn connect_async(&self, addr: &TransportAddr) -> Result<(), TransportError> {
@@ -844,7 +789,8 @@ async fn pubkey_exchange<S: BleStream>(
 /// Accept loop: accepts inbound L2CAP connections, exchanges pubkeys,
 /// and adds to pool.
 #[allow(clippy::too_many_arguments)]
-async fn accept_loop<A>(
+async fn accept_loop<A, I: BleIo>(
+    io: Arc<I>,
     adapter: String,
     mut acceptor: A,
     pool: Arc<Mutex<ConnectionPool<Arc<A::Stream>>>>,
@@ -943,6 +889,7 @@ async fn accept_loop<A>(
                 ));
 
                 let backoff_addr = addr.clone();
+                let on_drop_addr = addr.clone();
                 let conn = BleConnection {
                     stream,
                     recv_task: Some(recv_task),
@@ -951,7 +898,15 @@ async fn accept_loop<A>(
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr,
-                    on_drop: None,
+                    on_drop: Some(Box::new({
+                        let io = io.clone();
+                        move || {
+                            let io = io.clone();
+                            tokio::spawn(async move {
+                                io.disconnect_device(&on_drop_addr).await;
+                            });
+                        }
+                    })),
                 };
 
                 let mut pool_guard = pool.lock().await;

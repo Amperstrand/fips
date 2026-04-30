@@ -113,6 +113,7 @@ Control-plane traffic (Noise handshake, rekey) bypasses the rate-limited drain q
 On Linux, sends directly via the L2CAP socket. On macOS central, uses the urgent
 writer directly. On macOS peripheral, enqueues with backpressure (best-effort).
 This prevents control-plane stalls when the data plane is congested.
+Congestion (`SendFailed`) sets the backpressure flag but does NOT remove the connection.
 
 ### Layer 3: Backpressure flag (`src/node/handlers/rx_loop.rs`)
 `Arc<AtomicBool>` on `BleTransport`, set on `SendFailed`, cleared on send success.
@@ -123,6 +124,18 @@ allowing the drain task to catch up before new packets enter the pipeline.
 `MAX_BLE_TCP_WINDOW = 2920` (2 × BLE L2CAP MTU of 1460). TCP Window Scale option is stripped
 for packets routed over BLE links. This prevents the kernel from advertising large windows
 that would cause burst-flood-drop cycles on the constrained link.
+
+### GATT PSM discovery with retry
+Linux reads the PSM from a GATT characteristic on the remote device. BlueZ #1489 causes
+`ServicesResolved=true` to fire before D-Bus GATT objects are populated — handled by
+retrying after `PSM_RETRY_DELAY` (200ms) on any first-attempt failure. macOS uses
+`discover_services_with_uuid()` to force fresh CoreBluetooth discovery (dynamic PSMs).
+Linux PSM is fixed (133, bound via socket API); macOS PSM is dynamic (changes on sleep/wake).
+
+### Inbound device lifecycle
+Accepted inbound connections register an `on_drop` callback that disconnects the BLE device
+when the connection is evicted from the pool. This prevents stale device handles from
+leaking on Linux. The `accept_loop` receives `Arc<I>` (BleIo) for this purpose.
 
 ### TUN channel sizing
 The TUN outbound channel is sized at 16 (default). This gives ~24KB of kernel buffer

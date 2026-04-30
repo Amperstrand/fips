@@ -748,14 +748,15 @@ mod bluer_impl {
             device: &bluer::Device,
             addr: &BleAddr,
         ) -> Result<u16, TransportError> {
+            const PSM_RETRY_DELAY: Duration = Duration::from_millis(200);
             let psm = Self::try_read_psm_from_gatt(device, addr).await;
             if let Err(ref e) = psm {
                 debug!(
                     remote_addr = %addr,
                     error = %e,
-                    "GATT PSM discovery: first attempt failed, retrying in 200ms"
+                    "GATT PSM discovery: first attempt failed, retrying"
                 );
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(PSM_RETRY_DELAY).await;
                 return Self::try_read_psm_from_gatt(device, addr).await;
             }
             psm
@@ -915,7 +916,7 @@ mod bluer_impl {
                     Ok(Err(e)) => {
                         let err_str = format!("{e}");
                         if attempt < MAX_GATT_ATTEMPTS
-                            && (err_str.contains("abort-by-local") || err_str.contains("Not Ready"))
+                            && (err_str.contains("abort") || err_str.contains("Not Ready"))
                         {
                             debug!(
                                 remote_addr = %addr, attempt, error = %e,
