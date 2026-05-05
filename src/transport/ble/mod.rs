@@ -225,12 +225,6 @@ impl<I: BleIo> BleTransport<I> {
         let psm = self.config.psm();
         let adapter = self.io.adapter_name().to_string();
 
-        let local_node_addr = self.local_pubkey.and_then(|pk| {
-            XOnlyPublicKey::from_slice(&pk)
-                .ok()
-                .map(|xonly| NodeAddr::from_pubkey(&xonly))
-        });
-
         // Start L2CAP listener for inbound connections
         if self.config.accept_connections() {
             match self.io.listen(psm).await {
@@ -253,7 +247,6 @@ impl<I: BleIo> BleTransport<I> {
                         max_conns,
                         self.local_pubkey,
                         Arc::clone(&self.discovery_buffer),
-                        local_node_addr,
                         self.local_capabilities,
                         Arc::clone(&self.backoff),
                     )));
@@ -292,7 +285,6 @@ impl<I: BleIo> BleTransport<I> {
                         self.config.connect_timeout_ms(),
                         self.config.probe_cooldown_secs(),
                         RECV_TIMEOUT_SECS,
-                        local_node_addr,
                         self.packet_tx.clone(),
                         self.disconnect_tx.clone(),
                         self.transport_id,
@@ -807,7 +799,6 @@ async fn accept_loop<A, I: BleIo>(
     _max_conns: usize,
     local_pubkey: Option<[u8; 32]>,
     discovery_buffer: Arc<DiscoveryBuffer>,
-    local_node_addr: Option<NodeAddr>,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
 ) where
@@ -850,13 +841,6 @@ async fn accept_loop<A, I: BleIo>(
                                     && !local_capabilities.prefers_outbound()
                                 {
                                     debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: peer prefers outbound, keeping connection");
-                                } else if let Some(ref our_addr) = local_node_addr {
-                                    let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
-                                    if our_addr < &peer_addr {
-                                        debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)");
-                                        backoff.lock().await.clear(&addr);
-                                        continue;
-                                    }
                                 }
                             }
                             Err(e) => {
@@ -1024,7 +1008,6 @@ async fn scan_probe_supervisor<I: io::BleIo>(
     connect_timeout_ms: u64,
     cooldown_secs: u64,
     recv_timeout_secs: u64,
-    local_node_addr: Option<NodeAddr>,
     packet_tx: PacketTx,
     disconnect_tx: Option<DisconnectTx>,
     transport_id: TransportId,
@@ -1048,7 +1031,6 @@ async fn scan_probe_supervisor<I: io::BleIo>(
                 connect_timeout_ms,
                 cooldown_secs,
                 recv_timeout_secs,
-                local_node_addr,
                 packet_tx.clone(),
                 disconnect_tx.clone(),
                 transport_id,
@@ -1097,7 +1079,6 @@ async fn scan_probe_loop<I: io::BleIo>(
     connect_timeout_ms: u64,
     cooldown_secs: u64,
     recv_timeout_secs: u64,
-    local_node_addr: Option<NodeAddr>,
     packet_tx: PacketTx,
     disconnect_tx: Option<DisconnectTx>,
     transport_id: TransportId,
@@ -1221,15 +1202,6 @@ async fn scan_probe_loop<I: io::BleIo>(
                     debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: peer prefers outbound, yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
                     continue;
-                }
-
-                if let Some(ref our_addr) = local_node_addr {
-                    let peer_addr = NodeAddr::from_pubkey(&result.peer_pubkey);
-                    if peer_capabilities.can_initiate_outbound() && our_addr >= &peer_addr {
-                        debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe tie-breaker: yielding to peer's outbound");
-                        buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
-                        continue;
-                    }
                 }
 
                 let peer_pubkey = result.peer_pubkey;
