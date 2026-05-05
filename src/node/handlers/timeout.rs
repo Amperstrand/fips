@@ -123,8 +123,15 @@ impl Node {
                 None => continue,
             };
 
+            let ble_congested = self
+                .ble_congested
+                .iter()
+                .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
             // Send the stored msg1
-            let sent = if let Some(transport) = self.transports.get(&transport_id) {
+            let sent = if ble_congested {
+                false
+            } else if let Some(transport) = self.transports.get(&transport_id) {
                 match transport.send(&remote_addr, &msg1_bytes).await {
                     Ok(_) => true,
                     Err(e) => {

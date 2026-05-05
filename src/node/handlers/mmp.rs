@@ -236,14 +236,27 @@ impl Node {
             }
         }
 
-        // Send collected reports
+        // Send collected reports (skip if BLE congested — next tick will retry)
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
         for (node_addr, encoded) in sender_reports {
+            if ble_congested {
+                trace!(peer = %self.peer_display_name(&node_addr), "SenderReport deferred (BLE congested)");
+                continue;
+            }
             if let Err(e) = self.send_encrypted_link_message(&node_addr, &encoded).await {
                 debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send SenderReport");
             }
         }
 
         for (node_addr, encoded) in receiver_reports {
+            if ble_congested {
+                trace!(peer = %self.peer_display_name(&node_addr), "ReceiverReport deferred (BLE congested)");
+                continue;
+            }
             if let Err(e) = self.send_encrypted_link_message(&node_addr, &encoded).await {
                 debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send ReceiverReport");
             }
@@ -379,6 +392,16 @@ impl Node {
         }
 
         // Send collected reports via session-layer encryption.
+        // Skip if BLE congested — next tick will retry.
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
+        if ble_congested {
+            return;
+        }
+
         // Track per-destination success/failure for backoff and log suppression.
         let mut send_results: Vec<(NodeAddr, bool)> = Vec::new();
         for (dest_addr, msg_type, body) in reports {
@@ -561,13 +584,21 @@ impl Node {
             self.schedule_reconnect(*addr, now_ms);
         }
 
-        // Send heartbeats (skip peers we just removed)
+        // Send heartbeats (skip peers we just removed, skip if BLE congested)
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
         for addr in heartbeats {
             if dead_peers.contains(&addr) {
                 continue;
             }
             if let Some(peer) = self.peers.get_mut(&addr) {
                 peer.mark_heartbeat_sent(now);
+            }
+            if ble_congested {
+                continue;
             }
             if let Err(e) = self
                 .send_encrypted_link_message(&addr, &heartbeat_msg)
