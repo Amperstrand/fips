@@ -870,16 +870,14 @@ async fn test_resend_scheduling() {
     assert_eq!(conn.resend_count(), 0, "No resend before scheduled time");
 
     // At resend time: would resend if transport existed. Without transport,
-    // the send fails silently and resend_count stays at 0.
-    // This tests the filtering logic — the connection IS a candidate.
+    // the send fails but the resend is still recorded (timer advances to
+    // prevent hammering on the next tick).
     node.resend_pending_handshakes(now_ms + 1000).await;
-    // No transport registered, so send fails — count stays 0.
-    // That's the expected behavior (transport absence is a transient condition).
     let conn = node.connections.get(&link_id).unwrap();
     assert_eq!(
         conn.resend_count(),
-        0,
-        "No transport means no resend recorded"
+        1,
+        "Resend recorded even when send fails (timer must advance)"
     );
 }
 

@@ -253,13 +253,22 @@ impl Node {
                 false
             };
 
+            // Always advance the resend timer, even on send failure.
+            // Without this, needs_msg1_resend() returns true on every
+            // tick (1s), hammering the drain queue when congested.
+            if let Some(peer) = self.peers.get_mut(&node_addr) {
+                peer.set_msg1_next_resend(now_ms + interval_ms);
+            }
+
             if sent {
-                if let Some(peer) = self.peers.get_mut(&node_addr) {
-                    peer.set_msg1_next_resend(now_ms + interval_ms);
-                }
                 trace!(
                     peer = %self.peer_display_name(&node_addr),
                     "Resent rekey msg1"
+                );
+            } else {
+                debug!(
+                    peer = %self.peer_display_name(&node_addr),
+                    "Rekey msg1 resend deferred (send failed)"
                 );
             }
         }
