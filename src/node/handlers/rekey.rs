@@ -182,7 +182,7 @@ impl Node {
         let wire_msg1 = build_msg1(our_index, &noise_msg1);
 
         // Send msg1 on the existing link (same transport + address)
-        if let Some(transport) = self.transports.get(&transport_id) {
+        let sent = if let Some(transport) = self.transports.get(&transport_id) {
             match transport.send(&remote_addr, &wire_msg1).await {
                 Ok(_) => {
                     debug!(
@@ -190,6 +190,7 @@ impl Node {
                         our_index = %our_index,
                         "Rekey initiated, sent msg1 on existing link"
                     );
+                    true
                 }
                 Err(e) => {
                     warn!(
@@ -197,17 +198,25 @@ impl Node {
                         error = %e,
                         "Failed to send rekey msg1"
                     );
-                    let _ = self.index_allocator.free(our_index);
-                    return;
+                    false
                 }
             }
-        }
+        } else {
+            false
+        };
 
-        // Store handshake state on the ActivePeer (not a separate PeerConnection)
+        // Always store rekey state, even on send failure. Without this,
+        // rekey_in_progress() stays false and check_rekey re-enters
+        // initiate_rekey on every tick (1s), hammering the drain queue.
+        // The resend_pending_rekeys path handles retry with backoff.
         let resend_interval = self.config.node.rate_limit.handshake_resend_interval_ms;
         let now_ms = Self::now_ms();
         if let Some(peer) = self.peers.get_mut(node_addr) {
             peer.set_rekey_state(hs, our_index, wire_msg1, now_ms + resend_interval);
+        }
+
+        if !sent {
+            return;
         }
 
         // Register in pending_outbound for msg2 dispatch (maps to existing link)
