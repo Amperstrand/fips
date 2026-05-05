@@ -1213,10 +1213,7 @@ mod bluer_impl {
 }
 
 #[cfg(bluer_available)]
-pub use bluer_impl::{
-    BluerAcceptor, BluerIo, BluerScanner, BluerStream, FIPS_GATT_PSM_CHAR_UUID,
-    FIPS_GATT_PSM_SERVICE_UUID, FIPS_SERVICE_UUID,
-};
+pub use bluer_impl::{BluerAcceptor, BluerIo, BluerScanner, BluerStream};
 
 // ============================================================================
 // BluestIo — macOS BLE I/O via CoreBluetooth (bluest)
