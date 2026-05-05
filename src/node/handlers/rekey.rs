@@ -120,8 +120,20 @@ impl Node {
             }
         }
 
-        // Initiate new rekeys
+        // Initiate new rekeys (skip if BLE transport is congested)
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
         for node_addr in peers_to_rekey {
+            if ble_congested {
+                trace!(
+                    peer = %self.peer_display_name(&node_addr),
+                    "Rekey initiation deferred (BLE congested)"
+                );
+                continue;
+            }
             self.initiate_rekey(&node_addr).await;
         }
     }
@@ -235,7 +247,12 @@ impl Node {
 
         let interval_ms = self.config.node.rate_limit.handshake_resend_interval_ms;
 
-        // Collect peers needing action
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
+        let mut deferred: Vec<NodeAddr> = Vec::new();
         let mut to_resend: Vec<(NodeAddr, Vec<u8>)> = Vec::new();
 
         for (node_addr, peer) in &self.peers {
@@ -243,8 +260,22 @@ impl Node {
                 continue;
             }
             if peer.needs_msg1_resend(now_ms) {
-                to_resend.push((*node_addr, peer.rekey_msg1().unwrap().to_vec()));
+                if ble_congested {
+                    deferred.push(*node_addr);
+                } else {
+                    to_resend.push((*node_addr, peer.rekey_msg1().unwrap().to_vec()));
+                }
             }
+        }
+
+        for node_addr in &deferred {
+            if let Some(peer) = self.peers.get_mut(node_addr) {
+                peer.set_msg1_next_resend(now_ms + interval_ms);
+            }
+            trace!(
+                peer = %self.peer_display_name(node_addr),
+                "Rekey msg1 resend deferred (BLE congested)"
+            );
         }
 
         for (node_addr, msg1_bytes) in to_resend {
