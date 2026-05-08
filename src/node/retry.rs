@@ -6,7 +6,7 @@
 
 use super::Node;
 use crate::PeerIdentity;
-use crate::config::PeerConfig;
+use crate::config::{PeerAddress, PeerConfig};
 use crate::identity::NodeAddr;
 use tracing::{debug, info, warn};
 
@@ -58,6 +58,56 @@ impl RetryState {
 }
 
 impl Node {
+    /// Store a synthetic PeerConfig for a runtime-discovered peer if it has no
+    /// static config entry. The synthetic config enables reconnect after
+    /// transport disconnect. The transport_name and transport_addr are captured
+    /// from the active link so the reconnect can redial the same endpoint.
+    pub(in crate::node) fn store_discovered_peer_config(
+        &mut self,
+        node_addr: NodeAddr,
+        peer_identity: &PeerIdentity,
+        transport_name: &str,
+        transport_addr: &crate::transport::TransportAddr,
+    ) {
+        let already_in_static_config = self
+            .config
+            .auto_connect_peers()
+            .any(|pc| {
+                PeerIdentity::from_npub(&pc.npub)
+                    .map(|id| *id.node_addr() == node_addr)
+                    .unwrap_or(false)
+            });
+
+        if already_in_static_config {
+            return;
+        }
+
+        let npub = peer_identity.npub();
+        let peer_address = PeerAddress::new(transport_name, transport_addr.to_string());
+
+        let peer_config = PeerConfig {
+            npub,
+            alias: None,
+            addresses: vec![peer_address],
+            auto_reconnect: true,
+            connect_policy: crate::config::ConnectPolicy::AutoConnect,
+            via_nostr: false,
+        };
+
+        self.discovered_peer_configs.insert(node_addr, peer_config);
+
+        if self.discovered_peer_configs.len() > super::DISCOVERED_PEER_CONFIGS_MAX {
+            let oldest_key = self
+                .discovered_peer_configs
+                .keys()
+                .next()
+                .copied();
+            if let Some(key) = oldest_key {
+                self.discovered_peer_configs.remove(&key);
+            }
+        }
+    }
+
     /// Schedule a retry for a failed outbound connection, if applicable.
     ///
     /// Only schedules if the peer is an auto-connect peer and max retries
@@ -111,7 +161,8 @@ impl Node {
                         .map(|id| *id.node_addr() == node_addr)
                         .unwrap_or(false)
                 })
-                .cloned();
+                .cloned()
+                .or_else(|| self.discovered_peer_configs.get(&node_addr).cloned());
 
             if let Some(pc) = peer_config {
                 let mut state = RetryState::new(pc);
@@ -141,7 +192,6 @@ impl Node {
     /// exponential backoff accumulates across repeated link-dead events instead
     /// of resetting to the base interval on every peer removal.
     pub(super) fn schedule_reconnect(&mut self, node_addr: NodeAddr, now_ms: u64) {
-        // Find peer in auto-connect config
         let peer_config = self
             .config
             .auto_connect_peers()
@@ -150,7 +200,8 @@ impl Node {
                     .map(|id| *id.node_addr() == node_addr)
                     .unwrap_or(false)
             })
-            .cloned();
+            .cloned()
+            .or_else(|| self.discovered_peer_configs.get(&node_addr).cloned());
 
         let Some(pc) = peer_config else {
             return; // Not an auto-connect peer, no reconnect

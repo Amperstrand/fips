@@ -193,6 +193,12 @@ impl Node {
                 let now_ms = Self::now_ms();
                 let entry = self.sessions.get_mut(src_addr).unwrap();
                 entry.handle_peer_kbit_flip(now_ms);
+
+                // FSP responder→FMP coordination: reset FMP peer timer
+                // so the FMP rekey timer restarts from now, preventing cascade.
+                if let Some(peer) = self.peers.get_mut(src_addr) {
+                    peer.reset_session_established_at();
+                }
             }
         }
 

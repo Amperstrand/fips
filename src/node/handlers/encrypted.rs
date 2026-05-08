@@ -77,6 +77,13 @@ impl Node {
                         "peers_by_index should contain pre-registered new index after K-bit flip"
                     );
                 }
+
+                // FMP responder→FSP coordination: reset FSP session timer
+                // so the FSP rekey timer restarts from now, preventing cascade.
+                let now_ms = Self::now_ms();
+                if let Some(entry) = self.sessions.get_mut(&node_addr) {
+                    entry.reset_session_start_ms(now_ms);
+                }
             }
         }
 

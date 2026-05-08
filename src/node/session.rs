@@ -376,6 +376,11 @@ impl SessionEntry {
         self.session_start_ms
     }
 
+    /// Coordinate with FMP rekey cutover to prevent cascade.
+    pub(crate) fn reset_session_start_ms(&mut self, now_ms: u64) {
+        self.session_start_ms = now_ms;
+    }
+
     /// Get the current send counter from the established NoiseSession.
     pub(crate) fn send_counter(&self) -> u64 {
         match self.state.as_ref() {

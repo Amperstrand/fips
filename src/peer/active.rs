@@ -783,6 +783,11 @@ impl ActivePeer {
         self.session_established_at
     }
 
+    /// Coordinate with FSP rekey cutover to prevent cascade.
+    pub fn reset_session_established_at(&mut self) {
+        self.session_established_at = Instant::now();
+    }
+
     /// Current K-bit epoch value.
     pub fn current_k_bit(&self) -> bool {
         self.current_k_bit

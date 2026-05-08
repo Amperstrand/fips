@@ -80,6 +80,7 @@ impl Node {
         }
 
         // Execute cutover for initiator side
+        let mut fmp_cutover_addrs: Vec<NodeAddr> = Vec::new();
         for node_addr in peers_to_cutover {
             if let Some(peer) = self.peers.get_mut(&node_addr)
                 && let Some(_old_our_index) = peer.cutover_to_new_session()
@@ -99,6 +100,18 @@ impl Node {
                     peer = %self.peer_display_name(&node_addr),
                     "Rekey cutover complete (initiator), K-bit flipped"
                 );
+                fmp_cutover_addrs.push(node_addr);
+            }
+        }
+
+        // FMP→FSP coordination: reset FSP session timers for cut-over peers
+        // so the FSP rekey timer restarts from now, preventing cascade.
+        if !fmp_cutover_addrs.is_empty() {
+            let now_ms = Self::now_ms();
+            for addr in &fmp_cutover_addrs {
+                if let Some(entry) = self.sessions.get_mut(addr) {
+                    entry.reset_session_start_ms(now_ms);
+                }
             }
         }
 
@@ -375,6 +388,7 @@ impl Node {
         }
 
         // Execute cutover for initiator side
+        let mut fsp_cutover_addrs: Vec<NodeAddr> = Vec::new();
         for node_addr in sessions_to_cutover {
             if let Some(entry) = self.sessions.get_mut(&node_addr)
                 && entry.cutover_to_new_session(now_ms)
@@ -383,6 +397,15 @@ impl Node {
                     peer = %self.peer_display_name(&node_addr),
                     "FSP rekey cutover complete (initiator), K-bit flipped"
                 );
+                fsp_cutover_addrs.push(node_addr);
+            }
+        }
+
+        // FSP→FMP coordination: reset FMP peer timers for cut-over sessions
+        // so the FMP rekey timer restarts from now, preventing cascade.
+        for addr in &fsp_cutover_addrs {
+            if let Some(peer) = self.peers.get_mut(addr) {
+                peer.reset_session_established_at();
             }
         }
 

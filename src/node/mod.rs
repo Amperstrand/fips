@@ -220,6 +220,10 @@ impl RecentRequest {
     }
 }
 
+/// Maximum number of synthetic peer configs retained for runtime-discovered
+/// peers. Oldest entries are evicted when this limit is exceeded.
+const DISCOVERED_PEER_CONFIGS_MAX: usize = 64;
+
 /// Key for addr_to_link reverse lookup.
 type AddrKey = (TransportId, TransportAddr);
 
@@ -492,6 +496,13 @@ pub struct Node {
     /// Reloadable peer ACL state from standard allow/deny files.
     peer_acl: acl::PeerAclReloader,
 
+    // === Discovered Peer Configs ===
+    /// Synthetic PeerConfigs for peers discovered at runtime (e.g. via BLE scan)
+    /// rather than configured statically. Used by schedule_reconnect() and
+    /// schedule_retry() to reconnect discovered peers after transport disconnect.
+    /// Bounded by DISCOVERED_PEER_CONFIGS_MAX to prevent unbounded growth.
+    discovered_peer_configs: HashMap<NodeAddr, crate::config::PeerConfig>,
+
     // === Host Map ===
     /// Static hostname → npub mapping for DNS resolution.
     /// Built at construction from peer aliases and /etc/fips/hosts.
@@ -640,6 +651,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            discovered_peer_configs: HashMap::new(),
         })
     }
 
@@ -774,6 +786,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            discovered_peer_configs: HashMap::new(),
         })
     }
 

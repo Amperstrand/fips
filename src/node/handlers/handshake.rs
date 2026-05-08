@@ -1014,6 +1014,7 @@ impl Node {
 
                 self.seed_path_mtu_for_link_peer(&peer_node_addr, transport_id, &current_addr);
 
+                let discovered_addr = current_addr.clone();
                 let mut new_peer = ActivePeer::with_session(
                     verified_identity,
                     link_id,
@@ -1037,6 +1038,16 @@ impl Node {
                     .insert((transport_id, our_index.as_u32()), peer_node_addr);
                 self.retry_pending.remove(&peer_node_addr);
                 self.register_identity(peer_node_addr, verified_identity.pubkey_full());
+
+                let transport_name = self.transports.get(&transport_id)
+                    .map(|t| t.transport_type().name)
+                    .unwrap_or("unknown");
+                self.store_discovered_peer_config(
+                    peer_node_addr,
+                    &verified_identity,
+                    transport_name,
+                    &discovered_addr,
+                );
 
                 debug!(
                     peer = %self.peer_display_name(&peer_node_addr),
@@ -1111,6 +1122,7 @@ impl Node {
 
             self.seed_path_mtu_for_link_peer(&peer_node_addr, transport_id, &current_addr);
 
+            let discovered_addr = current_addr.clone();
             let mut new_peer = ActivePeer::with_session(
                 verified_identity,
                 link_id,
@@ -1136,6 +1148,16 @@ impl Node {
                 .insert((transport_id, our_index.as_u32()), peer_node_addr);
             self.retry_pending.remove(&peer_node_addr);
             self.register_identity(peer_node_addr, verified_identity.pubkey_full());
+
+            let transport_name = self.transports.get(&transport_id)
+                .map(|t| t.transport_type().name)
+                .unwrap_or("unknown");
+            self.store_discovered_peer_config(
+                peer_node_addr,
+                &verified_identity,
+                transport_name,
+                &discovered_addr,
+            );
 
             info!(
                 peer = %self.peer_display_name(&peer_node_addr),
