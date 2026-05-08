@@ -12,7 +12,8 @@ use crate::utils::index::SessionIndex;
 use crate::{FipsAddress, NodeAddr, PeerIdentity};
 use secp256k1::XOnlyPublicKey;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tracing::trace;
 
 /// Connectivity state for an active peer.
 ///
@@ -174,6 +175,10 @@ pub struct ActivePeer {
     rekey_in_progress: bool,
     /// When we last received a rekey msg1 from this peer (dampening).
     last_peer_rekey: Option<Instant>,
+    /// Earliest time at which rekey is allowed.
+    /// Set to now + REKEY_COOLDOWN_AFTER_RECONNECT_SECS after a fresh
+    /// (non-rekey) handshake completion.
+    rekey_allowed_after: Option<Instant>,
     /// In-progress rekey: Noise handshake state (initiator only).
     rekey_handshake: Option<NoiseHandshakeState>,
     /// In-progress rekey: our new session index.
@@ -229,6 +234,7 @@ impl ActivePeer {
             pending_their_index: None,
             rekey_in_progress: false,
             last_peer_rekey: None,
+            rekey_allowed_after: None,
             rekey_handshake: None,
             rekey_our_index: None,
             rekey_msg1: None,
@@ -309,6 +315,7 @@ impl ActivePeer {
             pending_their_index: None,
             rekey_in_progress: false,
             last_peer_rekey: None,
+            rekey_allowed_after: None,
             rekey_handshake: None,
             rekey_our_index: None,
             rekey_msg1: None,
@@ -816,6 +823,17 @@ impl ActivePeer {
         self.last_peer_rekey = Some(Instant::now());
     }
 
+    pub fn set_rekey_cooldown(&mut self, cooldown_secs: u64) {
+        self.rekey_allowed_after = Some(Instant::now() + Duration::from_secs(cooldown_secs));
+    }
+
+    pub fn is_in_rekey_cooldown(&self) -> bool {
+        match self.rekey_allowed_after {
+            Some(t) => Instant::now() < t,
+            None => false,
+        }
+    }
+
     /// Get the pending new session's our_index.
     pub fn pending_our_index(&self) -> Option<SessionIndex> {
         self.pending_our_index
@@ -890,6 +908,7 @@ impl ActivePeer {
         // Flip K-bit and reset timing
         self.current_k_bit = !self.current_k_bit;
         self.session_established_at = Instant::now();
+        trace!(reason = "rekey_cutover", "session_established_at reset");
         self.session_start = Instant::now();
         self.rekey_in_progress = false;
         self.reset_replay_suppressed();
@@ -925,6 +944,7 @@ impl ActivePeer {
         // Match peer's K-bit
         self.current_k_bit = !self.current_k_bit;
         self.session_established_at = Instant::now();
+        trace!(reason = "rekey_cutover", "session_established_at reset");
         self.session_start = Instant::now();
         self.rekey_in_progress = false;
         self.reset_replay_suppressed();

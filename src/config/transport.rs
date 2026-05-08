@@ -818,9 +818,9 @@ impl BleConfig {
         }
     }
 
-    /// Initial send rate for BLE streams, clamped to 80 Kbps.
+    /// Initial send rate for BLE streams, clamped to 50 Kbps.
     pub fn initial_stream_rate_bps(&self) -> u64 {
-        const BLE_MAX_RATE_BPS: u64 = 80_000;
+        const BLE_MAX_RATE_BPS: u64 = 50_000;
         self.effective_send_rate_bps().min(BLE_MAX_RATE_BPS)
     }
 

@@ -19,9 +19,21 @@ const DRAIN_WINDOW_SECS: u64 = 10;
 /// a peer's rekey msg1.
 const REKEY_DAMPENING_SECS: u64 = 30;
 
+/// After a fresh (non-rekey) IK handshake, suppress rekey initiation
+/// for this long to prevent rapid rekey cycles during reconnect storms.
+pub(in crate::node) const REKEY_COOLDOWN_AFTER_CONNECT_SECS: u64 = 60;
+
 /// Delay FSP initiator cutover after handshake completion to allow
 /// XK msg3 to reach the responder before K-bit-flipped data arrives.
 const FSP_CUTOVER_DELAY_MS: u64 = 2000;
+
+fn rekey_jitter_secs(peer_addr: &NodeAddr, jitter_secs: u64) -> u64 {
+    if jitter_secs == 0 {
+        return 0;
+    }
+    let offset = peer_addr.as_bytes().iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64));
+    offset % jitter_secs
+}
 
 impl Node {
     /// Periodic rekey check. Called from the tick loop.
@@ -67,6 +79,9 @@ impl Node {
             if peer.is_rekey_dampened(REKEY_DAMPENING_SECS) {
                 continue;
             }
+            if peer.is_in_rekey_cooldown() {
+                continue;
+            }
 
             let elapsed = peer.session_established_at().elapsed().as_secs();
             let counter = peer
@@ -74,7 +89,8 @@ impl Node {
                 .map(|s| s.current_send_counter())
                 .unwrap_or(0);
 
-            if elapsed >= rekey_after_secs || counter >= rekey_after_messages {
+            let jittered_secs = rekey_after_secs + rekey_jitter_secs(node_addr, 5);
+            if elapsed >= jittered_secs || counter >= rekey_after_messages {
                 peers_to_rekey.push(*node_addr);
             }
         }
@@ -109,7 +125,13 @@ impl Node {
         if !fmp_cutover_addrs.is_empty() {
             let now_ms = Self::now_ms();
             for addr in &fmp_cutover_addrs {
+                let name = self.peer_display_name(addr);
                 if let Some(entry) = self.sessions.get_mut(addr) {
+                    trace!(
+                        peer = %name,
+                        reason = "fmp_cutover_coordination",
+                        "FSP session timer reset"
+                    );
                     entry.reset_session_start_ms(now_ms);
                 }
             }
@@ -382,7 +404,8 @@ impl Node {
             let elapsed_secs = now_ms.saturating_sub(entry.session_start_ms()) / 1000;
             let counter = entry.send_counter();
 
-            if elapsed_secs >= rekey_after_secs || counter >= rekey_after_messages {
+            let jittered_secs = rekey_after_secs + rekey_jitter_secs(node_addr, 5);
+            if elapsed_secs >= jittered_secs || counter >= rekey_after_messages {
                 sessions_to_rekey.push(*node_addr);
             }
         }
@@ -404,7 +427,13 @@ impl Node {
         // FSP→FMP coordination: reset FMP peer timers for cut-over sessions
         // so the FMP rekey timer restarts from now, preventing cascade.
         for addr in &fsp_cutover_addrs {
+            let name = self.peer_display_name(addr);
             if let Some(peer) = self.peers.get_mut(addr) {
+                trace!(
+                    peer = %name,
+                    reason = "fsp_cutover_coordination",
+                    "FMP peer timer reset"
+                );
                 peer.reset_session_established_at();
             }
         }

@@ -2,6 +2,7 @@
 
 use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
+use crate::node::handlers::rekey::REKEY_COOLDOWN_AFTER_CONNECT_SECS;
 use crate::node::wire::{Msg1Header, Msg2Header, build_msg2};
 use crate::node::{Node, NodeError};
 use crate::peer::{ActivePeer, PeerConnection, PromotionResult, cross_connection_winner};
@@ -1032,6 +1033,7 @@ impl Node {
                 new_peer.set_tree_announce_min_interval_ms(
                     self.config.node.tree.announce_min_interval_ms,
                 );
+                new_peer.set_rekey_cooldown(REKEY_COOLDOWN_AFTER_CONNECT_SECS);
 
                 self.peers.insert(peer_node_addr, new_peer);
                 self.peers_by_index
@@ -1142,6 +1144,7 @@ impl Node {
             if let Some(ts) = old_announce_ts {
                 new_peer.set_last_tree_announce_sent_ms(ts);
             }
+            new_peer.set_rekey_cooldown(REKEY_COOLDOWN_AFTER_CONNECT_SECS);
 
             self.peers.insert(peer_node_addr, new_peer);
             self.peers_by_index

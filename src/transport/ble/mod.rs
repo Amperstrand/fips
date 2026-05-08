@@ -110,7 +110,10 @@ pub struct BleTransport<I: BleIo> {
     congested: Arc<AtomicBool>,
 }
 
-const RECV_TIMEOUT_SECS: u64 = 30;
+/// Receive timeout in seconds. BLE links under congestion can experience
+/// RTT spikes exceeding 35 seconds; 60 s avoids premature disconnects
+/// during transient congestion while still detecting truly dead links.
+const RECV_TIMEOUT_SECS: u64 = 60;
 
 struct ConnectingEntry {
     task: JoinHandle<()>,
@@ -944,6 +947,8 @@ async fn receive_loop<S: BleStream>(
     args: ReceiveLoopArgs,
 ) {
     let mut buf = vec![0u8; args.recv_mtu as usize];
+    let start = std::time::Instant::now();
+    let mut consecutive_errors: u32 = 0;
     loop {
         let recv_result = tokio::time::timeout(
             std::time::Duration::from_secs(args.recv_timeout_secs),
@@ -953,10 +958,12 @@ async fn receive_loop<S: BleStream>(
 
         match recv_result {
             Ok(Ok(0)) => {
-                debug!(transport_id = %args.transport_id, remote_addr = %args.addr, "BLE connection closed by peer");
+                let elapsed = start.elapsed();
+                info!(transport_id = %args.transport_id, remote_addr = %args.addr, elapsed_secs = elapsed.as_secs_f32(), "BLE connection closed by peer");
                 break;
             }
             Ok(Ok(n)) => {
+                consecutive_errors = 0;
                 args.stats.record_recv(n);
                 let frame_data = buf[..n].to_vec();
                 let packet = ReceivedPacket::new(args.transport_id, args.addr.clone(), frame_data);
@@ -966,17 +973,22 @@ async fn receive_loop<S: BleStream>(
                 }
             }
             Ok(Err(e)) => {
+                consecutive_errors += 1;
                 let err_str = format!("{e}");
                 if err_str.contains("framed message too short") {
                     args.stats.record_recv_error();
                     continue;
                 }
-                debug!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, "BLE receive error");
+                if consecutive_errors >= 3 {
+                    warn!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, consecutive = consecutive_errors, "BLE receive errors exceeded threshold");
+                } else {
+                    debug!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, "BLE receive error");
+                }
                 args.stats.record_recv_error();
                 break;
             }
             Err(_) => {
-                debug!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, "BLE recv timeout — link may be silently dead");
+                warn!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, "BLE recv timeout — link may be silently dead");
                 args.stats.record_recv_error();
                 break;
             }
