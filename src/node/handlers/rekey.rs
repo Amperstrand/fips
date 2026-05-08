@@ -121,7 +121,20 @@ impl Node {
         }
 
         // Initiate new rekeys
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
         for node_addr in peers_to_rekey {
+            if ble_congested {
+                trace!(
+                    peer = %self.peer_display_name(&node_addr),
+                    "Rekey initiation deferred (BLE congested)"
+                );
+                continue;
+            }
+
             self.initiate_rekey(&node_addr).await;
         }
     }
@@ -182,7 +195,7 @@ impl Node {
         let wire_msg1 = build_msg1(our_index, &noise_msg1);
 
         // Send msg1 on the existing link (same transport + address)
-        if let Some(transport) = self.transports.get(&transport_id) {
+        let sent = if let Some(transport) = self.transports.get(&transport_id) {
             match transport.send(&remote_addr, &wire_msg1).await {
                 Ok(_) => {
                     debug!(
@@ -190,6 +203,7 @@ impl Node {
                         our_index = %our_index,
                         "Rekey initiated, sent msg1 on existing link"
                     );
+                    true
                 }
                 Err(e) => {
                     warn!(
@@ -197,17 +211,22 @@ impl Node {
                         error = %e,
                         "Failed to send rekey msg1"
                     );
-                    let _ = self.index_allocator.free(our_index);
-                    return;
+                    false
                 }
             }
-        }
+        } else {
+            false
+        };
 
         // Store handshake state on the ActivePeer (not a separate PeerConnection)
         let resend_interval = self.config.node.rate_limit.handshake_resend_interval_ms;
         let now_ms = Self::now_ms();
         if let Some(peer) = self.peers.get_mut(node_addr) {
             peer.set_rekey_state(hs, our_index, wire_msg1, now_ms + resend_interval);
+        }
+
+        if !sent {
+            return;
         }
 
         // Register in pending_outbound for msg2 dispatch (maps to existing link)
@@ -226,6 +245,13 @@ impl Node {
 
         let interval_ms = self.config.node.rate_limit.handshake_resend_interval_ms;
 
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
+        let mut deferred: Vec<NodeAddr> = Vec::new();
+
         // Collect peers needing action
         let mut to_resend: Vec<(NodeAddr, Vec<u8>)> = Vec::new();
 
@@ -234,8 +260,22 @@ impl Node {
                 continue;
             }
             if peer.needs_msg1_resend(now_ms) {
-                to_resend.push((*node_addr, peer.rekey_msg1().unwrap().to_vec()));
+                if ble_congested {
+                    deferred.push(*node_addr);
+                } else {
+                    to_resend.push((*node_addr, peer.rekey_msg1().unwrap().to_vec()));
+                }
             }
+        }
+
+        for node_addr in &deferred {
+            if let Some(peer) = self.peers.get_mut(node_addr) {
+                peer.set_msg1_next_resend(now_ms + interval_ms);
+            }
+            trace!(
+                peer = %self.peer_display_name(node_addr),
+                "Rekey msg1 resend deferred (BLE congested)"
+            );
         }
 
         for (node_addr, msg1_bytes) in to_resend {
@@ -253,13 +293,19 @@ impl Node {
                 false
             };
 
+            if let Some(peer) = self.peers.get_mut(&node_addr) {
+                peer.set_msg1_next_resend(now_ms + interval_ms);
+            }
+
             if sent {
-                if let Some(peer) = self.peers.get_mut(&node_addr) {
-                    peer.set_msg1_next_resend(now_ms + interval_ms);
-                }
                 trace!(
                     peer = %self.peer_display_name(&node_addr),
                     "Resent rekey msg1"
+                );
+            } else {
+                debug!(
+                    peer = %self.peer_display_name(&node_addr),
+                    "Rekey msg1 resend deferred (send failed)"
                 );
             }
         }

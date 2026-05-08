@@ -820,7 +820,7 @@ impl Default for BuffersConfig {
     fn default() -> Self {
         Self {
             packet_channel: 1024,
-            tun_channel: 1024,
+            tun_channel: 16,
             dns_channel: 64,
         }
     }
@@ -831,7 +831,7 @@ impl BuffersConfig {
         1024
     }
     fn default_tun_channel() -> usize {
-        1024
+        16
     }
     fn default_dns_channel() -> usize {
         64

@@ -33,6 +33,9 @@ __pycache__/
 *.egg-info/
 *.egg
 
+bluest/
+.opencode/
+
 # Runtime artifacts from running fips in-tree during local testing.
 # Root-anchored so legitimately-tracked fips.yaml under packaging/ and
 # examples/ stays included.

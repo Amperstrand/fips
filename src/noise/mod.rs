@@ -36,6 +36,7 @@
 //! initiator identity protection.
 
 mod handshake;
+pub mod keylog;
 mod replay;
 mod session;
 
@@ -409,6 +410,11 @@ impl CipherState {
     /// Check if cipher has a key.
     pub fn has_key(&self) -> bool {
         self.has_key
+    }
+
+    /// Get the raw key bytes (for key logging after handshake completion).
+    pub(super) fn key_bytes(&self) -> &[u8; 32] {
+        &self.key
     }
 }
 

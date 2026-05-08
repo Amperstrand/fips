@@ -62,7 +62,7 @@ impl Node {
     /// Frees the session index, removes pending_outbound entry, and cleans up
     /// the link and address mapping. Does not log — callers provide context-appropriate
     /// log messages.
-    fn cleanup_stale_connection(&mut self, link_id: LinkId, _now_ms: u64) {
+    pub(in crate::node) fn cleanup_stale_connection(&mut self, link_id: LinkId, _now_ms: u64) {
         let conn = match self.connections.remove(&link_id) {
             Some(c) => c,
             None => return,
@@ -124,8 +124,15 @@ impl Node {
                 None => continue,
             };
 
+            let ble_congested = self
+                .ble_congested
+                .iter()
+                .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
             // Send the stored msg1
-            let sent = if let Some(transport) = self.transports.get(&transport_id) {
+            let sent = if ble_congested {
+                false
+            } else if let Some(transport) = self.transports.get(&transport_id) {
                 match transport.send(&remote_addr, &msg1_bytes).await {
                     Ok(_) => true,
                     Err(e) => {
@@ -141,15 +148,17 @@ impl Node {
                 false
             };
 
-            if sent && let Some(conn) = self.connections.get_mut(&link_id) {
+            if let Some(conn) = self.connections.get_mut(&link_id) {
                 let count = conn.resend_count() + 1;
                 let next = now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
                 conn.record_resend(next);
-                debug!(
-                    link_id = %link_id,
-                    resend = count,
-                    "Resent handshake msg1"
-                );
+                if sent {
+                    debug!(
+                        link_id = %link_id,
+                        resend = count,
+                        "Resent handshake msg1"
+                    );
+                }
             }
         }
     }
@@ -219,15 +228,17 @@ impl Node {
                 }
             };
 
-            if sent && let Some(entry) = self.sessions.get_mut(&dest_addr) {
+            if let Some(entry) = self.sessions.get_mut(&dest_addr) {
                 let count = entry.resend_count() + 1;
                 let next = now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
                 entry.record_resend(next);
-                debug!(
-                    dest = %self.peer_display_name(&dest_addr),
-                    resend = count,
-                    "Resent session handshake"
-                );
+                if sent {
+                    debug!(
+                        dest = %self.peer_display_name(&dest_addr),
+                        resend = count,
+                        "Resent session handshake"
+                    );
+                }
             }
         }
     }

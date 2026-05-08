@@ -95,8 +95,10 @@ impl Node {
             }
         };
 
-        // Get session timestamp before taking mutable borrow on MMP
+        // Get session timestamp and transport info before taking mutable borrow on MMP
         let our_timestamp_ms = peer.session_elapsed_ms();
+        let peer_transport_id = peer.transport_id();
+        let peer_transport_addr = peer.current_addr().cloned();
 
         let Some(mmp) = peer.mmp_mut() else {
             return;
@@ -110,11 +112,14 @@ impl Node {
             .process_receiver_report(&rr, our_timestamp_ms, now);
 
         // Feed SRTT back to sender/receiver report interval tuning
-        if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
+        let ble_srtt_ms = if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
             let srtt_us = (srtt_ms * 1000.0) as i64;
             mmp.sender.update_report_interval_from_srtt(srtt_us);
             mmp.receiver.update_report_interval_from_srtt(srtt_us);
-        }
+            Some(srtt_ms)
+        } else {
+            None
+        };
 
         // Update reverse delivery ratio from our own receiver state
         // (what fraction of peer's frames we received), using per-interval deltas.
@@ -130,6 +135,14 @@ impl Node {
             etx = format_args!("{:.2}", mmp.metrics.etx),
             "Processed ReceiverReport"
         );
+
+        if let Some(srtt_ms) = ble_srtt_ms
+            && let Some(tid) = peer_transport_id
+            && let Some(taddr) = peer_transport_addr
+            && let Some(transport) = self.transports.get(&tid)
+        {
+            transport.update_rate_from_srtt(&taddr, srtt_ms).await;
+        }
 
         // First RTT sample — peer is now eligible for parent selection.
         // Trigger re-evaluation so the node doesn't wait for the next
@@ -224,13 +237,26 @@ impl Node {
         }
 
         // Send collected reports
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
         for (node_addr, encoded) in sender_reports {
+            if ble_congested {
+                trace!(peer = %self.peer_display_name(&node_addr), "SenderReport deferred (BLE congested)");
+                continue;
+            }
             if let Err(e) = self.send_encrypted_link_message(&node_addr, &encoded).await {
                 debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send SenderReport");
             }
         }
 
         for (node_addr, encoded) in receiver_reports {
+            if ble_congested {
+                trace!(peer = %self.peer_display_name(&node_addr), "ReceiverReport deferred (BLE congested)");
+                continue;
+            }
             if let Err(e) = self.send_encrypted_link_message(&node_addr, &encoded).await {
                 debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send ReceiverReport");
             }
@@ -367,6 +393,15 @@ impl Node {
 
         // Send collected reports via session-layer encryption.
         // Track per-destination success/failure for backoff and log suppression.
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
+        if ble_congested {
+            return;
+        }
+
         let mut send_results: Vec<(NodeAddr, bool)> = Vec::new();
         for (dest_addr, msg_type, body) in reports {
             match self.send_session_msg(&dest_addr, msg_type, &body).await {
@@ -548,13 +583,21 @@ impl Node {
             self.schedule_reconnect(*addr, now_ms);
         }
 
-        // Send heartbeats (skip peers we just removed)
+        // Send heartbeats (skip peers we just removed, skip if BLE congested)
+        let ble_congested = self
+            .ble_congested
+            .iter()
+            .any(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+
         for addr in heartbeats {
             if dead_peers.contains(&addr) {
                 continue;
             }
             if let Some(peer) = self.peers.get_mut(&addr) {
                 peer.mark_heartbeat_sent(now);
+            }
+            if ble_congested {
+                continue;
             }
             if let Err(e) = self
                 .send_encrypted_link_message(&addr, &heartbeat_msg)

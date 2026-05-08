@@ -743,6 +743,14 @@ pub struct BleConfig {
     /// this long before probing the same address again. Default: 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_cooldown_secs: Option<u64>,
+
+    /// Send rate limit in bits per second. 0 = unlimited. Default: 100_000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_rate_bps: Option<u64>,
+
+    /// Send burst size in bytes. Default: 2048.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_burst_bytes: Option<u32>,
 }
 
 impl BleConfig {
@@ -796,6 +804,52 @@ impl BleConfig {
     pub fn probe_cooldown_secs(&self) -> u64 {
         self.probe_cooldown_secs
             .unwrap_or(DEFAULT_BLE_PROBE_COOLDOWN_SECS)
+    }
+
+    /// Get the send rate limit in bits per second. Default: 100_000.
+    pub fn send_rate_bps(&self) -> u64 {
+        self.send_rate_bps.unwrap_or(100_000)
+    }
+
+    pub fn effective_send_rate_bps(&self) -> u64 {
+        match self.send_rate_bps {
+            Some(0) => 150_000,
+            _ => self.send_rate_bps(),
+        }
+    }
+
+    /// Initial send rate for BLE streams, clamped to 80 Kbps.
+    pub fn initial_stream_rate_bps(&self) -> u64 {
+        const BLE_MAX_RATE_BPS: u64 = 80_000;
+        self.effective_send_rate_bps().min(BLE_MAX_RATE_BPS)
+    }
+
+    /// Get the send burst size in bytes. Default: 2048.
+    pub fn send_burst_bytes(&self) -> u32 {
+        self.send_burst_bytes.unwrap_or(2048)
+    }
+
+    pub fn validate(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.mtu == Some(0) {
+            self.mtu = None;
+            warnings.push("transports.ble.mtu was 0, reset to default 2048".into());
+        }
+        if self.max_connections == Some(0) {
+            self.max_connections = None;
+            warnings.push("transports.ble.max_connections was 0, reset to default 7".into());
+        }
+        if self.connect_timeout_ms == Some(0) {
+            self.connect_timeout_ms = None;
+            warnings.push("transports.ble.connect_timeout_ms was 0, reset to default 10000".into());
+        }
+        if self.send_burst_bytes == Some(0) {
+            self.send_burst_bytes = None;
+            warnings.push("transports.ble.send_burst_bytes was 0, reset to default 2048".into());
+        }
+
+        warnings
     }
 }
 
@@ -964,5 +1018,78 @@ mod tests {
         assert_eq!(parse_bind_port("0.0.0.0:2121"), Some(2121));
         assert_eq!(parse_bind_port("[::]:443"), Some(443));
         assert_eq!(parse_bind_port("not-a-socket-addr"), None);
+    }
+
+    fn make_ble_config() -> BleConfig {
+        BleConfig {
+            mtu: Some(2048),
+            max_connections: Some(7),
+            connect_timeout_ms: Some(10_000),
+            send_burst_bytes: Some(2048),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_default_is_ok() {
+        let mut config = BleConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_resets_zero_mtu() {
+        let mut config = make_ble_config();
+        config.mtu = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("mtu"));
+        assert_eq!(config.mtu(), 2048);
+    }
+
+    #[test]
+    fn validate_resets_zero_max_connections() {
+        let mut config = make_ble_config();
+        config.max_connections = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("max_connections"));
+        assert_eq!(config.max_connections(), 7);
+    }
+
+    #[test]
+    fn validate_resets_zero_connect_timeout() {
+        let mut config = make_ble_config();
+        config.connect_timeout_ms = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("connect_timeout_ms"));
+        assert_eq!(config.connect_timeout_ms(), 10_000);
+    }
+
+    #[test]
+    fn validate_resets_zero_send_burst_bytes() {
+        let mut config = make_ble_config();
+        config.send_burst_bytes = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("send_burst_bytes"));
+        assert_eq!(config.send_burst_bytes(), 2048);
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let mut config = make_ble_config();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_multiple_fixes() {
+        let mut config = make_ble_config();
+        config.mtu = Some(0);
+        config.max_connections = Some(0);
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(config.mtu(), 2048);
+        assert_eq!(config.max_connections(), 7);
     }
 }

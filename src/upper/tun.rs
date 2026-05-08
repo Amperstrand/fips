@@ -133,6 +133,72 @@ pub(crate) fn per_flow_max_mss(
     result
 }
 
+/// Token-bucket rate limiter for TUN→transport outbound pacing.
+///
+/// Used when a BLE transport is configured to prevent the TUN reader
+/// from flooding BLE's limited bandwidth. Non-BLE configurations pass
+/// `None` and bypass pacing entirely.
+pub struct TunPacer {
+    inner: std::sync::Mutex<PacerInner>,
+}
+
+struct PacerInner {
+    rate_bytes_per_sec: f64,
+    burst_bytes: f64,
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TunPacer {
+    pub fn new(rate_bps: u64, burst_bytes: u32) -> Self {
+        let rate_bytes_per_sec = rate_bps as f64 / 8.0;
+        Self {
+            inner: std::sync::Mutex::new(PacerInner {
+                rate_bytes_per_sec,
+                burst_bytes: burst_bytes as f64,
+                tokens: burst_bytes as f64,
+                last_refill: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    pub fn acquire(&self, bytes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.rate_bytes_per_sec <= 0.0 {
+            return;
+        }
+        inner.refill();
+        if inner.tokens >= bytes as f64 {
+            inner.tokens -= bytes as f64;
+            return;
+        }
+        let deficit = bytes as f64 - inner.tokens;
+        let wait_secs = deficit / inner.rate_bytes_per_sec;
+        let wait =
+            std::time::Duration::from_secs_f64(wait_secs).max(std::time::Duration::from_millis(1));
+        drop(inner);
+        std::thread::sleep(wait);
+        let mut inner = self.inner.lock().unwrap();
+        inner.refill();
+        inner.tokens -= bytes as f64;
+        if inner.tokens < 0.0 {
+            inner.tokens = 0.0;
+        }
+    }
+}
+
+impl PacerInner {
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens += elapsed * self.rate_bytes_per_sec;
+        if self.tokens > self.burst_bytes {
+            self.tokens = self.burst_bytes;
+        }
+        self.last_refill = now;
+    }
+}
+
 /// Channel sender for packets to be written to TUN.
 pub type TunTx = mpsc::Sender<Vec<u8>>;
 
@@ -513,6 +579,7 @@ pub fn run_tun_reader(
     outbound_tx: TunOutboundTx,
     transport_mtu: u16,
     path_mtu_lookup: PathMtuLookup,
+    pacer: Option<std::sync::Arc<TunPacer>>,
 ) {
     let (name, mut buf, max_mss) = tun_reader_setup(device.name(), mtu, transport_mtu);
 
@@ -523,6 +590,7 @@ pub fn run_tun_reader(
                     &mut buf[..n],
                     max_mss,
                     &name,
+                    &pacer,
                     our_addr,
                     &tun_tx,
                     &outbound_tx,
@@ -574,6 +642,7 @@ pub fn run_tun_reader(
     transport_mtu: u16,
     path_mtu_lookup: PathMtuLookup,
     shutdown_fd: std::os::unix::io::RawFd,
+    pacer: Option<std::sync::Arc<TunPacer>>,
 ) {
     let _shutdown_fd = ShutdownFd(shutdown_fd);
     let tun_fd = device.device().as_raw_fd();
@@ -629,6 +698,7 @@ pub fn run_tun_reader(
                         &mut buf[..n],
                         max_mss,
                         &name,
+                        &pacer,
                         our_addr,
                         &tun_tx,
                         &outbound_tx,
@@ -685,6 +755,7 @@ fn handle_tun_packet(
     packet: &mut [u8],
     max_mss: u16,
     name: &str,
+    pacer: &Option<std::sync::Arc<TunPacer>>,
     our_addr: FipsAddress,
     tun_tx: &TunTx,
     outbound_tx: &TunOutboundTx,
@@ -700,6 +771,11 @@ fn handle_tun_packet(
         return true;
     }
 
+    // BLE rate limiting: if a TunPacer is configured, throttle this packet
+    if let Some(pacer) = pacer {
+        pacer.acquire(packet.len());
+    }
+
     // Check if destination is a FIPS address (fd::/8 prefix)
     if packet[24] == crate::identity::FIPS_ADDRESS_PREFIX {
         // Per-destination clamp: if discovery has learned a smaller path
@@ -707,6 +783,11 @@ fn handle_tun_packet(
         let effective_max_mss = per_flow_max_mss(path_mtu_lookup, &packet[24..40], max_mss);
         if clamp_tcp_mss(packet, effective_max_mss) {
             trace!(name = %name, max_mss = effective_max_mss, "Clamped TCP MSS in SYN packet");
+        }
+        // For BLE transports, set TCP Window Scale to 0 to prevent the
+        // kernel from advertising large windows that BLE cannot service.
+        if pacer.is_some() {
+            super::tcp_mss::strip_window_scale(packet);
         }
         if outbound_tx.blocking_send(packet.to_vec()).is_err() {
             return false; // Channel closed, shutdown
@@ -1046,6 +1127,7 @@ mod windows_tun {
         outbound_tx: TunOutboundTx,
         transport_mtu: u16,
         path_mtu_lookup: PathMtuLookup,
+        pacer: Option<std::sync::Arc<super::TunPacer>>,
     ) {
         let (name, mut buf, max_mss) = super::tun_reader_setup(device.name(), mtu, transport_mtu);
 
@@ -1056,6 +1138,7 @@ mod windows_tun {
                         &mut buf[..n],
                         max_mss,
                         &name,
+                        &pacer,
                         our_addr,
                         &tun_tx,
                         &outbound_tx,

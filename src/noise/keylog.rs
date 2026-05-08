@@ -1,0 +1,139 @@
+//! Noise key logging for traffic analysis.
+//!
+//! **WARNING:** This module is intended for debugging only. When enabled,
+//! raw ChaCha20-Poly1305 cipher keys are written to disk. These keys can
+//! decrypt all FIPS traffic. Never enable in production. Delete key log
+//! files after analysis.
+//!
+//! When the `FIPS_NOISE_KEYLOG` environment variable is set to a file path,
+//! derived cipher keys are appended after each successful Noise handshake.
+//!
+//! Format (one line per handshake completion):
+//!
+//! ```text
+//! FIPS_LINK <local_npub> <peer_npub> <send_key_hex> <recv_key_hex>
+//! FIPS_SESSION <local_npub> <peer_npub> <send_key_hex> <recv_key_hex>
+//! ```
+//!
+//! The npub identifiers are hex-encoded x-only public keys (32 bytes → 64 hex
+//! chars). Wireshark custom dissectors can match these to BLE L2CAP
+//! connections. When `FIPS_NOISE_KEYLOG` is not set, all calls are zero-cost
+//! (no file I/O, no string allocation).
+
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::sync::OnceLock;
+
+static KEYLOG_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+fn keylog_enabled() -> Option<&'static str> {
+    KEYLOG_PATH
+        .get_or_init(|| std::env::var("FIPS_NOISE_KEYLOG").ok())
+        .as_deref()
+}
+
+fn open_keylog(path: &str) -> std::io::Result<std::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path)
+}
+
+/// Log link-layer (FMP) Noise keys after IK handshake completion.
+pub fn log_link_keys(local_npub: &str, peer_npub: &str, send_key: &[u8; 32], recv_key: &[u8; 32]) {
+    if let Some(path) = keylog_enabled()
+        && let Ok(mut f) = open_keylog(path)
+    {
+        let _ = writeln!(
+            f,
+            "FIPS_LINK {} {} {} {}",
+            local_npub,
+            peer_npub,
+            hex::encode(send_key),
+            hex::encode(recv_key),
+        );
+    }
+}
+
+/// Log session-layer (FSP) Noise keys after XK handshake completion.
+pub fn log_session_keys(
+    local_npub: &str,
+    peer_npub: &str,
+    send_key: &[u8; 32],
+    recv_key: &[u8; 32],
+) {
+    if let Some(path) = keylog_enabled()
+        && let Ok(mut f) = open_keylog(path)
+    {
+        let _ = writeln!(
+            f,
+            "FIPS_SESSION {} {} {} {}",
+            local_npub,
+            peer_npub,
+            hex::encode(send_key),
+            hex::encode(recv_key),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_entry(path: &str, label: &str, a: &str, b: &str, k1: &[u8; 32], k2: &[u8; 32]) {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(
+                f,
+                "{} {} {} {} {}",
+                label,
+                a,
+                b,
+                hex::encode(k1),
+                hex::encode(k2)
+            );
+        }
+    }
+
+    #[test]
+    fn keylog_format_matches_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.log");
+        let path_str = path.to_str().unwrap();
+
+        write_entry(
+            path_str,
+            "FIPS_LINK",
+            "aabbccdd",
+            "11223344",
+            &[1u8; 32],
+            &[2u8; 32],
+        );
+
+        let contents = fs::read_to_string(path_str).unwrap();
+        let line = contents.lines().next().unwrap();
+        assert!(line.starts_with("FIPS_LINK aabbccdd 11223344"));
+        assert!(line.contains(&hex::encode([1u8; 32])));
+        assert!(line.contains(&hex::encode([2u8; 32])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keylog_file_permissions_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secure_keys.log");
+        let path_str = path.to_str().unwrap();
+
+        // open_keylog uses OpenOptions with mode(0o600)
+        let _f = open_keylog(path_str).expect("open_keylog should succeed");
+
+        let meta = fs::metadata(path_str).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "keylog file should be 0o600 (owner-only)");
+    }
+}

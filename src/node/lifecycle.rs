@@ -596,11 +596,14 @@ impl Node {
         // Create packet channel for transport -> Node communication
         let packet_buffer_size = self.config.node.buffers.packet_channel;
         let (packet_tx, packet_rx) = packet_channel(packet_buffer_size);
+        let (disconnect_tx, disconnect_rx) =
+            crate::transport::disconnect_channel(packet_buffer_size);
         self.packet_tx = Some(packet_tx.clone());
         self.packet_rx = Some(packet_rx);
+        self.disconnect_rx = Some(disconnect_rx);
 
         // Initialize transports first (before TUN, before Nostr discovery).
-        let transport_handles = self.create_transports(&packet_tx).await;
+        let transport_handles = self.create_transports(&packet_tx, &disconnect_tx).await;
 
         for mut handle in transport_handles {
             let transport_id = handle.transport_id();
@@ -700,6 +703,19 @@ impl Node {
                     let tun_channel_size = self.config.node.buffers.tun_channel;
                     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(tun_channel_size);
 
+                    let tun_pacer =
+                        self.config
+                            .transports
+                            .ble
+                            .iter()
+                            .next()
+                            .map(|(_, ble_config)| {
+                                std::sync::Arc::new(crate::upper::tun::TunPacer::new(
+                                    ble_config.initial_stream_rate_bps(),
+                                    ble_config.send_burst_bytes(),
+                                ))
+                            });
+
                     // Spawn reader thread
                     let transport_mtu = self.transport_mtu();
                     let path_mtu_lookup = self.path_mtu_lookup.clone();
@@ -714,6 +730,7 @@ impl Node {
                             transport_mtu,
                             path_mtu_lookup,
                             shutdown_read_fd,
+                            tun_pacer,
                         );
                     });
                     #[cfg(not(target_os = "macos"))]
@@ -726,6 +743,7 @@ impl Node {
                             outbound_tx,
                             transport_mtu,
                             path_mtu_lookup,
+                            tun_pacer,
                         );
                     });
 
@@ -952,6 +970,7 @@ impl Node {
         // Drop packet channels
         self.packet_tx.take();
         self.packet_rx.take();
+        self.disconnect_rx.take();
 
         // Shutdown TUN interface
         if let Some(name) = self.tun_name.take() {
