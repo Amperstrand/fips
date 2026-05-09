@@ -367,7 +367,7 @@ mod bluer_impl {
                     match tokio::time::timeout(BLE_SEND_TIMEOUT, conn_guard.send(&frame)).await {
                         Ok(Ok(_n)) => {}
                         Ok(Err(e)) => {
-                            warn!(remote_addr = %drain_remote, error = %e, "BLE linux drain task write error, marking connection dead");
+                            warn!(remote_addr = %drain_remote, error = %e, error_kind = ?e.kind(), "BLE linux drain task write error, marking connection dead");
                             drain_alive.store(false, Ordering::Relaxed);
                             break;
                         }

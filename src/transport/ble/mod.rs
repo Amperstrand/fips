@@ -483,6 +483,7 @@ impl<I: BleIo> BleTransport<I> {
             let local_pubkey = self.local_pubkey;
             let local_capabilities = self.local_capabilities;
             let discovery_buffer = Arc::clone(&self.discovery_buffer);
+            let backoff = Arc::clone(&self.backoff);
 
             let task = tokio::spawn(async move {
                 let result = tokio::time::timeout(
@@ -523,6 +524,9 @@ impl<I: BleIo> BleTransport<I> {
                                 stats: Arc::clone(&stats),
                                 recv_mtu,
                                 recv_timeout_secs: RECV_TIMEOUT_SECS,
+                                backoff: Arc::clone(&backoff),
+                                ble_addr: ble_addr.clone(),
+                                established_at: tokio::time::Instant::now(),
                             },
                         ));
 
@@ -878,6 +882,9 @@ async fn accept_loop<A, I: BleIo>(
                         stats: Arc::clone(&stats),
                         recv_mtu,
                         recv_timeout_secs: RECV_TIMEOUT_SECS,
+                        backoff: Arc::clone(&backoff),
+                        ble_addr: addr.clone(),
+                        established_at: tokio::time::Instant::now(),
                     },
                 ));
 
@@ -934,7 +941,16 @@ struct ReceiveLoopArgs {
     stats: Arc<BleStats>,
     recv_mtu: u16,
     recv_timeout_secs: u64,
+    backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    ble_addr: BleAddr,
+    established_at: tokio::time::Instant,
 }
+
+/// Minimum connection lifetime before a drop is considered "normal".
+/// Connections that last less than this trigger exponential backoff to
+/// prevent rapid reconnect cascades (observed when Linux BlueZ acts as
+/// BLE central to macOS CoreBluetooth peripherals).
+const MIN_HEALTHY_CONNECTION_SECS: u64 = 30;
 
 /// Receive loop: reads packets from a BLE stream and delivers to node.
 ///
@@ -979,16 +995,18 @@ async fn receive_loop<S: BleStream>(
                     args.stats.record_recv_error();
                     continue;
                 }
+                let uptime = start.elapsed();
                 if consecutive_errors >= 3 {
-                    warn!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, consecutive = consecutive_errors, "BLE receive errors exceeded threshold");
+                    warn!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, consecutive = consecutive_errors, uptime_secs = uptime.as_secs_f32(), "BLE receive errors exceeded threshold");
                 } else {
-                    debug!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, "BLE receive error");
+                    debug!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, uptime_secs = uptime.as_secs_f32(), "BLE receive error");
                 }
                 args.stats.record_recv_error();
                 break;
             }
             Err(_) => {
-                warn!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, "BLE recv timeout — link may be silently dead");
+                let uptime = start.elapsed();
+                warn!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, uptime_secs = uptime.as_secs_f32(), "BLE recv timeout — link may be silently dead");
                 args.stats.record_recv_error();
                 break;
             }
@@ -1000,6 +1018,17 @@ async fn receive_loop<S: BleStream>(
             transport_id: args.transport_id,
             remote_addr: args.addr.clone(),
         });
+    }
+
+    let uptime = args.established_at.elapsed();
+    if uptime < tokio::time::Duration::from_secs(MIN_HEALTHY_CONNECTION_SECS) {
+        info!(
+            transport_id = %args.transport_id,
+            remote_addr = %args.addr,
+            uptime_secs = uptime.as_secs_f32(),
+            "BLE connection dropped prematurely, recording backoff"
+        );
+        args.backoff.lock().await.record_failure(&args.ble_addr);
     }
 
     let mut pool = pool.lock().await;
@@ -1233,6 +1262,9 @@ async fn scan_probe_loop<I: io::BleIo>(
                         stats: Arc::clone(&stats),
                         recv_mtu,
                         recv_timeout_secs,
+                        backoff: Arc::clone(&backoff),
+                        ble_addr: addr.clone(),
+                        established_at: tokio::time::Instant::now(),
                     },
                 ));
 
