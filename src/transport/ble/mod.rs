@@ -527,6 +527,17 @@ impl<I: BleIo> BleTransport<I> {
                                 backoff: Arc::clone(&backoff),
                                 ble_addr: ble_addr.clone(),
                                 established_at: tokio::time::Instant::now(),
+                                on_cleanup: {
+                                    let io = Arc::clone(&io);
+                                    let ble_addr = ble_addr.clone();
+                                    Some(Box::new(move || {
+                                        let io = Arc::clone(&io);
+                                        let ble_addr = ble_addr.clone();
+                                        tokio::spawn(async move {
+                                            io.disconnect_device(&ble_addr).await;
+                                        });
+                                    }))
+                                },
                             },
                         ));
 
@@ -876,6 +887,17 @@ async fn accept_loop<A, I: BleIo>(
                         backoff: Arc::clone(&backoff),
                         ble_addr: addr.clone(),
                         established_at: tokio::time::Instant::now(),
+                        on_cleanup: {
+                            let io = Arc::clone(&io);
+                            let ble_addr = addr.clone();
+                            Some(Box::new(move || {
+                                let io = Arc::clone(&io);
+                                let ble_addr = ble_addr.clone();
+                                tokio::spawn(async move {
+                                    io.disconnect_device(&ble_addr).await;
+                                });
+                            }))
+                        },
                     },
                 ));
 
@@ -926,6 +948,12 @@ struct ReceiveLoopArgs {
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
     ble_addr: BleAddr,
     established_at: tokio::time::Instant,
+    /// Called once after the connection is removed from the pool.
+    /// Used on macOS to call `cancelPeripheralConnection` so CoreBluetooth
+    /// releases the peripheral and allows re-discovery. Not called during
+    /// cross-connection resolution (which uses `pool.insert()` →
+    /// `old.on_drop.take()` instead).
+    on_cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Minimum connection lifetime before a drop is considered "normal".
@@ -1015,6 +1043,12 @@ async fn receive_loop<S: BleStream>(
 
     let mut pool = pool.lock().await;
     pool.remove(&args.addr);
+    drop(pool);
+
+    if let Some(on_cleanup) = args.on_cleanup {
+        info!(transport_id = %args.transport_id, remote_addr = %args.addr, "BLE calling on_cleanup (disconnect_device for platform)");
+        on_cleanup();
+    }
 }
 
 /// Scanner supervisor: wraps scan_probe_loop and auto-restarts on
@@ -1247,6 +1281,17 @@ async fn scan_probe_loop<I: io::BleIo>(
                         backoff: Arc::clone(&backoff),
                         ble_addr: addr.clone(),
                         established_at: tokio::time::Instant::now(),
+                        on_cleanup: {
+                            let io = Arc::clone(&io);
+                            let ble_addr = addr.clone();
+                            Some(Box::new(move || {
+                                let io = Arc::clone(&io);
+                                let ble_addr = ble_addr.clone();
+                                tokio::spawn(async move {
+                                    io.disconnect_device(&ble_addr).await;
+                                });
+                            }))
+                        },
                     },
                 ));
 
@@ -1451,6 +1496,10 @@ mod tests {
                 stats,
                 recv_mtu: 2048,
                 recv_timeout_secs: 30,
+                backoff: Arc::new(Mutex::new(backoff::PeerBackoff::with_defaults())),
+                ble_addr: test_addr(2),
+                established_at: tokio::time::Instant::now(),
+                on_cleanup: None,
             },
         ));
 
