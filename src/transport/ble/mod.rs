@@ -111,9 +111,10 @@ pub struct BleTransport<I: BleIo> {
 }
 
 /// Receive timeout in seconds. BLE links under congestion can experience
-/// RTT spikes exceeding 35 seconds; 60 s avoids premature disconnects
-/// during transient congestion while still detecting truly dead links.
-const RECV_TIMEOUT_SECS: u64 = 60;
+/// RTT spikes exceeding 35 seconds; 120 s provides additional headroom for
+/// transient congestion during rekey and heavy traffic bursts while still
+/// detecting truly dead links.
+const RECV_TIMEOUT_SECS: u64 = 120;
 
 struct ConnectingEntry {
     task: JoinHandle<()>,
