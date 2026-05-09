@@ -530,7 +530,6 @@ impl<I: BleIo> BleTransport<I> {
                             },
                         ));
 
-                        let drop_addr = ble_addr.clone();
                         let conn = BleConnection {
                             stream,
                             recv_task: Some(recv_task),
@@ -539,15 +538,7 @@ impl<I: BleIo> BleTransport<I> {
                             established_at: tokio::time::Instant::now(),
                             is_static: false,
                             addr: ble_addr,
-                            on_drop: Some(Box::new({
-                                let io = io.clone();
-                                move || {
-                                    let io = io.clone();
-                                    tokio::spawn(async move {
-                                        io.disconnect_device(&drop_addr).await;
-                                    });
-                                }
-                            })),
+                            on_drop: None,
                         };
 
                         let mut pool = pool.lock().await;
@@ -889,7 +880,6 @@ async fn accept_loop<A, I: BleIo>(
                 ));
 
                 let backoff_addr = addr.clone();
-                let on_drop_addr = addr.clone();
                 let conn = BleConnection {
                     stream,
                     recv_task: Some(recv_task),
@@ -898,15 +888,7 @@ async fn accept_loop<A, I: BleIo>(
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr,
-                    on_drop: Some(Box::new({
-                        let io = io.clone();
-                        move || {
-                            let io = io.clone();
-                            tokio::spawn(async move {
-                                io.disconnect_device(&on_drop_addr).await;
-                            });
-                        }
-                    })),
+                    on_drop: None,
                 };
 
                 let mut pool_guard = pool.lock().await;
@@ -1268,7 +1250,6 @@ async fn scan_probe_loop<I: io::BleIo>(
                     },
                 ));
 
-                let drop_addr = addr.clone();
                 let conn = BleConnection {
                     stream,
                     recv_task: Some(recv_task),
@@ -1277,15 +1258,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr: addr.clone(),
-                    on_drop: Some(Box::new({
-                        let io = io.clone();
-                        move || {
-                            let io = io.clone();
-                            tokio::spawn(async move {
-                                io.disconnect_device(&drop_addr).await;
-                            });
-                        }
-                    })),
+                    on_drop: None,
                 };
 
                 let mut pool_guard = pool.lock().await;
