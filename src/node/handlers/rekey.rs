@@ -23,6 +23,12 @@ const REKEY_DAMPENING_SECS: u64 = 30;
 /// for this long to prevent rapid rekey cycles during reconnect storms.
 pub(in crate::node) const REKEY_COOLDOWN_AFTER_CONNECT_SECS: u64 = 60;
 
+/// Delay FMP initiator cutover after handshake completion to allow
+/// msg3 to reach the responder before K-bit-flipped data arrives.
+/// Matches FSP_CUTOVER_DELAY_MS to prevent decryption failures during
+/// the cutover window.
+const FMP_CUTOVER_DELAY_MS: u64 = 2000;
+
 /// Delay FSP initiator cutover after handshake completion to allow
 /// XK msg3 to reach the responder before K-bit-flipped data arrives.
 const FSP_CUTOVER_DELAY_MS: u64 = 2000;
@@ -55,14 +61,20 @@ impl Node {
         let mut peers_to_drain: Vec<NodeAddr> = Vec::new();
         let mut peers_to_rekey: Vec<NodeAddr> = Vec::new();
 
+        let now_ms = Self::now_ms();
+
         for (node_addr, peer) in &self.peers {
             if !peer.has_session() || !peer.is_healthy() {
                 continue;
             }
 
             // 1. Initiator-side cutover: we completed a rekey and have
-            //    a pending session ready. Cut over on the next tick.
-            if peer.pending_new_session().is_some() && !peer.rekey_in_progress() {
+            //    a pending session ready. Delay cutover until msg3 has
+            //    had time to reach the responder.
+            if peer.pending_new_session().is_some()
+                && !peer.rekey_in_progress()
+                && now_ms.saturating_sub(peer.rekey_completed_ms()) >= FMP_CUTOVER_DELAY_MS
+            {
                 peers_to_cutover.push(*node_addr);
                 continue;
             }
@@ -89,7 +101,7 @@ impl Node {
                 .map(|s| s.current_send_counter())
                 .unwrap_or(0);
 
-            let jittered_secs = rekey_after_secs + rekey_jitter_secs(node_addr, 5);
+            let jittered_secs = rekey_after_secs + rekey_jitter_secs(node_addr, rekey_after_secs / 3);
             if elapsed >= jittered_secs || counter >= rekey_after_messages {
                 peers_to_rekey.push(*node_addr);
             }
@@ -231,7 +243,7 @@ impl Node {
 
         // Send msg1 on the existing link (same transport + address)
         let sent = if let Some(transport) = self.transports.get(&transport_id) {
-            match transport.send(&remote_addr, &wire_msg1).await {
+            match transport.send_urgent(&remote_addr, &wire_msg1).await {
                 Ok(_) => {
                     debug!(
                         peer = %self.peer_display_name(node_addr),
@@ -323,7 +335,7 @@ impl Node {
             };
 
             let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                transport.send(&remote_addr, &msg1_bytes).await.is_ok()
+                transport.send_urgent(&remote_addr, &msg1_bytes).await.is_ok()
             } else {
                 false
             };
@@ -404,7 +416,7 @@ impl Node {
             let elapsed_secs = now_ms.saturating_sub(entry.session_start_ms()) / 1000;
             let counter = entry.send_counter();
 
-            let jittered_secs = rekey_after_secs + rekey_jitter_secs(node_addr, 5);
+            let jittered_secs = rekey_after_secs + rekey_jitter_secs(node_addr, rekey_after_secs / 3);
             if elapsed_secs >= jittered_secs || counter >= rekey_after_messages {
                 sessions_to_rekey.push(*node_addr);
             }

@@ -349,6 +349,7 @@ impl Node {
                                 noise_session,
                                 our_new_index,
                                 header.sender_idx,
+                                Self::now_ms(),
                             );
                             peer.record_peer_rekey();
                         }
@@ -632,7 +633,7 @@ impl Node {
                     match peer.complete_rekey_msg2(noise_msg2) {
                         Ok(session) => {
                             let our_index = peer.rekey_our_index().unwrap_or(header.receiver_idx);
-                            peer.set_pending_session(session, our_index, header.sender_idx);
+                            peer.set_pending_session(session, our_index, header.sender_idx, Self::now_ms());
 
                             if let Some(transport_id) = peer.transport_id() {
                                 self.peers_by_index

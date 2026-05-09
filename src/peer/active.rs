@@ -173,6 +173,9 @@ pub struct ActivePeer {
     pending_their_index: Option<SessionIndex>,
     /// Whether a rekey is currently in progress (handshake sent, not yet complete).
     rekey_in_progress: bool,
+    /// Timestamp (Unix ms) when the pending rekey session was completed.
+    /// Used to delay K-bit cutover so msg3 reaches the responder first.
+    rekey_completed_ms: u64,
     /// When we last received a rekey msg1 from this peer (dampening).
     last_peer_rekey: Option<Instant>,
     /// Earliest time at which rekey is allowed.
@@ -233,6 +236,7 @@ impl ActivePeer {
             pending_our_index: None,
             pending_their_index: None,
             rekey_in_progress: false,
+            rekey_completed_ms: 0,
             last_peer_rekey: None,
             rekey_allowed_after: None,
             rekey_handshake: None,
@@ -314,6 +318,7 @@ impl ActivePeer {
             pending_our_index: None,
             pending_their_index: None,
             rekey_in_progress: false,
+            rekey_completed_ms: 0,
             last_peer_rekey: None,
             rekey_allowed_after: None,
             rekey_handshake: None,
@@ -805,6 +810,10 @@ impl ActivePeer {
         self.rekey_in_progress
     }
 
+    pub fn rekey_completed_ms(&self) -> u64 {
+        self.rekey_completed_ms
+    }
+
     /// Mark that a rekey has been initiated.
     pub fn set_rekey_in_progress(&mut self) {
         self.rekey_in_progress = true;
@@ -873,12 +882,13 @@ impl ActivePeer {
         session: NoiseSession,
         our_index: SessionIndex,
         their_index: SessionIndex,
+        now_ms: u64,
     ) {
         self.pending_new_session = Some(session);
         self.pending_our_index = Some(our_index);
         self.pending_their_index = Some(their_index);
         self.rekey_in_progress = false;
-        // Clear initiator handshake state (index now lives in pending_our_index)
+        self.rekey_completed_ms = now_ms;
         self.rekey_our_index = None;
         self.rekey_handshake = None;
         self.rekey_msg1 = None;
@@ -911,9 +921,9 @@ impl ActivePeer {
         trace!(reason = "rekey_cutover", "session_established_at reset");
         self.session_start = Instant::now();
         self.rekey_in_progress = false;
+        self.rekey_completed_ms = 0;
         self.reset_replay_suppressed();
 
-        // Reset MMP counters to avoid metric discontinuity
         let now = Instant::now();
         if let Some(mmp) = &mut self.mmp {
             mmp.reset_for_rekey(now);
