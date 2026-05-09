@@ -124,10 +124,13 @@ impl SendRateLimiter {
 const RTT_LOW_MS: f64 = 200.0;
 
 /// RTT above this (ms) → congested → reduce rate to drain queue.
-/// Observed data-transfer RTT is 280-370ms. Setting at 500ms avoids
-/// false congestion signals during normal data transfer while still
-/// catching genuine queue buildup (>500ms = real congestion).
-const RTT_HIGH_MS: f64 = 500.0;
+/// Reduced from 500 ms to 400 ms to catch congestion earlier, before the
+/// L2CAP buffer fills to the point of causing 30 s+ RTT spikes.
+const RTT_HIGH_MS: f64 = 400.0;
+
+/// RTT above this (ms) → severe congestion → apply stronger backoff.
+/// At 1000 ms the link is in critical queue-overflow territory.
+const RTT_SEVERE_MS: f64 = 1000.0;
 
 /// Minimum rate. Must be BELOW actual BLE throughput (~34kbps) so the
 /// adapter can slow down to match the link. Previous 50kbps was above
@@ -135,14 +138,17 @@ const RTT_HIGH_MS: f64 = 500.0;
 const MIN_RATE_BPS: u64 = 15_000;
 
 /// Maximum sustainable BLE rate. Experiments show the L2CAP link dies after
-/// 3-5 minutes at ~110 kbps. Setting a conservative ceiling to let the AIMD
-/// adapter probe safely without overshooting into link-death territory.
-/// The adapter will increase from MIN up to this cap; adjust down if links
-/// still drop.
-pub const MAX_RATE_BPS: u64 = 80_000;
+/// 3-5 minutes at ~110 kbps. Reduced from 80 kbps to 50 kbps ceiling to
+/// further reduce link stress — the AIMD adapter probes up from MIN but must
+/// not overshoot into link-death territory. Links still dropping at 50 kbps
+/// indicate hardware or environmental issues rather than rate-induced stress.
+pub const MAX_RATE_BPS: u64 = 50_000;
 
 /// On congestion: `rate *= MD_FACTOR` (0.7 = 30% reduction).
 const MD_FACTOR: f64 = 0.7;
+
+/// On severe congestion: `rate *= MD_SEVERE_FACTOR` (0.5 = 50% reduction).
+const MD_SEVERE_FACTOR: f64 = 0.5;
 
 /// On uncongested: `rate += AI_STEP`. Conservative to avoid re-congestion.
 const AI_STEP_BPS: u64 = 5_000;
@@ -178,7 +184,10 @@ impl BleRateAdapter {
             return self.current_rate_bps;
         }
 
-        if srtt_ms > RTT_HIGH_MS {
+        if srtt_ms > RTT_SEVERE_MS {
+            self.current_rate_bps =
+                ((self.current_rate_bps as f64 * MD_SEVERE_FACTOR) as u64).max(MIN_RATE_BPS);
+        } else if srtt_ms > RTT_HIGH_MS {
             self.current_rate_bps =
                 ((self.current_rate_bps as f64 * MD_FACTOR) as u64).max(MIN_RATE_BPS);
         } else if srtt_ms < RTT_LOW_MS {
@@ -236,27 +245,27 @@ mod tests {
 
     #[test]
     fn test_rate_adapter_additive_increase() {
-        let mut adapter = BleRateAdapter::new(60_000);
-        assert_eq!(adapter.current_rate_bps(), 60_000);
+        let mut adapter = BleRateAdapter::new(40_000);
+        assert_eq!(adapter.current_rate_bps(), 40_000);
 
         let rate = adapter.update(150.0);
-        assert_eq!(rate, 65_000);
+        assert_eq!(rate, 45_000);
     }
 
     #[test]
     fn test_rate_adapter_multiplicative_decrease() {
-        let mut adapter = BleRateAdapter::new(80_000);
+        let mut adapter = BleRateAdapter::new(50_000);
 
         let rate = adapter.update(600.0);
-        assert_eq!(rate, 56_000); // 80k * 0.7
+        assert_eq!(rate, 35_000); // 50k * 0.7
     }
 
     #[test]
     fn test_rate_adapter_steady_zone() {
-        let mut adapter = BleRateAdapter::new(60_000);
+        let mut adapter = BleRateAdapter::new(40_000);
 
-        let rate = adapter.update(400.0);
-        assert_eq!(rate, 60_000);
+        let rate = adapter.update(300.0);
+        assert_eq!(rate, 40_000);
     }
 
     #[test]
@@ -268,11 +277,19 @@ mod tests {
     }
 
     #[test]
+    fn test_rate_adapter_severe_congestion() {
+        let mut adapter = BleRateAdapter::new(40_000);
+
+        let rate = adapter.update(1500.0);
+        assert_eq!(rate, 20_000); // 40k * 0.5 (severe)
+    }
+
+    #[test]
     fn test_rate_adapter_clamps_to_max() {
-        let mut adapter = BleRateAdapter::new(80_000);
+        let mut adapter = BleRateAdapter::new(50_000);
 
         let rate = adapter.update(200.0);
-        assert_eq!(rate, 80_000);
+        assert_eq!(rate, 50_000);
     }
 
     #[test]
