@@ -696,6 +696,21 @@ const DEFAULT_BLE_CONNECT_TIMEOUT_MS: u64 = 10_000;
 /// (success or failure), wait this long before probing it again.
 const DEFAULT_BLE_PROBE_COOLDOWN_SECS: u64 = 30;
 
+/// Default BLE connection parameter refresh interval in seconds. None = disabled.
+const DEFAULT_BLE_CONN_PARAM_REFRESH_SECS: Option<u64> = None;
+
+/// Default BLE min connection interval in 1.25ms units (6 = 7.5ms).
+const DEFAULT_BLE_CONN_PARAM_MIN_INTERVAL: u16 = 6;
+
+/// Default BLE max connection interval in 1.25ms units (20 = 25ms).
+const DEFAULT_BLE_CONN_PARAM_MAX_INTERVAL: u16 = 20;
+
+/// Default BLE peripheral latency.
+const DEFAULT_BLE_CONN_PARAM_LATENCY: u16 = 0;
+
+/// Default BLE supervision timeout in 10ms units (500 = 5s).
+const DEFAULT_BLE_CONN_PARAM_TIMEOUT: u16 = 500;
+
 /// BLE transport instance configuration.
 ///
 /// BleConfig is always compiled (for config parsing on any platform),
@@ -751,6 +766,29 @@ pub struct BleConfig {
     /// Send burst size in bytes. Default: 2048.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_burst_bytes: Option<u32>,
+
+    /// Connection parameter refresh interval in seconds. When set, periodically
+    /// runs `hcitool lecup` to force the BLE controller to re-negotiate tight
+    /// connection intervals, preventing the interval drift that causes
+    /// monotonically increasing RTT. None = disabled. Linux only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_param_refresh_secs: Option<u64>,
+
+    /// BLE minimum connection interval in 1.25ms units. Default: 6 (7.5ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_param_min_interval: Option<u16>,
+
+    /// BLE maximum connection interval in 1.25ms units. Default: 20 (25ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_param_max_interval: Option<u16>,
+
+    /// BLE peripheral latency. Default: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_param_latency: Option<u16>,
+
+    /// BLE supervision timeout in 10ms units. Default: 500 (5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_param_timeout: Option<u16>,
 }
 
 impl BleConfig {
@@ -829,6 +867,31 @@ impl BleConfig {
         self.send_burst_bytes.unwrap_or(2048)
     }
 
+    /// Connection parameter refresh interval in seconds. None = disabled.
+    pub fn conn_param_refresh_secs(&self) -> Option<u64> {
+        self.conn_param_refresh_secs.or(DEFAULT_BLE_CONN_PARAM_REFRESH_SECS)
+    }
+
+    /// BLE min connection interval in 1.25ms units. Default: 6 (7.5ms).
+    pub fn conn_param_min_interval(&self) -> u16 {
+        self.conn_param_min_interval.unwrap_or(DEFAULT_BLE_CONN_PARAM_MIN_INTERVAL)
+    }
+
+    /// BLE max connection interval in 1.25ms units. Default: 20 (25ms).
+    pub fn conn_param_max_interval(&self) -> u16 {
+        self.conn_param_max_interval.unwrap_or(DEFAULT_BLE_CONN_PARAM_MAX_INTERVAL)
+    }
+
+    /// BLE peripheral latency. Default: 0.
+    pub fn conn_param_latency(&self) -> u16 {
+        self.conn_param_latency.unwrap_or(DEFAULT_BLE_CONN_PARAM_LATENCY)
+    }
+
+    /// BLE supervision timeout in 10ms units. Default: 500 (5s).
+    pub fn conn_param_timeout(&self) -> u16 {
+        self.conn_param_timeout.unwrap_or(DEFAULT_BLE_CONN_PARAM_TIMEOUT)
+    }
+
     pub fn validate(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -847,6 +910,18 @@ impl BleConfig {
         if self.send_burst_bytes == Some(0) {
             self.send_burst_bytes = None;
             warnings.push("transports.ble.send_burst_bytes was 0, reset to default 2048".into());
+        }
+        if self.conn_param_min_interval == Some(0) {
+            self.conn_param_min_interval = None;
+            warnings.push("transports.ble.conn_param_min_interval was 0, reset to default 6".into());
+        }
+        if self.conn_param_max_interval == Some(0) {
+            self.conn_param_max_interval = None;
+            warnings.push("transports.ble.conn_param_max_interval was 0, reset to default 20".into());
+        }
+        if self.conn_param_timeout == Some(0) {
+            self.conn_param_timeout = None;
+            warnings.push("transports.ble.conn_param_timeout was 0, reset to default 500".into());
         }
 
         warnings

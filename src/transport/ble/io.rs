@@ -1210,10 +1210,163 @@ mod bluer_impl {
         fn require<T: Send + Sync>() {}
         require::<BluerIo>();
     }
+
+    /// Run `hcitool con` and find the connection handle for the given BLE address.
+    ///
+    /// `hcitool con` output format:
+    /// ```text
+    /// < LE AA:BB:CC:DD:EE:FF handle 42 state 1 lm CENTRAL
+    /// ```
+    ///
+    /// Returns the handle number (e.g. `42`) if found, or `None`.
+    async fn find_hci_handle(ble_addr: &BleAddr) -> Option<u16> {
+        let mac = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            ble_addr.device[0],
+            ble_addr.device[1],
+            ble_addr.device[2],
+            ble_addr.device[3],
+            ble_addr.device[4],
+            ble_addr.device[5],
+        );
+
+        let output = tokio::process::Command::new("hcitool")
+            .arg("con")
+            .output()
+            .await
+            .ok()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if !line.contains(&mac) {
+                continue;
+            }
+            // Parse "handle NNN" from the line
+            if let Some(handle_str) = line.split("handle").nth(1) {
+                let handle_str = handle_str.trim();
+                let handle_num = handle_str.split_whitespace().next()?;
+                return handle_num.parse::<u16>().ok();
+            }
+        }
+        None
+    }
+
+    /// Run `sudo hcitool lecup` to refresh BLE connection parameters.
+    async fn run_lecup(handle: u16, min: u16, max: u16, latency: u16, timeout: u16) -> Result<(), String> {
+        let output = tokio::process::Command::new("sudo")
+            .args([
+                "hcitool",
+                "lecup",
+                &format!("--handle=0x{:04X}", handle),
+                &format!("--min={}", min),
+                &format!("--max={}", max),
+                &format!("--latency={}", latency),
+                &format!("--timeout={}", timeout),
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("failed to execute sudo hcitool lecup: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "sudo hcitool lecup exited with {}: {}",
+                output.status, stderr.trim()
+            ))
+        }
+    }
+
+    /// Spawn a background task that periodically refreshes BLE connection parameters.
+    ///
+    /// Every `interval_secs` seconds, runs `hcitool con` to find the connection
+    /// handle for `ble_addr`, then `sudo hcitool lecup` to re-negotiate tight
+    /// connection intervals. Stops gracefully if the handle disappears (device
+    /// disconnected). Returns a `JoinHandle` so the caller can cancel it.
+    pub fn spawn_conn_param_refresh_loop(
+        ble_addr: BleAddr,
+        interval_secs: u64,
+        min_interval: u16,
+        max_interval: u16,
+        latency: u16,
+        supervision_timeout: u16,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.tick().await; // skip the immediate first tick
+
+            loop {
+                ticker.tick().await;
+
+                let handle = match find_hci_handle(&ble_addr).await {
+                    Some(h) => h,
+                    None => {
+                        debug!(
+                            remote_addr = %ble_addr,
+                            "BLE conn param refresh: no HCI handle found, device likely disconnected"
+                        );
+                        return;
+                    }
+                };
+
+                debug!(
+                    remote_addr = %ble_addr,
+                    handle = handle,
+                    min = min_interval,
+                    max = max_interval,
+                    latency = latency,
+                    timeout = supervision_timeout,
+                    "BLE conn param refresh: running hcitool lecup"
+                );
+
+                let addr_str = ble_addr.to_string_repr();
+                match run_lecup(handle, min_interval, max_interval, latency, supervision_timeout).await {
+                    Ok(()) => {
+                        crate::transport::ble::event_log::log(
+                            "ble_conn_param_refresh",
+                            &addr_str,
+                            &[
+                                ("handle", &format!("0x{:04X}", handle)),
+                                ("min", &min_interval.to_string()),
+                                ("max", &max_interval.to_string()),
+                                ("latency", &latency.to_string()),
+                                ("timeout", &supervision_timeout.to_string()),
+                            ],
+                        );
+                        debug!(
+                            remote_addr = %ble_addr,
+                            handle = handle,
+                            "BLE conn param refresh: hcitool lecup succeeded"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            remote_addr = %ble_addr,
+                            handle = handle,
+                            error = %e,
+                            "BLE conn param refresh: hcitool lecup failed"
+                        );
+                        crate::transport::ble::event_log::log(
+                            "ble_conn_param_refresh_failed",
+                            &addr_str,
+                            &[
+                                ("handle", &format!("0x{:04X}", handle)),
+                                ("error", &e),
+                            ],
+                        );
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[cfg(bluer_available)]
-pub use bluer_impl::{BluerAcceptor, BluerIo, BluerScanner, BluerStream};
+pub use bluer_impl::{
+    spawn_conn_param_refresh_loop, BluerAcceptor, BluerIo, BluerScanner, BluerStream,
+};
 
 // ============================================================================
 // BluestIo — macOS BLE I/O via CoreBluetooth (bluest)

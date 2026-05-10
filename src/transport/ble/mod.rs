@@ -253,6 +253,11 @@ impl<I: BleIo> BleTransport<I> {
                         Arc::clone(&self.discovery_buffer),
                         self.local_capabilities,
                         Arc::clone(&self.backoff),
+                        self.config.conn_param_refresh_secs(),
+                        self.config.conn_param_min_interval(),
+                        self.config.conn_param_max_interval(),
+                        self.config.conn_param_latency(),
+                        self.config.conn_param_timeout(),
                     )));
                     debug!(adapter = %adapter, psm = psm, "BLE accept loop started");
                 }
@@ -294,6 +299,11 @@ impl<I: BleIo> BleTransport<I> {
                         self.transport_id,
                         self.local_capabilities,
                         Arc::clone(&self.backoff),
+                        self.config.conn_param_refresh_secs(),
+                        self.config.conn_param_min_interval(),
+                        self.config.conn_param_max_interval(),
+                        self.config.conn_param_latency(),
+                        self.config.conn_param_timeout(),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe supervisor started");
                 }
@@ -487,6 +497,11 @@ impl<I: BleIo> BleTransport<I> {
             let local_capabilities = self.local_capabilities;
             let discovery_buffer = Arc::clone(&self.discovery_buffer);
             let backoff = Arc::clone(&self.backoff);
+            let conn_param_refresh_secs = self.config.conn_param_refresh_secs();
+            let conn_param_min_interval = self.config.conn_param_min_interval();
+            let conn_param_max_interval = self.config.conn_param_max_interval();
+            let conn_param_latency = self.config.conn_param_latency();
+            let conn_param_timeout = self.config.conn_param_timeout();
 
             let task = tokio::spawn(async move {
                 let result = tokio::time::timeout(
@@ -545,6 +560,11 @@ impl<I: BleIo> BleTransport<I> {
                                         });
                                     }))
                                 },
+                                conn_param_refresh_secs,
+                                conn_param_min_interval,
+                                conn_param_max_interval,
+                                conn_param_latency,
+                                conn_param_timeout,
                             },
                         ));
 
@@ -817,6 +837,11 @@ async fn accept_loop<A, I: BleIo>(
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    conn_param_refresh_secs: Option<u64>,
+    conn_param_min_interval: u16,
+    conn_param_max_interval: u16,
+    conn_param_latency: u16,
+    conn_param_timeout: u16,
 ) where
     A: io::BleAcceptor,
     A::Stream: 'static,
@@ -910,6 +935,11 @@ async fn accept_loop<A, I: BleIo>(
                                 });
                             }))
                         },
+                        conn_param_refresh_secs,
+                        conn_param_min_interval,
+                        conn_param_max_interval,
+                        conn_param_latency,
+                        conn_param_timeout,
                     },
                 ));
 
@@ -960,12 +990,12 @@ struct ReceiveLoopArgs {
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
     ble_addr: BleAddr,
     established_at: tokio::time::Instant,
-    /// Called once after the connection is removed from the pool.
-    /// Used on macOS to call `cancelPeripheralConnection` so CoreBluetooth
-    /// releases the peripheral and allows re-discovery. Not called during
-    /// cross-connection resolution (which uses `pool.insert()` →
-    /// `old.on_drop.take()` instead).
     on_cleanup: Option<Box<dyn FnOnce() + Send>>,
+    conn_param_refresh_secs: Option<u64>,
+    conn_param_min_interval: u16,
+    conn_param_max_interval: u16,
+    conn_param_latency: u16,
+    conn_param_timeout: u16,
 }
 
 /// Minimum connection lifetime before a drop is considered "normal".
@@ -987,6 +1017,19 @@ async fn receive_loop<S: BleStream>(
     let mut buf = vec![0u8; args.recv_mtu as usize];
     let start = std::time::Instant::now();
     let mut consecutive_errors: u32 = 0;
+
+    #[cfg(bluer_available)]
+    let _conn_param_refresh_task: Option<tokio::task::JoinHandle<()>> =
+        args.conn_param_refresh_secs.map(|secs| {
+            io::spawn_conn_param_refresh_loop(
+                args.ble_addr.clone(),
+                secs,
+                args.conn_param_min_interval,
+                args.conn_param_max_interval,
+                args.conn_param_latency,
+                args.conn_param_timeout,
+            )
+        });
 
     event_log::log("ble_connect", &args.addr.to_string(), &[
         ("transport_id", &args.transport_id.to_string()),
@@ -1057,6 +1100,11 @@ async fn receive_loop<S: BleStream>(
         }
     }
 
+    #[cfg(bluer_available)]
+    if let Some(task) = _conn_param_refresh_task {
+        task.abort();
+    }
+
     if let Some(tx) = disconnect_tx {
         let _ = tx.try_send(TransportDisconnect {
             transport_id: args.transport_id,
@@ -1104,6 +1152,11 @@ async fn scan_probe_supervisor<I: io::BleIo>(
     transport_id: TransportId,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    conn_param_refresh_secs: Option<u64>,
+    conn_param_min_interval: u16,
+    conn_param_max_interval: u16,
+    conn_param_latency: u16,
+    conn_param_timeout: u16,
 ) {
     let mut scanner = Some(scanner);
     let mut restart_backoff = tokio::time::Duration::from_secs(2);
@@ -1127,6 +1180,11 @@ async fn scan_probe_supervisor<I: io::BleIo>(
                 transport_id,
                 local_capabilities,
                 Arc::clone(&backoff),
+                conn_param_refresh_secs,
+                conn_param_min_interval,
+                conn_param_max_interval,
+                conn_param_latency,
+                conn_param_timeout,
             )
             .await;
         }
@@ -1175,6 +1233,11 @@ async fn scan_probe_loop<I: io::BleIo>(
     transport_id: TransportId,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    conn_param_refresh_secs: Option<u64>,
+    conn_param_min_interval: u16,
+    conn_param_max_interval: u16,
+    conn_param_latency: u16,
+    conn_param_timeout: u16,
 ) {
     let mut last_probed: HashMap<BleAddr, tokio::time::Instant> = HashMap::new();
     let mut pending_addrs: Vec<BleAddr> = Vec::new();
@@ -1326,6 +1389,11 @@ async fn scan_probe_loop<I: io::BleIo>(
                                 });
                             }))
                         },
+                        conn_param_refresh_secs,
+                        conn_param_min_interval,
+                        conn_param_max_interval,
+                        conn_param_latency,
+                        conn_param_timeout,
                     },
                 ));
 
@@ -1534,6 +1602,11 @@ mod tests {
                 ble_addr: test_addr(2),
                 established_at: tokio::time::Instant::now(),
                 on_cleanup: None,
+                conn_param_refresh_secs: None,
+                conn_param_min_interval: 6,
+                conn_param_max_interval: 20,
+                conn_param_latency: 0,
+                conn_param_timeout: 500,
             },
         ));
 
