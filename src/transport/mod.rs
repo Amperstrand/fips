@@ -1134,7 +1134,7 @@ impl TransportHandle {
         }
     }
 
-    /// Close a specific connection on this transport.
+    /// Close a specific connection on this transport (async).
     ///
     /// No-op for connectionless transports. For TCP/Tor, removes the
     /// connection from the pool and drops the stream.
@@ -1147,6 +1147,22 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.close_connection_async(addr).await,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.close_connection_async(addr).await,
+        }
+    }
+
+    /// Close a specific connection on this transport (sync, best-effort).
+    ///
+    /// Uses try_lock to avoid blocking. If the pool lock is contended,
+    /// the close is skipped and the connection will eventually time out.
+    pub fn close_connection_sync(&self, addr: &TransportAddr) {
+        match self {
+            TransportHandle::Udp(t) => t.close_connection(addr),
+            #[cfg(unix)]
+            TransportHandle::Ethernet(t) => t.close_connection(addr),
+            TransportHandle::Tcp(_) => {},
+            TransportHandle::Tor(_) => {},
+            #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+            TransportHandle::Ble(t) => t.close_connection(addr),
         }
     }
 

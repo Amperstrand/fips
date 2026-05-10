@@ -176,10 +176,10 @@ impl Node {
 
         if let Some(srtt_ms) = ble_srtt_ms
             && let Some(tid) = peer_transport_id
-            && let Some(taddr) = peer_transport_addr
+            && let Some(ref taddr) = peer_transport_addr
             && let Some(transport) = self.transports.get(&tid)
         {
-            transport.update_rate_from_srtt(&taddr, srtt_ms).await;
+            transport.update_rate_from_srtt(taddr, srtt_ms).await;
         }
 
         // H13: Proactive reconnect when SRTT exceeds threshold for BLE transport.
@@ -207,7 +207,13 @@ impl Node {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                let close_target = peer_transport_id.zip(peer_transport_addr.as_ref().cloned());
                 self.remove_active_peer(from);
+                if let Some((tid, taddr)) = close_target {
+                    if let Some(transport) = self.transports.get(&tid) {
+                        transport.close_connection_sync(&taddr);
+                    }
+                }
                 self.schedule_reconnect(addr, now_ms);
                 return;
             }

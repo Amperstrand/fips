@@ -731,7 +731,13 @@ impl<I: BleIo> Transport for BleTransport<I> {
         self.config.accept_connections()
     }
 
-    fn close_connection(&self, _addr: &TransportAddr) {}
+    fn close_connection(&self, addr: &TransportAddr) {
+        if let Ok(mut pool) = self.pool.try_lock() {
+            if pool.remove(addr).is_some() {
+                debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE connection closed (sync)");
+            }
+        }
+    }
 }
 
 // ============================================================================
