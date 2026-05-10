@@ -182,6 +182,37 @@ impl Node {
             transport.update_rate_from_srtt(&taddr, srtt_ms).await;
         }
 
+        // H13: Proactive reconnect when SRTT exceeds threshold for BLE transport.
+        // Since SRTT resets to ~1s after reconnect (ActivePeer is rebuilt),
+        // this caps the effective RTT by forcing a reconnection with fresh
+        // BLE connection parameters.
+        if let Some(srtt_ms) = ble_srtt_ms {
+            let exceeded = self.config.transports.ble.iter().find_map(|(_, cfg)| {
+                cfg.srtt_reconnect_threshold_ms()
+                    .filter(|&threshold| srtt_ms > threshold as f64)
+            });
+            if exceeded.is_some() {
+                ble_log("srtt_reconnect", &peer_name, &[
+                    ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                    ("threshold_ms", &format!("{}", exceeded.unwrap())),
+                ]);
+                warn!(
+                    peer = %peer_name,
+                    srtt_ms = format!("{:.1}", srtt_ms),
+                    threshold_ms = exceeded.unwrap(),
+                    "Proactive BLE reconnect: SRTT exceeded threshold"
+                );
+                let addr = *from;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.remove_active_peer(from);
+                self.schedule_reconnect(addr, now_ms);
+                return;
+            }
+        }
+
         // First RTT sample — peer is now eligible for parent selection.
         // Trigger re-evaluation so the node doesn't wait for the next
         // periodic tick or TreeAnnounce.

@@ -789,6 +789,13 @@ pub struct BleConfig {
     /// BLE supervision timeout in 10ms units. Default: 500 (5s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn_param_timeout: Option<u16>,
+
+    /// SRTT threshold in milliseconds. When the smoothed RTT exceeds this value,
+    /// the BLE transport proactively disconnects to force a reconnection with
+    /// fresh BLE connection parameters. This caps the effective RTT since SRTT
+    /// resets on reconnect. None = disabled. Default: disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srtt_reconnect_threshold_ms: Option<u64>,
 }
 
 impl BleConfig {
@@ -892,6 +899,11 @@ impl BleConfig {
         self.conn_param_timeout.unwrap_or(DEFAULT_BLE_CONN_PARAM_TIMEOUT)
     }
 
+    /// SRTT reconnect threshold in milliseconds. None = disabled.
+    pub fn srtt_reconnect_threshold_ms(&self) -> Option<u64> {
+        self.srtt_reconnect_threshold_ms
+    }
+
     pub fn validate(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -922,6 +934,10 @@ impl BleConfig {
         if self.conn_param_timeout == Some(0) {
             self.conn_param_timeout = None;
             warnings.push("transports.ble.conn_param_timeout was 0, reset to default 500".into());
+        }
+        if self.srtt_reconnect_threshold_ms == Some(0) {
+            self.srtt_reconnect_threshold_ms = None;
+            warnings.push("transports.ble.srtt_reconnect_threshold_ms was 0, reset to disabled".into());
         }
 
         warnings
