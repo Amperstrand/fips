@@ -185,17 +185,33 @@ impl BleRateAdapter {
             return self.current_rate_bps;
         }
 
-        if srtt_ms > RTT_SEVERE_MS {
+        let old_rate = self.current_rate_bps;
+
+        let decision = if srtt_ms > RTT_SEVERE_MS {
             self.current_rate_bps =
                 ((self.current_rate_bps as f64 * MD_SEVERE_FACTOR) as u64).max(MIN_RATE_BPS);
+            "decrease_severe"
         } else if srtt_ms > RTT_HIGH_MS {
             self.current_rate_bps =
                 ((self.current_rate_bps as f64 * MD_FACTOR) as u64).max(MIN_RATE_BPS);
+            "decrease"
         } else if srtt_ms < RTT_LOW_MS {
             self.current_rate_bps = self
                 .current_rate_bps
                 .saturating_add(AI_STEP_BPS)
                 .min(MAX_RATE_BPS);
+            "increase"
+        } else {
+            "hold"
+        };
+
+        if old_rate != self.current_rate_bps {
+            super::event_log::log("rate_adapter", "", &[
+                ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                ("old_rate_bps", &old_rate.to_string()),
+                ("new_rate_bps", &self.current_rate_bps.to_string()),
+                ("decision", decision),
+            ]);
         }
 
         self.current_rate_bps

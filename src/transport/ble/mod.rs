@@ -22,6 +22,7 @@ pub mod addr;
 pub mod backoff;
 pub mod capabilities;
 pub mod discovery;
+pub mod event_log;
 pub mod io;
 pub mod pool;
 pub mod rate_limit;
@@ -377,9 +378,11 @@ impl<I: BleIo> BleTransport<I> {
                 self.stats.record_send_error();
                 if matches!(e, TransportError::SendFailed(_)) {
                     self.congested.store(true, Ordering::Relaxed);
+                    event_log::log("ble_congested", &addr.to_string(), &[]);
                     debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE send dropped (congested), packet discarded");
                     return Err(e);
                 }
+                event_log::log("ble_send_failed", &addr.to_string(), &[("error", &format!("{e}"))]);
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 if let Some(tx) = &self.disconnect_tx {
@@ -511,6 +514,10 @@ impl<I: BleIo> BleTransport<I> {
 
                         let send_mtu = stream.send_mtu();
                         let recv_mtu = stream.recv_mtu();
+                        event_log::log("ble_outbound", &addr_clone.to_string(), &[
+                            ("send_mtu", &send_mtu.to_string()),
+                            ("recv_mtu", &recv_mtu.to_string()),
+                        ]);
                         let stream = Arc::new(stream);
 
                         let recv_task = tokio::spawn(receive_loop(
@@ -836,6 +843,11 @@ async fn accept_loop<A, I: BleIo>(
                 let send_mtu = stream.send_mtu();
                 let recv_mtu = stream.recv_mtu();
 
+                event_log::log("ble_inbound", &ta.to_string(), &[
+                    ("send_mtu", &send_mtu.to_string()),
+                    ("recv_mtu", &recv_mtu.to_string()),
+                ]);
+
                 if let Some(ref our_pubkey) = local_pubkey {
                     if stream.supports_bidirectional_pubkey_exchange() {
                         match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
@@ -975,6 +987,13 @@ async fn receive_loop<S: BleStream>(
     let mut buf = vec![0u8; args.recv_mtu as usize];
     let start = std::time::Instant::now();
     let mut consecutive_errors: u32 = 0;
+
+    event_log::log("ble_connect", &args.addr.to_string(), &[
+        ("transport_id", &args.transport_id.to_string()),
+        ("recv_timeout_secs", &args.recv_timeout_secs.to_string()),
+        ("recv_mtu", &args.recv_mtu.to_string()),
+    ]);
+
     loop {
         let recv_result = tokio::time::timeout(
             std::time::Duration::from_secs(args.recv_timeout_secs),
@@ -985,6 +1004,10 @@ async fn receive_loop<S: BleStream>(
         match recv_result {
             Ok(Ok(0)) => {
                 let elapsed = start.elapsed();
+                event_log::log("ble_disconnect", &args.addr.to_string(), &[
+                    ("reason", "closed_by_peer"),
+                    ("uptime_secs", &format!("{:.1}", elapsed.as_secs_f32())),
+                ]);
                 info!(transport_id = %args.transport_id, remote_addr = %args.addr, elapsed_secs = elapsed.as_secs_f32(), "BLE connection closed by peer");
                 break;
             }
@@ -1006,6 +1029,12 @@ async fn receive_loop<S: BleStream>(
                     continue;
                 }
                 let uptime = start.elapsed();
+                event_log::log("ble_disconnect", &args.addr.to_string(), &[
+                    ("reason", "recv_error"),
+                    ("error", &err_str),
+                    ("consecutive_errors", &consecutive_errors.to_string()),
+                    ("uptime_secs", &format!("{:.1}", uptime.as_secs_f32())),
+                ]);
                 if consecutive_errors >= 3 {
                     warn!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, consecutive = consecutive_errors, uptime_secs = uptime.as_secs_f32(), "BLE receive errors exceeded threshold");
                 } else {
@@ -1016,6 +1045,11 @@ async fn receive_loop<S: BleStream>(
             }
             Err(_) => {
                 let uptime = start.elapsed();
+                event_log::log("ble_disconnect", &args.addr.to_string(), &[
+                    ("reason", "recv_timeout"),
+                    ("timeout_secs", &args.recv_timeout_secs.to_string()),
+                    ("uptime_secs", &format!("{:.1}", uptime.as_secs_f32())),
+                ]);
                 warn!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, uptime_secs = uptime.as_secs_f32(), "BLE recv timeout — link may be silently dead");
                 args.stats.record_recv_error();
                 break;

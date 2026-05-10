@@ -16,6 +16,27 @@ use crate::protocol::{
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
+#[cfg(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+use crate::transport::ble::event_log;
+
+#[cfg(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+fn ble_log(event: &str, peer: &str, fields: &[(&str, &str)]) {
+    event_log::log(event, peer, fields);
+}
+
+#[cfg(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos"))]
+fn ble_log_enabled() -> bool {
+    event_log::is_enabled()
+}
+
+#[cfg(not(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos")))]
+fn ble_log(_event: &str, _peer: &str, _fields: &[(&str, &str)]) {}
+
+#[cfg(not(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos")))]
+fn ble_log_enabled() -> bool {
+    false
+}
+
 /// Format bytes/sec as human-readable throughput.
 fn format_throughput(bps: f64) -> String {
     if bps == 0.0 {
@@ -110,6 +131,23 @@ impl Node {
         let first_rtt = mmp
             .metrics
             .process_receiver_report(&rr, our_timestamp_ms, now);
+
+        // Log RTT sample for BLE event correlation if enabled
+        if rr.timestamp_echo > 0 && ble_log_enabled() {
+            let echo_ms = rr.timestamp_echo;
+            let dwell_ms = rr.dwell_time as u32;
+            if our_timestamp_ms > echo_ms + dwell_ms {
+                let rtt_ms = our_timestamp_ms - echo_ms - dwell_ms;
+                let srtt_ms = mmp.metrics.srtt_ms().unwrap_or(0.0);
+                ble_log("mmp_rtt_sample", &peer_name, &[
+                    ("our_ts", &our_timestamp_ms.to_string()),
+                    ("echo_ts", &echo_ms.to_string()),
+                    ("dwell_ms", &dwell_ms.to_string()),
+                    ("rtt_ms", &rtt_ms.to_string()),
+                    ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                ]);
+            }
+        }
 
         // Feed SRTT back to sender/receiver report interval tuning
         let ble_srtt_ms = if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
@@ -574,6 +612,9 @@ impl Node {
             .unwrap_or(0);
 
         for addr in &dead_peers {
+            ble_log("link_dead", &self.peer_display_name(addr), &[
+                ("timeout_secs", &self.config.node.link_dead_timeout_secs.to_string()),
+            ]);
             warn!(
                 peer = %self.peer_display_name(addr),
                 timeout_secs = self.config.node.link_dead_timeout_secs,
@@ -595,6 +636,9 @@ impl Node {
             }
             if let Some(peer) = self.peers.get_mut(&addr) {
                 peer.mark_heartbeat_sent(now);
+            }
+            if ble_log_enabled() {
+                ble_log("heartbeat_sent", &self.peer_display_name(&addr), &[]);
             }
             if ble_congested {
                 continue;
