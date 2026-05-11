@@ -145,34 +145,40 @@ impl SendRateLimiter {
 const RTT_LOW_MS: f64 = 200.0;
 
 /// RTT above this (ms) → congested → reduce rate to drain queue.
-/// Reduced from 500 ms to 400 ms to catch congestion earlier, before the
-/// L2CAP buffer fills to the point of causing 30 s+ RTT spikes.
-const RTT_HIGH_MS: f64 = 400.0;
+/// Lowered from 400ms to 300ms: experiments show RTT grows ~167ms/s, so
+/// catching it at 300ms gives us ~2s of headroom before the queue becomes
+/// critical. At 300ms the queue is building but still drainable.
+const RTT_HIGH_MS: f64 = 300.0;
 
 /// RTT above this (ms) → severe congestion → apply stronger backoff.
-/// At 1000 ms the link is in critical queue-overflow territory.
-const RTT_SEVERE_MS: f64 = 1000.0;
+/// Lowered from 1000ms to 600ms: by 600ms the RTT has already been growing
+/// for ~3-4 seconds. The 50% rate cut is aggressive to drain quickly before
+/// the queue reaches the point of causing multi-second RTT.
+const RTT_SEVERE_MS: f64 = 600.0;
 
 /// Minimum rate. Must be BELOW actual BLE throughput (~34kbps) so the
 /// adapter can slow down to match the link. Previous 50kbps was above
 /// BLE capacity, causing permanent buffer accumulation.
-const MIN_RATE_BPS: u64 = 15_000;
+const MIN_RATE_BPS: u64 = 10_000;
 
 /// Maximum sustainable BLE rate. Experiments show the L2CAP link dies after
-/// 3-5 minutes at ~110 kbps. Reduced from 80 kbps to 50 kbps ceiling to
-/// further reduce link stress — the AIMD adapter probes up from MIN but must
-/// not overshoot into link-death territory. Links still dropping at 50 kbps
-/// indicate hardware or environmental issues rather than rate-induced stress.
-pub const MAX_RATE_BPS: u64 = 50_000;
+/// 3-5 minutes at ~110 kbps. Lowered from 50kbps to 35kbps — below observed
+/// BLE throughput (~34kbps) to prevent the AIMD probe from ever exceeding
+/// the link's actual capacity. The adapter probes UP from MIN but must not
+/// overshoot into queue-accumulation territory.
+pub const MAX_RATE_BPS: u64 = 35_000;
 
-/// On congestion: `rate *= MD_FACTOR` (0.7 = 30% reduction).
-const MD_FACTOR: f64 = 0.7;
+/// On congestion: `rate *= MD_FACTOR` (0.6 = 40% reduction).
+/// Lowered from 0.7 to 0.6 for more aggressive drain.
+const MD_FACTOR: f64 = 0.6;
 
-/// On severe congestion: `rate *= MD_SEVERE_FACTOR` (0.5 = 50% reduction).
-const MD_SEVERE_FACTOR: f64 = 0.5;
+/// On severe congestion: `rate *= MD_SEVERE_FACTOR` (0.4 = 60% reduction).
+/// Lowered from 0.5 to 0.4 for more aggressive emergency drain.
+const MD_SEVERE_FACTOR: f64 = 0.4;
 
 /// On uncongested: `rate += AI_STEP`. Conservative to avoid re-congestion.
-const AI_STEP_BPS: u64 = 5_000;
+/// Lowered from 5000 to 2000 for slower probing to stay below BLE capacity.
+const AI_STEP_BPS: u64 = 2_000;
 
 /// BBR-inspired adaptive rate controller for BLE links.
 ///

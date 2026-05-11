@@ -73,21 +73,23 @@ pub const DEFAULT_COLD_START_INTERVAL_MS: u64 = 200;
 
 /// Minimum report interval (SRTT clamp floor).
 ///
-/// Raised from 100ms to 1000ms: parent re-evaluation runs every 60s,
-/// so 60 samples/cycle is more than sufficient for EWMA convergence (~10).
-/// The cold-start phase uses `DEFAULT_COLD_START_INTERVAL_MS` (200ms) for
-/// fast initial SRTT convergence before transitioning to this floor.
-pub const MIN_REPORT_INTERVAL_MS: u64 = 1_000;
+/// Lowered from 1000ms to 500ms for BLE links: experiments show RTT grows
+/// ~167ms/s, so a 1s floor means the first post-cold-start report already
+/// has a bloated RTT. At 500ms, we get more samples per second, keeping
+/// SRTT closer to the actual link RTT. The cold-start phase uses 200ms.
+pub const MIN_REPORT_INTERVAL_MS: u64 = 500;
 
 /// Maximum report interval (SRTT clamp ceiling).
-pub const MAX_REPORT_INTERVAL_MS: u64 = 5_000;
+/// Lowered from 5000ms to 3000ms to cap the maximum gap between reports.
+pub const MAX_REPORT_INTERVAL_MS: u64 = 3_000;
 
 /// Number of SRTT samples before transitioning from cold-start to normal floor.
 ///
 /// During cold-start, report intervals use `DEFAULT_COLD_START_INTERVAL_MS` as
 /// the floor to gather SRTT samples quickly. After this many updates, the floor
 /// switches to `MIN_REPORT_INTERVAL_MS`.
-pub const COLD_START_SAMPLES: u32 = 5;
+/// Increased from 5 to 8 to stay in cold-start longer for better initial tracking.
+pub const COLD_START_SAMPLES: u32 = 8;
 
 /// Default OWD ring buffer capacity.
 pub const DEFAULT_OWD_WINDOW_SIZE: usize = 32;
