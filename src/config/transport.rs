@@ -901,7 +901,10 @@ impl BleConfig {
 
     /// SRTT reconnect threshold in milliseconds. None = disabled.
     pub fn srtt_reconnect_threshold_ms(&self) -> Option<u64> {
-        self.srtt_reconnect_threshold_ms
+        match self.srtt_reconnect_threshold_ms {
+            Some(0) => None,
+            other => other,
+        }
     }
 
     pub fn validate(&mut self) -> Vec<String> {
