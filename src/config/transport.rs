@@ -914,9 +914,14 @@ impl BleConfig {
         }
     }
 
-    /// SRTT inflation ratio threshold. None = disabled.
+    /// SRTT inflation ratio threshold. Default: 5.0 (validated in experiment #117).
+    /// Set to -1 to explicitly disable.
     pub fn srtt_inflation_threshold(&self) -> Option<f64> {
-        self.srtt_inflation_threshold.filter(|&v| v > 0.0)
+        match self.srtt_inflation_threshold {
+            Some(v) if v < 0.0 => None,
+            Some(v) if v > 0.0 => Some(v),
+            _ => Some(5.0),
+        }
     }
 
     pub fn validate(&mut self) -> Vec<String> {
@@ -956,7 +961,7 @@ impl BleConfig {
         }
         if self.srtt_inflation_threshold == Some(0.0) {
             self.srtt_inflation_threshold = None;
-            warnings.push("transports.ble.srtt_inflation_threshold was 0, reset to disabled".into());
+            warnings.push("transports.ble.srtt_inflation_threshold was 0, using default 5.0".into());
         }
 
         warnings

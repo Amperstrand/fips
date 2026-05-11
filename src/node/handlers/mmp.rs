@@ -264,6 +264,21 @@ impl Node {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                // Cooldown guard: skip reconnect if last one was <30s ago.
+                const PROACTIVE_RECONNECT_COOLDOWN_MS: u64 = 30_000;
+                if let Some(&last_ms) = self.last_proactive_reconnect_ms.get(&addr) {
+                    let elapsed = now_ms.saturating_sub(last_ms);
+                    if elapsed < PROACTIVE_RECONNECT_COOLDOWN_MS {
+                        debug!(
+                            peer = %peer_name,
+                            elapsed_secs = elapsed / 1000,
+                            cooldown_secs = PROACTIVE_RECONNECT_COOLDOWN_MS / 1000,
+                            "Proactive BLE reconnect skipped: cooldown active"
+                        );
+                        return;
+                    }
+                }
+                self.last_proactive_reconnect_ms.insert(addr, now_ms);
                 let close_target = peer_transport_id.zip(peer_transport_addr.as_ref().cloned());
                 // Reset SRTT before removing peer — new BLE channel = new path.
                 // RFC 9002 §5.3: RTT measurements MUST be reset on path change.

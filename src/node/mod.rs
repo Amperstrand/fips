@@ -439,6 +439,11 @@ pub struct Node {
     /// connection_state() and initiates the handshake when connected.
     pending_connects: Vec<PendingConnect>,
 
+    // === BLE Proactive Reconnect ===
+    /// Per-peer timestamp (Unix ms) of last H13 proactive reconnect.
+    /// Used to enforce a minimum cooldown between reconnects to prevent storms.
+    last_proactive_reconnect_ms: HashMap<NodeAddr, u64>,
+
     // === Connection Retry ===
     /// Retry state for peers whose outbound connections have failed.
     /// Keyed by NodeAddr. Entries are created when a handshake times out
@@ -636,6 +641,7 @@ impl Node {
                 std::time::Duration::from_secs(forward_min_interval_secs),
             ),
             pending_connects: Vec::new(),
+            last_proactive_reconnect_ms: HashMap::new(),
             retry_pending: HashMap::new(),
             nostr_discovery: None,
             nostr_discovery_started_at_ms: None,
@@ -771,6 +777,7 @@ impl Node {
             discovery_backoff: DiscoveryBackoff::new(),
             discovery_forward_limiter: DiscoveryForwardRateLimiter::new(),
             pending_connects: Vec::new(),
+            last_proactive_reconnect_ms: HashMap::new(),
             retry_pending: HashMap::new(),
             nostr_discovery: None,
             nostr_discovery_started_at_ms: None,
