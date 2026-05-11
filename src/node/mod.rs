@@ -1044,7 +1044,7 @@ impl Node {
     /// Resolve a BLE address string (`"adapter/AA:BB:CC:DD:EE:FF"`) to a
     /// (TransportId, TransportAddr) pair by finding the BLE transport
     /// instance matching the adapter name.
-    #[cfg(bluer_available)]
+    #[cfg(any(bluer_available, feature = "ble-macos"))]
     fn resolve_ble_addr(&self, addr_str: &str) -> Result<(TransportId, TransportAddr), NodeError> {
         let ta = TransportAddr::from_string(addr_str);
         let adapter = crate::transport::ble::addr::adapter_from_addr(&ta).ok_or_else(|| {

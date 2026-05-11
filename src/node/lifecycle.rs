@@ -1168,7 +1168,7 @@ impl Node {
                     }
                 }
             } else if addr.transport == "ble" {
-                #[cfg(bluer_available)]
+                #[cfg(any(bluer_available, feature = "ble-macos"))]
                 {
                     match self.resolve_ble_addr(&addr.addr) {
                         Ok(result) => result,
@@ -1183,7 +1183,7 @@ impl Node {
                         }
                     }
                 }
-                #[cfg(not(bluer_available))]
+                #[cfg(not(any(bluer_available, feature = "ble-macos")))]
                 {
                     debug!(transport = %addr.transport, "BLE transport not available on this build");
                     continue;
