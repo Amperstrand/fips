@@ -297,10 +297,13 @@ impl MmpMetrics {
 
     /// RTT inflation ratio (SRTT / min_rtt), or `None` if not yet measured.
     ///
-    /// A ratio of 1.0 means no inflation. Values > 2.0 indicate the link
-    /// has accumulated significant queue delay relative to the best-case RTT.
-    /// Can be used as a reconnect trigger alongside absolute SRTT threshold.
+    /// Returns `None` until at least 5 RTT samples have been observed to avoid
+    /// false triggers during the initial SRTT convergence period where min_rtt
+    /// is unrealistically low and SRTT variance is high.
     pub fn inflation_ratio(&self) -> Option<f64> {
+        if self.srtt.sample_count() < 5 {
+            return None;
+        }
         let srtt = self.srtt_ms()?;
         let min = self.min_rtt_ms()?;
         if min > 0.0 {

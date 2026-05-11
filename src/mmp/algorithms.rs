@@ -90,6 +90,8 @@ pub struct SrttEstimator {
     rttvar_us: i64,
     /// Whether the first sample has been applied.
     initialized: bool,
+    /// Number of RTT samples observed since creation or last reset.
+    sample_count: u32,
     /// Minimum observed RTT (microseconds) over the lifetime of the path.
     ///
     /// Per RFC 9002 §5.2: min_rtt is the minimum RTT observed over the lifetime
@@ -104,11 +106,11 @@ impl SrttEstimator {
             srtt_us: 0,
             rttvar_us: 0,
             initialized: false,
+            sample_count: 0,
             min_rtt_us: i64::MAX,
         }
     }
 
-    /// Feed an RTT sample in microseconds.
     pub fn update(&mut self, rtt_us: i64) {
         if !self.initialized {
             // RFC 6298 §2.2 (rule 2.2): on the first RTT measurement R':
@@ -130,6 +132,7 @@ impl SrttEstimator {
         // the path. It MUST NOT be inflated by reordering or loss recovery.
         // min_rtt is reset only on path change (see reset()).
         self.min_rtt_us = self.min_rtt_us.min(rtt_us);
+        self.sample_count += 1;
     }
 
     pub fn srtt_us(&self) -> i64 {
@@ -142,6 +145,10 @@ impl SrttEstimator {
 
     pub fn initialized(&self) -> bool {
         self.initialized
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
     }
 
     /// Minimum observed RTT in microseconds over the lifetime of the path.
@@ -162,6 +169,7 @@ impl SrttEstimator {
         self.rttvar_us = 0;
         self.min_rtt_us = i64::MAX;
         self.initialized = false;
+        self.sample_count = 0;
     }
 
     /// Retransmission timeout per RFC 6298 §2.3 (rule 2.3):
@@ -637,17 +645,20 @@ mod tests {
         s.update(30_000);
         assert!(s.initialized());
         assert_eq!(s.min_rtt_us(), 30_000);
+        assert_eq!(s.sample_count(), 2);
 
         s.reset();
         assert!(!s.initialized());
         assert_eq!(s.srtt_us(), 0);
         assert_eq!(s.rttvar_us(), 0);
         assert_eq!(s.min_rtt_us(), i64::MAX);
+        assert_eq!(s.sample_count(), 0);
 
         // After reset, first sample initializes fresh
         s.update(40_000);
         assert!(s.initialized());
         assert_eq!(s.srtt_us(), 40_000);
         assert_eq!(s.min_rtt_us(), 40_000);
+        assert_eq!(s.sample_count(), 1);
     }
 }
