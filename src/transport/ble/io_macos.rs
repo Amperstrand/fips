@@ -594,7 +594,13 @@ define_class!(
             }
             self.drain_to_stream(output_stream);
         }
+    }
 
+    // Custom notification handler — not part of NSStreamDelegate protocol.
+    // Registered via NSNotificationCenter.addObserver:selector:name:object:.
+    // Must be defined as a class method, not inside a protocol impl block,
+    // or objc2's define_class! will reject it at runtime.
+    impl PeripheralOutputDelegate {
         #[unsafe(method(onWriteNotify:))]
         fn on_write_notify(&self, _notification: &NSNotification) {
             if let Ok(guard) = self.ivars().output_stream.lock() {
