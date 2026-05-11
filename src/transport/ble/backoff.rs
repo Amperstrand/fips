@@ -1,26 +1,55 @@
-//! Per-address exponential backoff for BLE connection failures.
+//! BLE transport-level per-address backoff.
 //!
-//! Tracks consecutive connection failures per peer address and applies
-//! increasing backoff delays. After `max_failures` consecutive failures,
-//! the address is auto-denied for `deny_duration` to prevent wasting
-//! resources on unreachable peers.
+//! Tracks connection failures per BLE hardware address and applies
+//! exponential backoff to prevent hammering unreachable devices.
+//! This is SEPARATE from the node-level retry_pending backoff
+//! (see `src/node/retry.rs`) — both can compound.
+//!
+//! Design rationale: BLE connections can fail at the HCI/controller level
+//! (device not advertising, out of range, controller busy) which is below
+//! the mesh reconnection layer. The transport-level backoff prevents
+//! wasting controller resources on repeated failed connections.
+//!
+//! The "deny" mechanism (1-hour blacklist after max_failures) prevents
+//! a broken device from consuming reconnection resources indefinitely.
+//! Only connections that fail within the first 30s (healthy_threshold)
+//! count as failures — a connection that lasted >30s before disconnecting
+//! is considered healthy and doesn't add to the failure count.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::addr::BleAddr;
 
+// Base backoff interval: 5 seconds. Conservative for BLE — HCI-level
+// operations (scan, connect) take 1-3s, so a 5s base gives the controller
+// time to settle between attempts.
 const DEFAULT_BASE_SECS: u64 = 5;
+
+// Maximum backoff: 300 seconds (5 minutes). Caps the exponential growth
+// to prevent excessive delays on intermittently reachable devices.
 const DEFAULT_MAX_SECS: u64 = 300;
+
+// Maximum consecutive failures before auto-deny. After 5 rapid failures
+// the device is considered persistently unreachable and is blacklisted.
 const DEFAULT_MAX_FAILURES: u32 = 5;
+
+// Deny duration: 3600 seconds (1 hour). After max_failures consecutive
+// failures, the address is blacklisted for 1 hour. This is similar to
+// TCP's exponential backoff with timeout pattern (RFC 6298 §5.5).
 const DEFAULT_DENY_DURATION_SECS: u64 = 3600;
 
+/// Tracks consecutive failures and next-allowed-attempt time for a single peer.
 struct Entry {
+    /// Number of consecutive connection failures (reset on success).
     failures: u32,
+    /// Earliest time a new connection attempt is allowed.
     next_allowed: Instant,
 }
 
+/// Tracks the deny-blacklist expiry time for a peer.
 struct DenyEntry {
+    /// Time at which the deny expires and reconnection is allowed.
     until: Instant,
 }
 
@@ -29,12 +58,23 @@ struct DenyEntry {
 /// Tracks consecutive connection failures per BLE address and applies
 /// exponentially increasing backoff delays. After `max_failures` consecutive
 /// failures the address is auto-denied for `deny_duration`.
+///
+/// The deny mechanism is similar to TCP's "exponential backoff with timeout"
+/// pattern (RFC 6298): repeated failures trigger progressively longer waits,
+/// eventually culminating in a hard timeout (the deny period) after which
+/// attempts resume.
 pub struct PeerBackoff {
+    /// Per-address failure counts and next-allowed times.
     entries: HashMap<BleAddr, Entry>,
+    /// Per-address deny-blacklist entries (1-hour blacklist after max_failures).
     denied: HashMap<BleAddr, DenyEntry>,
+    /// Base backoff interval (seconds). First retry after `base`, then `2*base`, etc.
     base: Duration,
+    /// Maximum backoff cap (seconds). Prevents unbounded exponential growth.
     max: Duration,
+    /// Consecutive failures before triggering auto-deny.
     max_failures: u32,
+    /// Duration of the deny blacklist after max_failures (seconds).
     deny_duration: Duration,
 }
 
@@ -61,8 +101,10 @@ impl PeerBackoff {
         )
     }
 
-    /// Whether the address is currently auto-denied.
+    /// Whether the address is currently auto-denied (1-hour blacklist).
     /// Removes expired entries to prevent unbounded memory growth.
+    /// After the deny period expires, the address is eligible for connection
+    /// attempts again with a fresh failure count.
     pub fn is_denied(&mut self, addr: &BleAddr) -> bool {
         if let Some(d) = self.denied.get(addr)
             && Instant::now() < d.until
@@ -79,6 +121,8 @@ impl PeerBackoff {
     }
 
     /// Whether the address is currently in backoff (should not be probed).
+    /// Returns the time-until-next-allowed if in backoff, or `false` if
+    /// the peer is eligible for a connection attempt right now.
     pub fn is_in_backoff(&self, addr: &BleAddr) -> bool {
         if let Some(e) = self.entries.get(addr) {
             return Instant::now() < e.next_allowed;
@@ -87,6 +131,11 @@ impl PeerBackoff {
     }
 
     /// Record a connection failure for the given address.
+    ///
+    /// Connections lasting longer than the healthy threshold (30s) should NOT
+    /// be recorded as failures — only rapid disconnects indicate a transport-
+    /// level problem. A connection that survived >30s was healthy; its
+    /// disconnection was likely due to mobility or session-level issues.
     ///
     /// Returns `true` if the address has been auto-denied as a result.
     pub fn record_failure(&mut self, addr: &BleAddr) -> bool {

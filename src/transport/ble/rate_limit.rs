@@ -1,11 +1,23 @@
 //! BLE send rate limiter and adaptive rate control.
 //!
-//! Token bucket that throttles BLE sends to match the link's actual throughput.
-//! Prevents the L2CAP pipe from filling when mesh-speed data hits a BLE link.
+//! Two components:
+//! 1. `SendRateLimiter`: Token-bucket rate limiter that throttles BLE sends
+//!    to match the link's actual throughput. Prevents the L2CAP pipe from
+//!    filling when mesh-speed data hits a BLE link.
+//! 2. `BleRateAdapter`: BBR-inspired adaptive rate controller using MMP SRTT
+//!    feedback. Uses AIMD (Additive Increase / Multiplicative Decrease) to
+//!    find the sustainable send rate.
 //!
-//! The `BleRateAdapter` provides BBR-inspired adaptive rate control using
-//! MMP SRTT feedback: reduces rate when RTT rises (congestion), increases
-//! when RTT is stable and low.
+//! Design rationale: BLE L2CAP CoC has limited throughput (~34 kbps observed)
+//! and small credit windows. Sending faster than the link can drain causes
+//! queue buildup in the L2CAP socket buffer, which manifests as monotonically
+//! increasing RTT (see issue #105). The rate adapter uses SRTT as a congestion
+//! signal: rising RTT indicates queue buildup → reduce rate; stable low RTT
+//! indicates drain → probe for more bandwidth.
+//!
+//! Reference: The AIMD approach is inspired by TCP Reno/BBR congestion control.
+//! TCP uses loss as a congestion signal; we use RTT inflation because BLE
+//! L2CAP does not have explicit congestion notification at the link layer.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +25,8 @@ use tracing::trace;
 
 /// BLE send rate limiter using token bucket algorithm.
 ///
+/// The token bucket is a standard traffic-shaping algorithm (cf. RFC 3290,
+/// "An Informal Management Model for Diffserv Router Elements" §2.2).
 /// Tokens represent bytes. The bucket refills at `rate_bytes_per_sec` and
 /// caps at `burst_bytes`. Before each send, `acquire(bytes)` waits until
 /// enough tokens are available.
@@ -53,6 +67,11 @@ impl SendRateLimiter {
     }
 
     /// Acquire `bytes` tokens, waiting if necessary.
+    ///
+    /// Uses async sleep to wait for tokens, which adds latency to sends when
+    /// the rate is throttled. This is intentional — it is better to slow down
+    /// at the sender than to fill the L2CAP buffer, which causes RTT inflation
+    /// and eventual link instability.
     pub async fn acquire(&mut self, bytes: usize) {
         if self.rate_bytes_per_sec <= 0.0 {
             return;
@@ -103,6 +122,8 @@ impl SendRateLimiter {
         self.rate_bytes_per_sec = rate_bps as f64 / 8.0;
     }
 
+    /// Standard token bucket refill: `tokens += elapsed × rate`.
+    /// Caps at `burst_bytes` (bucket capacity) to prevent infinite accumulation.
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
@@ -176,6 +197,25 @@ impl BleRateAdapter {
         }
     }
 
+    /// Update the rate based on the latest SRTT measurement.
+    ///
+    /// AIMD rate control using SRTT as congestion signal:
+    ///
+    /// SRTT > 1000ms: Severe congestion → rate *= 0.5 (50% cut)
+    ///   Aggressive drain. Queue is critically full.
+    /// SRTT > 400ms:  Congestion → rate *= 0.7 (30% cut)
+    ///   Moderate drain. Queue is building but not critical.
+    /// SRTT < 200ms:  Uncongested → rate += 5 Kbps (additive increase)
+    ///   Probe for more bandwidth. Conservative to avoid re-congestion.
+    /// 200-400ms:     Hold steady
+    ///   Link is operating in its normal range.
+    ///
+    /// This is a simplified BBR-like approach. Unlike TCP BBR which models
+    /// bandwidth and RTT separately, we use a single SRTT signal because
+    /// BLE links have a single bottleneck (the L2CAP channel).
+    ///
+    /// Minimum update interval: 1 second. Prevents over-reaction to
+    /// transient RTT spikes from individual samples.
     pub fn update(&mut self, srtt_ms: f64) -> u64 {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update);
@@ -206,6 +246,9 @@ impl BleRateAdapter {
         };
 
         if old_rate != self.current_rate_bps {
+            // Log rate changes to the BLE event log for experiment correlation.
+            // Each entry includes the SRTT sample that triggered the decision,
+            // the old/new rates, and the decision name for filtering.
             super::event_log::log("rate_adapter", "", &[
                 ("srtt_ms", &format!("{:.1}", srtt_ms)),
                 ("old_rate_bps", &old_rate.to_string()),
