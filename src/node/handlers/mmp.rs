@@ -269,12 +269,10 @@ impl Node {
                 if let Some(&last_ms) = self.last_proactive_reconnect_ms.get(&addr) {
                     let elapsed = now_ms.saturating_sub(last_ms);
                     if elapsed < PROACTIVE_RECONNECT_COOLDOWN_MS {
-                        debug!(
-                            peer = %peer_name,
-                            elapsed_secs = elapsed / 1000,
-                            cooldown_secs = PROACTIVE_RECONNECT_COOLDOWN_MS / 1000,
-                            "Proactive BLE reconnect skipped: cooldown active"
-                        );
+                        ble_log("srtt_reconnect_cooldown", &peer_name, &[
+                            ("elapsed_secs", &format!("{}", elapsed / 1000)),
+                            ("cooldown_secs", &format!("{}", PROACTIVE_RECONNECT_COOLDOWN_MS / 1000)),
+                        ]);
                         return;
                     }
                 }
