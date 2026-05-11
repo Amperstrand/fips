@@ -3,6 +3,13 @@
 //! Handles incoming SenderReport / ReceiverReport messages, drives
 //! periodic report generation on the tick timer, and emits periodic
 //! and teardown metric logs.
+//!
+//! This handler processes incoming MMP ReceiverReports and fans out SRTT updates
+//! to report interval tuning, BLE rate adaptation, and proactive reconnect decisions.
+//!
+//! RTT computation (`rtt_ms = our_timestamp_ms - echo_ms - dwell_ms`) follows the
+//! timestamp-echo pattern similar to TCP timestamps (RFC 7323). The SRTT update
+//! algorithm lives in `metrics.rs` and follows RFC 6298.
 
 use crate::NodeAddr;
 use crate::mmp::MmpMode;
@@ -132,7 +139,20 @@ impl Node {
             .metrics
             .process_receiver_report(&rr, our_timestamp_ms, now);
 
-        // Log RTT sample for BLE event correlation if enabled
+        // RTT sample construction from ReceiverReport fields:
+        //   rtt_ms = our_timestamp_ms - rr.timestamp_echo - rr.dwell_time
+        //
+        // our_timestamp_ms: current session-relative time (sender's clock)
+        // rr.timestamp_echo: the sender timestamp that was echoed back by the receiver
+        //   (this is the session-relative time from the inner header of the last frame
+        //   the receiver processed before generating the report)
+        // rr.dwell_time: ms the receiver held the frame before generating the report
+        //
+        // Dwell is subtracted to isolate actual network latency from report scheduling delay.
+        // This prevents a feedback loop where longer report intervals would inflate RTT.
+        // See also: TCP timestamp RTT measurement (RFC 7323 §4.1).
+        //
+        // Log RTT sample for BLE transport event correlation if enabled.
         if rr.timestamp_echo > 0 && ble_log_enabled() {
             let echo_ms = rr.timestamp_echo;
             let dwell_ms = rr.dwell_time as u32;
@@ -149,7 +169,8 @@ impl Node {
             }
         }
 
-        // Feed SRTT back to sender/receiver report interval tuning
+        // Feed SRTT back to sender/receiver report interval tuning.
+        // Also capture ble_srtt_ms for BLE rate adapter below.
         let ble_srtt_ms = if let Some(srtt_ms) = mmp.metrics.srtt_ms() {
             let srtt_us = (srtt_ms * 1000.0) as i64;
             mmp.sender.update_report_interval_from_srtt(srtt_us);
@@ -174,6 +195,13 @@ impl Node {
             "Processed ReceiverReport"
         );
 
+        // SRTT fanout: propagate the updated SRTT to all consumers.
+        // 1. Sender report interval: 2×SRTT (clamped)
+        // 2. Receiver report interval: 1×SRTT (clamped) — per RFC 8961 §2
+        // 3. BLE rate adapter: AIMD rate control based on SRTT thresholds
+        // 4. Path MTU probe interval: max(10s, 5×SRTT)
+        // This fanout creates a feedback loop for rate adaptation but NOT for
+        // RTT inflation (dwell is subtracted from RTT, breaking the positive feedback).
         if let Some(srtt_ms) = ble_srtt_ms
             && let Some(tid) = peer_transport_id
             && let Some(ref taddr) = peer_transport_addr
@@ -182,10 +210,24 @@ impl Node {
             transport.update_rate_from_srtt(taddr, srtt_ms).await;
         }
 
-        // H13: Proactive reconnect when SRTT exceeds threshold for BLE transport.
-        // Since SRTT resets to ~1s after reconnect (ActivePeer is rebuilt),
-        // this caps the effective RTT by forcing a reconnection with fresh
-        // BLE connection parameters.
+        // H13: Proactive BLE reconnect on SRTT threshold.
+        //
+        // When SRTT exceeds the configured threshold, we proactively disconnect and
+        // reconnect to establish a fresh BLE L2CAP channel. This is a mitigation for
+        // the observed monotonic RTT growth caused by L2CAP credit backpressure and
+        // receive-buffer queue buildup (see issue #105).
+        //
+        // Design rationale: The underlying BLE link accumulates queue delay over time.
+        // Rather than trying to drain the queue (which requires the remote side to
+        // consume faster), we re-establish the channel with fresh L2CAP credits and
+        // empty queues. This is analogous to TCP connection reset vs. recovery.
+        //
+        // The close_connection() call is critical — without it, the stale BLE
+        // connection remains in the transport pool, and the new connection competes
+        // with the zombie. This was a bug (commit cc00106).
+        //
+        // Reference: RFC 6298 SRTT is per-path; a new BLE channel constitutes a new path.
+        // QUIC (RFC 9002 §5.3) explicitly resets RTT estimator on path migration.
         if let Some(srtt_ms) = ble_srtt_ms {
             let exceeded = self.config.transports.ble.iter().find_map(|(_, cfg)| {
                 cfg.srtt_reconnect_threshold_ms()
@@ -208,12 +250,16 @@ impl Node {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 let close_target = peer_transport_id.zip(peer_transport_addr.as_ref().cloned());
+                // remove_active_peer() first, then close_connection(): removing the peer
+                // ensures no new frames are routed to the stale transport before we close it.
                 self.remove_active_peer(from);
                 if let Some((tid, taddr)) = close_target {
                     if let Some(transport) = self.transports.get(&tid) {
                         transport.close_connection_sync(&taddr);
                     }
                 }
+                // schedule_reconnect() with reconnect flag — bypasses max_retries,
+                // keeps trying indefinitely (per RFC 1122 §4.2.3.5 persistent connections).
                 self.schedule_reconnect(addr, now_ms);
                 return;
             }

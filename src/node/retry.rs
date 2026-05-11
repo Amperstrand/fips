@@ -1,8 +1,18 @@
-//! Connection retry logic for auto-connect peers.
+//! Node-level reconnection and retry logic.
 //!
-//! When an outbound handshake fails (timeout or send error), the node can
-//! automatically retry with exponential backoff. Retry state lives on Node
-//! (not PeerConnection) because each retry creates a fresh connection.
+//! Provides exponential backoff for peer reconnection attempts following
+//! link failures. Uses a separate backoff state per peer address.
+//!
+//! Design: Backoff follows the exponential pattern from TCP RTO (RFC 6298 §5),
+//! but is applied at the mesh reconnection layer rather than the transport layer.
+//! BLE transport has its own additional backoff (see `transport/ble/backoff.rs`).
+//!
+//! Reconnect vs. retry:
+//! - **Retry**: Initial connection attempt or failure during handshake.
+//!   Subject to max_retries cap.
+//! - **Reconnect**: Re-establishment of a previously-active peer connection.
+//!   Bypasses max_retries (a reconnecting peer should keep trying indefinitely,
+//!   similar to TCP's persistent connection attempts per RFC 1122 §4.2.3.5).
 
 use super::Node;
 use crate::PeerIdentity;
@@ -15,21 +25,27 @@ use tracing::{debug, info, warn};
 /// Tracks retry state for a peer across connection attempts.
 pub struct RetryState {
     /// The peer config to use for initiating retries.
+    /// Contains transport addresses and auto_reconnect flag.
     pub peer_config: PeerConfig,
 
     /// Number of retries attempted so far.
+    /// Used as the exponent in backoff: delay = base * 2^retry_count.
     pub retry_count: u32,
 
     /// Timestamp (Unix ms) when the next retry should be attempted.
+    /// Set to `now_ms + backoff_ms()` after each attempt.
     pub retry_after_ms: u64,
 
     /// Whether this is an auto-reconnect (unlimited retries, ignores max_retries).
+    /// Reconnect entries persist until the peer connects or the entry expires.
+    /// See RFC 1122 §4.2.3.5 for the TCP analogue (persistent connections).
     pub reconnect: bool,
 
     /// Optional absolute expiry for this retry entry (Unix ms).
     ///
     /// When set, retries are dropped after this point even if reconnect logic
-    /// would otherwise continue.
+    /// would otherwise continue. This prevents stale discovered peers from
+    /// retrying forever after they have left the mesh.
     pub expires_at_ms: Option<u64>,
 }
 
@@ -48,7 +64,14 @@ impl RetryState {
     /// Calculate the backoff delay in milliseconds for the current retry count.
     ///
     /// Uses exponential backoff: `base_interval_ms * 2^retry_count`,
-    /// capped at `MAX_BACKOFF_MS`.
+    /// capped at `max_backoff_ms`.
+    ///
+    /// This follows the same exponential pattern as TCP RTO backoff (RFC 6298 §5),
+    /// where each subsequent retry doubles the wait time.
+    ///
+    /// Note: For proactive reconnects (H13), this compounds with any previous
+    /// failure reconnects since retry_count is preserved. See issue #108 for
+    /// the proposal to use a separate, lighter backoff for proactive reconnects.
     pub fn backoff_ms(&self, base_interval_ms: u64, max_backoff_ms: u64) -> u64 {
         let multiplier = 1u64.checked_shl(self.retry_count).unwrap_or(u64::MAX);
         base_interval_ms
@@ -108,7 +131,10 @@ impl Node {
         }
     }
 
-    /// Schedule a retry for a failed outbound connection, if applicable.
+    /// Schedule an initial connection retry (not a reconnect).
+    ///
+    /// Unlike reconnects, retries ARE subject to max_retries cap.
+    /// Used for failed handshake attempts and initial connection failures.
     ///
     /// Only schedules if the peer is an auto-connect peer and max retries
     /// have not been exhausted (unless `reconnect` is true, which retries
@@ -181,7 +207,15 @@ impl Node {
         }
     }
 
-    /// Schedule auto-reconnect for a peer removed by MMP dead timeout.
+    /// Schedule a reconnection attempt for a peer.
+    ///
+    /// If an entry already exists in retry_pending, increments retry_count and
+    /// preserves the existing backoff (no reset). This means proactive reconnects
+    /// (H13) compound with any previous failure history.
+    ///
+    /// The `reconnect` flag indicates this was an established peer that lost
+    /// connectivity. Reconnect entries bypass max_retries — we keep trying
+    /// indefinitely, similar to TCP persistent connections (RFC 1122 §4.2.3.5).
     ///
     /// Looks up the peer in auto-connect config and checks `auto_reconnect`.
     /// If enabled, feeds the peer into the retry system with unlimited retries.
@@ -251,6 +285,10 @@ impl Node {
     }
 
     /// Process pending retries whose time has arrived.
+    ///
+    /// Called every node.tick_interval_secs (default: 1s) from the RX loop.
+    /// Checks if any pending retry has expired and initiates reconnection.
+    /// If a peer connects inbound while pending, the stale entry is removed.
     ///
     /// For each due retry, initiates a fresh connection attempt. The retry
     /// entry stays in `retry_pending` until the connection succeeds (cleared
