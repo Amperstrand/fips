@@ -234,15 +234,21 @@ impl Node {
                     .filter(|&threshold| srtt_ms > threshold as f64)
             });
             if exceeded.is_some() {
+                let min_rtt_str = self.peers.get(from)
+                    .and_then(|p| p.mmp())
+                    .and_then(|mmp| mmp.metrics.min_rtt_ms())
+                    .map(|v| format!("{:.1}", v))
+                    .unwrap_or_else(|| "n/a".to_string());
                 ble_log("srtt_reconnect", &peer_name, &[
                     ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                    ("min_rtt_ms", &min_rtt_str),
                     ("threshold_ms", &format!("{}", exceeded.unwrap())),
                 ]);
                 warn!(
                     peer = %peer_name,
                     srtt_ms = format!("{:.1}", srtt_ms),
                     threshold_ms = exceeded.unwrap(),
-                    "Proactive BLE reconnect: SRTT exceeded threshold"
+                    "Proactive BLE reconnect: SRTT exceeded threshold, scheduling reconnect with lighter backoff"
                 );
                 let addr = *from;
                 let now_ms = std::time::SystemTime::now()
@@ -250,6 +256,13 @@ impl Node {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 let close_target = peer_transport_id.zip(peer_transport_addr.as_ref().cloned());
+                // Reset SRTT before removing peer — new BLE channel = new path.
+                // RFC 9002 §5.3: RTT measurements MUST be reset on path change.
+                if let Some(peer) = self.peers.get_mut(from) {
+                    if let Some(mmp) = peer.mmp_mut() {
+                        mmp.metrics.reset_srtt();
+                    }
+                }
                 // remove_active_peer() first, then close_connection(): removing the peer
                 // ensures no new frames are routed to the stale transport before we close it.
                 self.remove_active_peer(from);
@@ -258,9 +271,9 @@ impl Node {
                         transport.close_connection_sync(&taddr);
                     }
                 }
-                // schedule_reconnect() with reconnect flag — bypasses max_retries,
-                // keeps trying indefinitely (per RFC 1122 §4.2.3.5 persistent connections).
-                self.schedule_reconnect(addr, now_ms);
+                // Proactive reconnect with lighter backoff — the link was healthy,
+                // we're cycling the BLE channel to get fresh L2CAP credits.
+                self.schedule_proactive_reconnect(addr, now_ms);
                 return;
             }
         }

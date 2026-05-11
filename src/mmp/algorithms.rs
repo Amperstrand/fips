@@ -90,6 +90,12 @@ pub struct SrttEstimator {
     rttvar_us: i64,
     /// Whether the first sample has been applied.
     initialized: bool,
+    /// Minimum observed RTT (microseconds) over the lifetime of the path.
+    ///
+    /// Per RFC 9002 §5.2: min_rtt is the minimum RTT observed over the lifetime
+    /// of the path. It MUST NOT be inflated by reordering or loss recovery.
+    /// Reset only on path change (see [`reset()`](Self::reset)).
+    min_rtt_us: i64,
 }
 
 impl SrttEstimator {
@@ -98,6 +104,7 @@ impl SrttEstimator {
             srtt_us: 0,
             rttvar_us: 0,
             initialized: false,
+            min_rtt_us: i64::MAX,
         }
     }
 
@@ -119,6 +126,10 @@ impl SrttEstimator {
             self.rttvar_us = self.rttvar_us - (self.rttvar_us >> 2) + (err >> 2);
             self.srtt_us = self.srtt_us - (self.srtt_us >> 3) + (rtt_us >> 3);
         }
+        // RFC 9002 §5.2: min_rtt is the minimum RTT observed over the lifetime of
+        // the path. It MUST NOT be inflated by reordering or loss recovery.
+        // min_rtt is reset only on path change (see reset()).
+        self.min_rtt_us = self.min_rtt_us.min(rtt_us);
     }
 
     pub fn srtt_us(&self) -> i64 {
@@ -131,6 +142,26 @@ impl SrttEstimator {
 
     pub fn initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Minimum observed RTT in microseconds over the lifetime of the path.
+    ///
+    /// Returns `i64::MAX` if no samples have been observed yet.
+    pub fn min_rtt_us(&self) -> i64 {
+        self.min_rtt_us
+    }
+
+    /// Reset the estimator completely (path change).
+    ///
+    /// Per RFC 9002 §5.3: "On confirming a peer's new address, the sender
+    /// MUST reset RTT measurements for the new path to initial values."
+    /// A new BLE L2CAP channel constitutes a path change — fresh queues,
+    /// fresh L2CAP credits, potentially different connection parameters.
+    pub fn reset(&mut self) {
+        self.srtt_us = 0;
+        self.rttvar_us = 0;
+        self.min_rtt_us = i64::MAX;
+        self.initialized = false;
     }
 
     /// Retransmission timeout per RFC 6298 §2.3 (rule 2.3):
@@ -574,5 +605,49 @@ mod tests {
         // Reordered packet with counter=3 and spin=false should be ignored
         responder.rx_observe(false, 3, Instant::now());
         assert!(responder.tx_bit()); // unchanged
+    }
+
+    #[test]
+    fn test_srtt_min_rtt() {
+        let mut s = SrttEstimator::new();
+        assert_eq!(s.min_rtt_us(), i64::MAX);
+        assert!(!s.initialized());
+
+        // Feed samples: [50000, 30000, 40000, 20000, 60000]
+        s.update(50_000);
+        assert_eq!(s.min_rtt_us(), 50_000);
+
+        s.update(30_000);
+        assert_eq!(s.min_rtt_us(), 30_000);
+
+        s.update(40_000);
+        assert_eq!(s.min_rtt_us(), 30_000);
+
+        s.update(20_000);
+        assert_eq!(s.min_rtt_us(), 20_000);
+
+        s.update(60_000);
+        assert_eq!(s.min_rtt_us(), 20_000);
+    }
+
+    #[test]
+    fn test_srtt_reset() {
+        let mut s = SrttEstimator::new();
+        s.update(50_000);
+        s.update(30_000);
+        assert!(s.initialized());
+        assert_eq!(s.min_rtt_us(), 30_000);
+
+        s.reset();
+        assert!(!s.initialized());
+        assert_eq!(s.srtt_us(), 0);
+        assert_eq!(s.rttvar_us(), 0);
+        assert_eq!(s.min_rtt_us(), i64::MAX);
+
+        // After reset, first sample initializes fresh
+        s.update(40_000);
+        assert!(s.initialized());
+        assert_eq!(s.srtt_us(), 40_000);
+        assert_eq!(s.min_rtt_us(), 40_000);
     }
 }

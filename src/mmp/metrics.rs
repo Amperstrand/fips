@@ -269,6 +269,47 @@ impl MmpMetrics {
         }
     }
 
+    /// Minimum observed RTT in milliseconds, or `None` if not yet measured.
+    ///
+    /// Per RFC 9002 §5.2: min_rtt provides a baseline for detecting queuing
+    /// delay inflation. When SRTT/min_rtt exceeds a threshold, it indicates
+    /// the link has accumulated queue delay.
+    pub fn min_rtt_ms(&self) -> Option<f64> {
+        if self.srtt.initialized() {
+            Some(self.srtt.min_rtt_us() as f64 / 1000.0)
+        } else {
+            None
+        }
+    }
+
+    /// Reset SRTT estimator for path change (proactive reconnect).
+    ///
+    /// Called when the BLE L2CAP channel is proactively re-established.
+    /// The new channel has fresh L2CAP credits and empty queues, so the
+    /// old SRTT and min_rtt are no longer valid.
+    ///
+    /// Per RFC 9002 §5.3: RTT measurements MUST be reset on path change.
+    /// Counter deltas are preserved (reconnected peer continues from where
+    /// it was, not from counter 0).
+    pub fn reset_srtt(&mut self) {
+        self.srtt.reset();
+    }
+
+    /// RTT inflation ratio (SRTT / min_rtt), or `None` if not yet measured.
+    ///
+    /// A ratio of 1.0 means no inflation. Values > 2.0 indicate the link
+    /// has accumulated significant queue delay relative to the best-case RTT.
+    /// Can be used as a reconnect trigger alongside absolute SRTT threshold.
+    pub fn inflation_ratio(&self) -> Option<f64> {
+        let srtt = self.srtt_ms()?;
+        let min = self.min_rtt_ms()?;
+        if min > 0.0 {
+            Some(srtt / min)
+        } else {
+            None
+        }
+    }
+
     /// Current loss rate (0.0 = no loss, 1.0 = total loss).
     pub fn loss_rate(&self) -> f64 {
         1.0 - self.delivery_ratio_forward

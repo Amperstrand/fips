@@ -41,6 +41,12 @@ pub struct RetryState {
     /// See RFC 1122 §4.2.3.5 for the TCP analogue (persistent connections).
     pub reconnect: bool,
 
+    /// Whether this reconnect was triggered proactively (H13 SRTT threshold)
+    /// vs. reactively (link failure). Proactive reconnects use lighter backoff
+    /// since the link was healthy — we're cycling the channel, not recovering
+    /// from a failure.
+    pub proactive: bool,
+
     /// Optional absolute expiry for this retry entry (Unix ms).
     ///
     /// When set, retries are dropped after this point even if reconnect logic
@@ -57,6 +63,7 @@ impl RetryState {
             retry_count: 0,
             retry_after_ms: 0,
             reconnect: false,
+            proactive: false,
             expires_at_ms: None,
         }
     }
@@ -73,6 +80,14 @@ impl RetryState {
     /// failure reconnects since retry_count is preserved. See issue #108 for
     /// the proposal to use a separate, lighter backoff for proactive reconnects.
     pub fn backoff_ms(&self, base_interval_ms: u64, max_backoff_ms: u64) -> u64 {
+        if self.proactive {
+            // Proactive reconnect: fixed 2s delay, no exponential growth.
+            // The link was healthy (we chose to cycle it), so rapid reconnection
+            // is safe. The 2s gives the BLE controller time to clean up the old
+            // channel and accept the new connection.
+            return base_interval_ms.min(2_000);
+        }
+        // Normal exponential backoff for failure reconnects
         let multiplier = 1u64.checked_shl(self.retry_count).unwrap_or(u64::MAX);
         base_interval_ms
             .saturating_mul(multiplier)
@@ -284,6 +299,65 @@ impl Node {
         self.retry_pending.insert(node_addr, state);
     }
 
+    /// Schedule a proactive reconnection attempt for a peer.
+    ///
+    /// Similar to schedule_reconnect but sets the `proactive` flag for lighter
+    /// backoff. Used by H13 SRTT threshold reconnect — the link was healthy,
+    /// we're cycling the BLE channel to get fresh L2CAP credits.
+    pub(super) fn schedule_proactive_reconnect(&mut self, node_addr: NodeAddr, now_ms: u64) {
+        let peer_config = self
+            .config
+            .auto_connect_peers()
+            .find(|pc| {
+                PeerIdentity::from_npub(&pc.npub)
+                    .map(|id| *id.node_addr() == node_addr)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .or_else(|| self.discovered_peer_configs.get(&node_addr).cloned());
+
+        let Some(pc) = peer_config else {
+            return;
+        };
+
+        if !pc.auto_reconnect {
+            return;
+        }
+
+        let base_interval_ms = self.config.node.retry.base_interval_secs * 1000;
+        let max_backoff_ms = self.config.node.retry.max_backoff_secs * 1000;
+        let peer_name = self.peer_display_name(&node_addr);
+
+        if let Some(state) = self.retry_pending.get_mut(&node_addr) {
+            // Existing entry — mark as proactive for lighter backoff
+            state.reconnect = true;
+            state.proactive = true;
+            // Don't increment retry_count for proactive — it wasn't a failure
+            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+            state.retry_after_ms = now_ms + delay;
+            debug!(
+                peer = %peer_name,
+                delay_secs = delay / 1000,
+                "Scheduling proactive reconnect (lighter backoff)"
+            );
+            return;
+        }
+
+        let mut state = RetryState::new(pc);
+        state.reconnect = true;
+        state.proactive = true;
+        let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+        state.retry_after_ms = now_ms + delay;
+
+        debug!(
+            peer = %peer_name,
+            delay_secs = delay / 1000,
+            "Scheduling proactive reconnect"
+        );
+
+        self.retry_pending.insert(node_addr, state);
+    }
+
     /// Process pending retries whose time has arrived.
     ///
     /// Called every node.tick_interval_secs (default: 1s) from the RX loop.
@@ -394,6 +468,7 @@ mod tests {
             retry_count: 0,
             retry_after_ms: 0,
             reconnect: false,
+            proactive: false,
             expires_at_ms: None,
         };
         // base = 5000ms
@@ -431,6 +506,7 @@ mod tests {
             retry_count: 20, // 2^20 * 5000 would be huge
             retry_after_ms: 0,
             reconnect: false,
+            proactive: false,
             expires_at_ms: None,
         };
         assert_eq!(
@@ -446,8 +522,34 @@ mod tests {
             retry_count: 3,
             retry_after_ms: 0,
             reconnect: false,
+            proactive: false,
             expires_at_ms: None,
         };
         assert_eq!(state.backoff_ms(0, TEST_MAX_BACKOFF_MS), 0);
+    }
+
+    #[test]
+    fn test_backoff_proactive() {
+        let state = RetryState {
+            peer_config: PeerConfig::default(),
+            retry_count: 5,
+            retry_after_ms: 0,
+            reconnect: true,
+            proactive: true,
+            expires_at_ms: None,
+        };
+        // Proactive: fixed 2s delay regardless of retry_count
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 2000);
+
+        // If base is less than 2s, use base
+        let state = RetryState {
+            peer_config: PeerConfig::default(),
+            retry_count: 5,
+            retry_after_ms: 0,
+            reconnect: true,
+            proactive: true,
+            expires_at_ms: None,
+        };
+        assert_eq!(state.backoff_ms(1000, TEST_MAX_BACKOFF_MS), 1000);
     }
 }
