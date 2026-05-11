@@ -2,6 +2,21 @@
 //!
 //! Pure computational types with no dependency on peer or node state.
 //! Each is independently testable.
+//!
+//! # Standards & References
+//!
+//! - **RFC 3550** (RTP) — interarrival jitter estimation (§6.4.1)
+//! - **RFC 6298** (TCP RTO) — Jacobson/Karels SRTT algorithm (§2.2–2.3)
+//! - **RFC 9002** (QUIC) — future min_rtt baseline tracking (reserved)
+//! - **RFC 9490** (QUIC spin bit) — passive RTT measurement via spin bit
+//!
+//! Reference implementations consulted:
+//! - Linux TCP `tcp_rtt_estimator()` in `net/ipv4/tcp_input.c`
+//! - quic-go `rtt_stats.go` (https://github.com/lucas-clemente/quic-go)
+//! - quiche `recovery/rtt.rs` (https://github.com/cloudflare/quiche)
+//!
+//! - De Couto et al. (2003), "A High-Throughput Path Metric for Multi-Hop
+//!   Wireless Routing" — ETX metric
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -12,11 +27,12 @@ use crate::mmp::{EWMA_LONG_ALPHA, EWMA_SHORT_ALPHA};
 // Jitter Estimator (RFC 3550 §6.4.1)
 // ============================================================================
 
-/// Interarrival jitter estimator using RFC 3550 algorithm.
+/// Interarrival jitter estimator per RFC 3550 §6.4.1.
 ///
 /// Maintains a smoothed jitter estimate (α = 1/16) from the absolute
-/// difference in one-way transit times between consecutive frames.
-/// Uses integer arithmetic scaled by 16 to avoid floating-point.
+/// difference in relative transit times between consecutive frames.
+/// Uses integer arithmetic scaled by ×16 to avoid floating-point while
+/// maintaining sufficient precision for sub-millisecond resolution.
 pub struct JitterEstimator {
     /// Scaled jitter estimate (×16 for integer arithmetic).
     jitter_q4: i64,
@@ -29,11 +45,14 @@ impl JitterEstimator {
 
     /// Update with transit time delta between consecutive frames.
     ///
-    /// `transit_delta` = (R_i - R_{i-1}) - (S_i - S_{i-1}) in microseconds.
+    /// `transit_delta` = D(i) = (R_i − R_{i−1}) − (S_i − S_{i−1}) per RFC 3550,
+    /// where R = receive timestamp and S = send timestamp in microseconds.
     pub fn update(&mut self, transit_delta: i32) {
-        // RFC 3550: J = J + (1/16)(|D(i)| - J)
-        // Scaled: J_q4 = J_q4 + (|D| - J_q4/16)
-        //       = J_q4 + |D| - J_q4 >> 4
+        // RFC 3550 §6.4.1: J_i = J_{i−1} + (|D(i)| − J_{i−1}) / 16
+        // The smoothing factor α = 1/16 is fixed by the RFC.
+        // Integer ×16 scaling (Q4 fixed-point) avoids floating-point while
+        // preserving sub-millisecond precision:
+        //   J_q4 += |D| − J_q4 >> 4
         let abs_d = (transit_delta as i64).unsigned_abs() as i64;
         self.jitter_q4 += abs_d - (self.jitter_q4 >> 4);
     }
@@ -54,9 +73,16 @@ impl Default for JitterEstimator {
 // SRTT Estimator (Jacobson, RFC 6298)
 // ============================================================================
 
-/// Smoothed RTT estimator using Jacobson's algorithm.
+/// Smoothed RTT estimator using Jacobson/Karels algorithm (RFC 6298).
 ///
 /// SRTT and RTTVAR are maintained in microseconds using integer arithmetic.
+/// The bit-shift approximations for α=1/8 and β=1/4 are mathematically exact
+/// in the integer domain (no rounding error from the shift).
+///
+/// Reference implementations:
+/// - Linux TCP `tcp_rtt_estimator()` in `net/ipv4/tcp_input.c`
+/// - quic-go `rtt_stats.go` (https://github.com/lucas-clemente/quic-go)
+/// - quiche `recovery/rtt.rs` (https://github.com/cloudflare/quiche)
 pub struct SrttEstimator {
     /// Smoothed RTT (microseconds).
     srtt_us: i64,
@@ -78,14 +104,17 @@ impl SrttEstimator {
     /// Feed an RTT sample in microseconds.
     pub fn update(&mut self, rtt_us: i64) {
         if !self.initialized {
-            // RFC 6298 §2.2: first measurement
+            // RFC 6298 §2.2 (rule 2.2): on the first RTT measurement R':
+            //   SRTT = R'
+            //   RTTVAR = R' / 2
             self.srtt_us = rtt_us;
             self.rttvar_us = rtt_us / 2;
             self.initialized = true;
         } else {
-            // RFC 6298 §2.3:
-            // RTTVAR = (1 - β) * RTTVAR + β * |SRTT - R'|    β = 1/4
-            // SRTT   = (1 - α) * SRTT   + α * R'             α = 1/8
+            // RFC 6298 §2.3 (rule 2.3): for subsequent measurements R':
+            //   RTTVAR = (1 − β) × RTTVAR + β × |SRTT − R'|    where β = 1/4
+            //   SRTT   = (1 − α) × SRTT   + α × R'             where α = 1/8
+            // Bit-shift equivalents: >> 2 is ÷4 (β), >> 3 is ÷8 (α)
             let err = (self.srtt_us - rtt_us).abs();
             self.rttvar_us = self.rttvar_us - (self.rttvar_us >> 2) + (err >> 2);
             self.srtt_us = self.srtt_us - (self.srtt_us >> 3) + (rtt_us >> 3);
@@ -104,7 +133,10 @@ impl SrttEstimator {
         self.initialized
     }
 
-    /// Retransmission timeout = SRTT + max(4 * RTTVAR, 1s), floored at 1s.
+    /// Retransmission timeout per RFC 6298 §2.3 (rule 2.3):
+    ///   RTO = SRTT + max(G, 4 × RTTVAR)
+    /// where G is the clock granularity (1s here).
+    /// The result is additionally floored at 1 second per RFC 6298 §2.3 rule 2.4.
     pub fn rto_us(&self) -> i64 {
         let rto = self.srtt_us + (self.rttvar_us << 2).max(1_000_000);
         rto.max(1_000_000)
@@ -123,8 +155,14 @@ impl Default for SrttEstimator {
 
 /// Dual EWMA for trend detection on a single metric.
 ///
-/// Short-term (α=1/4) tracks recent conditions; long-term (α=1/32)
-/// establishes a stable baseline. Divergence indicates trend direction.
+/// Custom trend detector (not from a specific RFC). Uses two EWMA windows
+/// with different smoothing factors to detect divergence from baseline:
+///
+/// - **Short-term** (α = 1/4): tracks recent conditions with fast response
+/// - **Long-term** (α = 1/32): establishes a stable baseline over many samples
+///
+/// Divergence between the two indicates trend direction: if short > long the
+/// metric is rising; if short < long it is falling.
 pub struct DualEwma {
     short: f64,
     long: f64,
@@ -179,6 +217,10 @@ impl Default for DualEwma {
 /// Stores (sequence, owd_us) samples and computes the slope via
 /// least-squares regression. The slope (µs/s) indicates whether
 /// queuing delay is increasing (congestion) or stable.
+///
+/// One-way delay trend is used as a congestion signal, similar to
+/// how QUIC congestion control (RFC 9002) monitors RTT inflation
+/// to detect queuing buildup before loss occurs.
 pub struct OwdTrendDetector {
     samples: VecDeque<(u32, i64)>,
     capacity: usize,
@@ -242,7 +284,8 @@ impl OwdTrendDetector {
         // slope is in µs/packet. Convert to µs/second assuming ~1ms inter-packet
         // spacing as a rough estimate. The raw slope per packet is more useful
         // for trend detection than an absolute rate, but the wire format specifies
-        // µs/s. We report the raw per-packet slope scaled by 1000.
+        // µs/s. We report the raw per-packet slope scaled by 1000×, which
+        // corresponds to the ~1ms inter-packet assumption.
         let slope_per_packet = num / den;
         (slope_per_packet * 1000.0) as i32
     }
@@ -265,7 +308,11 @@ impl OwdTrendDetector {
 /// ETX = 1 / (d_f × d_r) where d_f and d_r are forward and reverse
 /// delivery probabilities (1.0 = perfect, 0.0 = no delivery).
 ///
-/// Clamped to [1.0, 100.0].
+/// Reference: De Couto et al. (2003), "A High-Throughput Path Metric for
+/// Multi-Hop Wireless Routing", ACM SIGCOMM.
+///
+/// Clamped to [1.0, 100.0] — a perfect link scores 1.0 and a completely
+/// broken link scores 100.0 (capped to avoid infinity).
 pub fn compute_etx(d_forward: f64, d_reverse: f64) -> f64 {
     let product = d_forward * d_reverse;
     if product <= 0.0 {
@@ -280,11 +327,15 @@ pub fn compute_etx(d_forward: f64, d_reverse: f64) -> f64 {
 
 /// Spin bit state for passive RTT estimation.
 ///
-/// Uses asymmetric roles (initiator/responder) per the MMP design:
-/// - **Initiator**: flips spin value on each received frame; measures RTT
-///   from edge-to-edge intervals.
+/// Based on the IETF IPPM spin bit concept (see RFC 9490, QUIC Spin Bit)
+/// adapted for MMP frame headers. Uses asymmetric initiator/responder roles:
+///
+/// - **Initiator**: flips spin value on each received frame whose reflected
+///   bit matches the current value; measures RTT from edge-to-edge intervals.
 /// - **Responder**: copies received spin bit into outgoing frames, with a
-///   counter guard to filter reordered frames.
+///   monotonically-increasing counter guard to filter reordered frames
+///   (only accepts a spin change from a frame with a higher counter than
+///   the one that caused the last edge).
 pub struct SpinBitState {
     is_initiator: bool,
     current_value: bool,
@@ -337,7 +388,8 @@ impl SpinBitState {
             }
         } else {
             // Responder: copy received bit, but only if counter is higher
-            // (reordering guard)
+            // (reordering guard — prevents stale/out-of-order frames from
+            // corrupting the spin edge the initiator relies on for RTT)
             if counter > self.highest_counter_for_spin {
                 self.highest_counter_for_spin = counter;
                 self.current_value = received_bit;

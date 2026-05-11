@@ -2,6 +2,16 @@
 //!
 //! Tracks what this node has sent to a specific peer and produces
 //! SenderReport messages on demand. One `SenderState` per active peer.
+//!
+//! # Design references
+//!
+//! - SenderReports track cumulative and interval counters for frames
+//!   transmitted to a specific peer, primarily carrying delivery ratio
+//!   and goodput statistics.
+//! - Report interval tuning uses 2× SRTT (less frequent than receiver's
+//!   1× SRTT) because sender reports carry less timing information — the
+//!   receiver reports are the ones that echo timestamps for RTT measurement.
+//!   See [`receiver.rs`] for the complete picture and the 1× SRTT rationale.
 
 use std::time::{Duration, Instant};
 
@@ -33,6 +43,7 @@ pub struct SenderState {
 
     // --- Report timing ---
     last_report_time: Option<Instant>,
+    /// Report interval, tuned from SRTT. See `update_report_interval_from_srtt()`.
     report_interval: Duration,
 
     // --- Send failure backoff ---
@@ -40,7 +51,8 @@ pub struct SenderState {
     consecutive_send_failures: u32,
 
     // --- Cold-start tracking ---
-    /// Number of SRTT-based interval updates received.
+    /// Number of SRTT-based interval updates received. Tracks cold-start phase
+    /// for report interval floor selection (200ms during cold-start, 1000ms after).
     srtt_sample_count: u32,
 }
 
@@ -149,7 +161,9 @@ impl SenderState {
     /// Get the backoff multiplier based on consecutive failures.
     ///
     /// Returns 1.0 for no failures, 2.0 for 1 failure, 4.0 for 2, ...
-    /// capped at 32.0 (5 failures).
+    /// capped at 32.0 (5 failures). The progression is 1.0 → 2.0 → 4.0 →
+    /// 8.0 → 16.0 → 32.0. Exponential backoff is the standard congestion
+    /// response pattern (cf. TCP RTO, RFC 6298 §5).
     pub fn send_failure_backoff_multiplier(&self) -> f64 {
         if self.consecutive_send_failures == 0 {
             1.0
@@ -160,10 +174,12 @@ impl SenderState {
 
     /// Update the report interval based on SRTT (link-layer defaults).
     ///
-    /// Sender reports at 2× SRTT clamped to [floor, MAX]. During cold-start
-    /// (first `COLD_START_SAMPLES` updates), the floor is the cold-start
-    /// interval (200ms) for fast SRTT convergence. After that, it rises to
-    /// `MIN_REPORT_INTERVAL_MS` (1000ms) for steady-state efficiency.
+    /// Sender reports at 2× SRTT. Less frequent than receiver reports (1× SRTT)
+    /// because sender reports primarily carry cumulative counters for loss/goodput,
+    /// while receiver reports carry the timestamp echo needed for RTT measurement.
+    /// The 2× multiplier halves the sender report overhead while still providing
+    /// timely delivery ratio updates. Cold-start uses 200ms floor for fast
+    /// convergence, then rises to MIN_REPORT_INTERVAL_MS (1000ms).
     pub fn update_report_interval_from_srtt(&mut self, srtt_us: i64) {
         self.srtt_sample_count = self.srtt_sample_count.saturating_add(1);
         let floor = if self.srtt_sample_count <= COLD_START_SAMPLES {
@@ -178,6 +194,10 @@ impl SenderState {
     ///
     /// Used by session-layer MMP which needs higher clamp values since
     /// each report consumes bandwidth on every transit link.
+    ///
+    /// The `srtt_us * 2` multiplier is where the 2× SRTT factor originates
+    /// (receiver uses 1× — no multiplier). The result is then clamped to
+    /// `[min_ms, max_ms]` to bound the report rate.
     pub fn update_report_interval_with_bounds(&mut self, srtt_us: i64, min_ms: u64, max_ms: u64) {
         if srtt_us <= 0 {
             return;

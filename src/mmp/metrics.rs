@@ -4,6 +4,22 @@
 //! maintains derived metrics: SRTT, loss rate, goodput, ETX, and dual
 //! EWMA trend indicators. Updated by the sender side when it receives
 //! a ReceiverReport about its own traffic.
+//!
+//! # RTT Measurement
+//!
+//! RTT is measured via the timestamp-echo pattern: the sender embeds its
+//! session-relative timestamp in each frame header; the receiver echoes
+//! it back in the ReceiverReport. This is the same approach as TCP
+//! timestamps (RFC 7323 §4.1). The SRTT update itself delegates to the
+//! RFC 6298 implementation in [`algorithms::SrttEstimator`].
+//!
+//! # Sender-Side Processing
+//!
+//! This module is the "sender side" — it processes ReceiverReports that
+//! describe the peer's observations of *our* outbound traffic. The
+//! reverse delivery ratio is fed separately from our own receiver state.
+//!
+//! [`algorithms::SrttEstimator`]: crate::mmp::algorithms::SrttEstimator
 
 use crate::mmp::algorithms::{DualEwma, SrttEstimator, compute_etx};
 use crate::mmp::report::ReceiverReport;
@@ -62,7 +78,11 @@ impl MmpMetrics {
     ///
     /// The new session starts with counter 0, so the prev_rr deltas must
     /// be reset to avoid computing bogus loss/goodput from the counter
-    /// discontinuity. RTT (SRTT) is preserved since it remains valid.
+    /// discontinuity. RTT (SRTT) is preserved since it remains valid:
+    /// per RFC 6298, SRTT remains valid as long as the transport path
+    /// doesn't change. Rekey changes the cryptographic session but not
+    /// the underlying BLE/L2CAP path, so only counter deltas need
+    /// resetting (new session starts at counter 0).
     pub fn reset_for_rekey(&mut self) {
         self.prev_rr_cum_packets = 0;
         self.prev_rr_cum_bytes = 0;
@@ -120,6 +140,22 @@ impl MmpMetrics {
 
         // --- RTT from timestamp echo ---
         // RTT = now - echoed_timestamp - dwell_time
+        //
+        // Following the same pattern as TCP timestamp echoes (RFC 7323 §4.1):
+        //   our_timestamp_ms  — sender's session-relative time when processing
+        //                        this report (i.e., "now" for the sender)
+        //   echo_ms           — the sender's timestamp that was embedded in the
+        //                        frame header when it was originally transmitted;
+        //                        the receiver echoes it back verbatim
+        //   dwell_ms          — time the receiver held the frame before generating
+        //                        the report; subtracted to isolate network latency
+        //                        from report-interval delays that would inflate RTT
+        //
+        // The guard `our_timestamp_ms > echo_ms + dwell_ms` prevents wrap-around
+        // artifacts and bogus negative RTT values from clock skew.
+        //
+        // RFC 8961 §2: "RTT observations SHOULD be taken at least once per RTT" —
+        // the ReceiverReport interval is configured to satisfy this.
         if rr.timestamp_echo > 0 {
             let echo_ms = rr.timestamp_echo;
             let dwell_ms = rr.dwell_time as u32;
@@ -141,7 +177,10 @@ impl MmpMetrics {
         }
 
         // --- Loss rate from cumulative counters ---
-        // Delta: frames the peer should have received vs. actually received
+        // Per-interval delta pattern: compare this report's cumulative counters
+        // against the previous report's, not a lifetime cumulative ratio.
+        // This makes ETX responsive to recent conditions rather than dominated
+        // by historical averages.
         if self.has_prev_rr {
             let counter_span = rr
                 .highest_counter
@@ -173,7 +212,8 @@ impl MmpMetrics {
                 let secs = elapsed.as_secs_f64();
                 if secs > 0.0 {
                     let bps = bytes_delta as f64 / secs;
-                    // EWMA smoothing: α = 1/4
+                    // Simple EWMA with α = 1/4 (not Jacobson-style; just a
+                    // straightforward smoothing factor for goodput tracking).
                     if self.goodput_bps == 0.0 {
                         self.goodput_bps = bps;
                     } else {

@@ -2,6 +2,20 @@
 //!
 //! Tracks what this node has received from a specific peer and produces
 //! ReceiverReport messages on demand. One `ReceiverState` per active peer.
+//!
+//! # Design references
+//!
+//! - ReceiverReports follow the RTP Receiver Report concept (RFC 3550 §6.4.2)
+//!   adapted for mesh metrics: each report echoes the sender's timestamp for
+//!   RTT measurement and carries per-interval loss/jitter/OWD statistics.
+//! - Report interval tuning uses SRTT feedback following RFC 8961 §2 guidance
+//!   that RTT observations should be taken "at least once per RTT" — the
+//!   receiver generates reports at 1× SRTT to ensure one observation per cycle.
+//! - The `dwell_time` field measures the delay between last frame reception
+//!   and report generation; it is subtracted from the sender-side RTT
+//!   computation (see [`metrics.rs`]: `rtt_ms = our_timestamp_ms - echo_ms - dwell_ms`).
+//!   Without this subtraction, longer report intervals would inflate RTT,
+//!   creating a positive feedback loop.
 
 use std::time::{Duration, Instant};
 
@@ -14,10 +28,11 @@ use crate::mmp::{
 
 /// Grace period after rekey before resuming jitter calculation.
 ///
-/// During rekey cutover, frames from the old session may still arrive via the
-/// drain window (DRAIN_WINDOW_SECS = 10s). These carry large sender timestamps
-/// from the old session, producing enormous transit deltas that spike the EWMA
-/// jitter estimator. We suppress jitter updates for drain window + 5s margin.
+/// During rekey cutover, old-session frames may still arrive via the 10s drain
+/// window (DRAIN_WINDOW_SECS). These carry large sender timestamps from the old
+/// session, producing enormous transit deltas that spike the EWMA jitter
+/// estimator. We suppress jitter updates for the full drain window plus a 5s
+/// safety margin: 15s = 10s drain + 5s margin.
 const REKEY_JITTER_GRACE_SECS: u64 = 15;
 
 // ============================================================================
@@ -26,8 +41,10 @@ const REKEY_JITTER_GRACE_SECS: u64 = 15;
 
 /// Tracks counter gaps to detect loss bursts.
 ///
-/// Each gap in the counter sequence is a burst of lost frames.
-/// Maintains per-interval statistics that are reset when a report is built.
+/// Each gap in the counter sequence represents a burst of lost frames,
+/// analogous to TCP SACK gap analysis where the receiver reports missing
+/// ranges to infer burst loss patterns. Per-interval statistics are reset
+/// when a report is generated via [`take_interval_stats()`].
 struct GapTracker {
     /// Next expected counter value.
     expected_next: Option<u64>,
@@ -283,6 +300,8 @@ impl ReceiverState {
         // Jitter: compute transit time delta
         // Transit = recv_local - sender_timestamp (in µs for precision)
         // We use a monotonic local reference derived from Instant offsets.
+        // See JitterEstimator::update() in algorithms.rs and RFC 3550 §6.4.1
+        // for the inter-arrival jitter formula: J = J + (|D| - J)/16.
         let sender_us = (sender_timestamp_ms as i64) * 1000;
         // We can't get absolute µs from Instant, but we can compute the delta
         // between consecutive transits using relative Instant differences.
@@ -302,7 +321,9 @@ impl ReceiverState {
 
         // OWD trend: use sender timestamp as a proxy for send time
         // and Instant delta from a fixed reference as receive time.
-        // Since we only need the *trend* (slope), absolute offsets cancel out.
+        // Since we only need the *trend* (slope), absolute offsets cancel out —
+        // the unknown clock offset between sender and receiver is a constant
+        // that does not affect the derivative.
         if let Some(first_recv) = self.last_recv_time.or(Some(now)) {
             let recv_offset_us = now.duration_since(first_recv).as_micros() as i64;
             let owd_us = recv_offset_us - sender_us;
@@ -311,7 +332,12 @@ impl ReceiverState {
         }
 
         // Timestamp echo state
+        // This is the sender's session-relative timestamp from the inner header,
+        // which will be echoed as `timestamp_echo` in the next ReceiverReport
+        // for RTT measurement by the sender.
         self.last_sender_timestamp = sender_timestamp_ms;
+        // Monotonic local time of this frame's reception, used to compute
+        // `dwell_time` in the next report (see build_report()).
         self.last_recv_time = Some(now);
     }
 
@@ -323,7 +349,12 @@ impl ReceiverState {
             return None;
         }
 
-        // Dwell time: ms between last frame reception and report generation
+        // Dwell time: ms between last frame reception and report generation.
+        // This is SUBTRACTED from the RTT computation on the sender side
+        // (see metrics.rs: rtt_ms = our_timestamp_ms - echo_ms - dwell_ms),
+        // so longer report intervals do NOT inflate RTT. This is critical for
+        // correct SRTT behavior — without subtracting dwell, the RTT would
+        // grow linearly with report interval, creating a positive feedback loop.
         let dwell_time = self
             .last_recv_time
             .map(|t| now.duration_since(t).as_millis() as u16)
@@ -335,6 +366,8 @@ impl ReceiverState {
             highest_counter: self.highest_counter,
             cumulative_packets_recv: self.cumulative_packets_recv,
             cumulative_bytes_recv: self.cumulative_bytes_recv,
+            // last_sender_timestamp: the sender's session-relative timestamp
+            // of the last received frame, echoed back for RTT measurement.
             timestamp_echo: self.last_sender_timestamp,
             dwell_time,
             max_burst_loss: max_burst,
@@ -370,10 +403,15 @@ impl ReceiverState {
 
     /// Update the report interval based on SRTT (link-layer defaults).
     ///
-    /// Receiver reports at 1× SRTT clamped to [floor, MAX]. During cold-start
-    /// (first `COLD_START_SAMPLES` updates), the floor is the cold-start
-    /// interval (200ms) for fast SRTT convergence. After that, it rises to
-    /// `MIN_REPORT_INTERVAL_MS` (1000ms) for steady-state efficiency.
+    /// Receiver reports at 1× SRTT, per RFC 8961 §2 guidance that RTT
+    /// observations should be taken at least once per RTT. The 1× multiplier
+    /// ensures we generate one report per RTT cycle on average.
+    /// Cold-start uses 200ms floor for fast SRTT convergence (first
+    /// COLD_START_SAMPLES updates), then rises to MIN_REPORT_INTERVAL_MS
+    /// (1000ms) for steady-state efficiency.
+    ///
+    /// Note: the sender uses 2× SRTT (less frequent than receiver's 1×) —
+    /// see sender.rs `update_report_interval_from_srtt()`.
     pub fn update_report_interval_from_srtt(&mut self, srtt_us: i64) {
         self.srtt_sample_count = self.srtt_sample_count.saturating_add(1);
         let floor = if self.srtt_sample_count <= COLD_START_SAMPLES {
@@ -388,6 +426,10 @@ impl ReceiverState {
     ///
     /// Used by session-layer MMP which needs higher clamp values since
     /// each report consumes bandwidth on every transit link.
+    ///
+    /// The interval is clamped: `interval = max(min_ms, min(max_ms, srtt_ms))`.
+    /// This bounds the report rate even when SRTT is very low (prevents
+    /// flooding) or very high (prevents stale metrics).
     pub fn update_report_interval_with_bounds(&mut self, srtt_us: i64, min_ms: u64, max_ms: u64) {
         if srtt_us <= 0 {
             return;
