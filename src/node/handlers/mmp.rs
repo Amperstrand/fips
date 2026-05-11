@@ -229,9 +229,16 @@ impl Node {
         // Reference: RFC 6298 SRTT is per-path; a new BLE channel constitutes a new path.
         // QUIC (RFC 9002 §5.3) explicitly resets RTT estimator on path migration.
         if let Some(srtt_ms) = ble_srtt_ms {
+            let inflation_ratio = self.peers.get(from)
+                .and_then(|p| p.mmp())
+                .and_then(|mmp| mmp.metrics.inflation_ratio());
             let exceeded = self.config.transports.ble.iter().find_map(|(_, cfg)| {
-                cfg.srtt_reconnect_threshold_ms()
-                    .filter(|&threshold| srtt_ms > threshold as f64)
+                let abs = cfg.srtt_reconnect_threshold_ms()
+                    .filter(|&threshold| srtt_ms > threshold as f64);
+                let ratio = cfg.srtt_inflation_threshold()
+                    .zip(inflation_ratio)
+                    .filter(|&(threshold, ratio)| ratio > threshold);
+                abs.or(ratio.map(|_| 0)) // 0 = ratio-based trigger (for logging)
             });
             if exceeded.is_some() {
                 let min_rtt_str = self.peers.get(from)
@@ -243,11 +250,13 @@ impl Node {
                     ("srtt_ms", &format!("{:.1}", srtt_ms)),
                     ("min_rtt_ms", &min_rtt_str),
                     ("threshold_ms", &format!("{}", exceeded.unwrap())),
+                    ("inflation_ratio", &format!("{:.1}", inflation_ratio.unwrap_or(0.0))),
                 ]);
                 warn!(
                     peer = %peer_name,
                     srtt_ms = format!("{:.1}", srtt_ms),
                     threshold_ms = exceeded.unwrap(),
+                    inflation_ratio = format!("{:.1}", inflation_ratio.unwrap_or(0.0)),
                     "Proactive BLE reconnect: SRTT exceeded threshold, scheduling reconnect with lighter backoff"
                 );
                 let addr = *from;

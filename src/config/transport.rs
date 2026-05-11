@@ -796,6 +796,13 @@ pub struct BleConfig {
     /// resets on reconnect. None = disabled. Default: disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srtt_reconnect_threshold_ms: Option<u64>,
+
+    /// SRTT inflation ratio threshold (SRTT / min_rtt). When the ratio exceeds
+    /// this value, the BLE transport proactively reconnects. This is adaptive:
+    /// it triggers based on relative degradation rather than absolute RTT.
+    /// E.g., 3.0 = reconnect when RTT is 3× the best-case. None = disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srtt_inflation_threshold: Option<f64>,
 }
 
 impl BleConfig {
@@ -907,6 +914,11 @@ impl BleConfig {
         }
     }
 
+    /// SRTT inflation ratio threshold. None = disabled.
+    pub fn srtt_inflation_threshold(&self) -> Option<f64> {
+        self.srtt_inflation_threshold.filter(|&v| v > 0.0)
+    }
+
     pub fn validate(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -941,6 +953,10 @@ impl BleConfig {
         if self.srtt_reconnect_threshold_ms == Some(0) {
             self.srtt_reconnect_threshold_ms = None;
             warnings.push("transports.ble.srtt_reconnect_threshold_ms was 0, reset to disabled".into());
+        }
+        if self.srtt_inflation_threshold == Some(0.0) {
+            self.srtt_inflation_threshold = None;
+            warnings.push("transports.ble.srtt_inflation_threshold was 0, reset to disabled".into());
         }
 
         warnings
