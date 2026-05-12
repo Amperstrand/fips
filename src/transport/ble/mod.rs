@@ -893,11 +893,6 @@ async fn accept_loop<A, I: BleIo>(
                 let addr = stream.remote_addr().clone();
                 let ta = addr.to_transport_addr();
 
-                if backoff.lock().await.is_denied(&addr) {
-                    debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: denied, dropping");
-                    continue;
-                }
-
                 {
                     let pool_guard = pool.lock().await;
                     if pool_guard.contains(&ta) {
