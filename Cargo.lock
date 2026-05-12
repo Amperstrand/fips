@@ -381,7 +381,7 @@ dependencies = [
 [[package]]
 name = "bluest"
 version = "0.6.10"
-source = "git+https://github.com/Amperstrand/bluest.git?rev=f3c8d09b68d9c12c20df4ba7d433b60a3bbbe2c1#f3c8d09b68d9c12c20df4ba7d433b60a3bbbe2c1"
+source = "git+https://github.com/Amperstrand/bluest.git?rev=cbb4eb5a24d7add178c5eed0784e270ea329d923#cbb4eb5a24d7add178c5eed0784e270ea329d923"
 dependencies = [
  "async-broadcast",
  "async-channel",

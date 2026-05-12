@@ -79,15 +79,9 @@ impl RetryState {
     /// Note: For proactive reconnects (H13), this compounds with any previous
     /// failure reconnects since retry_count is preserved. See issue #108 for
     /// the proposal to use a separate, lighter backoff for proactive reconnects.
-    pub fn backoff_ms(&self, base_interval_ms: u64, max_backoff_ms: u64) -> u64 {
+    pub fn backoff_ms(&self, base_interval_ms: u64, max_backoff_ms: u64, proactive_backoff_ms: u64) -> u64 {
         if self.proactive {
-            // Proactive reconnect: 10s fixed delay. The BLE controller needs
-            // time to tear down the old L2CAP channel and settle before a new
-            // connection attempt. 2s was too short — the old channel was still
-            // being cleaned up, causing pubkey exchange timeouts on the new
-            // connection. 10s matches the typical BLE connection interval
-            // negotiation window (Core Spec Vol 3 Part C §9.3.10).
-            return 10_000;
+            return proactive_backoff_ms;
         }
         // Normal exponential backoff for failure reconnects
         let multiplier = 1u64.checked_shl(self.retry_count).unwrap_or(u64::MAX);
@@ -185,7 +179,7 @@ impl Node {
                 self.retry_pending.remove(&node_addr);
                 return;
             }
-            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms, 0);
             state.retry_after_ms = now_ms + delay;
             debug!(
                 peer = %peer_name,
@@ -211,7 +205,7 @@ impl Node {
                 let mut state = RetryState::new(pc);
                 state.retry_count = 1;
                 state.reconnect = true;
-                let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+                let delay = state.backoff_ms(base_interval_ms, max_backoff_ms, 0);
                 state.retry_after_ms = now_ms + delay;
                 debug!(
                     peer = %self.peer_display_name(&node_addr),
@@ -276,7 +270,7 @@ impl Node {
         if let Some(state) = self.retry_pending.get_mut(&node_addr) {
             state.reconnect = true;
             state.retry_count += 1;
-            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms, 0);
             state.retry_after_ms = now_ms + delay;
             debug!(
                 peer = %peer_name,
@@ -289,7 +283,7 @@ impl Node {
 
         let mut state = RetryState::new(pc);
         state.reconnect = true;
-        let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+        let delay = state.backoff_ms(base_interval_ms, max_backoff_ms, 0);
         state.retry_after_ms = now_ms + delay;
 
         debug!(
@@ -306,7 +300,7 @@ impl Node {
     /// Similar to schedule_reconnect but sets the `proactive` flag for lighter
     /// backoff. Used by H13 SRTT threshold reconnect — the link was healthy,
     /// we're cycling the BLE channel to get fresh L2CAP credits.
-    pub(super) fn schedule_proactive_reconnect(&mut self, node_addr: NodeAddr, now_ms: u64) {
+    pub(super) fn schedule_proactive_reconnect(&mut self, node_addr: NodeAddr, now_ms: u64, proactive_backoff_ms: u64) {
         let peer_config = self
             .config
             .auto_connect_peers()
@@ -335,7 +329,7 @@ impl Node {
             state.reconnect = true;
             state.proactive = true;
             // Don't increment retry_count for proactive — it wasn't a failure
-            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+            let delay = state.backoff_ms(base_interval_ms, max_backoff_ms, proactive_backoff_ms);
             state.retry_after_ms = now_ms + delay;
             debug!(
                 peer = %peer_name,
@@ -348,7 +342,7 @@ impl Node {
         let mut state = RetryState::new(pc);
         state.reconnect = true;
         state.proactive = true;
-        let delay = state.backoff_ms(base_interval_ms, max_backoff_ms);
+        let delay = state.backoff_ms(base_interval_ms, max_backoff_ms, proactive_backoff_ms);
         state.retry_after_ms = now_ms + delay;
 
         debug!(
@@ -474,31 +468,31 @@ mod tests {
             expires_at_ms: None,
         };
         // base = 5000ms
-        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 5000); // 5s * 2^0
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 0), 5000); // 5s * 2^0
 
         let state = RetryState {
             retry_count: 1,
             ..state
         };
-        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 10_000); // 5s * 2^1
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 0), 10_000); // 5s * 2^1
 
         let state = RetryState {
             retry_count: 2,
             ..state
         };
-        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 20_000); // 5s * 2^2
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 0), 20_000); // 5s * 2^2
 
         let state = RetryState {
             retry_count: 3,
             ..state
         };
-        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 40_000); // 5s * 2^3
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 0), 40_000); // 5s * 2^3
 
         let state = RetryState {
             retry_count: 4,
             ..state
         };
-        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 80_000); // 5s * 2^4
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 0), 80_000); // 5s * 2^4
     }
 
     #[test]
@@ -512,7 +506,7 @@ mod tests {
             expires_at_ms: None,
         };
         assert_eq!(
-            state.backoff_ms(5000, TEST_MAX_BACKOFF_MS),
+            state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 0),
             TEST_MAX_BACKOFF_MS
         );
     }
@@ -527,7 +521,7 @@ mod tests {
             proactive: false,
             expires_at_ms: None,
         };
-        assert_eq!(state.backoff_ms(0, TEST_MAX_BACKOFF_MS), 0);
+        assert_eq!(state.backoff_ms(0, TEST_MAX_BACKOFF_MS, 0), 0);
     }
 
     #[test]
@@ -540,10 +534,10 @@ mod tests {
             proactive: true,
             expires_at_ms: None,
         };
-        // Proactive: fixed 2s delay regardless of retry_count
-        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS), 2000);
+        // Proactive: returns the configured proactive_backoff_ms regardless of retry_count
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 10_000), 10_000);
 
-        // If base is less than 2s, use base
+        // Proactive with different configured value
         let state = RetryState {
             peer_config: PeerConfig::default(),
             retry_count: 5,
@@ -552,6 +546,6 @@ mod tests {
             proactive: true,
             expires_at_ms: None,
         };
-        assert_eq!(state.backoff_ms(1000, TEST_MAX_BACKOFF_MS), 1000);
+        assert_eq!(state.backoff_ms(5000, TEST_MAX_BACKOFF_MS, 5_000), 5_000);
     }
 }

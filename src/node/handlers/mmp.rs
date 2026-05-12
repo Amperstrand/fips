@@ -264,14 +264,19 @@ impl Node {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                // Cooldown guard: skip reconnect if last one was <30s ago.
-                const PROACTIVE_RECONNECT_COOLDOWN_MS: u64 = 30_000;
+                // Cooldown guard: skip reconnect if last one was too recent.
+                let cooldown_ms = self.config.transports.ble.iter()
+                    .find_map(|(_, cfg)| {
+                        let secs = cfg.proactive_reconnect_cooldown_secs();
+                        Some(secs * 1000)
+                    })
+                    .unwrap_or(30_000u64);
                 if let Some(&last_ms) = self.last_proactive_reconnect_ms.get(&addr) {
                     let elapsed = now_ms.saturating_sub(last_ms);
-                    if elapsed < PROACTIVE_RECONNECT_COOLDOWN_MS {
+                    if elapsed < cooldown_ms {
                         ble_log("srtt_reconnect_cooldown", &peer_name, &[
                             ("elapsed_secs", &format!("{}", elapsed / 1000)),
-                            ("cooldown_secs", &format!("{}", PROACTIVE_RECONNECT_COOLDOWN_MS / 1000)),
+                            ("cooldown_secs", &format!("{}", cooldown_ms / 1000)),
                         ]);
                         return;
                     }
@@ -293,9 +298,15 @@ impl Node {
                         transport.close_connection_sync(&taddr);
                     }
                 }
-                // Proactive reconnect with lighter backoff — the link was healthy,
+                // Proactive reconnect with configurable backoff — the link was healthy,
                 // we're cycling the BLE channel to get fresh L2CAP credits.
-                self.schedule_proactive_reconnect(addr, now_ms);
+                let proactive_backoff_ms = self.config.transports.ble.iter()
+                    .find_map(|(_, cfg)| {
+                        let secs = cfg.proactive_reconnect_backoff_secs();
+                        Some(secs * 1000)
+                    })
+                    .unwrap_or(10_000u64);
+                self.schedule_proactive_reconnect(addr, now_ms, proactive_backoff_ms);
                 return;
             }
         }

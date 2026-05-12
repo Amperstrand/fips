@@ -803,6 +803,18 @@ pub struct BleConfig {
     /// E.g., 3.0 = reconnect when RTT is 3× the best-case. None = disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srtt_inflation_threshold: Option<f64>,
+
+    /// Fixed backoff delay in seconds for proactive (H13 SRTT-triggered)
+    /// reconnects. The BLE controller needs time to tear down the old L2CAP
+    /// channel before a new connection attempt. Default: 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactive_reconnect_backoff_secs: Option<u64>,
+
+    /// Minimum time in seconds between consecutive proactive reconnects
+    /// for the same peer. Prevents reconnect storms when SRTT remains
+    /// elevated after cycling. Default: 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactive_reconnect_cooldown_secs: Option<u64>,
 }
 
 impl BleConfig {
@@ -922,6 +934,14 @@ impl BleConfig {
             Some(v) if v > 0.0 => Some(v),
             _ => Some(5.0),
         }
+    }
+
+    pub fn proactive_reconnect_backoff_secs(&self) -> u64 {
+        self.proactive_reconnect_backoff_secs.unwrap_or(10)
+    }
+
+    pub fn proactive_reconnect_cooldown_secs(&self) -> u64 {
+        self.proactive_reconnect_cooldown_secs.unwrap_or(30)
     }
 
     pub fn validate(&mut self) -> Vec<String> {
