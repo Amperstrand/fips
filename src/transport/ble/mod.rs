@@ -550,9 +550,12 @@ impl<I: BleIo> BleTransport<I> {
                                 }
                                 Err(e) => {
                                     warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
-                                    let denied = backoff.lock().await.record_failure(&ble_addr);
-                                    if denied {
-                                        warn!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound: auto-denied after repeated pubkey failures");
+                                    // Bluest L2CAP recv race — see scan_probe_loop for rationale.
+                                    if !matches!(e, TransportError::Timeout) {
+                                        let denied = backoff.lock().await.record_failure(&ble_addr);
+                                        if denied {
+                                            warn!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound: auto-denied after repeated pubkey failures");
+                                        }
                                     }
                                     connecting_inner.lock().await.remove(&addr_clone);
                                     return;
@@ -1471,10 +1474,17 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
             Err(e) => {
                 debug!(transport_id = %transport_id, remote_addr = %addr, error = %e, "BLE probe pubkey exchange failed");
-                let denied = backoff.lock().await.record_failure(&addr);
-                if denied {
-                    warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
-                    pending_addrs.retain(|a| a != &addr);
+                // Timeout during pubkey exchange is the known bluest L2CAP recv
+                // race (Amperstrand/bluest#3): CoreBluetooth central never
+                // receives data sent by the peripheral before the central posts
+                // its recv(). Don't penalize the peer — the connection will form
+                // when the peer connects outbound to us instead.
+                if !matches!(e, TransportError::Timeout) {
+                    let denied = backoff.lock().await.record_failure(&addr);
+                    if denied {
+                        warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
+                        pending_addrs.retain(|a| a != &addr);
+                    }
                 }
             }
         }
