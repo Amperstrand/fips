@@ -1401,6 +1401,22 @@ async fn scan_probe_loop<I: io::BleIo>(
 
         last_probed.insert(addr.clone(), tokio::time::Instant::now());
 
+        // If we already know this peer prefers outbound and we don't,
+        // skip the outbound probe. Probing would tie up the BLE link
+        // and interfere with the peer's inbound connection attempt
+        // (especially on macOS where CoreBluetooth assigns a dynamic
+        // PSM that requires GATT discovery by the peer).
+        if !local_capabilities.prefers_outbound() {
+            let known = known_peer_capabilities.lock().await;
+            if let Some(peer_caps) = known.get(&addr) {
+                if peer_caps.prefers_outbound() {
+                    debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: peer known to prefer outbound, skipping probe");
+                    buffer.add_peer(&addr);
+                    continue;
+                }
+            }
+        }
+
         let our_pubkey = match local_pubkey {
             Some(pk) => pk,
             None => {
