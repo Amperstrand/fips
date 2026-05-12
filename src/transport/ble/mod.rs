@@ -109,6 +109,13 @@ pub struct BleTransport<I: BleIo> {
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
     disconnect_tx: Option<DisconnectTx>,
     congested: Arc<AtomicBool>,
+    /// Cache of peer capabilities learned during pubkey exchange.
+    /// Used by `connect_async` to respect PREFER_OUTBOUND: if the peer
+    /// is known to prefer outbound and our local node does not, we skip
+    /// the outbound attempt and wait for the peer to connect inbound.
+    /// Pattern: BlueZ maintains a similar peer-attribute cache in
+    /// `device.c` for connection parameter negotiation.
+    known_peer_capabilities: Arc<Mutex<HashMap<BleAddr, PeerCapabilities>>>,
 }
 
 /// Receive timeout in seconds. BLE links under congestion can experience
@@ -154,6 +161,7 @@ impl<I: BleIo> BleTransport<I> {
             backoff: Arc::new(Mutex::new(backoff::PeerBackoff::with_defaults())),
             disconnect_tx: None,
             congested: Arc::new(AtomicBool::new(false)),
+            known_peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -253,6 +261,7 @@ impl<I: BleIo> BleTransport<I> {
                         Arc::clone(&self.discovery_buffer),
                         self.local_capabilities,
                         Arc::clone(&self.backoff),
+                        Arc::clone(&self.known_peer_capabilities),
                         self.config.conn_param_refresh_secs(),
                         self.config.conn_param_min_interval(),
                         self.config.conn_param_max_interval(),
@@ -299,6 +308,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.transport_id,
                         self.local_capabilities,
                         Arc::clone(&self.backoff),
+                        Arc::clone(&self.known_peer_capabilities),
                         self.config.conn_param_refresh_secs(),
                         self.config.conn_param_min_interval(),
                         self.config.conn_param_max_interval(),
@@ -506,6 +516,26 @@ impl<I: BleIo> BleTransport<I> {
             ));
         }
 
+        // Respect PREFER_OUTBOUND: if the peer is known to prefer outbound
+        // connections and our local node does not, skip the outbound attempt.
+        // This prevents Mac (peripheral) from initiating outbound connections
+        // to Linux (central) after a reconnect tears down the working link.
+        // The peer will reconnect via its own scan_probe_loop.
+        {
+            let known_caps = self.known_peer_capabilities.lock().await;
+            if let Some(peer_caps) = known_caps.get(&ble_addr) {
+                if peer_caps.prefers_outbound() && !self.local_capabilities.prefers_outbound() {
+                    debug!(
+                        remote_addr = %addr,
+                        "BLE outbound connect: peer prefers outbound, deferring to peer's inbound"
+                    );
+                    return Err(TransportError::LinkFailed(
+                        "deferring to peer's preferred outbound role".into(),
+                    ));
+                }
+            }
+        }
+
         {
             let mut connecting = self.connecting.lock().await;
             if connecting.contains_key(addr) {
@@ -526,6 +556,7 @@ impl<I: BleIo> BleTransport<I> {
             let local_capabilities = self.local_capabilities;
             let discovery_buffer = Arc::clone(&self.discovery_buffer);
             let backoff = Arc::clone(&self.backoff);
+            let known_peer_capabilities = Arc::clone(&self.known_peer_capabilities);
             let conn_param_refresh_secs = self.config.conn_param_refresh_secs();
             let conn_param_min_interval = self.config.conn_param_min_interval();
             let conn_param_max_interval = self.config.conn_param_max_interval();
@@ -547,6 +578,7 @@ impl<I: BleIo> BleTransport<I> {
                                     debug!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound pubkey exchange complete");
                                     discovery_buffer
                                         .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
+                                    known_peer_capabilities.lock().await.insert(ble_addr.clone(), result.peer_capabilities);
                                 }
                                 Err(e) => {
                                     warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
@@ -903,6 +935,7 @@ async fn accept_loop<A, I: BleIo>(
     discovery_buffer: Arc<DiscoveryBuffer>,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    known_peer_capabilities: Arc<Mutex<HashMap<BleAddr, PeerCapabilities>>>,
     conn_param_refresh_secs: Option<u64>,
     conn_param_min_interval: u16,
     conn_param_max_interval: u16,
@@ -943,6 +976,7 @@ async fn accept_loop<A, I: BleIo>(
                                 discovery_buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
 
                                 let peer_capabilities = result.peer_capabilities;
+                                known_peer_capabilities.lock().await.insert(addr.clone(), peer_capabilities);
                                 if !peer_capabilities.can_accept_inbound() {
                                     debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: peer is central-only, accepting inbound connection anyway");
                                 } else if peer_capabilities.prefers_outbound()
@@ -1214,6 +1248,7 @@ async fn scan_probe_supervisor<I: io::BleIo>(
     transport_id: TransportId,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    known_peer_capabilities: Arc<Mutex<HashMap<BleAddr, PeerCapabilities>>>,
     conn_param_refresh_secs: Option<u64>,
     conn_param_min_interval: u16,
     conn_param_max_interval: u16,
@@ -1242,6 +1277,7 @@ async fn scan_probe_supervisor<I: io::BleIo>(
                 transport_id,
                 local_capabilities,
                 Arc::clone(&backoff),
+                Arc::clone(&known_peer_capabilities),
                 conn_param_refresh_secs,
                 conn_param_min_interval,
                 conn_param_max_interval,
@@ -1295,6 +1331,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     transport_id: TransportId,
     local_capabilities: PeerCapabilities,
     backoff: Arc<Mutex<backoff::PeerBackoff>>,
+    known_peer_capabilities: Arc<Mutex<HashMap<BleAddr, PeerCapabilities>>>,
     conn_param_refresh_secs: Option<u64>,
     conn_param_min_interval: u16,
     conn_param_max_interval: u16,
@@ -1408,6 +1445,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                 debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe complete");
 
                 let peer_capabilities = result.peer_capabilities;
+                known_peer_capabilities.lock().await.insert(addr.clone(), peer_capabilities);
                 if !peer_capabilities.can_accept_inbound() {
                     debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: peer cannot accept inbound, yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);

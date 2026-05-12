@@ -801,6 +801,10 @@ pub struct BleConfig {
     /// this value, the BLE transport proactively reconnects. This is adaptive:
     /// it triggers based on relative degradation rather than absolute RTT.
     /// E.g., 3.0 = reconnect when RTT is 3× the best-case. None = disabled.
+    /// Disabled by default because BLE RTT variance is normal due to controller
+    /// scheduling, L2CAP credit flow control, and radio interference.
+    /// Experiment 8 showed the 5.0 default tore down working connections
+    /// on transient spikes, triggering an outbound death spiral.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srtt_inflation_threshold: Option<f64>,
 
@@ -820,9 +824,8 @@ pub struct BleConfig {
     /// L2CAP channel, each side sends its Nostr pubkey and waits for the
     /// peer's response. On macOS (CoreBluetooth), the central's recv() can
     /// miss data sent by the peripheral before the central starts reading —
-    /// a known bluest race (Amperstrand/bluest#3). A short timeout (5s)
-    /// lets the backoff system escalate to auto-deny quickly, allowing
-    /// the peer to establish the connection as central instead. Default: 5.
+    /// a known bluest race (Amperstrand/bluest#3). Configurable so the
+    /// timeout can be tuned per-deployment. Default: 15.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey_exchange_timeout_secs: Option<u64>,
 }
@@ -936,13 +939,14 @@ impl BleConfig {
         }
     }
 
-    /// SRTT inflation ratio threshold. Default: 5.0 (validated in experiment #117).
-    /// Set to -1 to explicitly disable.
+    /// SRTT inflation ratio threshold. Default: disabled (None).
+    /// Disabled after Experiment 8 showed the 5.0 default caused unnecessary
+    /// reconnection on transient BLE RTT variance.
     pub fn srtt_inflation_threshold(&self) -> Option<f64> {
         match self.srtt_inflation_threshold {
             Some(v) if v < 0.0 => None,
             Some(v) if v > 0.0 => Some(v),
-            _ => Some(5.0),
+            _ => None,
         }
     }
 
@@ -955,7 +959,7 @@ impl BleConfig {
     }
 
     pub fn pubkey_exchange_timeout_secs(&self) -> u64 {
-        self.pubkey_exchange_timeout_secs.unwrap_or(5)
+        self.pubkey_exchange_timeout_secs.unwrap_or(15)
     }
 
     pub fn validate(&mut self) -> Vec<String> {
@@ -995,7 +999,7 @@ impl BleConfig {
         }
         if self.srtt_inflation_threshold == Some(0.0) {
             self.srtt_inflation_threshold = None;
-            warnings.push("transports.ble.srtt_inflation_threshold was 0, using default 5.0".into());
+            warnings.push("transports.ble.srtt_inflation_threshold was 0, reset to disabled".into());
         }
 
         warnings
