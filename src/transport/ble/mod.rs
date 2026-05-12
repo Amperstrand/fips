@@ -935,6 +935,7 @@ async fn accept_loop<A, I: BleIo>(
                 ]);
 
                 if let Some(ref our_pubkey) = local_pubkey {
+                    wait_before_outbound_pubkey_exchange().await;
                     if stream.supports_bidirectional_pubkey_exchange() {
                         match pubkey_exchange(&stream, our_pubkey, local_capabilities).await {
                             Ok(result) => {

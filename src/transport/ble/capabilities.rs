@@ -22,14 +22,16 @@ impl PeerCapabilities {
         Self(0)
     }
 
-    /// Default capabilities for Linux (dual-role, prefers L2CAP, no outbound preference).
+    /// Default capabilities for Linux (dual-role, prefers outbound so macOS
+    /// yields and plays peripheral for maximum throughput).
     pub fn linux_default() -> Self {
         Self(
             Self::L2CAP_SUPPORTED
                 | Self::CAN_CENTRAL
                 | Self::CAN_PERIPHERAL
                 | Self::GATT_SUPPORTED
-                | Self::PREFER_L2CAP,
+                | Self::PREFER_L2CAP
+                | Self::PREFER_OUTBOUND,
         )
     }
 
@@ -43,14 +45,15 @@ impl PeerCapabilities {
         Self(Self::L2CAP_SUPPORTED | Self::CAN_PERIPHERAL | Self::GATT_SUPPORTED)
     }
 
-    /// Default capabilities for macOS (dual-role, prefers outbound).
+    /// Default capabilities for macOS (dual-role, no outbound preference so
+    /// Linux connects as central and macOS plays peripheral for maximum
+    /// throughput — the direct NSOutputStream write path is ~2.75× faster).
     pub fn macos_default() -> Self {
         Self(
             Self::L2CAP_SUPPORTED
                 | Self::CAN_CENTRAL
                 | Self::CAN_PERIPHERAL
-                | Self::GATT_SUPPORTED
-                | Self::PREFER_OUTBOUND,
+                | Self::GATT_SUPPORTED,
         )
     }
 
@@ -128,7 +131,7 @@ mod tests {
         assert!(!caps.is_central_only());
         assert!(caps.can_accept_inbound());
         assert!(caps.can_initiate_outbound());
-        assert!(caps.prefers_outbound());
+        assert!(!caps.prefers_outbound());
     }
 
     #[test]
@@ -137,7 +140,7 @@ mod tests {
         assert!(!caps.is_central_only());
         assert!(caps.can_accept_inbound());
         assert!(caps.can_initiate_outbound());
-        assert!(!caps.prefers_outbound());
+        assert!(caps.prefers_outbound());
     }
 
     #[test]
