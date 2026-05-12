@@ -782,7 +782,7 @@ impl<I: BleIo> Transport for BleTransport<I> {
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
 const PUBKEY_EXCHANGE_SIZE: usize = 33;
 const PUBKEY_EXCHANGE_SIZE_EXTENDED: usize = PUBKEY_EXCHANGE_SIZE + 1;
-const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
+const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 15;
 const OUTBOUND_PUBKEY_EXCHANGE_SETTLE_MS: u64 = 250;
 
 async fn wait_before_outbound_pubkey_exchange() {
