@@ -464,6 +464,13 @@ impl<I: BleIo> BleTransport<I> {
     }
 
     /// Initiate a non-blocking connection to a remote BLE device.
+    ///
+    /// Checks transport-level backoff before connecting. If the peer's BLE
+    /// address is in backoff (recent failures) or denied (repeated failures),
+    /// returns an error immediately so the node-level retry system defers
+    /// the attempt. This prevents proactive reconnects (H13) from bypassing
+    /// the exponential backoff that protects the BLE controller from
+    /// reconnection storms.
     pub async fn connect_async(&self, addr: &TransportAddr) -> Result<(), TransportError> {
         {
             let pool = self.pool.lock().await;
@@ -476,6 +483,28 @@ impl<I: BleIo> BleTransport<I> {
             addr.as_str()
                 .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?,
         )?;
+
+        // Transport-level backoff check: respect PeerBackoff state so
+        // node-initiated reconnects (e.g. H13 proactive) don't hammer a
+        // BLE device that the controller is still recovering from.
+        if self.backoff.lock().await.is_denied(&ble_addr) {
+            debug!(
+                remote_addr = %addr,
+                "BLE outbound connect: denied by transport backoff (repeated failures)"
+            );
+            return Err(TransportError::LinkFailed(
+                "peer denied by transport-level backoff".into(),
+            ));
+        }
+        if self.backoff.lock().await.is_in_backoff(&ble_addr) {
+            debug!(
+                remote_addr = %addr,
+                "BLE outbound connect: peer in backoff, deferring"
+            );
+            return Err(TransportError::LinkFailed(
+                "peer in transport-level backoff".into(),
+            ));
+        }
 
         {
             let mut connecting = self.connecting.lock().await;
@@ -521,6 +550,10 @@ impl<I: BleIo> BleTransport<I> {
                                 }
                                 Err(e) => {
                                     warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
+                                    let denied = backoff.lock().await.record_failure(&ble_addr);
+                                    if denied {
+                                        warn!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound: auto-denied after repeated pubkey failures");
+                                    }
                                     connecting_inner.lock().await.remove(&addr_clone);
                                     return;
                                 }
@@ -568,6 +601,7 @@ impl<I: BleIo> BleTransport<I> {
                             },
                         ));
 
+                        let ble_addr_for_backoff = ble_addr.clone();
                         let conn = BleConnection {
                             stream,
                             recv_task: Some(recv_task),
@@ -597,6 +631,7 @@ impl<I: BleIo> BleTransport<I> {
                         }
                         connecting_inner.lock().await.remove(&addr_clone);
                         stats.record_connection_established();
+                        backoff.lock().await.clear(&ble_addr_for_backoff);
                     }
                     Ok(Err(e)) => {
                         connecting_inner.lock().await.remove(&addr_clone);

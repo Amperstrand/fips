@@ -81,11 +81,13 @@ impl RetryState {
     /// the proposal to use a separate, lighter backoff for proactive reconnects.
     pub fn backoff_ms(&self, base_interval_ms: u64, max_backoff_ms: u64) -> u64 {
         if self.proactive {
-            // Proactive reconnect: fixed 2s delay, no exponential growth.
-            // The link was healthy (we chose to cycle it), so rapid reconnection
-            // is safe. The 2s gives the BLE controller time to clean up the old
-            // channel and accept the new connection.
-            return base_interval_ms.min(2_000);
+            // Proactive reconnect: 10s fixed delay. The BLE controller needs
+            // time to tear down the old L2CAP channel and settle before a new
+            // connection attempt. 2s was too short — the old channel was still
+            // being cleaned up, causing pubkey exchange timeouts on the new
+            // connection. 10s matches the typical BLE connection interval
+            // negotiation window (Core Spec Vol 3 Part C §9.3.10).
+            return 10_000;
         }
         // Normal exponential backoff for failure reconnects
         let multiplier = 1u64.checked_shl(self.retry_count).unwrap_or(u64::MAX);
