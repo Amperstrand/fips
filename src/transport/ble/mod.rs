@@ -782,7 +782,11 @@ impl<I: BleIo> Transport for BleTransport<I> {
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
 const PUBKEY_EXCHANGE_SIZE: usize = 33;
 const PUBKEY_EXCHANGE_SIZE_EXTENDED: usize = PUBKEY_EXCHANGE_SIZE + 1;
-const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 15;
+/// Default pubkey exchange timeout (seconds). 30s accommodates the
+/// CoreBluetooth L2CAP recv race (Amperstrand/bluest#3) where
+/// peripheral→central data sent before the central posts its recv()
+/// can be delayed by the BLE stack.
+const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 30;
 const OUTBOUND_PUBKEY_EXCHANGE_SETTLE_MS: u64 = 250;
 
 async fn wait_before_outbound_pubkey_exchange() {
