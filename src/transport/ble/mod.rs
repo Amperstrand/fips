@@ -782,12 +782,7 @@ impl<I: BleIo> Transport for BleTransport<I> {
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
 const PUBKEY_EXCHANGE_SIZE: usize = 33;
 const PUBKEY_EXCHANGE_SIZE_EXTENDED: usize = PUBKEY_EXCHANGE_SIZE + 1;
-/// Default pubkey exchange timeout (seconds). 5s is generous for a 34-byte
-/// exchange (<1s expected). The bluest L2CAP recv race (Amperstrand/bluest#3)
-/// causes CoreBluetooth central to never receive the peripheral's response,
-/// regardless of timeout. A short timeout lets the backoff system escalate
-/// to auto-deny quickly (~100s), allowing the peer to connect as central.
-const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
+const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 15;
 const OUTBOUND_PUBKEY_EXCHANGE_SETTLE_MS: u64 = 250;
 
 async fn wait_before_outbound_pubkey_exchange() {
@@ -816,6 +811,18 @@ struct PubkeyExchangeResult {
 }
 
 /// Exchange public keys over a newly established L2CAP connection.
+///
+/// Sends our pubkey and receives the peer's pubkey **concurrently** rather
+/// than sequentially. This is required because on macOS the bluest library
+/// wraps CoreBluetooth's L2CAP channel as an `AsyncRead` with **no receive
+/// buffer**: if data arrives before a `poll_read` is posted, the data is
+/// lost (Amperstrand/bluest#3). By posting recv concurrently with send
+/// (via `tokio::join!`), the reader's waker is registered *before* the
+/// peer can possibly respond, eliminating the race.
+///
+/// Both `send` and `recv` take `&self` on `BleStream`, and the underlying
+/// `BluestStream` uses separate `reader`/`writer` tokio mutexes, so
+/// concurrent send+recv on the same stream cannot deadlock.
 async fn pubkey_exchange<S: BleStream>(
     stream: &S,
     local_pubkey: &[u8; 32],
@@ -825,15 +832,28 @@ async fn pubkey_exchange<S: BleStream>(
     msg[0] = PUBKEY_EXCHANGE_PREFIX;
     msg[1..33].copy_from_slice(local_pubkey);
     msg[33] = local_capabilities.to_byte();
-    stream.send(&msg).await?;
 
-    // Receive peer's pubkey (with timeout to prevent indefinite blocking)
+    // Prepare recv buffer and timeout.
     let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE_EXTENDED];
     let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
-    let n = match tokio::time::timeout(timeout, stream.recv(&mut buf)).await {
-        Ok(result) => result?,
+
+    // Send our pubkey and receive the peer's pubkey concurrently.
+    // `tokio::join!` polls both futures in each poll cycle, ensuring
+    // the recv waker is registered before the send completes — the
+    // peer cannot have responded yet, so the race is eliminated.
+    let (send_result, recv_result) = tokio::join!(
+        stream.send(&msg),
+        tokio::time::timeout(timeout, stream.recv(&mut buf)),
+    );
+
+    send_result?;
+
+    let n = match recv_result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e),
         Err(_) => return Err(TransportError::Timeout),
     };
+
     if n < PUBKEY_EXCHANGE_SIZE {
         return Err(TransportError::RecvFailed(format!(
             "pubkey exchange: expected at least {} bytes, got {}",
