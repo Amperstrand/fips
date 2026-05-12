@@ -820,9 +820,9 @@ pub struct BleConfig {
     /// L2CAP channel, each side sends its Nostr pubkey and waits for the
     /// peer's response. On macOS (CoreBluetooth), the central's recv() can
     /// miss data sent by the peripheral before the central starts reading —
-    /// a known bluest race (Amperstrand/bluest#3). A 30s timeout gives the
-    /// BLE stack enough time to deliver buffered L2CAP frames that arrive
-    /// before the central's recv() is posted. Default: 30.
+    /// a known bluest race (Amperstrand/bluest#3). A short timeout (5s)
+    /// lets the backoff system escalate to auto-deny quickly, allowing
+    /// the peer to establish the connection as central instead. Default: 5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey_exchange_timeout_secs: Option<u64>,
 }
@@ -955,7 +955,7 @@ impl BleConfig {
     }
 
     pub fn pubkey_exchange_timeout_secs(&self) -> u64 {
-        self.pubkey_exchange_timeout_secs.unwrap_or(30)
+        self.pubkey_exchange_timeout_secs.unwrap_or(5)
     }
 
     pub fn validate(&mut self) -> Vec<String> {

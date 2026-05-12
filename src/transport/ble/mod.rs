@@ -550,12 +550,9 @@ impl<I: BleIo> BleTransport<I> {
                                 }
                                 Err(e) => {
                                     warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
-                                    // Bluest L2CAP recv race — see scan_probe_loop for rationale.
-                                    if !matches!(e, TransportError::Timeout) {
-                                        let denied = backoff.lock().await.record_failure(&ble_addr);
-                                        if denied {
-                                            warn!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound: auto-denied after repeated pubkey failures");
-                                        }
+                                    let denied = backoff.lock().await.record_failure(&ble_addr);
+                                    if denied {
+                                        warn!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound: auto-denied after repeated pubkey failures");
                                     }
                                     connecting_inner.lock().await.remove(&addr_clone);
                                     return;
@@ -785,11 +782,12 @@ impl<I: BleIo> Transport for BleTransport<I> {
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
 const PUBKEY_EXCHANGE_SIZE: usize = 33;
 const PUBKEY_EXCHANGE_SIZE_EXTENDED: usize = PUBKEY_EXCHANGE_SIZE + 1;
-/// Default pubkey exchange timeout (seconds). 30s accommodates the
-/// CoreBluetooth L2CAP recv race (Amperstrand/bluest#3) where
-/// peripheral→central data sent before the central posts its recv()
-/// can be delayed by the BLE stack.
-const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 30;
+/// Default pubkey exchange timeout (seconds). 5s is generous for a 34-byte
+/// exchange (<1s expected). The bluest L2CAP recv race (Amperstrand/bluest#3)
+/// causes CoreBluetooth central to never receive the peripheral's response,
+/// regardless of timeout. A short timeout lets the backoff system escalate
+/// to auto-deny quickly (~100s), allowing the peer to connect as central.
+const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 5;
 const OUTBOUND_PUBKEY_EXCHANGE_SETTLE_MS: u64 = 250;
 
 async fn wait_before_outbound_pubkey_exchange() {
@@ -1474,17 +1472,10 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
             Err(e) => {
                 debug!(transport_id = %transport_id, remote_addr = %addr, error = %e, "BLE probe pubkey exchange failed");
-                // Timeout during pubkey exchange is the known bluest L2CAP recv
-                // race (Amperstrand/bluest#3): CoreBluetooth central never
-                // receives data sent by the peripheral before the central posts
-                // its recv(). Don't penalize the peer — the connection will form
-                // when the peer connects outbound to us instead.
-                if !matches!(e, TransportError::Timeout) {
-                    let denied = backoff.lock().await.record_failure(&addr);
-                    if denied {
-                        warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
-                        pending_addrs.retain(|a| a != &addr);
-                    }
+                let denied = backoff.lock().await.record_failure(&addr);
+                if denied {
+                    warn!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: auto-denied after repeated pubkey failures");
+                    pending_addrs.retain(|a| a != &addr);
                 }
             }
         }
