@@ -978,11 +978,17 @@ impl Node {
                 }
             }
 
-            #[cfg(any(not(any(bluer_available, feature = "ble-macos")), test,))]
-            if !ble_instances.is_empty() {
-                #[cfg(not(test))]
-                tracing::warn!("BLE transport configured but this build lacks BLE support");
-            }
+        }
+
+        // Warn when BLE is configured in fips.yaml but this build lacks BLE
+        // support.  The cfg gate is the *inverse* of the BLE-creation block
+        // above so this branch is compiled ONLY when BLE is absent.
+        #[cfg(not(any(bluer_available, feature = "ble-macos")))]
+        if !self.config.transports.ble.is_empty() {
+            tracing::warn!(
+                "BLE transport configured in fips.yaml but this build lacks BLE support — \
+                 on macOS pass --features ble-macos, on Linux install bluez + libdbus-1-dev"
+            );
         }
 
         transports
