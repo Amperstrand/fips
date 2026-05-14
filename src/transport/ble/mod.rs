@@ -1051,7 +1051,21 @@ async fn accept_loop<A, I: BleIo>(
                     on_drop: None,
                 };
 
+                // Double-check: the scan_probe_loop may have completed an
+                // outbound connection to this same peer while we were doing
+                // the pubkey exchange.  If so, keep the existing (outbound)
+                // connection and drop this inbound one to avoid the
+                // cross-connection / dual-link collision that causes
+                // ChannelClosed after ~10 s  (see fips#128).
                 let mut pool_guard = pool.lock().await;
+                if pool_guard.contains(&ta) {
+                    debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: peer already connected after pubkey exchange, dropping duplicate inbound");
+                    drop(pool_guard);
+                    // on_drop fires disconnect_device — but the peer is
+                    // already connected via the outbound link, so the
+                    // adapter will simply close this second L2CAP channel.
+                    continue;
+                }
                 match pool_guard.insert(ta.clone(), conn) {
                     Ok(Some(evicted)) => {
                         stats.record_pool_eviction();
@@ -1524,7 +1538,15 @@ async fn scan_probe_loop<I: io::BleIo>(
                     on_drop: None,
                 };
 
+                // Mirror of the accept_loop double-check (fips#128):
+                // the accept_loop may have completed an inbound connection
+                // to this same peer while we were doing the pubkey exchange.
                 let mut pool_guard = pool.lock().await;
+                if pool_guard.contains(&ta) {
+                    debug!(transport_id = %transport_id, remote_addr = %ta, "BLE probe: peer already connected after pubkey exchange, dropping duplicate outbound");
+                    drop(pool_guard);
+                    continue;
+                }
                 match pool_guard.insert(ta.clone(), conn) {
                     Ok(Some(evicted)) => {
                         stats.record_pool_eviction();
