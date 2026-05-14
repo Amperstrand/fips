@@ -478,10 +478,16 @@ impl Node {
         match self.promote_connection(link_id, peer_identity, packet.timestamp_ms) {
             Ok(result) => {
                 match result {
-                    PromotionResult::Promoted(node_addr) => {
-                        // Store msg2 on peer for resend on duplicate msg1
+                    PromotionResult::Promoted { node_addr, cancelled_links } => {
                         if let Some(peer) = self.peers.get_mut(&node_addr) {
                             peer.set_handshake_msg2(wire_msg2.clone());
+                        }
+                        for cancelled_link_id in &cancelled_links {
+                            debug!(
+                                peer = %self.peer_display_name(&node_addr),
+                                cancelled_link_id = %cancelled_link_id,
+                                "Cancelled pending outbound link cleaned up"
+                            );
                         }
                         debug!(
                             peer = %self.peer_display_name(&node_addr),
@@ -866,7 +872,14 @@ impl Node {
                 self.pending_outbound.remove(&key);
 
                 match result {
-                    PromotionResult::Promoted(node_addr) => {
+                    PromotionResult::Promoted { node_addr, cancelled_links } => {
+                        for cancelled_link_id in &cancelled_links {
+                            debug!(
+                                peer = %self.peer_display_name(&node_addr),
+                                cancelled_link_id = %cancelled_link_id,
+                                "Cancelled pending outbound link cleaned up"
+                            );
+                        }
                         info!(
                             peer = %self.peer_display_name(&node_addr),
                             "Peer promoted to active"
@@ -1080,13 +1093,11 @@ impl Node {
                 })
             }
         } else {
-            // No existing promoted peer. There may be a pending outbound
-            // connection to the same peer (cross-connection in progress).
-            // Do NOT clean it up yet — we need the outbound to stay alive
-            // so that when the peer's msg2 arrives, we can learn the peer's
-            // inbound session index and update their_index on the promoted
-            // peer. The outbound will be cleaned up in handle_msg2 or by
-            // the 30s handshake timeout.
+            // No existing promoted peer. Cancel any pending outbound connections
+            // to the same peer immediately — they are now redundant since this
+            // connection is being promoted. Deferring cleanup causes the BLE
+            // transport pool to evict the pending outbound later, triggering
+            // ChannelClosed on the remote side.
             let pending_to_same_peer: Vec<LinkId> = self
                 .connections
                 .iter()
@@ -1098,14 +1109,31 @@ impl Node {
                 .map(|(lid, _)| *lid)
                 .collect();
 
-            for pending_link_id in &pending_to_same_peer {
-                debug!(
-                    peer = %self.peer_display_name(&peer_node_addr),
-                    pending_link_id = %pending_link_id,
-                    promoted_link_id = %link_id,
-                    "Deferring cleanup of pending outbound (awaiting msg2 for index update)"
-                );
-            }
+            let cancelled_links: Vec<LinkId> = pending_to_same_peer
+                .iter()
+                .filter_map(|&pending_link_id| {
+                    if pending_link_id == link_id {
+                        return None;
+                    }
+                    if let Some(pending_conn) = self.connections.get(&pending_link_id) {
+                        if let (Some(tid), Some(idx)) = (pending_conn.transport_id(), pending_conn.our_index()) {
+                            self.pending_outbound.remove(&(tid, idx.as_u32()));
+                        }
+                        if let Some(idx) = pending_conn.our_index() {
+                            let _ = self.index_allocator.free(idx);
+                        }
+                    }
+                    self.connections.remove(&pending_link_id);
+                    self.remove_link(&pending_link_id);
+                    debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        pending_link_id = %pending_link_id,
+                        promoted_link_id = %link_id,
+                        "Cancelled pending outbound (immediate cleanup)"
+                    );
+                    Some(pending_link_id)
+                })
+                .collect();
 
             // Normal promotion
             if self.max_peers > 0 && self.peers.len() >= self.max_peers {
@@ -1171,7 +1199,7 @@ impl Node {
                 "Connection promoted to active peer"
             );
 
-            Ok(PromotionResult::Promoted(peer_node_addr))
+            Ok(PromotionResult::Promoted { node_addr: peer_node_addr, cancelled_links })
         }
     }
 }

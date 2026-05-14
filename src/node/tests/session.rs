@@ -953,7 +953,7 @@ fn test_identity_cache_populated_on_promote() {
     let result = node
         .promote_connection(link_id, peer_identity, 2000)
         .unwrap();
-    assert!(matches!(result, PromotionResult::Promoted(_)));
+    assert!(matches!(result, PromotionResult::Promoted { .. }));
 
     // Identity cache should contain the peer
     let peer_addr = *peer_identity.node_addr();

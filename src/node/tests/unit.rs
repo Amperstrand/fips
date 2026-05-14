@@ -242,7 +242,7 @@ fn test_node_promote_connection() {
 
     let result = node.promote_connection(link_id, identity, 2000).unwrap();
 
-    assert!(matches!(result, PromotionResult::Promoted(_)));
+    assert!(matches!(result, PromotionResult::Promoted { .. }));
     assert_eq!(node.connection_count(), 0);
     assert_eq!(node.peer_count(), 1);
 
@@ -592,25 +592,23 @@ fn test_promote_cleans_up_pending_outbound_to_same_peer() {
         .promote_connection(completing_link_id, peer_b_identity, completing_time_ms)
         .unwrap();
 
-    assert!(matches!(result, PromotionResult::Promoted(_)));
+    assert!(matches!(result, PromotionResult::Promoted { cancelled_links, .. } if cancelled_links.len() == 1 && cancelled_links[0] == pending_link_id));
 
-    // The pending outbound should NOT be cleaned up during promotion —
-    // it's deferred so handle_msg2 can learn the peer's inbound index.
     assert_eq!(
         node.connection_count(),
-        1,
-        "Pending outbound should be preserved (deferred cleanup)"
+        0,
+        "Pending outbound should be immediately cleaned up on promotion"
     );
     assert_eq!(node.peer_count(), 1, "Promoted peer should exist");
     assert!(
-        node.pending_outbound
+        !node.pending_outbound
             .contains_key(&(transport_id, pending_index.as_u32())),
-        "pending_outbound entry should still exist (awaiting msg2)"
+        "pending_outbound entry should be removed immediately"
     );
     assert_eq!(
         node.index_allocator.count(),
-        2,
-        "Both indices should remain until msg2 cleanup"
+        1,
+        "Pending index should be freed on cleanup"
     );
 
     // Verify the promoted peer is correct

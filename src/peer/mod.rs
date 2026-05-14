@@ -72,10 +72,15 @@ pub enum PeerError {
 /// Note: Returns NodeAddr instead of ActivePeer because ActivePeer cannot
 /// be cloned (it contains NoiseSession which has cryptographic state).
 /// Callers can look up the peer from the peers map using the NodeAddr.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum PromotionResult {
-    /// New peer created successfully.
-    Promoted(NodeAddr),
+    /// New peer created successfully. Includes any pending outbound links
+    /// to the same peer that were cancelled during promotion (cross-connection
+    /// cleanup).
+    Promoted {
+        node_addr: NodeAddr,
+        cancelled_links: Vec<LinkId>,
+    },
 
     /// Cross-connection detected. This connection lost the tie-breaker
     /// and should be closed.
@@ -98,7 +103,7 @@ impl PromotionResult {
     /// Get the node ID if promotion succeeded.
     pub fn node_addr(&self) -> Option<NodeAddr> {
         match self {
-            PromotionResult::Promoted(node_addr) => Some(*node_addr),
+            PromotionResult::Promoted { node_addr, .. } => Some(*node_addr),
             PromotionResult::CrossConnectionWon { node_addr, .. } => Some(*node_addr),
             PromotionResult::CrossConnectionLost { .. } => None,
         }
@@ -114,7 +119,7 @@ impl PromotionResult {
         match self {
             PromotionResult::CrossConnectionLost { .. } => None, // Caller's link
             PromotionResult::CrossConnectionWon { loser_link_id, .. } => Some(*loser_link_id),
-            PromotionResult::Promoted(_) => None,
+            PromotionResult::Promoted { .. } => None,
         }
     }
 }
@@ -346,7 +351,7 @@ mod tests {
     fn test_promotion_result_promoted() {
         let identity = make_peer_identity();
         let node_addr = *identity.node_addr();
-        let result = PromotionResult::Promoted(node_addr);
+        let result = PromotionResult::Promoted { node_addr, cancelled_links: vec![] };
 
         assert!(result.node_addr().is_some());
         assert_eq!(result.node_addr(), Some(node_addr));
