@@ -307,7 +307,7 @@ mod bluer_impl {
     // ----------------------------------------------------------------
 
     pub struct BluerStream {
-        conn: Arc<Mutex<Arc<SeqPacket>>>,
+        conn: Arc<SeqPacket>,
         remote: BleAddr,
         send_mtu: u16,
         recv_mtu: u16,
@@ -348,7 +348,7 @@ mod bluer_impl {
             };
 
             let drain_limiter = rate_limiter.clone();
-            let shared_conn = Arc::new(tokio::sync::Mutex::new(Arc::new(conn)));
+            let shared_conn = Arc::new(conn);
             let drain_conn = shared_conn.clone();
             let drain_remote = remote.clone();
 
@@ -363,8 +363,7 @@ mod bluer_impl {
                     if let Some(ref limiter) = drain_limiter {
                         limiter.lock().await.acquire(frame.len()).await;
                     }
-                    let conn_guard = drain_conn.lock().await;
-                    match tokio::time::timeout(BLE_SEND_TIMEOUT, conn_guard.send(&frame)).await {
+                    match tokio::time::timeout(BLE_SEND_TIMEOUT, drain_conn.send(&frame)).await {
                         Ok(Ok(_n)) => {}
                         Ok(Err(e)) => {
                             warn!(remote_addr = %drain_remote, error = %e, error_kind = ?e.kind(), "BLE linux drain task write error, marking connection dead");
@@ -375,7 +374,6 @@ mod bluer_impl {
                             warn!(remote_addr = %drain_remote, "BLE linux drain task write timeout (congestion, not fatal)");
                         }
                     }
-                    drop(conn_guard);
                 }
                 debug!(remote_addr = %drain_remote, "BLE linux drain task stopped");
             });
@@ -440,8 +438,7 @@ mod bluer_impl {
 
             trace!(len = data.len(), framed_len = framed.len(), remote_addr = %self.remote, "BLE linux send_urgent (direct, bypasses rate limiter)");
 
-            let conn = self.conn.lock().await;
-            tokio::time::timeout(BLE_SEND_TIMEOUT, conn.send(&framed))
+            tokio::time::timeout(BLE_SEND_TIMEOUT, self.conn.send(&framed))
                 .await
                 .map_err(|_| {
                     warn!(remote_remote_addr = %self.remote, "BLE linux send_urgent timeout");
@@ -476,8 +473,7 @@ mod bluer_impl {
 
                 let mut chunk = vec![0u8; self.recv_mtu as usize];
                 let n = {
-                    let conn = self.conn.lock().await;
-                    conn.recv(&mut chunk)
+                    self.conn.recv(&mut chunk)
                         .await
                         .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?
                 };
