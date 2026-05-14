@@ -500,6 +500,18 @@ impl Node {
             return;
         }
 
+        // Deduplicate: if multiple pending_connects target the same
+        // (transport_id, remote_addr), only keep the first and remove the
+        // rest. This prevents retry + auto-connect from both sending msg1
+        // on the same BLE connection.
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.pending_connects.retain(|p| {
+                let key = (p.transport_id, p.remote_addr.clone());
+                seen.insert(key)
+            });
+        }
+
         let mut completed = Vec::new();
 
         for (i, pending) in self.pending_connects.iter().enumerate() {

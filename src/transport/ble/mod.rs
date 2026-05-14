@@ -616,11 +616,27 @@ impl<I: BleIo> BleTransport<I> {
                                 established_at: tokio::time::Instant::now(),
                                 on_cleanup: {
                                     let io = Arc::clone(&io);
+                                    let pool = Arc::clone(&pool);
                                     let ble_addr = ble_addr.clone();
+                                    let ta_check = addr_clone.clone();
                                     Some(Box::new(move || {
                                         let io = Arc::clone(&io);
+                                        let pool = Arc::clone(&pool);
                                         let ble_addr = ble_addr.clone();
                                         tokio::spawn(async move {
+                                            // fips#128: Don't disconnect the BLE device if a new
+                                            // connection to the same address was inserted into the
+                                            // pool after this receive_loop exited. The new connection
+                                            // shares the same BLE ACL link.
+                                            let pool_guard = pool.lock().await;
+                                            if pool_guard.contains(&ta_check) {
+                                                debug!(
+                                                    remote_addr = %ble_addr,
+                                                    "BLE on_cleanup: skipping disconnect_device, new connection exists in pool"
+                                                );
+                                                return;
+                                            }
+                                            drop(pool_guard);
                                             io.disconnect_device(&ble_addr).await;
                                         });
                                     }))
@@ -1022,11 +1038,24 @@ async fn accept_loop<A, I: BleIo>(
                         established_at: tokio::time::Instant::now(),
                         on_cleanup: {
                             let io = Arc::clone(&io);
+                            let pool = Arc::clone(&pool);
                             let ble_addr = addr.clone();
+                            let ta_check = ta.clone();
                             Some(Box::new(move || {
                                 let io = Arc::clone(&io);
+                                let pool = Arc::clone(&pool);
                                 let ble_addr = ble_addr.clone();
+                                let ta_check = ta_check.clone();
                                 tokio::spawn(async move {
+                                    let pool_guard = pool.lock().await;
+                                    if pool_guard.contains(&ta_check) {
+                                        debug!(
+                                            remote_addr = %ble_addr,
+                                            "BLE on_cleanup: skipping disconnect_device, new connection exists in pool"
+                                        );
+                                        return;
+                                    }
+                                    drop(pool_guard);
                                     io.disconnect_device(&ble_addr).await;
                                 });
                             }))
@@ -1508,26 +1537,39 @@ async fn scan_probe_loop<I: io::BleIo>(
                         backoff: Arc::clone(&backoff),
                         ble_addr: addr.clone(),
                         established_at: tokio::time::Instant::now(),
-                        on_cleanup: {
-                            let io = Arc::clone(&io);
-                            let ble_addr = addr.clone();
-                            Some(Box::new(move || {
-                                let io = Arc::clone(&io);
-                                let ble_addr = ble_addr.clone();
-                                tokio::spawn(async move {
-                                    io.disconnect_device(&ble_addr).await;
-                                });
-                            }))
-                        },
-                        conn_param_refresh_secs,
-                        conn_param_min_interval,
-                        conn_param_max_interval,
-                        conn_param_latency,
-                        conn_param_timeout,
-                    },
-                ));
+                         on_cleanup: {
+                             let io = Arc::clone(&io);
+                             let pool = Arc::clone(&pool);
+                             let ble_addr = addr.clone();
+                             let ta_check = ta.clone();
+                             Some(Box::new(move || {
+                                 let io = Arc::clone(&io);
+                                 let pool = Arc::clone(&pool);
+                                 let ble_addr = ble_addr.clone();
+                                 let ta_check = ta_check.clone();
+                                 tokio::spawn(async move {
+                                     let pool_guard = pool.lock().await;
+                                     if pool_guard.contains(&ta_check) {
+                                         debug!(
+                                             remote_addr = %ble_addr,
+                                             "BLE on_cleanup: skipping disconnect_device, new connection exists in pool"
+                                         );
+                                         return;
+                                     }
+                                     drop(pool_guard);
+                                     io.disconnect_device(&ble_addr).await;
+                                 });
+                             }))
+                         },
+                         conn_param_refresh_secs,
+                         conn_param_min_interval,
+                         conn_param_max_interval,
+                         conn_param_latency,
+                         conn_param_timeout,
+                     },
+                 ));
 
-                let conn = BleConnection {
+                 let conn = BleConnection {
                     stream,
                     recv_task: Some(recv_task),
                     send_mtu,
