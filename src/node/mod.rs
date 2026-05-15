@@ -1396,6 +1396,28 @@ impl Node {
         &mut self.benchmark
     }
 
+    #[cfg(feature = "benchmark")]
+    pub fn benchmark(&self) -> &crate::benchmark::BenchmarkManager {
+        &self.benchmark
+    }
+
+    /// Send a benchmark message to a peer over the encrypted link.
+    ///
+    /// Prepends the message type byte and delegates to
+    /// `send_encrypted_link_message`. Used by the control-socket
+    /// benchmark command handlers to fire echo/throughput frames.
+    #[cfg(feature = "benchmark")]
+    pub async fn api_send_benchmark_message(
+        &mut self,
+        node_addr: &NodeAddr,
+        msg_type: u8,
+        payload: &[u8],
+    ) -> Result<(), NodeError> {
+        let mut plaintext = vec![msg_type];
+        plaintext.extend_from_slice(payload);
+        self.send_encrypted_link_message(node_addr, &plaintext).await
+    }
+
     /// Sample the current node state into the stats history ring.
     /// Called once per tick from the RX loop.
     pub(crate) fn record_stats_history(&mut self) {

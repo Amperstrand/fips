@@ -117,6 +117,10 @@ impl BenchmarkManager {
         self.last_throughput_result.take()
     }
 
+    pub fn last_throughput_result(&self) -> Option<&(NodeAddr, ThroughputResult)> {
+        self.last_throughput_result.as_ref()
+    }
+
     pub fn expect_echo_probes(&mut self, peer: NodeAddr, count: u32) {
         self.echo_expected.insert(peer, count);
     }
@@ -125,6 +129,20 @@ impl BenchmarkManager {
         let results = self.echo_results.remove(peer)?;
         let expected = self.echo_expected.remove(peer).unwrap_or(results.len() as u32);
         Some(compute_echo_stats(results, expected as usize))
+    }
+
+    pub fn echo_results_ready(&self, peer: &NodeAddr) -> Option<bool> {
+        let expected = self.echo_expected.get(peer)?;
+        let current = self.echo_results.get(peer).map(|r| r.len()).unwrap_or(0);
+        Some(current >= *expected as usize)
+    }
+
+    pub fn get_echo_stats(&self, peer: &NodeAddr) -> Option<&[EchoResult]> {
+        self.echo_results.get(peer).map(|v| v.as_slice())
+    }
+
+    pub fn echo_expected_count(&self, peer: &NodeAddr) -> Option<u32> {
+        self.echo_expected.get(peer).copied()
     }
 
     pub fn prepare_echo_test(
