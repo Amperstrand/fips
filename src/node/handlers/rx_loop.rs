@@ -67,7 +67,7 @@ impl Node {
         let mut tick =
             tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
 
-        let mut benchmark_echo_tick = tokio::time::interval(Duration::from_millis(100));
+        let mut benchmark_tick = tokio::time::interval(Duration::from_millis(10));
 
         // Set up control socket channel
         let (control_tx, mut control_rx) =
@@ -157,7 +157,7 @@ impl Node {
                     self.poll_transport_discovery().await;
                     self.sample_transport_congestion();
                 }
-                _ = benchmark_echo_tick.tick() => {
+                _ = benchmark_tick.tick() => {
                     #[cfg(feature = "benchmark")]
                     {
                         if let Some((peer, payload)) = self.benchmark_mut().poll_echo_sends() {
