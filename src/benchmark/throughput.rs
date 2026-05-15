@@ -52,6 +52,7 @@ impl ThroughputTestState {
 /// Final result of a throughput test.
 #[derive(Clone, Debug)]
 pub struct ThroughputResult {
+    pub test_id: u32,
     pub achieved_bps: u64,
     pub frame_loss_rate: f64,
     pub total_bytes: u64,
@@ -165,6 +166,7 @@ pub fn parse_throughput_report(body: &[u8]) -> Option<ThroughputResult> {
         0.0
     };
     Some(ThroughputResult {
+        test_id: report.test_id,
         achieved_bps: report.achieved_bps,
         frame_loss_rate,
         total_bytes: report.bytes_recv,
@@ -275,6 +277,7 @@ mod tests {
         let frame = build_throughput_report_frame(&state);
         assert_eq!(frame[0], MSG_THROUGHPUT_REPORT);
         let result = parse_throughput_report(&frame[1..]).unwrap();
+        assert_eq!(result.test_id, 7);
         assert_eq!(result.frames_sent, 100);
         assert_eq!(result.frames_recv, 95);
         assert!((result.frame_loss_rate - 0.05).abs() < 0.001);

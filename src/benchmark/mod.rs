@@ -37,6 +37,7 @@ pub struct BenchmarkManager {
     pending_throughput_sends: VecDeque<(NodeAddr, Vec<u8>)>,
     throughput_send_interval_ms: u64,
     last_throughput_send_time: Option<Instant>,
+    initiator_frames_sent: HashMap<u32, u32>,
 }
 
 impl BenchmarkManager {
@@ -56,6 +57,7 @@ impl BenchmarkManager {
             pending_throughput_sends: VecDeque::new(),
             throughput_send_interval_ms: 100,
             last_throughput_send_time: None,
+            initiator_frames_sent: HashMap::new(),
         }
     }
 
@@ -107,7 +109,15 @@ impl BenchmarkManager {
                 }
             }
             MSG_THROUGHPUT_REPORT => {
-                if let Some(result) = parse_throughput_report(payload) {
+                if let Some(mut result) = parse_throughput_report(payload) {
+                    if let Some(initiator_sent) = self.initiator_frames_sent.remove(&result.test_id) {
+                        result.frame_loss_rate = if initiator_sent > 0 {
+                            1.0 - (result.frames_recv as f64 / initiator_sent as f64)
+                        } else {
+                            0.0
+                        };
+                        result.frames_sent = initiator_sent;
+                    }
                     info!(
                         peer = ?from,
                         achieved_bps = result.achieved_bps,
@@ -251,6 +261,7 @@ impl BenchmarkManager {
         if let Some(state) = self.active_tests.get_mut(&test_id) {
             state.frames_sent = total_frames as u32;
         }
+        self.initiator_frames_sent.insert(test_id, total_frames as u32);
 
         for seq in 0..total_frames {
             let frame = throughput::build_throughput_stream_frame(
