@@ -67,7 +67,7 @@ impl Node {
         let mut tick =
             tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
 
-        let mut benchmark_tick = tokio::time::interval(Duration::from_millis(10));
+        let mut benchmark_tick = tokio::time::interval(Duration::from_millis(25));
 
         // Set up control socket channel
         let (control_tx, mut control_rx) =
