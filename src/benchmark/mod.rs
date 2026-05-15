@@ -262,11 +262,10 @@ impl BenchmarkManager {
         }
     }
 
-    /// Drain all throughput frames that are due based on elapsed time.
+    /// Drain throughput frames that are due based on elapsed time.
     ///
     /// Returns a batch of (peer, frame) pairs to send immediately.
-    /// This allows catching up when the poll interval is slower than
-    /// the target send rate.
+    /// Capped at 2 frames per drain to avoid BLE transport congestion.
     pub fn poll_throughput_sends(&mut self) -> Vec<(NodeAddr, Vec<u8>)> {
         if self.pending_throughput_sends.is_empty() {
             return Vec::new();
@@ -283,7 +282,7 @@ impl BenchmarkManager {
         } else {
             1
         };
-        let count = frames_due.min(self.pending_throughput_sends.len());
+        let count = frames_due.min(2).min(self.pending_throughput_sends.len());
         let mut batch = Vec::with_capacity(count);
         for _ in 0..count {
             if let Some(item) = self.pending_throughput_sends.pop_front() {
