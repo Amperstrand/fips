@@ -33,7 +33,7 @@ pub struct BenchmarkManager {
     pending_echo_sends: VecDeque<(NodeAddr, u32, Vec<u8>)>,
     echo_inter_send_delay_ms: u64,
     last_echo_send_time: Option<Instant>,
-    echo_in_flight: bool,
+    echo_sent_at: Option<Instant>,
 }
 
 impl BenchmarkManager {
@@ -49,7 +49,7 @@ impl BenchmarkManager {
             pending_echo_sends: VecDeque::new(),
             echo_inter_send_delay_ms: DEFAULT_ECHO_INTER_SEND_DELAY_MS,
             last_echo_send_time: None,
-            echo_in_flight: false,
+            echo_sent_at: None,
         }
     }
 
@@ -74,7 +74,7 @@ impl BenchmarkManager {
             }
             MSG_ECHO_RESPONSE => {
                 debug!(peer = ?from, "Benchmark: echo response received");
-                self.echo_in_flight = false;
+                self.echo_sent_at = None;
                 if let Some(result) = echo::handle_echo_response(payload) {
                     self.echo_results.entry(*from).or_default().push(result);
                 }
@@ -184,15 +184,25 @@ impl BenchmarkManager {
         self.expect_echo_probes(peer, count);
         self.echo_results.remove(&peer);
         self.last_echo_send_time = None;
-        self.echo_in_flight = false;
+        self.echo_sent_at = None;
         for seq in 0..count {
             self.pending_echo_sends.push_back((peer, seq, payload.clone()));
         }
     }
 
+    const ECHO_RESPONSE_TIMEOUT_MS: u64 = 5000;
+
     pub fn poll_echo_sends(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
-        if self.pending_echo_sends.is_empty() || self.echo_in_flight {
+        if self.pending_echo_sends.is_empty() {
             return None;
+        }
+        if let Some(sent_at) = self.echo_sent_at {
+            let elapsed = sent_at.elapsed().as_millis() as u64;
+            if elapsed < Self::ECHO_RESPONSE_TIMEOUT_MS {
+                return None;
+            }
+            debug!(elapsed_ms = elapsed, "Benchmark: echo response timed out, sending next");
+            self.echo_sent_at = None;
         }
         if let Some(last) = self.last_echo_send_time {
             let elapsed = last.elapsed().as_millis() as u64;
@@ -201,7 +211,7 @@ impl BenchmarkManager {
             }
         }
         self.last_echo_send_time = Some(Instant::now());
-        self.echo_in_flight = true;
+        self.echo_sent_at = Some(Instant::now());
         let (peer, seq, payload) = self.pending_echo_sends.pop_front()?;
         // Build frame at send time so ts_us reflects actual transmission moment
         let frame = echo::build_echo_request_frame(seq, &payload);
