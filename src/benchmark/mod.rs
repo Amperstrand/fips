@@ -262,18 +262,38 @@ impl BenchmarkManager {
         }
     }
 
-    pub fn poll_throughput_sends(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
+    /// Drain all throughput frames that are due based on elapsed time.
+    ///
+    /// Returns a batch of (peer, frame) pairs to send immediately.
+    /// This allows catching up when the poll interval is slower than
+    /// the target send rate.
+    pub fn poll_throughput_sends(&mut self) -> Vec<(NodeAddr, Vec<u8>)> {
         if self.pending_throughput_sends.is_empty() {
-            return None;
+            return Vec::new();
         }
-        if let Some(last) = self.last_throughput_send_time {
-            let elapsed = last.elapsed().as_millis() as u64;
-            if elapsed < self.throughput_send_interval_ms {
-                return None;
+        let elapsed_ms = self
+            .last_throughput_send_time
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(u64::MAX);
+        if elapsed_ms < self.throughput_send_interval_ms {
+            return Vec::new();
+        }
+        let frames_due = if self.throughput_send_interval_ms > 0 {
+            (elapsed_ms / self.throughput_send_interval_ms).max(1) as usize
+        } else {
+            1
+        };
+        let count = frames_due.min(self.pending_throughput_sends.len());
+        let mut batch = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(item) = self.pending_throughput_sends.pop_front() {
+                batch.push(item);
             }
         }
-        self.last_throughput_send_time = Some(Instant::now());
-        self.pending_throughput_sends.pop_front()
+        if !batch.is_empty() {
+            self.last_throughput_send_time = Some(Instant::now());
+        }
+        batch
     }
 
     pub fn throughput_sends_pending(&self) -> bool {
