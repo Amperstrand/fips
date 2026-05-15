@@ -29,6 +29,7 @@ pub struct BenchmarkManager {
     next_test_id: u32,
     pending_echo_response: Option<(NodeAddr, Vec<u8>)>,
     pending_throughput_config: Option<(NodeAddr, ThroughputTestConfig)>,
+    pending_throughput_report: Option<(NodeAddr, Vec<u8>)>,
     last_throughput_result: Option<(NodeAddr, ThroughputResult)>,
     pending_echo_sends: VecDeque<(NodeAddr, u32, Vec<u8>)>,
     echo_inter_send_delay_ms: u64,
@@ -49,6 +50,7 @@ impl BenchmarkManager {
             next_test_id: 1,
             pending_echo_response: None,
             pending_throughput_config: None,
+            pending_throughput_report: None,
             last_throughput_result: None,
             pending_echo_sends: VecDeque::new(),
             echo_inter_send_delay_ms: DEFAULT_ECHO_INTER_SEND_DELAY_MS,
@@ -96,7 +98,7 @@ impl BenchmarkManager {
                         duration = config.duration_secs,
                         "Benchmark: throughput request received"
                     );
-                    let state = ThroughputTestState::new(config.test_id);
+                    let state = ThroughputTestState::new(config.test_id, config.duration_secs);
                     self.active_tests.insert(config.test_id, state);
                     self.pending_throughput_config = Some((*from, config));
                 }
@@ -105,6 +107,14 @@ impl BenchmarkManager {
                 if let Some((test_id, _, _)) = types::ThroughputStream::decode(payload) {
                     if let Some(state) = self.active_tests.get_mut(&test_id) {
                         handle_throughput_stream(state, payload);
+                        if state.is_expired() {
+                            let report_frame =
+                                throughput::build_throughput_report_frame(state);
+                            let peer = *from;
+                            self.active_tests.remove(&test_id);
+                            self.pending_throughput_report =
+                                Some((peer, report_frame));
+                        }
                     }
                 }
             }
@@ -139,6 +149,10 @@ impl BenchmarkManager {
 
     pub fn take_throughput_config(&mut self) -> Option<(NodeAddr, ThroughputTestConfig)> {
         self.pending_throughput_config.take()
+    }
+
+    pub fn take_throughput_report(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
+        self.pending_throughput_report.take()
     }
 
     pub fn take_throughput_result(&mut self) -> Option<(NodeAddr, ThroughputResult)> {
@@ -326,7 +340,7 @@ impl BenchmarkManager {
             rate_bps,
         };
         let frame = build_throughput_request_frame(&config);
-        let state = ThroughputTestState::new(test_id);
+        let state = ThroughputTestState::new(test_id, duration_secs);
         self.active_tests.insert(test_id, state);
         (test_id, config, frame)
     }

@@ -178,6 +178,21 @@ impl Node {
         // Dispatch to link message handler
         self.dispatch_link_message(&node_addr, link_message, ce_flag)
             .await;
+
+        // Drain any pending benchmark responses (echo reply, throughput report)
+        #[cfg(feature = "benchmark")]
+        {
+            if let Some((peer, frame)) = self.benchmark_mut().take_echo_response() {
+                let msg_type = frame[0];
+                let body = &frame[1..];
+                let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+            }
+            if let Some((peer, frame)) = self.benchmark_mut().take_throughput_report() {
+                let msg_type = frame[0];
+                let body = &frame[1..];
+                let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+            }
+        }
     }
 
     /// Log a decryption failure with replay suppression.

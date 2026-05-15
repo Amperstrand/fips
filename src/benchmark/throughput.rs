@@ -27,6 +27,7 @@ pub struct ThroughputTestConfig {
 #[derive(Clone, Debug)]
 pub struct ThroughputTestState {
     pub test_id: u32,
+    pub duration_secs: u8,
     pub frames_sent: u32,
     pub frames_recv: u32,
     pub bytes_recv: u64,
@@ -36,9 +37,10 @@ pub struct ThroughputTestState {
 }
 
 impl ThroughputTestState {
-    pub fn new(test_id: u32) -> Self {
+    pub fn new(test_id: u32, duration_secs: u8) -> Self {
         Self {
             test_id,
+            duration_secs,
             frames_sent: 0,
             frames_recv: 0,
             bytes_recv: 0,
@@ -46,6 +48,12 @@ impl ThroughputTestState {
             expected_seq: 0,
             gap_count: 0,
         }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        let elapsed_us = now_micros().saturating_sub(self.start_us);
+        let target_us = (self.duration_secs as u64) * 1_000_000;
+        elapsed_us >= target_us
     }
 }
 
@@ -220,7 +228,7 @@ mod tests {
 
     #[test]
     fn handle_stream_tracks_state() {
-        let mut state = ThroughputTestState::new(1);
+        let mut state = ThroughputTestState::new(1, 5);
         let body = {
             let frame = build_throughput_stream_frame(1, 0, 32);
             frame[1..].to_vec()
@@ -233,7 +241,7 @@ mod tests {
 
     #[test]
     fn handle_stream_detects_gaps() {
-        let mut state = ThroughputTestState::new(1);
+        let mut state = ThroughputTestState::new(1, 5);
         state.expected_seq = 0;
 
         let body = {
@@ -246,7 +254,7 @@ mod tests {
 
     #[test]
     fn handle_stream_rejects_wrong_test() {
-        let mut state = ThroughputTestState::new(1);
+        let mut state = ThroughputTestState::new(1, 5);
         let body = {
             let frame = build_throughput_stream_frame(99, 0, 16);
             frame[1..].to_vec()
@@ -267,6 +275,7 @@ mod tests {
     fn report_roundtrip() {
         let state = ThroughputTestState {
             test_id: 7,
+            duration_secs: 5,
             frames_sent: 100,
             frames_recv: 95,
             bytes_recv: 24320,
