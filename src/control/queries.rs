@@ -1120,8 +1120,11 @@ fn benchmark_echo_results(node: &Node, params: Option<&Value>) -> super::protoco
     };
 
     let bm = node.benchmark();
-    match (bm.get_echo_stats(&peer_addr), bm.echo_expected_count(&peer_addr)) {
-        (Some(results), Some(expected)) => {
+    let stats = bm.get_echo_stats(&peer_addr);
+    let expected = bm.echo_expected_count(&peer_addr);
+
+    match (stats, expected) {
+        (Some(results), Some(exp)) => {
             let results_vec: Vec<Value> = results
                 .iter()
                 .map(|r| {
@@ -1132,21 +1135,25 @@ fn benchmark_echo_results(node: &Node, params: Option<&Value>) -> super::protoco
                     })
                 })
                 .collect();
-            let stats = crate::benchmark::echo::compute_echo_stats(
+            let computed = crate::benchmark::echo::compute_echo_stats(
                 results.to_vec(),
-                expected as usize,
+                exp as usize,
             );
             Response::ok(json!({
                 "results": results_vec,
-                "min_us": stats.min_us,
-                "max_us": stats.max_us,
-                "mean_us": stats.mean_us,
-                "median_us": stats.median_us,
-                "p95_us": stats.p95_us,
-                "loss_count": stats.loss_count,
-                "jitter_us": stats.jitter_us,
+                "min_us": computed.min_us,
+                "max_us": computed.max_us,
+                "mean_us": computed.mean_us,
+                "median_us": computed.median_us,
+                "p95_us": computed.p95_us,
+                "loss_count": computed.loss_count,
+                "jitter_us": computed.jitter_us,
             }))
         }
+        (None, None) => Response::ok(json!({
+            "status": "no_test",
+            "peer": npub,
+        })),
         _ => Response::ok(json!({
             "status": "pending",
             "peer": npub,

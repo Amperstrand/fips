@@ -190,7 +190,7 @@ impl BenchmarkManager {
         }
     }
 
-    const ECHO_RESPONSE_TIMEOUT_MS: u64 = 5000;
+    const ECHO_RESPONSE_TIMEOUT_MS: u64 = 2000;
 
     pub fn poll_echo_sends(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
         if self.pending_echo_sends.is_empty() {
