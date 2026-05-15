@@ -1209,9 +1209,9 @@ pub fn dispatch(node: &Node, command: &str, params: Option<&Value>) -> super::pr
         "show_stats_peers" => super::protocol::Response::ok(show_stats_peers(node)),
         "show_stats_history_all_peers" => show_stats_history_all_peers(node, params),
         #[cfg(feature = "benchmark")]
-        "benchmark_echo_results" => benchmark_echo_results(node, params),
+        "show_benchmark_echo_results" => benchmark_echo_results(node, params),
         #[cfg(feature = "benchmark")]
-        "benchmark_throughput_results" => benchmark_throughput_results(node, params),
+        "show_benchmark_throughput_results" => benchmark_throughput_results(node, params),
         _ => super::protocol::Response::error(format!("unknown command: {}", command)),
     }
 }

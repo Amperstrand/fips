@@ -449,7 +449,7 @@ fn handle_benchmark(socket_path: &Path, what: &BenchmarkCommands) {
             let wait_secs = (*count as f64 * 0.1).ceil().max(1.0) as u64;
             std::thread::sleep(Duration::from_secs(wait_secs));
             let query_cmd =
-                build_command("benchmark_echo_results", serde_json::json!({"npub": npub}));
+                build_command("show_benchmark_echo_results", serde_json::json!({"npub": npub}));
             match send_request(socket_path, &query_cmd) {
                 Ok(value) => {
                     if *json {
@@ -498,7 +498,7 @@ fn handle_benchmark(socket_path: &Path, what: &BenchmarkCommands) {
             }
             std::thread::sleep(Duration::from_secs(*duration as u64 + 2));
             let query_cmd = build_command(
-                "benchmark_throughput_results",
+                "show_benchmark_throughput_results",
                 serde_json::json!({"npub": npub}),
             );
             match send_request(socket_path, &query_cmd) {
