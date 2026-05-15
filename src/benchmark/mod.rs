@@ -18,6 +18,7 @@ use throughput::{
 };
 use types::{MSG_ECHO_REQUEST, MSG_ECHO_RESPONSE, MSG_THROUGHPUT_REPORT, MSG_THROUGHPUT_STREAM};
 
+use crate::peer_policy::PeerPolicy;
 use tracing::{debug, info, warn};
 
 const DEFAULT_ECHO_INTER_SEND_DELAY_MS: u64 = 100;
@@ -39,6 +40,7 @@ pub struct BenchmarkManager {
     throughput_send_interval_ms: u64,
     last_throughput_send_time: Option<Instant>,
     initiator_frames_sent: HashMap<u32, u32>,
+    peer_policy: PeerPolicy,
 }
 
 impl BenchmarkManager {
@@ -60,6 +62,7 @@ impl BenchmarkManager {
             throughput_send_interval_ms: 100,
             last_throughput_send_time: None,
             initiator_frames_sent: HashMap::new(),
+            peer_policy: PeerPolicy::new(),
         }
     }
 
@@ -74,6 +77,10 @@ impl BenchmarkManager {
     /// `msg_type` is the first byte of the decrypted link payload.
     /// `payload` is everything after that first byte.
     pub fn handle_link_message(&mut self, from: &NodeAddr, msg_type: u8, payload: &[u8]) {
+        if !self.peer_policy.check_frame_rate() {
+            return;
+        }
+
         match msg_type {
             MSG_ECHO_REQUEST => {
                 debug!(peer = ?from, "Benchmark: echo request received");
