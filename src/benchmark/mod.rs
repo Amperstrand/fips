@@ -6,7 +6,8 @@ pub mod echo;
 pub mod throughput;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use crate::NodeAddr;
 use echo::{EchoResult, compute_echo_stats};
@@ -19,6 +20,8 @@ use types::{MSG_ECHO_REQUEST, MSG_ECHO_RESPONSE, MSG_THROUGHPUT_REPORT, MSG_THRO
 
 use tracing::{debug, info, warn};
 
+const DEFAULT_ECHO_INTER_SEND_DELAY_MS: u64 = 100;
+
 pub struct BenchmarkManager {
     active_tests: HashMap<u32, ThroughputTestState>,
     echo_results: HashMap<NodeAddr, Vec<EchoResult>>,
@@ -27,6 +30,9 @@ pub struct BenchmarkManager {
     pending_echo_response: Option<(NodeAddr, Vec<u8>)>,
     pending_throughput_config: Option<(NodeAddr, ThroughputTestConfig)>,
     last_throughput_result: Option<(NodeAddr, ThroughputResult)>,
+    pending_echo_sends: VecDeque<(NodeAddr, Vec<u8>)>,
+    echo_inter_send_delay_ms: u64,
+    last_echo_send_time: Option<Instant>,
 }
 
 impl BenchmarkManager {
@@ -39,6 +45,9 @@ impl BenchmarkManager {
             pending_echo_response: None,
             pending_throughput_config: None,
             last_throughput_result: None,
+            pending_echo_sends: VecDeque::new(),
+            echo_inter_send_delay_ms: DEFAULT_ECHO_INTER_SEND_DELAY_MS,
+            last_echo_send_time: None,
         }
     }
 
@@ -161,6 +170,39 @@ impl BenchmarkManager {
         (0..count)
             .map(|seq| echo::build_echo_request_frame(seq, &payload))
             .collect()
+    }
+
+    pub fn start_echo_test(&mut self, peer: NodeAddr, count: u32, payload_size: usize) {
+        let payload = if payload_size > 0 {
+            vec![0xAB; payload_size]
+        } else {
+            Vec::new()
+        };
+        self.expect_echo_probes(peer, count);
+        self.echo_results.remove(&peer);
+        self.last_echo_send_time = None;
+        for seq in 0..count {
+            let frame = echo::build_echo_request_frame(seq, &payload);
+            self.pending_echo_sends.push_back((peer, frame));
+        }
+    }
+
+    pub fn poll_echo_sends(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
+        if self.pending_echo_sends.is_empty() {
+            return None;
+        }
+        if let Some(last) = self.last_echo_send_time {
+            let elapsed = last.elapsed().as_millis() as u64;
+            if elapsed < self.echo_inter_send_delay_ms {
+                return None;
+            }
+        }
+        self.last_echo_send_time = Some(Instant::now());
+        self.pending_echo_sends.pop_front()
+    }
+
+    pub fn echo_sends_pending(&self) -> bool {
+        !self.pending_echo_sends.is_empty()
     }
 
     pub fn prepare_throughput_test(

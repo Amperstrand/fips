@@ -67,6 +67,8 @@ impl Node {
         let mut tick =
             tokio::time::interval(Duration::from_secs(self.config.node.tick_interval_secs));
 
+        let mut benchmark_echo_tick = tokio::time::interval(Duration::from_millis(100));
+
         // Set up control socket channel
         let (control_tx, mut control_rx) =
             tokio::sync::mpsc::channel::<crate::control::ControlMessage>(32);
@@ -154,6 +156,14 @@ impl Node {
                     self.check_pending_lookups(now_ms).await;
                     self.poll_transport_discovery().await;
                     self.sample_transport_congestion();
+                }
+                _ = benchmark_echo_tick.tick() => {
+                    #[cfg(feature = "benchmark")]
+                    if let Some((peer, payload)) = self.benchmark_mut().poll_echo_sends() {
+                        let msg_type = payload[0];
+                        let body = &payload[1..];
+                        let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+                    }
                 }
             }
         }

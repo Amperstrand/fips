@@ -95,26 +95,12 @@ async fn benchmark_echo(node: &mut Node, params: Option<&Value>) -> Response {
         Err(e) => return Response::error(format!("invalid peer npub: {e}")),
     };
 
-    let frames = node.benchmark_mut().prepare_echo_test(peer_addr, count, payload_size);
-
-    let mut sent = 0u32;
-    for payload in &frames {
-        // payload already includes msg_type byte (0xFF) + body
-        match node
-            .api_send_benchmark_message(&peer_addr, payload[0], &payload[1..])
-            .await
-        {
-            Ok(_) => sent += 1,
-            Err(e) => {
-                debug!(seq = sent, error = %e, "benchmark_echo: send failed");
-            }
-        }
-    }
+    node.benchmark_mut().start_echo_test(peer_addr, count, payload_size);
 
     Response::ok(serde_json::json!({
         "status": "echo_test_started",
         "peer": npub,
-        "sent": sent,
+        "queued": count,
         "expected": count,
     }))
 }

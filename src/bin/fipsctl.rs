@@ -446,7 +446,7 @@ fn handle_benchmark(socket_path: &Path, what: &BenchmarkCommands) {
                     std::process::exit(1);
                 }
             }
-            let wait_secs = (*count as f64 * 0.1).ceil().max(1.0) as u64;
+            let wait_secs = (*count as f64 * 0.15).ceil().max(1.0) as u64;
             std::thread::sleep(Duration::from_secs(wait_secs));
             let query_cmd =
                 build_command("show_benchmark_echo_results", serde_json::json!({"npub": npub}));
