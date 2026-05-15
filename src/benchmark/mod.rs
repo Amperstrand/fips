@@ -34,6 +34,9 @@ pub struct BenchmarkManager {
     echo_inter_send_delay_ms: u64,
     last_echo_send_time: Option<Instant>,
     echo_sent_at: Option<Instant>,
+    pending_throughput_sends: VecDeque<(NodeAddr, Vec<u8>)>,
+    throughput_send_interval_ms: u64,
+    last_throughput_send_time: Option<Instant>,
 }
 
 impl BenchmarkManager {
@@ -50,6 +53,9 @@ impl BenchmarkManager {
             echo_inter_send_delay_ms: DEFAULT_ECHO_INTER_SEND_DELAY_MS,
             last_echo_send_time: None,
             echo_sent_at: None,
+            pending_throughput_sends: VecDeque::new(),
+            throughput_send_interval_ms: 100,
+            last_throughput_send_time: None,
         }
     }
 
@@ -222,13 +228,65 @@ impl BenchmarkManager {
         !self.pending_echo_sends.is_empty()
     }
 
+    pub fn start_throughput_sends(
+        &mut self,
+        peer: NodeAddr,
+        test_id: u32,
+        frame_size: u16,
+        rate_bps: u32,
+        duration_secs: u8,
+    ) {
+        let data_len = frame_size as usize;
+        let interval_us = if rate_bps > 0 {
+            ((data_len as u64) * 8 * 1_000_000) / rate_bps as u64
+        } else {
+            1000
+        };
+        let total_frames = (duration_secs as u64 * 1_000_000) / interval_us.max(1);
+
+        self.throughput_send_interval_ms = (interval_us / 1000).max(1) as u64;
+        self.last_throughput_send_time = None;
+        self.pending_throughput_sends.clear();
+
+        if let Some(state) = self.active_tests.get_mut(&test_id) {
+            state.frames_sent = total_frames as u32;
+        }
+
+        for seq in 0..total_frames {
+            let frame = throughput::build_throughput_stream_frame(
+                test_id,
+                seq as u32,
+                data_len,
+            );
+            self.pending_throughput_sends.push_back((peer, frame));
+        }
+    }
+
+    pub fn poll_throughput_sends(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
+        if self.pending_throughput_sends.is_empty() {
+            return None;
+        }
+        if let Some(last) = self.last_throughput_send_time {
+            let elapsed = last.elapsed().as_millis() as u64;
+            if elapsed < self.throughput_send_interval_ms {
+                return None;
+            }
+        }
+        self.last_throughput_send_time = Some(Instant::now());
+        self.pending_throughput_sends.pop_front()
+    }
+
+    pub fn throughput_sends_pending(&self) -> bool {
+        !self.pending_throughput_sends.is_empty()
+    }
+
     pub fn prepare_throughput_test(
         &mut self,
         direction: Direction,
         duration_secs: u8,
         frame_size: u16,
         rate_bps: u32,
-    ) -> (u32, Vec<u8>) {
+    ) -> (u32, ThroughputTestConfig, Vec<u8>) {
         let test_id = self.allocate_test_id();
         let config = ThroughputTestConfig {
             test_id,
@@ -240,7 +298,7 @@ impl BenchmarkManager {
         let frame = build_throughput_request_frame(&config);
         let state = ThroughputTestState::new(test_id);
         self.active_tests.insert(test_id, state);
-        (test_id, frame)
+        (test_id, config, frame)
     }
 
     pub fn active_test_mut(&mut self, test_id: u32) -> Option<&mut ThroughputTestState> {

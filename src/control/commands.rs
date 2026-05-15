@@ -143,7 +143,7 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
         _ => return Response::error("direction must be 'upload' or 'download'"),
     };
 
-    let (test_id, request_frame) = node
+    let (test_id, config, request_frame) = node
         .benchmark_mut()
         .prepare_throughput_test(direction, duration, frame_size, rate);
 
@@ -159,10 +159,8 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
         return Response::error(format!("failed to send throughput request: {e}"));
     }
 
-    // For upload tests, also send the stream frames immediately.
-    // The BLE socket buffers them; the ESP32 counts and sends a report.
-    let mut stream_frames_sent = 0u32;
-    if direction == crate::benchmark::throughput::Direction::Upload {
+    // For upload tests, queue paced stream frames.
+    let queued_frames: u32 = if direction == crate::benchmark::throughput::Direction::Upload {
         let data_len = frame_size as usize;
         let interval_us = if rate > 0 {
             ((data_len as u64) * 8 * 1_000_000) / rate as u64
@@ -170,28 +168,17 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
             1000
         };
         let total_frames = (duration as u64 * 1_000_000) / interval_us.max(1);
-
-        for seq in 0..total_frames {
-            let stream_payload = crate::benchmark::throughput::build_throughput_stream_frame(
-                test_id,
-                seq as u32,
-                data_len,
-            );
-            match node
-                .api_send_benchmark_message(
-                    &peer_addr,
-                    stream_payload[0],
-                    &stream_payload[1..],
-                )
-                .await
-            {
-                Ok(_) => stream_frames_sent += 1,
-                Err(e) => {
-                    debug!(seq, error = %e, "benchmark_throughput: stream send failed");
-                }
-            }
-        }
-    }
+        node.benchmark_mut().start_throughput_sends(
+            peer_addr,
+            test_id,
+            frame_size,
+            rate,
+            duration,
+        );
+        total_frames as u32
+    } else {
+        0
+    };
 
     Response::ok(serde_json::json!({
         "status": "throughput_test_started",
@@ -201,6 +188,6 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
         "duration_secs": duration,
         "frame_size": frame_size,
         "rate_bps": rate,
-        "stream_frames_sent": stream_frames_sent,
+        "queued_stream_frames": queued_frames,
     }))
 }

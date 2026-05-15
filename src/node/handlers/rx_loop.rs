@@ -159,10 +159,17 @@ impl Node {
                 }
                 _ = benchmark_echo_tick.tick() => {
                     #[cfg(feature = "benchmark")]
-                    if let Some((peer, payload)) = self.benchmark_mut().poll_echo_sends() {
-                        let msg_type = payload[0];
-                        let body = &payload[1..];
-                        let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+                    {
+                        if let Some((peer, payload)) = self.benchmark_mut().poll_echo_sends() {
+                            let msg_type = payload[0];
+                            let body = &payload[1..];
+                            let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+                        }
+                        if let Some((peer, payload)) = self.benchmark_mut().poll_throughput_sends() {
+                            let msg_type = payload[0];
+                            let body = &payload[1..];
+                            let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+                        }
                     }
                 }
             }
