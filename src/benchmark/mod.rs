@@ -30,7 +30,7 @@ pub struct BenchmarkManager {
     pending_echo_response: Option<(NodeAddr, Vec<u8>)>,
     pending_throughput_config: Option<(NodeAddr, ThroughputTestConfig)>,
     last_throughput_result: Option<(NodeAddr, ThroughputResult)>,
-    pending_echo_sends: VecDeque<(NodeAddr, Vec<u8>)>,
+    pending_echo_sends: VecDeque<(NodeAddr, u32, Vec<u8>)>,
     echo_inter_send_delay_ms: u64,
     last_echo_send_time: Option<Instant>,
 }
@@ -182,8 +182,7 @@ impl BenchmarkManager {
         self.echo_results.remove(&peer);
         self.last_echo_send_time = None;
         for seq in 0..count {
-            let frame = echo::build_echo_request_frame(seq, &payload);
-            self.pending_echo_sends.push_back((peer, frame));
+            self.pending_echo_sends.push_back((peer, seq, payload.clone()));
         }
     }
 
@@ -198,7 +197,10 @@ impl BenchmarkManager {
             }
         }
         self.last_echo_send_time = Some(Instant::now());
-        self.pending_echo_sends.pop_front()
+        let (peer, seq, payload) = self.pending_echo_sends.pop_front()?;
+        // Build frame at send time so ts_us reflects actual transmission moment
+        let frame = echo::build_echo_request_frame(seq, &payload);
+        Some((peer, frame))
     }
 
     pub fn echo_sends_pending(&self) -> bool {
