@@ -1,0 +1,182 @@
+//! Benchmark module — echo latency and throughput measurement.
+//!
+//! Feature-gated behind `#[cfg(feature = "benchmark")]`.
+
+pub mod echo;
+pub mod throughput;
+pub mod types;
+
+use std::collections::HashMap;
+
+use crate::NodeAddr;
+use echo::{EchoResult, compute_echo_stats};
+use throughput::{
+    Direction, ThroughputResult, ThroughputTestConfig, ThroughputTestState,
+    build_throughput_request_frame, handle_throughput_stream, parse_throughput_report,
+    parse_throughput_request,
+};
+use types::{MSG_ECHO_REQUEST, MSG_ECHO_RESPONSE, MSG_THROUGHPUT_REPORT, MSG_THROUGHPUT_STREAM};
+
+use tracing::{debug, info, warn};
+
+pub struct BenchmarkManager {
+    active_tests: HashMap<u32, ThroughputTestState>,
+    echo_results: HashMap<NodeAddr, Vec<EchoResult>>,
+    echo_expected: HashMap<NodeAddr, u32>,
+    next_test_id: u32,
+    pending_echo_response: Option<(NodeAddr, Vec<u8>)>,
+    pending_throughput_config: Option<(NodeAddr, ThroughputTestConfig)>,
+    last_throughput_result: Option<(NodeAddr, ThroughputResult)>,
+}
+
+impl BenchmarkManager {
+    pub fn new() -> Self {
+        Self {
+            active_tests: HashMap::new(),
+            echo_results: HashMap::new(),
+            echo_expected: HashMap::new(),
+            next_test_id: 1,
+            pending_echo_response: None,
+            pending_throughput_config: None,
+            last_throughput_result: None,
+        }
+    }
+
+    pub fn allocate_test_id(&mut self) -> u32 {
+        let id = self.next_test_id;
+        self.next_test_id += 1;
+        id
+    }
+
+    /// Dispatch an incoming link-layer benchmark message.
+    ///
+    /// `msg_type` is the first byte of the decrypted link payload.
+    /// `payload` is everything after that first byte.
+    pub fn handle_link_message(&mut self, from: &NodeAddr, msg_type: u8, payload: &[u8]) {
+        match msg_type {
+            MSG_ECHO_REQUEST => {
+                debug!(peer = ?from, "Benchmark: echo request received");
+                // Build echo response and store for dispatch layer to send.
+                if let Some(frame) = echo::build_echo_response_frame(payload) {
+                    self.pending_echo_response = Some((*from, frame));
+                }
+            }
+            MSG_ECHO_RESPONSE => {
+                debug!(peer = ?from, "Benchmark: echo response received");
+                if let Some(result) = echo::handle_echo_response(payload) {
+                    self.echo_results.entry(*from).or_default().push(result);
+                }
+            }
+            types::MSG_THROUGHPUT_REQUEST => {
+                if let Some(config) = parse_throughput_request(payload) {
+                    info!(
+                        peer = ?from,
+                        test_id = config.test_id,
+                        direction = ?config.direction,
+                        duration = config.duration_secs,
+                        "Benchmark: throughput request received"
+                    );
+                    let state = ThroughputTestState::new(config.test_id);
+                    self.active_tests.insert(config.test_id, state);
+                    self.pending_throughput_config = Some((*from, config));
+                }
+            }
+            MSG_THROUGHPUT_STREAM => {
+                if let Some((test_id, _, _)) = types::ThroughputStream::decode(payload) {
+                    if let Some(state) = self.active_tests.get_mut(&test_id) {
+                        handle_throughput_stream(state, payload);
+                    }
+                }
+            }
+            MSG_THROUGHPUT_REPORT => {
+                if let Some(result) = parse_throughput_report(payload) {
+                    info!(
+                        peer = ?from,
+                        achieved_bps = result.achieved_bps,
+                        loss_rate = format!("{:.1}%", result.frame_loss_rate * 100.0),
+                        "Benchmark: throughput report received"
+                    );
+                    self.last_throughput_result = Some((*from, result));
+                }
+            }
+            _ => {
+                warn!(msg_type, "Benchmark: unknown benchmark message type");
+            }
+        }
+    }
+
+    pub fn take_echo_response(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
+        self.pending_echo_response.take()
+    }
+
+    pub fn take_throughput_config(&mut self) -> Option<(NodeAddr, ThroughputTestConfig)> {
+        self.pending_throughput_config.take()
+    }
+
+    pub fn take_throughput_result(&mut self) -> Option<(NodeAddr, ThroughputResult)> {
+        self.last_throughput_result.take()
+    }
+
+    pub fn expect_echo_probes(&mut self, peer: NodeAddr, count: u32) {
+        self.echo_expected.insert(peer, count);
+    }
+
+    pub fn take_echo_stats(&mut self, peer: &NodeAddr) -> Option<echo::EchoStats> {
+        let results = self.echo_results.remove(peer)?;
+        let expected = self.echo_expected.remove(peer).unwrap_or(results.len() as u32);
+        Some(compute_echo_stats(results, expected as usize))
+    }
+
+    pub fn prepare_echo_test(
+        &mut self,
+        peer: NodeAddr,
+        count: u32,
+        payload_size: usize,
+    ) -> Vec<Vec<u8>> {
+        let payload = if payload_size > 0 {
+            vec![0xAB; payload_size]
+        } else {
+            Vec::new()
+        };
+        self.expect_echo_probes(peer, count);
+        self.echo_results.remove(&peer);
+        (0..count)
+            .map(|seq| echo::build_echo_request_frame(seq, &payload))
+            .collect()
+    }
+
+    pub fn prepare_throughput_test(
+        &mut self,
+        direction: Direction,
+        duration_secs: u8,
+        frame_size: u16,
+        rate_bps: u32,
+    ) -> (u32, Vec<u8>) {
+        let test_id = self.allocate_test_id();
+        let config = ThroughputTestConfig {
+            test_id,
+            direction,
+            duration_secs,
+            frame_size,
+            rate_bps,
+        };
+        let frame = build_throughput_request_frame(&config);
+        let state = ThroughputTestState::new(test_id);
+        self.active_tests.insert(test_id, state);
+        (test_id, frame)
+    }
+
+    pub fn active_test_mut(&mut self, test_id: u32) -> Option<&mut ThroughputTestState> {
+        self.active_tests.get_mut(&test_id)
+    }
+
+    pub fn remove_test(&mut self, test_id: u32) -> Option<ThroughputTestState> {
+        self.active_tests.remove(&test_id)
+    }
+}
+
+impl Default for BenchmarkManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -59,6 +59,10 @@ impl Node {
                 // Heartbeat — no-op, last_recv_time already updated by record_recv()
                 trace!(peer = %self.peer_display_name(from), "Received heartbeat");
             }
+            #[cfg(feature = "benchmark")]
+            0xFF | 0xFE | 0xFD | 0xFC | 0xFB => {
+                self.benchmark.handle_link_message(from, msg_type, payload);
+            }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");
             }

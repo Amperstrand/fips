@@ -76,6 +76,11 @@ enum Commands {
         #[command(subcommand)]
         what: StatsCommands,
     },
+    /// Run benchmark tests against a peer
+    Benchmark {
+        #[command(subcommand)]
+        what: BenchmarkCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -137,6 +142,46 @@ enum ShowCommands {
 enum AclCommands {
     /// Loaded peer ACL state
     Show,
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchmarkCommands {
+    /// Measure round-trip latency
+    Echo {
+        /// Peer identifier (npub or hostname)
+        #[arg(short, long)]
+        peer: String,
+        /// Number of echo requests to send
+        #[arg(short, long, default_value_t = 10)]
+        count: u32,
+        /// Payload size in bytes (0 for minimal)
+        #[arg(short, long, default_value_t = 0)]
+        payload_size: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure throughput
+    Throughput {
+        /// Peer identifier (npub or hostname)
+        #[arg(short, long)]
+        peer: String,
+        /// Direction: upload or download
+        #[arg(short, long, default_value = "upload")]
+        direction: String,
+        /// Test duration in seconds
+        #[arg(short, long, default_value_t = 5)]
+        duration: u8,
+        /// Frame size in bytes
+        #[arg(short, long, default_value_t = 256)]
+        frame_size: u16,
+        /// Target rate in bits per second
+        #[arg(short, long, default_value_t = 40000)]
+        rate: u32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl ShowCommands {
@@ -466,6 +511,46 @@ fn main() {
                     params["peer"] = serde_json::json!(resolved);
                 }
                 build_command("show_stats_history", params)
+            }
+        },
+        Commands::Benchmark { what } => match what {
+            BenchmarkCommands::Echo {
+                peer,
+                count,
+                payload_size,
+                json,
+            } => {
+                let npub = resolve_peer(&peer);
+                build_command(
+                    "benchmark_echo",
+                    serde_json::json!({
+                        "npub": npub,
+                        "count": count,
+                        "payload_size": payload_size,
+                        "json": json,
+                    }),
+                )
+            }
+            BenchmarkCommands::Throughput {
+                peer,
+                direction,
+                duration,
+                frame_size,
+                rate,
+                json,
+            } => {
+                let npub = resolve_peer(&peer);
+                build_command(
+                    "benchmark_throughput",
+                    serde_json::json!({
+                        "npub": npub,
+                        "direction": direction,
+                        "duration": duration,
+                        "frame_size": frame_size,
+                        "rate": rate,
+                        "json": json,
+                    }),
+                )
             }
         },
         Commands::Keygen { .. } => unreachable!(),

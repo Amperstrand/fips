@@ -22,6 +22,9 @@ pub mod upper;
 pub mod utils;
 pub mod version;
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
+
 // Re-export identity types
 pub use identity::{
     AuthChallenge, AuthResponse, FipsAddress, Identity, IdentityError, NodeAddr, PeerIdentity,

@@ -512,6 +512,10 @@ pub struct Node {
     /// Static hostname → npub mapping for DNS resolution.
     /// Built at construction from peer aliases and /etc/fips/hosts.
     host_map: Arc<HostMap>,
+
+    // === Benchmark ===
+    #[cfg(feature = "benchmark")]
+    benchmark: crate::benchmark::BenchmarkManager,
 }
 
 impl Node {
@@ -658,6 +662,8 @@ impl Node {
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
             discovered_peer_configs: HashMap::new(),
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -794,6 +800,8 @@ impl Node {
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
             discovered_peer_configs: HashMap::new(),
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -1381,6 +1389,11 @@ impl Node {
     /// Get the stats history collector.
     pub fn stats_history(&self) -> &stats_history::StatsHistory {
         &self.stats_history
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn benchmark_mut(&mut self) -> &mut crate::benchmark::BenchmarkManager {
+        &mut self.benchmark
     }
 
     /// Sample the current node state into the stats history ring.
