@@ -10,6 +10,7 @@ readme = "README.md"
 
 [features]
 default = []
+benchmark = []
 ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2", "dep:uuid"]
 
 [dependencies]

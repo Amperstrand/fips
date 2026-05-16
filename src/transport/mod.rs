@@ -1159,8 +1159,8 @@ impl TransportHandle {
             TransportHandle::Udp(t) => t.close_connection(addr),
             #[cfg(unix)]
             TransportHandle::Ethernet(t) => t.close_connection(addr),
-            TransportHandle::Tcp(_) => {},
-            TransportHandle::Tor(_) => {},
+            TransportHandle::Tcp(_) => {}
+            TransportHandle::Tor(_) => {}
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.close_connection(addr),
         }

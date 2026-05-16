@@ -15,12 +15,16 @@ pub mod mmp;
 pub mod node;
 pub mod noise;
 pub mod peer;
+pub mod peer_policy;
 pub mod protocol;
 pub mod transport;
 pub mod tree;
 pub mod upper;
 pub mod utils;
 pub mod version;
+
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 
 // Re-export identity types
 pub use identity::{

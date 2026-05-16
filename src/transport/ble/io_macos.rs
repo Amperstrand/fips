@@ -1,10 +1,10 @@
 //! macOS BLE I/O via bluest (central role) and objc2-core-bluetooth (peripheral role).
 
 use super::{
-    BLE_DEFAULT_QUEUE_DEPTH, frame_payload, parse_psm_value, try_take_framed_payload,
-    gatt_err, BleAcceptor, BleIo, BleScanner, BleStream, FIPS_GATT_PSM_CHAR_UUID_RAW,
-    FIPS_GATT_PSM_SERVICE_UUID_RAW, FIPS_SERVICE_UUID_RAW, GATT_PSM_DISCOVER_TIMEOUT,
-    TransportError,
+    BLE_DEFAULT_QUEUE_DEPTH, BleAcceptor, BleIo, BleScanner, BleStream,
+    FIPS_GATT_PSM_CHAR_UUID_RAW, FIPS_GATT_PSM_SERVICE_UUID_RAW, FIPS_SERVICE_UUID_RAW,
+    GATT_PSM_DISCOVER_TIMEOUT, TransportError, frame_payload, gatt_err, parse_psm_value,
+    try_take_framed_payload,
 };
 use crate::transport::ble::Unpoison;
 use crate::transport::ble::addr::BleAddr;
@@ -746,10 +746,12 @@ impl PeripheralStream {
         send_rate_bps: u64,
         send_burst_bytes: u32,
     ) -> Result<Self, TransportError> {
-        let input_stream = unsafe { channel.0.inputStream() }
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("CBL2CAPChannel has no input stream")))?;
-        let output_stream = unsafe { channel.0.outputStream() }
-            .ok_or_else(|| TransportError::Io(std::io::Error::other("CBL2CAPChannel has no output stream")))?;
+        let input_stream = unsafe { channel.0.inputStream() }.ok_or_else(|| {
+            TransportError::Io(std::io::Error::other("CBL2CAPChannel has no input stream"))
+        })?;
+        let output_stream = unsafe { channel.0.outputStream() }.ok_or_else(|| {
+            TransportError::Io(std::io::Error::other("CBL2CAPChannel has no output stream"))
+        })?;
 
         let read_notify = Arc::new(tokio::sync::Notify::new());
         let input_delegate = PeripheralInputDelegate::new(read_notify.clone());
@@ -1181,7 +1183,7 @@ define_class!(
                         return;
                     }
                 };
-                 if let Ok(mut pending) = self.ivars().pending_streams.lock() {
+                if let Ok(mut pending) = self.ivars().pending_streams.lock() {
                     pending.push(SendablePeripheralStream(stream));
                 }
                 let _ = self
@@ -1400,9 +1402,7 @@ impl BluestIo {
                 .discover_services_with_uuid(FIPS_GATT_PSM_SERVICE_UUID)
                 .await
                 .map_err(|e| {
-                    TransportError::Io(std::io::Error::other(
-                        gatt_err::enum_services(addr, &e),
-                    ))
+                    TransportError::Io(std::io::Error::other(gatt_err::enum_services(addr, &e)))
                 })?;
 
             debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
@@ -1420,9 +1420,7 @@ impl BluestIo {
             };
 
             let characteristics = psm_service.characteristics().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(
-                    gatt_err::enum_chars(addr, &e),
-                ))
+                TransportError::Io(std::io::Error::other(gatt_err::enum_chars(addr, &e)))
             })?;
 
             let psm_char = characteristics
@@ -1438,9 +1436,7 @@ impl BluestIo {
             };
 
             let value = psm_char.read().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(
-                    gatt_err::read_psm(addr, &e),
-                ))
+                TransportError::Io(std::io::Error::other(gatt_err::read_psm(addr, &e)))
             })?;
 
             let psm = parse_psm_value(&value, addr)?;
@@ -1452,11 +1448,7 @@ impl BluestIo {
 
         tokio::time::timeout(GATT_PSM_DISCOVER_TIMEOUT, discover)
             .await
-            .map_err(|_| {
-                TransportError::Io(std::io::Error::other(
-                    gatt_err::timeout(addr),
-                ))
-            })?
+            .map_err(|_| TransportError::Io(std::io::Error::other(gatt_err::timeout(addr))))?
     }
 }
 

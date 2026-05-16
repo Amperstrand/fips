@@ -106,11 +106,7 @@ fn days_to_ymd(mut days: i64) -> (i64, u8, u8) {
         (days - 146096) / 146097
     };
     let mut doe = days - era * 146097; // day of era [0, 146096]
-    let yoe = (doe
-        - doe / 1460
-        + doe / 36524
-        - doe / 146096)
-        / 365; // year of era [0, 399]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
     let mut y = yoe + era * 400;
     doe -= yoe * 365 + yoe / 4 - yoe / 100;
     let mp = (doe * 10 + 5) / 306; // month [0-based from March]

@@ -50,10 +50,7 @@ impl PeerCapabilities {
     /// throughput — the direct NSOutputStream write path is ~2.75× faster).
     pub fn macos_default() -> Self {
         Self(
-            Self::L2CAP_SUPPORTED
-                | Self::CAN_CENTRAL
-                | Self::CAN_PERIPHERAL
-                | Self::GATT_SUPPORTED,
+            Self::L2CAP_SUPPORTED | Self::CAN_CENTRAL | Self::CAN_PERIPHERAL | Self::GATT_SUPPORTED,
         )
     }
 

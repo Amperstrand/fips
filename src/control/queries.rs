@@ -1104,6 +1104,94 @@ pub fn show_stats_history_all_peers(
     }))
 }
 
+#[cfg(feature = "benchmark")]
+fn benchmark_echo_results(node: &Node, params: Option<&Value>) -> super::protocol::Response {
+    use super::protocol::Response;
+    let Some(params) = params else {
+        return Response::error("missing params for benchmark_echo_results");
+    };
+    let npub = match params.get("npub").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return Response::error("missing 'npub' parameter"),
+    };
+    let peer_addr = match PeerIdentity::from_npub(npub) {
+        Ok(id) => *id.node_addr(),
+        Err(e) => return Response::error(format!("invalid peer npub: {e}")),
+    };
+
+    let bm = node.benchmark();
+    let stats = bm.get_echo_stats(&peer_addr);
+    let expected = bm.echo_expected_count(&peer_addr);
+
+    match (stats, expected) {
+        (Some(results), Some(exp)) => {
+            let results_vec: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "rtt_us": r.rtt_us,
+                        "seq": r.seq,
+                        "payload_len": r.payload_len,
+                    })
+                })
+                .collect();
+            let computed =
+                crate::benchmark::echo::compute_echo_stats(results.to_vec(), exp as usize);
+            Response::ok(json!({
+                "results": results_vec,
+                "min_us": computed.min_us,
+                "max_us": computed.max_us,
+                "mean_us": computed.mean_us,
+                "median_us": computed.median_us,
+                "p95_us": computed.p95_us,
+                "loss_count": computed.loss_count,
+                "jitter_us": computed.jitter_us,
+            }))
+        }
+        (None, None) => Response::ok(json!({
+            "status": "no_test",
+            "peer": npub,
+        })),
+        _ => Response::ok(json!({
+            "status": "pending",
+            "peer": npub,
+        })),
+    }
+}
+
+#[cfg(feature = "benchmark")]
+fn benchmark_throughput_results(node: &Node, params: Option<&Value>) -> super::protocol::Response {
+    use super::protocol::Response;
+    let Some(params) = params else {
+        return Response::error("missing params for benchmark_throughput_results");
+    };
+    let npub = match params.get("npub").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return Response::error("missing 'npub' parameter"),
+    };
+    let _peer_addr = match PeerIdentity::from_npub(npub) {
+        Ok(id) => *id.node_addr(),
+        Err(e) => return Response::error(format!("invalid peer npub: {e}")),
+    };
+
+    match node.benchmark().last_throughput_result() {
+        Some((peer, result)) => Response::ok(json!({
+            "status": "complete",
+            "peer": hex::encode(peer.as_bytes()),
+            "achieved_bps": result.achieved_bps,
+            "frame_loss_rate": result.frame_loss_rate,
+            "total_bytes": result.total_bytes,
+            "duration_us": result.duration_us,
+            "frames_sent": result.frames_sent,
+            "frames_recv": result.frames_recv,
+        })),
+        None => Response::ok(json!({
+            "status": "pending",
+            "peer": npub,
+        })),
+    }
+}
+
 /// Dispatch a command string to the appropriate query function.
 pub fn dispatch(node: &Node, command: &str, params: Option<&Value>) -> super::protocol::Response {
     match command {
@@ -1125,6 +1213,10 @@ pub fn dispatch(node: &Node, command: &str, params: Option<&Value>) -> super::pr
         "show_stats_all_history" => show_stats_all_history(node, params),
         "show_stats_peers" => super::protocol::Response::ok(show_stats_peers(node)),
         "show_stats_history_all_peers" => show_stats_history_all_peers(node, params),
+        #[cfg(feature = "benchmark")]
+        "show_benchmark_echo_results" => benchmark_echo_results(node, params),
+        #[cfg(feature = "benchmark")]
+        "show_benchmark_throughput_results" => benchmark_throughput_results(node, params),
         _ => super::protocol::Response::error(format!("unknown command: {}", command)),
     }
 }

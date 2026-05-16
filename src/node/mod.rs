@@ -512,6 +512,10 @@ pub struct Node {
     /// Static hostname → npub mapping for DNS resolution.
     /// Built at construction from peer aliases and /etc/fips/hosts.
     host_map: Arc<HostMap>,
+
+    // === Benchmark ===
+    #[cfg(feature = "benchmark")]
+    benchmark: crate::benchmark::BenchmarkManager,
 }
 
 impl Node {
@@ -589,21 +593,21 @@ impl Node {
             startup_epoch,
             started_at: std::time::Instant::now(),
             config,
-             state: NodeState::Created,
-             is_leaf_only,
-             tree_state,
-             bloom_state,
-             coord_cache,
-             recent_requests: HashMap::new(),
-             transports: HashMap::new(),
-             transport_drops: HashMap::new(),
-             links: HashMap::new(),
-             addr_to_link: HashMap::new(),
-             packet_tx: None,
-             packet_rx: None,
-             disconnect_rx: None,
-             tun_max_mss: None,
-             ble_congested: Vec::new(),
+            state: NodeState::Created,
+            is_leaf_only,
+            tree_state,
+            bloom_state,
+            coord_cache,
+            recent_requests: HashMap::new(),
+            transports: HashMap::new(),
+            transport_drops: HashMap::new(),
+            links: HashMap::new(),
+            addr_to_link: HashMap::new(),
+            packet_tx: None,
+            packet_rx: None,
+            disconnect_rx: None,
+            tun_max_mss: None,
+            ble_congested: Vec::new(),
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -658,6 +662,8 @@ impl Node {
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
             discovered_peer_configs: HashMap::new(),
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -727,21 +733,21 @@ impl Node {
             startup_epoch,
             started_at: std::time::Instant::now(),
             config,
-             state: NodeState::Created,
-             is_leaf_only: false,
-             tree_state,
-             bloom_state,
-             coord_cache,
-             recent_requests: HashMap::new(),
-             transports: HashMap::new(),
-             transport_drops: HashMap::new(),
-             links: HashMap::new(),
-             addr_to_link: HashMap::new(),
-             packet_tx: None,
-             packet_rx: None,
-             disconnect_rx: None,
-             tun_max_mss: None,
-             ble_congested: Vec::new(),
+            state: NodeState::Created,
+            is_leaf_only: false,
+            tree_state,
+            bloom_state,
+            coord_cache,
+            recent_requests: HashMap::new(),
+            transports: HashMap::new(),
+            transport_drops: HashMap::new(),
+            links: HashMap::new(),
+            addr_to_link: HashMap::new(),
+            packet_tx: None,
+            packet_rx: None,
+            disconnect_rx: None,
+            tun_max_mss: None,
+            ble_congested: Vec::new(),
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -794,6 +800,8 @@ impl Node {
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
             discovered_peer_configs: HashMap::new(),
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -977,7 +985,6 @@ impl Node {
                     }
                 }
             }
-
         }
 
         // Warn when BLE is configured in fips.yaml but this build lacks BLE
@@ -1381,6 +1388,34 @@ impl Node {
     /// Get the stats history collector.
     pub fn stats_history(&self) -> &stats_history::StatsHistory {
         &self.stats_history
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn benchmark_mut(&mut self) -> &mut crate::benchmark::BenchmarkManager {
+        &mut self.benchmark
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn benchmark(&self) -> &crate::benchmark::BenchmarkManager {
+        &self.benchmark
+    }
+
+    /// Send a benchmark message to a peer over the encrypted link.
+    ///
+    /// Prepends the message type byte and delegates to
+    /// `send_encrypted_link_message`. Used by the control-socket
+    /// benchmark command handlers to fire echo/throughput frames.
+    #[cfg(feature = "benchmark")]
+    pub async fn api_send_benchmark_message(
+        &mut self,
+        node_addr: &NodeAddr,
+        msg_type: u8,
+        payload: &[u8],
+    ) -> Result<(), NodeError> {
+        let mut plaintext = vec![msg_type];
+        plaintext.extend_from_slice(payload);
+        self.send_encrypted_link_message(node_addr, &plaintext)
+            .await
     }
 
     /// Sample the current node state into the stats history ring.

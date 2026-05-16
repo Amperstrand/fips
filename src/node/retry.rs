@@ -79,7 +79,12 @@ impl RetryState {
     /// Note: For proactive reconnects (H13), this compounds with any previous
     /// failure reconnects since retry_count is preserved. See issue #108 for
     /// the proposal to use a separate, lighter backoff for proactive reconnects.
-    pub fn backoff_ms(&self, base_interval_ms: u64, max_backoff_ms: u64, proactive_backoff_ms: u64) -> u64 {
+    pub fn backoff_ms(
+        &self,
+        base_interval_ms: u64,
+        max_backoff_ms: u64,
+        proactive_backoff_ms: u64,
+    ) -> u64 {
         if self.proactive {
             return proactive_backoff_ms;
         }
@@ -103,14 +108,11 @@ impl Node {
         transport_name: &str,
         transport_addr: &crate::transport::TransportAddr,
     ) {
-        let already_in_static_config = self
-            .config
-            .auto_connect_peers()
-            .any(|pc| {
-                PeerIdentity::from_npub(&pc.npub)
-                    .map(|id| *id.node_addr() == node_addr)
-                    .unwrap_or(false)
-            });
+        let already_in_static_config = self.config.auto_connect_peers().any(|pc| {
+            PeerIdentity::from_npub(&pc.npub)
+                .map(|id| *id.node_addr() == node_addr)
+                .unwrap_or(false)
+        });
 
         if already_in_static_config {
             return;
@@ -131,11 +133,7 @@ impl Node {
         self.discovered_peer_configs.insert(node_addr, peer_config);
 
         if self.discovered_peer_configs.len() > super::DISCOVERED_PEER_CONFIGS_MAX {
-            let oldest_key = self
-                .discovered_peer_configs
-                .keys()
-                .next()
-                .copied();
+            let oldest_key = self.discovered_peer_configs.keys().next().copied();
             if let Some(key) = oldest_key {
                 self.discovered_peer_configs.remove(&key);
             }
@@ -300,7 +298,12 @@ impl Node {
     /// Similar to schedule_reconnect but sets the `proactive` flag for lighter
     /// backoff. Used by H13 SRTT threshold reconnect — the link was healthy,
     /// we're cycling the BLE channel to get fresh L2CAP credits.
-    pub(super) fn schedule_proactive_reconnect(&mut self, node_addr: NodeAddr, now_ms: u64, proactive_backoff_ms: u64) {
+    pub(super) fn schedule_proactive_reconnect(
+        &mut self,
+        node_addr: NodeAddr,
+        now_ms: u64,
+        proactive_backoff_ms: u64,
+    ) {
         let peer_config = self
             .config
             .auto_connect_peers()
