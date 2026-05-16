@@ -1,9 +1,8 @@
 //! Throughput benchmark: bandwidth measurement.
 
 use crate::benchmark::types::{
-    DIRECTION_UPLOAD, ThroughputReport, ThroughputRequest, ThroughputStream,
-    MSG_THROUGHPUT_REPORT, MSG_THROUGHPUT_REQUEST, MSG_THROUGHPUT_STREAM,
-    now_micros,
+    DIRECTION_UPLOAD, MSG_THROUGHPUT_REPORT, MSG_THROUGHPUT_REQUEST, MSG_THROUGHPUT_STREAM,
+    ThroughputReport, ThroughputRequest, ThroughputStream, now_micros,
 };
 
 /// Throughput test direction.
@@ -105,11 +104,7 @@ pub fn parse_throughput_request(body: &[u8]) -> Option<ThroughputTestConfig> {
 /// Build a throughput stream frame with pseudorandom fill data.
 pub fn build_throughput_stream_frame(test_id: u32, seq: u32, data_len: usize) -> Vec<u8> {
     let data = generate_stream_data(test_id, seq, data_len);
-    let stream = ThroughputStream {
-        test_id,
-        seq,
-        data,
-    };
+    let stream = ThroughputStream { test_id, seq, data };
     let mut frame = vec![MSG_THROUGHPUT_STREAM];
     frame.extend(stream.encode());
     frame
@@ -119,10 +114,7 @@ pub fn build_throughput_stream_frame(test_id: u32, seq: u32, data_len: usize) ->
 ///
 /// Updates the test state with frame/byte counts and detects sequence gaps.
 /// Returns `false` if the frame doesn't match an active test.
-pub fn handle_throughput_stream(
-    state: &mut ThroughputTestState,
-    body: &[u8],
-) -> bool {
+pub fn handle_throughput_stream(state: &mut ThroughputTestState, body: &[u8]) -> bool {
     let (test_id, seq, data) = match ThroughputStream::decode(body) {
         Some(t) => t,
         None => return false,

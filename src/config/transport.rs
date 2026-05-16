@@ -908,27 +908,32 @@ impl BleConfig {
 
     /// Connection parameter refresh interval in seconds. None = disabled.
     pub fn conn_param_refresh_secs(&self) -> Option<u64> {
-        self.conn_param_refresh_secs.or(DEFAULT_BLE_CONN_PARAM_REFRESH_SECS)
+        self.conn_param_refresh_secs
+            .or(DEFAULT_BLE_CONN_PARAM_REFRESH_SECS)
     }
 
     /// BLE min connection interval in 1.25ms units. Default: 6 (7.5ms).
     pub fn conn_param_min_interval(&self) -> u16 {
-        self.conn_param_min_interval.unwrap_or(DEFAULT_BLE_CONN_PARAM_MIN_INTERVAL)
+        self.conn_param_min_interval
+            .unwrap_or(DEFAULT_BLE_CONN_PARAM_MIN_INTERVAL)
     }
 
     /// BLE max connection interval in 1.25ms units. Default: 20 (25ms).
     pub fn conn_param_max_interval(&self) -> u16 {
-        self.conn_param_max_interval.unwrap_or(DEFAULT_BLE_CONN_PARAM_MAX_INTERVAL)
+        self.conn_param_max_interval
+            .unwrap_or(DEFAULT_BLE_CONN_PARAM_MAX_INTERVAL)
     }
 
     /// BLE peripheral latency. Default: 0.
     pub fn conn_param_latency(&self) -> u16 {
-        self.conn_param_latency.unwrap_or(DEFAULT_BLE_CONN_PARAM_LATENCY)
+        self.conn_param_latency
+            .unwrap_or(DEFAULT_BLE_CONN_PARAM_LATENCY)
     }
 
     /// BLE supervision timeout in 10ms units. Default: 500 (5s).
     pub fn conn_param_timeout(&self) -> u16 {
-        self.conn_param_timeout.unwrap_or(DEFAULT_BLE_CONN_PARAM_TIMEOUT)
+        self.conn_param_timeout
+            .unwrap_or(DEFAULT_BLE_CONN_PARAM_TIMEOUT)
     }
 
     /// SRTT reconnect threshold in milliseconds. None = disabled.
@@ -983,11 +988,13 @@ impl BleConfig {
         }
         if self.conn_param_min_interval == Some(0) {
             self.conn_param_min_interval = None;
-            warnings.push("transports.ble.conn_param_min_interval was 0, reset to default 6".into());
+            warnings
+                .push("transports.ble.conn_param_min_interval was 0, reset to default 6".into());
         }
         if self.conn_param_max_interval == Some(0) {
             self.conn_param_max_interval = None;
-            warnings.push("transports.ble.conn_param_max_interval was 0, reset to default 20".into());
+            warnings
+                .push("transports.ble.conn_param_max_interval was 0, reset to default 20".into());
         }
         if self.conn_param_timeout == Some(0) {
             self.conn_param_timeout = None;
@@ -995,11 +1002,13 @@ impl BleConfig {
         }
         if self.srtt_reconnect_threshold_ms == Some(0) {
             self.srtt_reconnect_threshold_ms = None;
-            warnings.push("transports.ble.srtt_reconnect_threshold_ms was 0, reset to disabled".into());
+            warnings
+                .push("transports.ble.srtt_reconnect_threshold_ms was 0, reset to disabled".into());
         }
         if self.srtt_inflation_threshold == Some(0.0) {
             self.srtt_inflation_threshold = None;
-            warnings.push("transports.ble.srtt_inflation_threshold was 0, reset to disabled".into());
+            warnings
+                .push("transports.ble.srtt_inflation_threshold was 0, reset to disabled".into());
         }
 
         warnings

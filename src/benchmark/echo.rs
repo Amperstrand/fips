@@ -1,6 +1,6 @@
 //! Echo benchmark: round-trip latency measurement.
 
-use crate::benchmark::types::{EchoRequest, EchoResponse, now_micros, MSG_ECHO_RESPONSE};
+use crate::benchmark::types::{EchoRequest, EchoResponse, MSG_ECHO_RESPONSE, now_micros};
 
 /// Result of a single echo measurement.
 #[derive(Clone, Debug)]
@@ -108,10 +108,7 @@ pub fn compute_echo_stats(results: Vec<EchoResult>, total_expected: usize) -> Ec
 
     let jitter_us = if rtts.len() > 1 {
         let mean = mean_us as i64;
-        let deviation_sum: u64 = rtts
-            .iter()
-            .map(|&r| (r as i64 - mean).unsigned_abs())
-            .sum();
+        let deviation_sum: u64 = rtts.iter().map(|&r| (r as i64 - mean).unsigned_abs()).sum();
         deviation_sum / rtts.len() as u64
     } else {
         0
@@ -157,9 +154,21 @@ mod tests {
     #[test]
     fn compute_stats_basic() {
         let results = vec![
-            EchoResult { rtt_us: 100, seq: 0, payload_len: 0 },
-            EchoResult { rtt_us: 200, seq: 1, payload_len: 0 },
-            EchoResult { rtt_us: 300, seq: 2, payload_len: 0 },
+            EchoResult {
+                rtt_us: 100,
+                seq: 0,
+                payload_len: 0,
+            },
+            EchoResult {
+                rtt_us: 200,
+                seq: 1,
+                payload_len: 0,
+            },
+            EchoResult {
+                rtt_us: 300,
+                seq: 2,
+                payload_len: 0,
+            },
         ];
         let stats = compute_echo_stats(results, 5);
         assert_eq!(stats.min_us, 100);

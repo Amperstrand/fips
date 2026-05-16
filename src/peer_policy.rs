@@ -32,9 +32,7 @@ impl PeerPolicy {
     // Ported from microfips
     pub fn check_frame_rate(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed_ms = now
-            .duration_since(self.frame_window_start)
-            .as_millis() as u64;
+        let elapsed_ms = now.duration_since(self.frame_window_start).as_millis() as u64;
 
         if elapsed_ms >= FRAME_RATE_WINDOW_MS {
             self.frame_window_start = now;

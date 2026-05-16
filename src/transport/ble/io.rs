@@ -194,26 +194,42 @@ pub(super) const FIPS_GATT_PSM_CHAR_UUID_RAW: u128 = 0x250c_88dd_3dff_4c41_83b2_
 pub(super) const BLE_DEFAULT_QUEUE_DEPTH: usize = 32;
 
 /// Timeout for GATT PSM discovery operations.
-pub(super) const GATT_PSM_DISCOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const GATT_PSM_DISCOVER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 /// Error message helpers for GATT PSM discovery (shared across platforms).
 pub(super) mod gatt_err {
     use super::super::addr::BleAddr;
 
     pub fn enum_services(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
-        format!("discover_gatt_psm: failed to enumerate services for {}: {}", addr, e)
+        format!(
+            "discover_gatt_psm: failed to enumerate services for {}: {}",
+            addr, e
+        )
     }
     pub fn service_not_found(addr: &BleAddr) -> String {
-        format!("discover_gatt_psm: FIPS GATT PSM service not found on {}", addr)
+        format!(
+            "discover_gatt_psm: FIPS GATT PSM service not found on {}",
+            addr
+        )
     }
     pub fn enum_chars(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
-        format!("discover_gatt_psm: failed to enumerate characteristics for {}: {}", addr, e)
+        format!(
+            "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
+            addr, e
+        )
     }
     pub fn char_not_found(addr: &BleAddr) -> String {
-        format!("discover_gatt_psm: PSM characteristic not found on {}", addr)
+        format!(
+            "discover_gatt_psm: PSM characteristic not found on {}",
+            addr
+        )
     }
     pub fn read_psm(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
-        format!("discover_gatt_psm: failed to read PSM characteristic on {}: {}", addr, e)
+        format!(
+            "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
+            addr, e
+        )
     }
     pub fn timeout(addr: &BleAddr) -> String {
         format!("discover_gatt_psm: timed out discovering PSM for {}", addr)
@@ -250,6 +266,7 @@ mod bluer_impl {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use crate::transport::ble::rate_limit::SendRateLimiter;
     use bluer::Address;
     use bluer::l2cap::{FlowControl, SeqPacket, SeqPacketListener, Socket, SocketAddr};
     use bluer::{
@@ -260,7 +277,6 @@ mod bluer_impl {
     use std::pin::Pin;
     use tokio::sync::Mutex;
     use tokio::time::{Duration, timeout};
-    use crate::transport::ble::rate_limit::SendRateLimiter;
     use tracing::{debug, trace, warn};
 
     pub(super) const FIPS_SERVICE_UUID: bluer::Uuid = bluer::Uuid::from_u128(FIPS_SERVICE_UUID_RAW);
@@ -337,12 +353,11 @@ mod bluer_impl {
                 }
             }
 
-            let rate_limiter: Option<
-                Arc<Mutex<SendRateLimiter>>,
-            > = if send_rate_bps > 0 {
-                Some(Arc::new(tokio::sync::Mutex::new(
-                    SendRateLimiter::new(send_rate_bps, send_burst_bytes),
-                )))
+            let rate_limiter: Option<Arc<Mutex<SendRateLimiter>>> = if send_rate_bps > 0 {
+                Some(Arc::new(tokio::sync::Mutex::new(SendRateLimiter::new(
+                    send_rate_bps,
+                    send_burst_bytes,
+                ))))
             } else {
                 None
             };
@@ -473,7 +488,8 @@ mod bluer_impl {
 
                 let mut chunk = vec![0u8; self.recv_mtu as usize];
                 let n = {
-                    self.conn.recv(&mut chunk)
+                    self.conn
+                        .recv(&mut chunk)
                         .await
                         .map_err(|e| TransportError::RecvFailed(format!("{}", e)))?
                 };
@@ -762,11 +778,7 @@ mod bluer_impl {
 
             timeout(GATT_PSM_DISCOVER_TIMEOUT, discover)
                 .await
-                .map_err(|_| {
-                    TransportError::Io(std::io::Error::other(
-                        gatt_err::timeout(addr),
-                    ))
-                })?
+                .map_err(|_| TransportError::Io(std::io::Error::other(gatt_err::timeout(addr))))?
         }
 
         async fn read_psm_from_gatt(
@@ -793,9 +805,7 @@ mod bluer_impl {
             addr: &BleAddr,
         ) -> Result<u16, TransportError> {
             let services = device.services().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(
-                    gatt_err::enum_services(addr, &e),
-                ))
+                TransportError::Io(std::io::Error::other(gatt_err::enum_services(addr, &e)))
             })?;
 
             debug!(remote_addr = %addr, count = services.len(), "GATT PSM discovery: enumerated services");
@@ -811,9 +821,7 @@ mod bluer_impl {
             };
 
             let characteristics = psm_service.characteristics().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(
-                    gatt_err::enum_chars(addr, &e),
-                ))
+                TransportError::Io(std::io::Error::other(gatt_err::enum_chars(addr, &e)))
             })?;
 
             let psm_char = find_char_by_uuid(&characteristics, FIPS_GATT_PSM_CHAR_UUID).await;
@@ -827,9 +835,7 @@ mod bluer_impl {
             };
 
             let value = psm_char.read().await.map_err(|e| {
-                TransportError::Io(std::io::Error::other(
-                    gatt_err::read_psm(addr, &e),
-                ))
+                TransportError::Io(std::io::Error::other(gatt_err::read_psm(addr, &e)))
             })?;
 
             let psm = parse_psm_value(&value, addr)?;
@@ -1249,7 +1255,13 @@ mod bluer_impl {
     }
 
     /// Run `sudo hcitool lecup` to refresh BLE connection parameters.
-    async fn run_lecup(handle: u16, min: u16, max: u16, latency: u16, timeout: u16) -> Result<(), String> {
+    async fn run_lecup(
+        handle: u16,
+        min: u16,
+        max: u16,
+        latency: u16,
+        timeout: u16,
+    ) -> Result<(), String> {
         let output = tokio::process::Command::new("sudo")
             .args([
                 "hcitool",
@@ -1270,7 +1282,8 @@ mod bluer_impl {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!(
                 "sudo hcitool lecup exited with {}: {}",
-                output.status, stderr.trim()
+                output.status,
+                stderr.trim()
             ))
         }
     }
@@ -1318,7 +1331,15 @@ mod bluer_impl {
                 );
 
                 let addr_str = ble_addr.to_string_repr();
-                match run_lecup(handle, min_interval, max_interval, latency, supervision_timeout).await {
+                match run_lecup(
+                    handle,
+                    min_interval,
+                    max_interval,
+                    latency,
+                    supervision_timeout,
+                )
+                .await
+                {
                     Ok(()) => {
                         crate::transport::ble::event_log::log(
                             "ble_conn_param_refresh",
@@ -1347,10 +1368,7 @@ mod bluer_impl {
                         crate::transport::ble::event_log::log(
                             "ble_conn_param_refresh_failed",
                             &addr_str,
-                            &[
-                                ("handle", &format!("0x{:04X}", handle)),
-                                ("error", &e),
-                            ],
+                            &[("handle", &format!("0x{:04X}", handle)), ("error", &e)],
                         );
                     }
                 }
@@ -1361,7 +1379,7 @@ mod bluer_impl {
 
 #[cfg(bluer_available)]
 pub use bluer_impl::{
-    spawn_conn_param_refresh_loop, BluerAcceptor, BluerIo, BluerScanner, BluerStream,
+    BluerAcceptor, BluerIo, BluerScanner, BluerStream, spawn_conn_param_refresh_loop,
 };
 
 // ============================================================================

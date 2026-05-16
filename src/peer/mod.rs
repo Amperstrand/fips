@@ -351,7 +351,10 @@ mod tests {
     fn test_promotion_result_promoted() {
         let identity = make_peer_identity();
         let node_addr = *identity.node_addr();
-        let result = PromotionResult::Promoted { node_addr, cancelled_links: vec![] };
+        let result = PromotionResult::Promoted {
+            node_addr,
+            cancelled_links: vec![],
+        };
 
         assert!(result.node_addr().is_some());
         assert_eq!(result.node_addr(), Some(node_addr));

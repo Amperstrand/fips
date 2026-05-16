@@ -306,11 +306,7 @@ impl MmpMetrics {
         }
         let srtt = self.srtt_ms()?;
         let min = self.min_rtt_ms()?;
-        if min > 0.0 {
-            Some(srtt / min)
-        } else {
-            None
-        }
+        if min > 0.0 { Some(srtt / min) } else { None }
     }
 
     /// Current loss rate (0.0 = no loss, 1.0 = total loss).

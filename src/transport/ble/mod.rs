@@ -402,7 +402,11 @@ impl<I: BleIo> BleTransport<I> {
                     debug!(transport_id = %self.transport_id, remote_addr = %addr, "BLE send dropped (congested), packet discarded");
                     return Err(e);
                 }
-                event_log::log("ble_send_failed", &addr.to_string(), &[("error", &format!("{e}"))]);
+                event_log::log(
+                    "ble_send_failed",
+                    &addr.to_string(),
+                    &[("error", &format!("{e}"))],
+                );
                 let mut pool = self.pool.lock().await;
                 pool.remove(addr);
                 if let Some(tx) = &self.disconnect_tx {
@@ -578,7 +582,10 @@ impl<I: BleIo> BleTransport<I> {
                                     debug!(transport_id = %transport_id, remote_addr = %addr_clone, "BLE outbound pubkey exchange complete");
                                     discovery_buffer
                                         .add_peer_with_pubkey(&ble_addr, result.peer_pubkey);
-                                    known_peer_capabilities.lock().await.insert(ble_addr.clone(), result.peer_capabilities);
+                                    known_peer_capabilities
+                                        .lock()
+                                        .await
+                                        .insert(ble_addr.clone(), result.peer_capabilities);
                                 }
                                 Err(e) => {
                                     warn!(transport_id = %transport_id, remote_addr = %addr_clone, error = %e, "BLE outbound pubkey exchange failed");
@@ -594,10 +601,14 @@ impl<I: BleIo> BleTransport<I> {
 
                         let send_mtu = stream.send_mtu();
                         let recv_mtu = stream.recv_mtu();
-                        event_log::log("ble_outbound", &addr_clone.to_string(), &[
-                            ("send_mtu", &send_mtu.to_string()),
-                            ("recv_mtu", &recv_mtu.to_string()),
-                        ]);
+                        event_log::log(
+                            "ble_outbound",
+                            &addr_clone.to_string(),
+                            &[
+                                ("send_mtu", &send_mtu.to_string()),
+                                ("recv_mtu", &recv_mtu.to_string()),
+                            ],
+                        );
                         let stream = Arc::new(stream);
 
                         let recv_task = tokio::spawn(receive_loop(
@@ -978,10 +989,14 @@ async fn accept_loop<A, I: BleIo>(
                 let send_mtu = stream.send_mtu();
                 let recv_mtu = stream.recv_mtu();
 
-                event_log::log("ble_inbound", &ta.to_string(), &[
-                    ("send_mtu", &send_mtu.to_string()),
-                    ("recv_mtu", &recv_mtu.to_string()),
-                ]);
+                event_log::log(
+                    "ble_inbound",
+                    &ta.to_string(),
+                    &[
+                        ("send_mtu", &send_mtu.to_string()),
+                        ("recv_mtu", &recv_mtu.to_string()),
+                    ],
+                );
 
                 if let Some(ref our_pubkey) = local_pubkey {
                     wait_before_outbound_pubkey_exchange().await;
@@ -992,7 +1007,10 @@ async fn accept_loop<A, I: BleIo>(
                                 discovery_buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
 
                                 let peer_capabilities = result.peer_capabilities;
-                                known_peer_capabilities.lock().await.insert(addr.clone(), peer_capabilities);
+                                known_peer_capabilities
+                                    .lock()
+                                    .await
+                                    .insert(addr.clone(), peer_capabilities);
                                 if !peer_capabilities.can_accept_inbound() {
                                     debug!(transport_id = %transport_id, remote_addr = %ta, "BLE inbound: peer is central-only, accepting inbound connection anyway");
                                 } else if peer_capabilities.prefers_outbound()
@@ -1170,11 +1188,15 @@ async fn receive_loop<S: BleStream>(
             )
         });
 
-    event_log::log("ble_connect", &args.addr.to_string(), &[
-        ("transport_id", &args.transport_id.to_string()),
-        ("recv_timeout_secs", &args.recv_timeout_secs.to_string()),
-        ("recv_mtu", &args.recv_mtu.to_string()),
-    ]);
+    event_log::log(
+        "ble_connect",
+        &args.addr.to_string(),
+        &[
+            ("transport_id", &args.transport_id.to_string()),
+            ("recv_timeout_secs", &args.recv_timeout_secs.to_string()),
+            ("recv_mtu", &args.recv_mtu.to_string()),
+        ],
+    );
 
     loop {
         let recv_result = tokio::time::timeout(
@@ -1186,10 +1208,14 @@ async fn receive_loop<S: BleStream>(
         match recv_result {
             Ok(Ok(0)) => {
                 let elapsed = start.elapsed();
-                event_log::log("ble_disconnect", &args.addr.to_string(), &[
-                    ("reason", "closed_by_peer"),
-                    ("uptime_secs", &format!("{:.1}", elapsed.as_secs_f32())),
-                ]);
+                event_log::log(
+                    "ble_disconnect",
+                    &args.addr.to_string(),
+                    &[
+                        ("reason", "closed_by_peer"),
+                        ("uptime_secs", &format!("{:.1}", elapsed.as_secs_f32())),
+                    ],
+                );
                 info!(transport_id = %args.transport_id, remote_addr = %args.addr, elapsed_secs = elapsed.as_secs_f32(), "BLE connection closed by peer");
                 break;
             }
@@ -1211,12 +1237,16 @@ async fn receive_loop<S: BleStream>(
                     continue;
                 }
                 let uptime = start.elapsed();
-                event_log::log("ble_disconnect", &args.addr.to_string(), &[
-                    ("reason", "recv_error"),
-                    ("error", &err_str),
-                    ("consecutive_errors", &consecutive_errors.to_string()),
-                    ("uptime_secs", &format!("{:.1}", uptime.as_secs_f32())),
-                ]);
+                event_log::log(
+                    "ble_disconnect",
+                    &args.addr.to_string(),
+                    &[
+                        ("reason", "recv_error"),
+                        ("error", &err_str),
+                        ("consecutive_errors", &consecutive_errors.to_string()),
+                        ("uptime_secs", &format!("{:.1}", uptime.as_secs_f32())),
+                    ],
+                );
                 if consecutive_errors >= 3 {
                     warn!(transport_id = %args.transport_id, remote_addr = %args.addr, error = %e, consecutive = consecutive_errors, uptime_secs = uptime.as_secs_f32(), "BLE receive errors exceeded threshold");
                 } else {
@@ -1227,11 +1257,15 @@ async fn receive_loop<S: BleStream>(
             }
             Err(_) => {
                 let uptime = start.elapsed();
-                event_log::log("ble_disconnect", &args.addr.to_string(), &[
-                    ("reason", "recv_timeout"),
-                    ("timeout_secs", &args.recv_timeout_secs.to_string()),
-                    ("uptime_secs", &format!("{:.1}", uptime.as_secs_f32())),
-                ]);
+                event_log::log(
+                    "ble_disconnect",
+                    &args.addr.to_string(),
+                    &[
+                        ("reason", "recv_timeout"),
+                        ("timeout_secs", &args.recv_timeout_secs.to_string()),
+                        ("uptime_secs", &format!("{:.1}", uptime.as_secs_f32())),
+                    ],
+                );
                 warn!(transport_id = %args.transport_id, remote_addr = %args.addr, timeout_secs = args.recv_timeout_secs, uptime_secs = uptime.as_secs_f32(), "BLE recv timeout — link may be silently dead");
                 args.stats.record_recv_error();
                 break;
@@ -1504,7 +1538,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                 debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe complete");
 
                 let peer_capabilities = result.peer_capabilities;
-                known_peer_capabilities.lock().await.insert(addr.clone(), peer_capabilities);
+                known_peer_capabilities
+                    .lock()
+                    .await
+                    .insert(addr.clone(), peer_capabilities);
                 if !peer_capabilities.can_accept_inbound() {
                     debug!(transport_id = %transport_id, remote_addr = %addr, "BLE probe: peer cannot accept inbound, yielding to peer's outbound");
                     buffer.add_peer_with_pubkey(&addr, result.peer_pubkey);
@@ -1537,39 +1574,39 @@ async fn scan_probe_loop<I: io::BleIo>(
                         backoff: Arc::clone(&backoff),
                         ble_addr: addr.clone(),
                         established_at: tokio::time::Instant::now(),
-                         on_cleanup: {
-                             let io = Arc::clone(&io);
-                             let pool = Arc::clone(&pool);
-                             let ble_addr = addr.clone();
-                             let ta_check = ta.clone();
-                             Some(Box::new(move || {
-                                 let io = Arc::clone(&io);
-                                 let pool = Arc::clone(&pool);
-                                 let ble_addr = ble_addr.clone();
-                                 let ta_check = ta_check.clone();
-                                 tokio::spawn(async move {
-                                     let pool_guard = pool.lock().await;
-                                     if pool_guard.contains(&ta_check) {
-                                         debug!(
-                                             remote_addr = %ble_addr,
-                                             "BLE on_cleanup: skipping disconnect_device, new connection exists in pool"
-                                         );
-                                         return;
-                                     }
-                                     drop(pool_guard);
-                                     io.disconnect_device(&ble_addr).await;
-                                 });
-                             }))
-                         },
-                         conn_param_refresh_secs,
-                         conn_param_min_interval,
-                         conn_param_max_interval,
-                         conn_param_latency,
-                         conn_param_timeout,
-                     },
-                 ));
+                        on_cleanup: {
+                            let io = Arc::clone(&io);
+                            let pool = Arc::clone(&pool);
+                            let ble_addr = addr.clone();
+                            let ta_check = ta.clone();
+                            Some(Box::new(move || {
+                                let io = Arc::clone(&io);
+                                let pool = Arc::clone(&pool);
+                                let ble_addr = ble_addr.clone();
+                                let ta_check = ta_check.clone();
+                                tokio::spawn(async move {
+                                    let pool_guard = pool.lock().await;
+                                    if pool_guard.contains(&ta_check) {
+                                        debug!(
+                                            remote_addr = %ble_addr,
+                                            "BLE on_cleanup: skipping disconnect_device, new connection exists in pool"
+                                        );
+                                        return;
+                                    }
+                                    drop(pool_guard);
+                                    io.disconnect_device(&ble_addr).await;
+                                });
+                            }))
+                        },
+                        conn_param_refresh_secs,
+                        conn_param_min_interval,
+                        conn_param_max_interval,
+                        conn_param_latency,
+                        conn_param_timeout,
+                    },
+                ));
 
-                 let conn = BleConnection {
+                let conn = BleConnection {
                     stream,
                     recv_task: Some(recv_task),
                     send_mtu,

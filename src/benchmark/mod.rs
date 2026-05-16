@@ -115,19 +115,18 @@ impl BenchmarkManager {
                     if let Some(state) = self.active_tests.get_mut(&test_id) {
                         handle_throughput_stream(state, payload);
                         if state.is_expired() {
-                            let report_frame =
-                                throughput::build_throughput_report_frame(state);
+                            let report_frame = throughput::build_throughput_report_frame(state);
                             let peer = *from;
                             self.active_tests.remove(&test_id);
-                            self.pending_throughput_report =
-                                Some((peer, report_frame));
+                            self.pending_throughput_report = Some((peer, report_frame));
                         }
                     }
                 }
             }
             MSG_THROUGHPUT_REPORT => {
                 if let Some(mut result) = parse_throughput_report(payload) {
-                    if let Some(initiator_sent) = self.initiator_frames_sent.remove(&result.test_id) {
+                    if let Some(initiator_sent) = self.initiator_frames_sent.remove(&result.test_id)
+                    {
                         result.frame_loss_rate = if initiator_sent > 0 {
                             1.0 - (result.frames_recv as f64 / initiator_sent as f64)
                         } else {
@@ -176,7 +175,10 @@ impl BenchmarkManager {
 
     pub fn take_echo_stats(&mut self, peer: &NodeAddr) -> Option<echo::EchoStats> {
         let results = self.echo_results.remove(peer)?;
-        let expected = self.echo_expected.remove(peer).unwrap_or(results.len() as u32);
+        let expected = self
+            .echo_expected
+            .remove(peer)
+            .unwrap_or(results.len() as u32);
         Some(compute_echo_stats(results, expected as usize))
     }
 
@@ -223,7 +225,8 @@ impl BenchmarkManager {
         self.last_echo_send_time = None;
         self.echo_sent_at = None;
         for seq in 0..count {
-            self.pending_echo_sends.push_back((peer, seq, payload.clone()));
+            self.pending_echo_sends
+                .push_back((peer, seq, payload.clone()));
         }
     }
 
@@ -238,7 +241,10 @@ impl BenchmarkManager {
             if elapsed < Self::ECHO_RESPONSE_TIMEOUT_MS {
                 return None;
             }
-            debug!(elapsed_ms = elapsed, "Benchmark: echo response timed out, sending next");
+            debug!(
+                elapsed_ms = elapsed,
+                "Benchmark: echo response timed out, sending next"
+            );
             self.echo_sent_at = None;
         }
         if let Some(last) = self.last_echo_send_time {
@@ -282,14 +288,11 @@ impl BenchmarkManager {
         if let Some(state) = self.active_tests.get_mut(&test_id) {
             state.frames_sent = total_frames as u32;
         }
-        self.initiator_frames_sent.insert(test_id, total_frames as u32);
+        self.initiator_frames_sent
+            .insert(test_id, total_frames as u32);
 
         for seq in 0..total_frames {
-            let frame = throughput::build_throughput_stream_frame(
-                test_id,
-                seq as u32,
-                data_len,
-            );
+            let frame = throughput::build_throughput_stream_frame(test_id, seq as u32, data_len);
             self.pending_throughput_sends.push_back((peer, frame));
         }
     }

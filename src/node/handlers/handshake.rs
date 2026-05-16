@@ -375,7 +375,7 @@ impl Node {
                     if let Some(msg2) = existing_peer.handshake_msg2().map(|m| m.to_vec())
                         && let Some(transport) = self.transports.get(&packet.transport_id)
                     {
-                            match transport.send_urgent(&packet.remote_addr, &msg2).await {
+                        match transport.send_urgent(&packet.remote_addr, &msg2).await {
                             Ok(_) => debug!(
                                 peer = %self.peer_display_name(&peer_node_addr),
                                 "Resent msg2 for duplicate msg1 (same epoch)"
@@ -444,7 +444,7 @@ impl Node {
         }
 
         if let Some(transport) = self.transports.get(&packet.transport_id) {
-                            match transport.send_urgent(&packet.remote_addr, &wire_msg2).await {
+            match transport.send_urgent(&packet.remote_addr, &wire_msg2).await {
                 Ok(bytes) => {
                     debug!(
                         link_id = %link_id,
@@ -478,7 +478,10 @@ impl Node {
         match self.promote_connection(link_id, peer_identity, packet.timestamp_ms) {
             Ok(result) => {
                 match result {
-                    PromotionResult::Promoted { node_addr, cancelled_links } => {
+                    PromotionResult::Promoted {
+                        node_addr,
+                        cancelled_links,
+                    } => {
                         if let Some(peer) = self.peers.get_mut(&node_addr) {
                             peer.set_handshake_msg2(wire_msg2.clone());
                         }
@@ -639,7 +642,12 @@ impl Node {
                     match peer.complete_rekey_msg2(noise_msg2) {
                         Ok(session) => {
                             let our_index = peer.rekey_our_index().unwrap_or(header.receiver_idx);
-                            peer.set_pending_session(session, our_index, header.sender_idx, Self::now_ms());
+                            peer.set_pending_session(
+                                session,
+                                our_index,
+                                header.sender_idx,
+                                Self::now_ms(),
+                            );
 
                             if let Some(transport_id) = peer.transport_id() {
                                 self.peers_by_index
@@ -872,7 +880,10 @@ impl Node {
                 self.pending_outbound.remove(&key);
 
                 match result {
-                    PromotionResult::Promoted { node_addr, cancelled_links } => {
+                    PromotionResult::Promoted {
+                        node_addr,
+                        cancelled_links,
+                    } => {
                         for cancelled_link_id in &cancelled_links {
                             debug!(
                                 peer = %self.peer_display_name(&node_addr),
@@ -1055,7 +1066,9 @@ impl Node {
                 self.retry_pending.remove(&peer_node_addr);
                 self.register_identity(peer_node_addr, verified_identity.pubkey_full());
 
-                let transport_name = self.transports.get(&transport_id)
+                let transport_name = self
+                    .transports
+                    .get(&transport_id)
                     .map(|t| t.transport_type().name)
                     .unwrap_or("unknown");
                 self.store_discovered_peer_config(
@@ -1116,7 +1129,9 @@ impl Node {
                         return None;
                     }
                     if let Some(pending_conn) = self.connections.get(&pending_link_id) {
-                        if let (Some(tid), Some(idx)) = (pending_conn.transport_id(), pending_conn.our_index()) {
+                        if let (Some(tid), Some(idx)) =
+                            (pending_conn.transport_id(), pending_conn.our_index())
+                        {
                             self.pending_outbound.remove(&(tid, idx.as_u32()));
                         }
                         if let Some(idx) = pending_conn.our_index() {
@@ -1181,7 +1196,9 @@ impl Node {
             self.retry_pending.remove(&peer_node_addr);
             self.register_identity(peer_node_addr, verified_identity.pubkey_full());
 
-            let transport_name = self.transports.get(&transport_id)
+            let transport_name = self
+                .transports
+                .get(&transport_id)
                 .map(|t| t.transport_type().name)
                 .unwrap_or("unknown");
             self.store_discovered_peer_config(
@@ -1199,7 +1216,10 @@ impl Node {
                 "Connection promoted to active peer"
             );
 
-            Ok(PromotionResult::Promoted { node_addr: peer_node_addr, cancelled_links })
+            Ok(PromotionResult::Promoted {
+                node_addr: peer_node_addr,
+                cancelled_links,
+            })
         }
     }
 }

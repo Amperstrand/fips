@@ -593,21 +593,21 @@ impl Node {
             startup_epoch,
             started_at: std::time::Instant::now(),
             config,
-             state: NodeState::Created,
-             is_leaf_only,
-             tree_state,
-             bloom_state,
-             coord_cache,
-             recent_requests: HashMap::new(),
-             transports: HashMap::new(),
-             transport_drops: HashMap::new(),
-             links: HashMap::new(),
-             addr_to_link: HashMap::new(),
-             packet_tx: None,
-             packet_rx: None,
-             disconnect_rx: None,
-             tun_max_mss: None,
-             ble_congested: Vec::new(),
+            state: NodeState::Created,
+            is_leaf_only,
+            tree_state,
+            bloom_state,
+            coord_cache,
+            recent_requests: HashMap::new(),
+            transports: HashMap::new(),
+            transport_drops: HashMap::new(),
+            links: HashMap::new(),
+            addr_to_link: HashMap::new(),
+            packet_tx: None,
+            packet_rx: None,
+            disconnect_rx: None,
+            tun_max_mss: None,
+            ble_congested: Vec::new(),
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -733,21 +733,21 @@ impl Node {
             startup_epoch,
             started_at: std::time::Instant::now(),
             config,
-             state: NodeState::Created,
-             is_leaf_only: false,
-             tree_state,
-             bloom_state,
-             coord_cache,
-             recent_requests: HashMap::new(),
-             transports: HashMap::new(),
-             transport_drops: HashMap::new(),
-             links: HashMap::new(),
-             addr_to_link: HashMap::new(),
-             packet_tx: None,
-             packet_rx: None,
-             disconnect_rx: None,
-             tun_max_mss: None,
-             ble_congested: Vec::new(),
+            state: NodeState::Created,
+            is_leaf_only: false,
+            tree_state,
+            bloom_state,
+            coord_cache,
+            recent_requests: HashMap::new(),
+            transports: HashMap::new(),
+            transport_drops: HashMap::new(),
+            links: HashMap::new(),
+            addr_to_link: HashMap::new(),
+            packet_tx: None,
+            packet_rx: None,
+            disconnect_rx: None,
+            tun_max_mss: None,
+            ble_congested: Vec::new(),
             connections: HashMap::new(),
             peers: HashMap::new(),
             sessions: HashMap::new(),
@@ -985,7 +985,6 @@ impl Node {
                     }
                 }
             }
-
         }
 
         // Warn when BLE is configured in fips.yaml but this build lacks BLE
@@ -1415,7 +1414,8 @@ impl Node {
     ) -> Result<(), NodeError> {
         let mut plaintext = vec![msg_type];
         plaintext.extend_from_slice(payload);
-        self.send_encrypted_link_message(node_addr, &plaintext).await
+        self.send_encrypted_link_message(node_addr, &plaintext)
+            .await
     }
 
     /// Sample the current node state into the stats history ring.

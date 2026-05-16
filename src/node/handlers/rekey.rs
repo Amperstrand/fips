@@ -297,7 +297,10 @@ impl Node {
             };
 
             let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                transport.send_urgent(&remote_addr, &msg1_bytes).await.is_ok()
+                transport
+                    .send_urgent(&remote_addr, &msg1_bytes)
+                    .await
+                    .is_ok()
             } else {
                 false
             };

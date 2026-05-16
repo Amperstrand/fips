@@ -159,13 +159,17 @@ impl Node {
             if our_timestamp_ms > echo_ms + dwell_ms {
                 let rtt_ms = our_timestamp_ms - echo_ms - dwell_ms;
                 let srtt_ms = mmp.metrics.srtt_ms().unwrap_or(0.0);
-                ble_log("mmp_rtt_sample", &peer_name, &[
-                    ("our_ts", &our_timestamp_ms.to_string()),
-                    ("echo_ts", &echo_ms.to_string()),
-                    ("dwell_ms", &dwell_ms.to_string()),
-                    ("rtt_ms", &rtt_ms.to_string()),
-                    ("srtt_ms", &format!("{:.1}", srtt_ms)),
-                ]);
+                ble_log(
+                    "mmp_rtt_sample",
+                    &peer_name,
+                    &[
+                        ("our_ts", &our_timestamp_ms.to_string()),
+                        ("echo_ts", &echo_ms.to_string()),
+                        ("dwell_ms", &dwell_ms.to_string()),
+                        ("rtt_ms", &rtt_ms.to_string()),
+                        ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                    ],
+                );
             }
         }
 
@@ -229,29 +233,42 @@ impl Node {
         // Reference: RFC 6298 SRTT is per-path; a new BLE channel constitutes a new path.
         // QUIC (RFC 9002 §5.3) explicitly resets RTT estimator on path migration.
         if let Some(srtt_ms) = ble_srtt_ms {
-            let inflation_ratio = self.peers.get(from)
+            let inflation_ratio = self
+                .peers
+                .get(from)
                 .and_then(|p| p.mmp())
                 .and_then(|mmp| mmp.metrics.inflation_ratio());
             let exceeded = self.config.transports.ble.iter().find_map(|(_, cfg)| {
-                let abs = cfg.srtt_reconnect_threshold_ms()
+                let abs = cfg
+                    .srtt_reconnect_threshold_ms()
                     .filter(|&threshold| srtt_ms > threshold as f64);
-                let ratio = cfg.srtt_inflation_threshold()
+                let ratio = cfg
+                    .srtt_inflation_threshold()
                     .zip(inflation_ratio)
                     .filter(|&(threshold, ratio)| ratio > threshold);
                 abs.or(ratio.map(|_| 0)) // 0 = ratio-based trigger (for logging)
             });
             if exceeded.is_some() {
-                let min_rtt_str = self.peers.get(from)
+                let min_rtt_str = self
+                    .peers
+                    .get(from)
                     .and_then(|p| p.mmp())
                     .and_then(|mmp| mmp.metrics.min_rtt_ms())
                     .map(|v| format!("{:.1}", v))
                     .unwrap_or_else(|| "n/a".to_string());
-                ble_log("srtt_reconnect", &peer_name, &[
-                    ("srtt_ms", &format!("{:.1}", srtt_ms)),
-                    ("min_rtt_ms", &min_rtt_str),
-                    ("threshold_ms", &format!("{}", exceeded.unwrap())),
-                    ("inflation_ratio", &format!("{:.1}", inflation_ratio.unwrap_or(0.0))),
-                ]);
+                ble_log(
+                    "srtt_reconnect",
+                    &peer_name,
+                    &[
+                        ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                        ("min_rtt_ms", &min_rtt_str),
+                        ("threshold_ms", &format!("{}", exceeded.unwrap())),
+                        (
+                            "inflation_ratio",
+                            &format!("{:.1}", inflation_ratio.unwrap_or(0.0)),
+                        ),
+                    ],
+                );
                 warn!(
                     peer = %peer_name,
                     srtt_ms = format!("{:.1}", srtt_ms),
@@ -265,7 +282,11 @@ impl Node {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 // Cooldown guard: skip reconnect if last one was too recent.
-                let cooldown_ms = self.config.transports.ble.iter()
+                let cooldown_ms = self
+                    .config
+                    .transports
+                    .ble
+                    .iter()
                     .find_map(|(_, cfg)| {
                         let secs = cfg.proactive_reconnect_cooldown_secs();
                         Some(secs * 1000)
@@ -274,10 +295,14 @@ impl Node {
                 if let Some(&last_ms) = self.last_proactive_reconnect_ms.get(&addr) {
                     let elapsed = now_ms.saturating_sub(last_ms);
                     if elapsed < cooldown_ms {
-                        ble_log("srtt_reconnect_cooldown", &peer_name, &[
-                            ("elapsed_secs", &format!("{}", elapsed / 1000)),
-                            ("cooldown_secs", &format!("{}", cooldown_ms / 1000)),
-                        ]);
+                        ble_log(
+                            "srtt_reconnect_cooldown",
+                            &peer_name,
+                            &[
+                                ("elapsed_secs", &format!("{}", elapsed / 1000)),
+                                ("cooldown_secs", &format!("{}", cooldown_ms / 1000)),
+                            ],
+                        );
                         return;
                     }
                 }
@@ -300,7 +325,11 @@ impl Node {
                 }
                 // Proactive reconnect with configurable backoff — the link was healthy,
                 // we're cycling the BLE channel to get fresh L2CAP credits.
-                let proactive_backoff_ms = self.config.transports.ble.iter()
+                let proactive_backoff_ms = self
+                    .config
+                    .transports
+                    .ble
+                    .iter()
                     .find_map(|(_, cfg)| {
                         let secs = cfg.proactive_reconnect_backoff_secs();
                         Some(secs * 1000)
@@ -741,9 +770,14 @@ impl Node {
             .unwrap_or(0);
 
         for addr in &dead_peers {
-            ble_log("link_dead", &self.peer_display_name(addr), &[
-                ("timeout_secs", &self.config.node.link_dead_timeout_secs.to_string()),
-            ]);
+            ble_log(
+                "link_dead",
+                &self.peer_display_name(addr),
+                &[(
+                    "timeout_secs",
+                    &self.config.node.link_dead_timeout_secs.to_string(),
+                )],
+            );
             warn!(
                 peer = %self.peer_display_name(addr),
                 timeout_secs = self.config.node.link_dead_timeout_secs,

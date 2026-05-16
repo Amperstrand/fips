@@ -81,10 +81,7 @@ async fn benchmark_echo(node: &mut Node, params: Option<&Value>) -> Response {
         Some(v) => v,
         None => return Response::error("missing 'npub' parameter"),
     };
-    let count = params
-        .get("count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as u32;
+    let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
     let payload_size = params
         .get("payload_size")
         .and_then(|v| v.as_u64())
@@ -95,7 +92,8 @@ async fn benchmark_echo(node: &mut Node, params: Option<&Value>) -> Response {
         Err(e) => return Response::error(format!("invalid peer npub: {e}")),
     };
 
-    node.benchmark_mut().start_echo_test(peer_addr, count, payload_size);
+    node.benchmark_mut()
+        .start_echo_test(peer_addr, count, payload_size);
 
     Response::ok(serde_json::json!({
         "status": "echo_test_started",
@@ -119,18 +117,12 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
         .get("direction")
         .and_then(|v| v.as_str())
         .unwrap_or("upload");
-    let duration = params
-        .get("duration")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5) as u8;
+    let duration = params.get("duration").and_then(|v| v.as_u64()).unwrap_or(5) as u8;
     let frame_size = params
         .get("frame_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(256) as u16;
-    let rate = params
-        .get("rate")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(40000) as u32;
+    let rate = params.get("rate").and_then(|v| v.as_u64()).unwrap_or(40000) as u32;
 
     let peer_addr = match crate::identity::PeerIdentity::from_npub(npub) {
         Ok(id) => *id.node_addr(),
@@ -149,11 +141,7 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
 
     // Send the ThroughputRequest frame
     if let Err(e) = node
-        .api_send_benchmark_message(
-            &peer_addr,
-            request_frame[0],
-            &request_frame[1..],
-        )
+        .api_send_benchmark_message(&peer_addr, request_frame[0], &request_frame[1..])
         .await
     {
         return Response::error(format!("failed to send throughput request: {e}"));
@@ -168,13 +156,8 @@ async fn benchmark_throughput(node: &mut Node, params: Option<&Value>) -> Respon
             1000
         };
         let total_frames = (duration as u64 * 1_000_000) / interval_us.max(1);
-        node.benchmark_mut().start_throughput_sends(
-            peer_addr,
-            test_id,
-            frame_size,
-            rate,
-            duration,
-        );
+        node.benchmark_mut()
+            .start_throughput_sends(peer_addr, test_id, frame_size, rate, duration);
         total_frames as u32
     } else {
         0

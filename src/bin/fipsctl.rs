@@ -448,8 +448,10 @@ fn handle_benchmark(socket_path: &Path, what: &BenchmarkCommands) {
             }
             let wait_secs = (*count as f64 * 0.15).ceil().max(1.0) as u64;
             std::thread::sleep(Duration::from_secs(wait_secs));
-            let query_cmd =
-                build_command("show_benchmark_echo_results", serde_json::json!({"npub": npub}));
+            let query_cmd = build_command(
+                "show_benchmark_echo_results",
+                serde_json::json!({"npub": npub}),
+            );
             match send_request(socket_path, &query_cmd) {
                 Ok(value) => {
                     if *json {
@@ -728,15 +730,30 @@ fn print_throughput_results(value: &serde_json::Value) {
         return;
     }
 
-    let bps = data.get("achieved_bps").and_then(|v| v.as_u64()).unwrap_or(0);
+    let bps = data
+        .get("achieved_bps")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let loss = data
         .get("frame_loss_rate")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    let bytes = data.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-    let dur_us = data.get("duration_us").and_then(|v| v.as_u64()).unwrap_or(0);
-    let sent = data.get("frames_sent").and_then(|v| v.as_u64()).unwrap_or(0);
-    let recv = data.get("frames_recv").and_then(|v| v.as_u64()).unwrap_or(0);
+    let bytes = data
+        .get("total_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let dur_us = data
+        .get("duration_us")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let sent = data
+        .get("frames_sent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let recv = data
+        .get("frames_recv")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let kbps = bps as f64 / 1000.0;
     let dur_s = dur_us as f64 / 1_000_000.0;
@@ -749,11 +766,7 @@ fn print_throughput_results(value: &serde_json::Value) {
         recv,
         loss * 100.0,
     );
-    println!(
-        "  {} bytes in {:.2}s",
-        bytes,
-        dur_s,
-    );
+    println!("  {} bytes in {:.2}s", bytes, dur_s,);
 }
 
 /// Render the response as a Unicode block sparkline plot.

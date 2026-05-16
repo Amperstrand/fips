@@ -255,12 +255,16 @@ impl BleRateAdapter {
             // Log rate changes to the BLE event log for experiment correlation.
             // Each entry includes the SRTT sample that triggered the decision,
             // the old/new rates, and the decision name for filtering.
-            super::event_log::log("rate_adapter", "", &[
-                ("srtt_ms", &format!("{:.1}", srtt_ms)),
-                ("old_rate_bps", &old_rate.to_string()),
-                ("new_rate_bps", &self.current_rate_bps.to_string()),
-                ("decision", decision),
-            ]);
+            super::event_log::log(
+                "rate_adapter",
+                "",
+                &[
+                    ("srtt_ms", &format!("{:.1}", srtt_ms)),
+                    ("old_rate_bps", &old_rate.to_string()),
+                    ("new_rate_bps", &self.current_rate_bps.to_string()),
+                    ("decision", decision),
+                ],
+            );
         }
 
         self.current_rate_bps

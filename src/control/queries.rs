@@ -1135,10 +1135,8 @@ fn benchmark_echo_results(node: &Node, params: Option<&Value>) -> super::protoco
                     })
                 })
                 .collect();
-            let computed = crate::benchmark::echo::compute_echo_stats(
-                results.to_vec(),
-                exp as usize,
-            );
+            let computed =
+                crate::benchmark::echo::compute_echo_stats(results.to_vec(), exp as usize);
             Response::ok(json!({
                 "results": results_vec,
                 "min_us": computed.min_us,
