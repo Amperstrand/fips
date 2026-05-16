@@ -1169,15 +1169,15 @@ fn benchmark_throughput_results(node: &Node, params: Option<&Value>) -> super::p
         Some(v) => v,
         None => return Response::error("missing 'npub' parameter"),
     };
-    let _peer_addr = match PeerIdentity::from_npub(npub) {
+    let peer_addr = match PeerIdentity::from_npub(npub) {
         Ok(id) => *id.node_addr(),
         Err(e) => return Response::error(format!("invalid peer npub: {e}")),
     };
 
-    match node.benchmark().last_throughput_result() {
-        Some((peer, result)) => Response::ok(json!({
+    match node.benchmark().last_throughput_result(&peer_addr) {
+        Some(result) => Response::ok(json!({
             "status": "complete",
-            "peer": hex::encode(peer.as_bytes()),
+            "peer": hex::encode(peer_addr.as_bytes()),
             "achieved_bps": result.achieved_bps,
             "frame_loss_rate": result.frame_loss_rate,
             "total_bytes": result.total_bytes,

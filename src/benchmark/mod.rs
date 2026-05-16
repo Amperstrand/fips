@@ -23,22 +23,27 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_ECHO_INTER_SEND_DELAY_MS: u64 = 100;
 
+/// Per-peer state for paced throughput stream sends.
+struct ThroughputSendState {
+    pending: VecDeque<(NodeAddr, Vec<u8>)>,
+    interval_ms: u64,
+    last_send: Option<Instant>,
+}
+
 pub struct BenchmarkManager {
     active_tests: HashMap<u32, ThroughputTestState>,
     echo_results: HashMap<NodeAddr, Vec<EchoResult>>,
     echo_expected: HashMap<NodeAddr, u32>,
     next_test_id: u32,
-    pending_echo_response: Option<(NodeAddr, Vec<u8>)>,
+    pending_echo_response: VecDeque<(NodeAddr, Vec<u8>)>,
     pending_throughput_config: Option<(NodeAddr, ThroughputTestConfig)>,
-    pending_throughput_report: Option<(NodeAddr, Vec<u8>)>,
-    last_throughput_result: Option<(NodeAddr, ThroughputResult)>,
+    pending_throughput_report: VecDeque<(NodeAddr, Vec<u8>)>,
+    throughput_results: HashMap<NodeAddr, ThroughputResult>,
     pending_echo_sends: VecDeque<(NodeAddr, u32, Vec<u8>)>,
     echo_inter_send_delay_ms: u64,
     last_echo_send_time: Option<Instant>,
     echo_sent_at: Option<Instant>,
-    pending_throughput_sends: VecDeque<(NodeAddr, Vec<u8>)>,
-    throughput_send_interval_ms: u64,
-    last_throughput_send_time: Option<Instant>,
+    throughput_send_states: HashMap<NodeAddr, ThroughputSendState>,
     initiator_frames_sent: HashMap<u32, u32>,
     peer_policy: PeerPolicy,
 }
@@ -50,17 +55,15 @@ impl BenchmarkManager {
             echo_results: HashMap::new(),
             echo_expected: HashMap::new(),
             next_test_id: 1,
-            pending_echo_response: None,
+            pending_echo_response: VecDeque::new(),
             pending_throughput_config: None,
-            pending_throughput_report: None,
-            last_throughput_result: None,
+            pending_throughput_report: VecDeque::new(),
+            throughput_results: HashMap::new(),
             pending_echo_sends: VecDeque::new(),
             echo_inter_send_delay_ms: DEFAULT_ECHO_INTER_SEND_DELAY_MS,
             last_echo_send_time: None,
             echo_sent_at: None,
-            pending_throughput_sends: VecDeque::new(),
-            throughput_send_interval_ms: 100,
-            last_throughput_send_time: None,
+            throughput_send_states: HashMap::new(),
             initiator_frames_sent: HashMap::new(),
             peer_policy: PeerPolicy::new(),
         }
@@ -84,9 +87,8 @@ impl BenchmarkManager {
         match msg_type {
             MSG_ECHO_REQUEST => {
                 debug!(peer = ?from, "Benchmark: echo request received");
-                // Build echo response and store for dispatch layer to send.
                 if let Some(frame) = echo::build_echo_response_frame(payload) {
-                    self.pending_echo_response = Some((*from, frame));
+                    self.pending_echo_response.push_back((*from, frame));
                 }
             }
             MSG_ECHO_RESPONSE => {
@@ -118,7 +120,7 @@ impl BenchmarkManager {
                             let report_frame = throughput::build_throughput_report_frame(state);
                             let peer = *from;
                             self.active_tests.remove(&test_id);
-                            self.pending_throughput_report = Some((peer, report_frame));
+                            self.pending_throughput_report.push_back((peer, report_frame));
                         }
                     }
                 }
@@ -140,7 +142,7 @@ impl BenchmarkManager {
                         loss_rate = format!("{:.1}%", result.frame_loss_rate * 100.0),
                         "Benchmark: throughput report received"
                     );
-                    self.last_throughput_result = Some((*from, result));
+                    self.throughput_results.insert(*from, result);
                 }
             }
             _ => {
@@ -150,7 +152,7 @@ impl BenchmarkManager {
     }
 
     pub fn take_echo_response(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
-        self.pending_echo_response.take()
+        self.pending_echo_response.pop_front()
     }
 
     pub fn take_throughput_config(&mut self) -> Option<(NodeAddr, ThroughputTestConfig)> {
@@ -158,15 +160,15 @@ impl BenchmarkManager {
     }
 
     pub fn take_throughput_report(&mut self) -> Option<(NodeAddr, Vec<u8>)> {
-        self.pending_throughput_report.take()
+        self.pending_throughput_report.pop_front()
     }
 
-    pub fn take_throughput_result(&mut self) -> Option<(NodeAddr, ThroughputResult)> {
-        self.last_throughput_result.take()
+    pub fn take_throughput_result(&mut self, peer: &NodeAddr) -> Option<ThroughputResult> {
+        self.throughput_results.remove(peer)
     }
 
-    pub fn last_throughput_result(&self) -> Option<&(NodeAddr, ThroughputResult)> {
-        self.last_throughput_result.as_ref()
+    pub fn last_throughput_result(&self, peer: &NodeAddr) -> Option<&ThroughputResult> {
+        self.throughput_results.get(peer)
     }
 
     pub fn expect_echo_probes(&mut self, peer: NodeAddr, count: u32) {
@@ -281,9 +283,13 @@ impl BenchmarkManager {
         };
         let total_frames = (duration_secs as u64 * 1_000_000) / interval_us.max(1);
 
-        self.throughput_send_interval_ms = (interval_us / 1000).max(1) as u64;
-        self.last_throughput_send_time = None;
-        self.pending_throughput_sends.clear();
+        let interval_ms = (interval_us / 1000).max(1) as u64;
+
+        let mut pending = VecDeque::new();
+        for seq in 0..total_frames {
+            let frame = throughput::build_throughput_stream_frame(test_id, seq as u32, data_len);
+            pending.push_back((peer, frame));
+        }
 
         if let Some(state) = self.active_tests.get_mut(&test_id) {
             state.frames_sent = total_frames as u32;
@@ -291,47 +297,51 @@ impl BenchmarkManager {
         self.initiator_frames_sent
             .insert(test_id, total_frames as u32);
 
-        for seq in 0..total_frames {
-            let frame = throughput::build_throughput_stream_frame(test_id, seq as u32, data_len);
-            self.pending_throughput_sends.push_back((peer, frame));
-        }
+        self.throughput_send_states.insert(
+            peer,
+            ThroughputSendState {
+                pending,
+                interval_ms,
+                last_send: None,
+            },
+        );
     }
 
-    /// Drain throughput frames that are due based on elapsed time.
-    ///
-    /// Returns a batch of (peer, frame) pairs to send immediately.
-    /// Capped at 2 frames per drain to avoid BLE transport congestion.
     pub fn poll_throughput_sends(&mut self) -> Vec<(NodeAddr, Vec<u8>)> {
-        if self.pending_throughput_sends.is_empty() {
-            return Vec::new();
-        }
-        let elapsed_ms = self
-            .last_throughput_send_time
-            .map(|t| t.elapsed().as_millis() as u64)
-            .unwrap_or(u64::MAX);
-        if elapsed_ms < self.throughput_send_interval_ms {
-            return Vec::new();
-        }
-        let frames_due = if self.throughput_send_interval_ms > 0 {
-            (elapsed_ms / self.throughput_send_interval_ms).max(1) as usize
-        } else {
-            1
-        };
-        let count = frames_due.min(2).min(self.pending_throughput_sends.len());
-        let mut batch = Vec::with_capacity(count);
-        for _ in 0..count {
-            if let Some(item) = self.pending_throughput_sends.pop_front() {
-                batch.push(item);
+        let mut batch = Vec::new();
+        for state in self.throughput_send_states.values_mut() {
+            if state.pending.is_empty() {
+                continue;
             }
-        }
-        if !batch.is_empty() {
-            self.last_throughput_send_time = Some(Instant::now());
+            let elapsed_ms = state
+                .last_send
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            if elapsed_ms < state.interval_ms {
+                continue;
+            }
+            let frames_due = if state.interval_ms > 0 {
+                (elapsed_ms / state.interval_ms).max(1) as usize
+            } else {
+                1
+            };
+            let count = frames_due.min(2).min(state.pending.len());
+            for _ in 0..count {
+                if let Some(item) = state.pending.pop_front() {
+                    batch.push(item);
+                }
+            }
+            if !batch.is_empty() {
+                state.last_send = Some(Instant::now());
+            }
         }
         batch
     }
 
     pub fn throughput_sends_pending(&self) -> bool {
-        !self.pending_throughput_sends.is_empty()
+        self.throughput_send_states
+            .values()
+            .any(|s| !s.pending.is_empty())
     }
 
     pub fn prepare_throughput_test(
