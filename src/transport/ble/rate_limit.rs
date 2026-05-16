@@ -315,43 +315,47 @@ mod tests {
 
     #[test]
     fn test_rate_adapter_additive_increase() {
-        let mut adapter = BleRateAdapter::new(40_000);
-        assert_eq!(adapter.current_rate_bps(), 40_000);
+        let mut adapter = BleRateAdapter::new(20_000);
+        assert_eq!(adapter.current_rate_bps(), 20_000);
 
+        // SRTT < RTT_LOW → +AI_STEP_BPS (2000)
         let rate = adapter.update(150.0);
-        assert_eq!(rate, 45_000);
+        assert_eq!(rate, 22_000);
     }
 
     #[test]
     fn test_rate_adapter_multiplicative_decrease() {
-        let mut adapter = BleRateAdapter::new(50_000);
-
-        let rate = adapter.update(600.0);
-        assert_eq!(rate, 35_000); // 50k * 0.7
+        // SRTT > RTT_HIGH (300ms), < RTT_SEVERE (600ms) → rate × MD_FACTOR (0.6)
+        let mut adapter = BleRateAdapter::new(30_000);
+        let rate = adapter.update(350.0);
+        assert_eq!(rate, 18_000); // 30k × 0.6
     }
 
     #[test]
     fn test_rate_adapter_steady_zone() {
-        let mut adapter = BleRateAdapter::new(40_000);
-
-        let rate = adapter.update(300.0);
-        assert_eq!(rate, 40_000);
+        // SRTT in [RTT_LOW, RTT_HIGH] → hold
+        let mut adapter = BleRateAdapter::new(25_000);
+        let rate = adapter.update(250.0);
+        assert_eq!(rate, 25_000);
     }
 
     #[test]
     fn test_rate_adapter_clamps_to_min() {
-        let mut adapter = BleRateAdapter::new(20_000);
-
-        let rate = adapter.update(1000.0);
-        assert_eq!(rate, 15_000); // 20k * 0.7 = 14k, clamped to MIN (15k)
+        // SRTT > RTT_SEVERE (600ms) → rate × MD_SEVERE (0.4), clamped to MIN_RATE_BPS
+        // 15k × 0.4 = 6000 < MIN_RATE_BPS (10k)
+        let mut adapter = BleRateAdapter::new(15_000);
+        let rate = adapter.update(800.0);
+        assert_eq!(rate, 10_000);
     }
 
     #[test]
     fn test_rate_adapter_clamps_to_max() {
         let mut adapter = BleRateAdapter::new(50_000);
+        assert_eq!(adapter.current_rate_bps(), 35_000); // constructor clamps to MAX_RATE_BPS
 
-        let rate = adapter.update(200.0);
-        assert_eq!(rate, 50_000);
+        // SRTT < RTT_LOW → +AI_STEP_BPS, but already at MAX → stays at MAX
+        let rate = adapter.update(100.0);
+        assert_eq!(rate, 35_000);
     }
 
     #[test]
