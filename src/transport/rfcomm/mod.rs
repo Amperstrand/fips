@@ -391,9 +391,11 @@ impl RfcommTransport {
         let remote_addr = addr.clone();
         let local_pubkey = self.local_pubkey;
 
+        let recv_writer = writer.clone();
         let recv_task = tokio::spawn(async move {
             rfcomm_receive_loop(
                 reader,
+                recv_writer,
                 transport_id,
                 remote_addr.clone(),
                 packet_tx,
@@ -405,7 +407,7 @@ impl RfcommTransport {
         });
 
         let conn = RfcommConnection {
-            writer: writer.clone(),
+            writer,
             recv_task,
         };
 
@@ -580,9 +582,11 @@ async fn server_poll_loop(
                 let recv_pool = pool.clone();
                 let recv_pubkey = local_pubkey;
 
+                let recv_writer = writer.clone();
                 let recv_task = tokio::spawn(async move {
                     rfcomm_receive_loop(
                         reader,
+                        recv_writer,
                         transport_id,
                         remote_addr.clone(),
                         recv_packet_tx,
@@ -626,6 +630,7 @@ async fn server_poll_loop(
 /// On error or EOF, removes the connection from the pool and exits.
 async fn rfcomm_receive_loop(
     reader: tokio::fs::File,
+    writer: Arc<Mutex<tokio::fs::File>>,
     transport_id: TransportId,
     remote_addr: TransportAddr,
     packet_tx: PacketTx,
@@ -643,7 +648,7 @@ async fn rfcomm_receive_loop(
 
     // Pubkey exchange: if we have a local pubkey, send it and wait for peer's
     if let Some(pubkey) = local_pubkey {
-        match pubkey_exchange(&mut buf_reader, &pubkey).await {
+        match pubkey_exchange(&mut buf_reader, &writer, &pubkey).await {
             Ok(_peer_pubkey) => {
                 debug!(
                     transport_id = %transport_id,
@@ -728,17 +733,18 @@ struct PubkeyExchangeResult {
 /// the exchange messages.
 async fn pubkey_exchange<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-    _local_pubkey: &[u8; 32],
+    writer: &Arc<Mutex<tokio::fs::File>>,
+    local_pubkey: &[u8; 32],
 ) -> Result<PubkeyExchangeResult, TransportError> {
-    // For pubkey exchange, we need a writer too. But we only have a reader
-    // in this context. The pubkey exchange for RFCOMM is simplified:
-    // we just read the first framed packet from the peer and interpret it
-    // as a pubkey announcement.
-    //
-    // The actual send of our pubkey happens as the first regular framed
-    // packet through the writer in a higher-level handshake.
-    //
-    // For now, we read the peer's pubkey as the first framed packet.
+    let mut our_announce = vec![PUBKEY_EXCHANGE_PREFIX];
+    our_announce.extend_from_slice(local_pubkey);
+
+    {
+        let mut w = writer.lock().await;
+        write_framed_packet(&mut *w, &our_announce)
+            .await
+            .map_err(|e| TransportError::SendFailed(format!("pubkey exchange send: {}", e)))?;
+    }
 
     let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
 
