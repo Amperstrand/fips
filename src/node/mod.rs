@@ -319,6 +319,7 @@ pub struct Node {
     /// Packet receiver (for event loop).
     packet_rx: Option<PacketRx>,
     /// Disconnect receiver for connection-oriented transports.
+    disconnect_tx: Option<DisconnectTx>,
     disconnect_rx: Option<DisconnectRx>,
 
     // === Connections (Handshake Phase) ===
@@ -558,6 +559,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_tx: None,
             disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),
@@ -689,6 +691,7 @@ impl Node {
             addr_to_link: HashMap::new(),
             packet_tx: None,
             packet_rx: None,
+            disconnect_tx: None,
             disconnect_rx: None,
             connections: HashMap::new(),
             peers: HashMap::new(),

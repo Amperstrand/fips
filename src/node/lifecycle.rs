@@ -566,6 +566,7 @@ impl Node {
         let (disconnect_tx, disconnect_rx) = disconnect_channel(packet_buffer_size);
         self.packet_tx = Some(packet_tx.clone());
         self.packet_rx = Some(packet_rx);
+        self.disconnect_tx = Some(disconnect_tx.clone());
         self.disconnect_rx = Some(disconnect_rx);
 
         // Initialize transports first (before TUN)
@@ -905,6 +906,7 @@ impl Node {
 
         // Drop packet channels
         self.packet_tx.take();
+        self.disconnect_tx.take();
         self.packet_rx.take();
 
         // Shutdown TUN interface
