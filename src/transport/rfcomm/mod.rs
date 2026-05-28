@@ -31,6 +31,7 @@ use stats::RfcommStats;
 
 use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::BufReader;
@@ -42,6 +43,26 @@ use tracing::{debug, info, trace, warn};
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
 const PUBKEY_EXCHANGE_SIZE: usize = 33; // prefix(1) + pubkey(32)
 const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 15;
+
+fn set_tty_raw(fd: std::os::unix::io::RawFd) -> Result<(), TransportError> {
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            return Err(TransportError::StartFailed(format!(
+                "tcgetattr failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        libc::cfmakeraw(&mut termios);
+        if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+            return Err(TransportError::StartFailed(format!(
+                "tcsetattr failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Connection Pool
@@ -370,10 +391,8 @@ impl RfcommTransport {
                 TransportError::StartFailed(format!("failed to open {}: {}", device_path, e))
             })?;
 
-        // Split into reader and writer using separate file handles
-        // We need two file handles since tokio::fs::File doesn't support split.
-        // Instead, we clone the file for writing and use the original for reading.
         let file_std = file.into_std().await;
+        set_tty_raw(file_std.as_raw_fd())?;
 
         let writer_std = file_std
             .try_clone()
@@ -559,6 +578,15 @@ async fn server_poll_loop(
                 };
 
                 let file_std = file.into_std().await;
+                if let Err(e) = set_tty_raw(file_std.as_raw_fd()) {
+                    warn!(
+                        transport_id = %transport_id,
+                        device = %device,
+                        error = %e,
+                        "RFCOMM server: failed to set raw mode"
+                    );
+                    continue;
+                }
 
                 let writer_std = match file_std.try_clone() {
                     Ok(f) => f,
