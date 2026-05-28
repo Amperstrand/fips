@@ -1,22 +1,18 @@
-//! RFCOMM (Bluetooth Classic Serial) Transport Implementation
+//! RFCOMM (Bluetooth Classic) Transport Implementation
 //!
-//! Provides RFCOMM serial transport for FIPS peer communication over
-//! Bluetooth Classic. Designed for AR3012 chips on OpenWrt routers
-//! running musl libc.
+//! Provides RFCOMM transport for FIPS peer communication over
+//! Bluetooth Classic using direct AF_BLUETOOTH sockets.
 //!
-//! ## Architecture
-//!
-//! Operates on `/dev/rfcommN` device files created externally by procd
-//! init scripts (e.g., `rfcomm connect`, `rfcomm watch`). FIPS opens
-//! these serial port files and uses length-prefix framing (2-byte BE
-//! length + payload) to recover packet boundaries from the byte stream.
+//! Bypasses the Linux TTY layer entirely — no `/dev/rfcommN` device files
+//! or `rfcomm` CLI tools required. Creates RFCOMM sockets directly via
+//! `AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM` and wraps them in tokio
+//! for async I/O.
 //!
 //! ## Modes
 //!
-//! - **Server mode**: Polls for new `/dev/rfcommN` device files appearing
-//!   (created externally when peers connect via `rfcomm watch`).
-//! - **Client mode**: Opens a configured `/dev/rfcommN` device file
-//!   (created externally via `rfcomm connect`).
+//! - **Server mode**: Binds a listening RFCOMM socket on the configured
+//!   channel and accepts incoming connections.
+//! - **Client mode**: Connects directly to configured peer MAC addresses.
 
 pub mod framing;
 pub mod stats;
@@ -31,48 +27,234 @@ use stats::RfcommStats;
 
 use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
-use tokio::fs::OpenOptions;
-use tokio::io::BufReader;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
+// Linux Bluetooth/RFCOMM constants
+const AF_BLUETOOTH: libc::c_int = 31;
+const BTPROTO_RFCOMM: libc::c_int = 3;
+
 /// Pubkey exchange constants (matches BLE pattern).
 const PUBKEY_EXCHANGE_PREFIX: u8 = 0x00;
-const PUBKEY_EXCHANGE_SIZE: usize = 33; // prefix(1) + pubkey(32)
+const PUBKEY_EXCHANGE_SIZE: usize = 33;
 const PUBKEY_EXCHANGE_TIMEOUT_SECS: u64 = 15;
 
-fn set_tty_raw(fd: std::os::unix::io::RawFd) -> Result<(), TransportError> {
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut termios) != 0 {
-            return Err(TransportError::StartFailed(format!(
-                "tcgetattr failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        libc::cfmakeraw(&mut termios);
-        if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
-            return Err(TransportError::StartFailed(format!(
-                "tcsetattr failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        libc::tcflush(fd, libc::TCIOFLUSH);
+// ============================================================================
+// sockaddr_rc Helpers
+// ============================================================================
+
+/// Build a `sockaddr_rc` byte buffer for connect/bind syscalls.
+///
+/// `mac_le` is the Bluetooth address in little-endian byte order
+/// (reversed from the string representation).
+fn make_sockaddr_rc(mac_le: &[u8; 6], channel: u8) -> [u8; 10] {
+    let mut addr = [0u8; 10];
+    // sa_family_t (2 bytes, host byte order — LE on all targets we care about)
+    addr[0] = AF_BLUETOOTH as u8;
+    addr[1] = 0;
+    // bdaddr_t: 6 bytes, little-endian
+    addr[2..8].copy_from_slice(mac_le);
+    // rc_channel: 1 byte
+    addr[8] = channel;
+    addr
+}
+
+/// Parse a MAC address string ("AA:BB:CC:DD:EE:FF") to little-endian bytes
+/// for `sockaddr_rc`. Returns `[0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]`.
+fn parse_mac_addr(s: &str) -> Result<[u8; 6], TransportError> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return Err(TransportError::InvalidAddress(format!(
+            "invalid MAC address: expected 6 octets, got {}: {}",
+            parts.len(),
+            s
+        )));
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).map_err(|e| {
+            TransportError::InvalidAddress(format!("invalid MAC octet '{}': {}", part, e))
+        })?;
+    }
+    // Reverse to little-endian for sockaddr_rc
+    mac.reverse();
+    Ok(mac)
+}
+
+/// Format a little-endian MAC address back to canonical string form.
+fn format_mac_addr(mac_le: &[u8; 6]) -> String {
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        mac_le[5], mac_le[4], mac_le[3], mac_le[2], mac_le[1], mac_le[0]
+    )
+}
+
+/// Extract the MAC address from a `sockaddr_rc` byte buffer (bytes 2..8).
+fn mac_from_sockaddr(addr: &[u8]) -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&addr[2..8]);
+    mac
+}
+
+// ============================================================================
+// Socket Syscalls
+// ============================================================================
+
+/// Set a file descriptor to non-blocking mode.
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Create an RFCOMM socket and connect to a peer.
+///
+/// Blocking — call via `spawn_blocking` to avoid stalling the tokio runtime.
+fn rfcomm_socket_connect(mac_le: &[u8; 6], channel: u8) -> Result<RawFd, TransportError> {
+    let fd = unsafe { libc::socket(AF_BLUETOOTH, libc::SOCK_STREAM, BTPROTO_RFCOMM) };
+    if fd < 0 {
+        return Err(TransportError::StartFailed(format!(
+            "RFCOMM socket() failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let addr = make_sockaddr_rc(mac_le, channel);
+    let ret = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            10,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(TransportError::StartFailed(format!(
+            "RFCOMM connect() failed: {}",
+            err
+        )));
+    }
+
+    set_nonblocking(fd).map_err(|e| {
+        unsafe { libc::close(fd) };
+        TransportError::StartFailed(format!("fcntl(O_NONBLOCK) failed: {}", e))
+    })?;
+
+    Ok(fd)
+}
+
+/// Create an RFCOMM listening socket bound to the given channel.
+fn rfcomm_socket_listen(channel: u8) -> Result<RawFd, TransportError> {
+    let fd = unsafe { libc::socket(AF_BLUETOOTH, libc::SOCK_STREAM, BTPROTO_RFCOMM) };
+    if fd < 0 {
+        return Err(TransportError::StartFailed(format!(
+            "RFCOMM socket() failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let opt: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &opt as *const _ as *const _,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
+    // Bind to BDADDR_ANY on the given channel
+    let addr = make_sockaddr_rc(&[0u8; 6], channel);
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            10,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(TransportError::StartFailed(format!(
+            "RFCOMM bind() failed: {}",
+            err
+        )));
+    }
+
+    let ret = unsafe { libc::listen(fd, 4) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(TransportError::StartFailed(format!(
+            "RFCOMM listen() failed: {}",
+            err
+        )));
+    }
+
+    set_nonblocking(fd).map_err(|e| {
+        unsafe { libc::close(fd) };
+        TransportError::StartFailed(format!("fcntl(O_NONBLOCK) failed: {}", e))
+    })?;
+
+    Ok(fd)
+}
+
+/// Accept an incoming connection on a non-blocking listen socket.
+///
+/// Returns `(client_fd, client_mac_le)`.
+/// Returns `WouldBlock` if no pending connection is available.
+fn rfcomm_socket_accept(listen_fd: RawFd) -> std::io::Result<(RawFd, [u8; 6])> {
+    let mut addr = [0u8; 16];
+    let mut addr_len: libc::socklen_t = 16;
+    let client_fd = unsafe {
+        libc::accept(
+            listen_fd,
+            addr.as_mut_ptr() as *mut libc::sockaddr,
+            &mut addr_len,
+        )
+    };
+    if client_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mac = mac_from_sockaddr(&addr);
+
+    if let Err(e) = set_nonblocking(client_fd) {
+        unsafe { libc::close(client_fd) };
+        return Err(e);
+    }
+
+    Ok((client_fd, mac))
+}
+
+/// Wrap a raw connected socket fd as a tokio `UnixStream`.
+fn fd_to_tokio_stream(fd: RawFd) -> std::io::Result<tokio::net::UnixStream> {
+    // from_raw_fd takes ownership of the fd; UnixStream closes it on drop.
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    tokio::net::UnixStream::from_std(std_stream)
 }
 
 // ============================================================================
 // Connection Pool
 // ============================================================================
 
-/// State for a single RFCOMM serial connection.
+/// State for a single RFCOMM connection.
 struct RfcommConnection {
-    /// Write half of the serial port file.
-    writer: Arc<Mutex<tokio::fs::File>>,
+    /// Write half of the socket (shared with pubkey exchange in recv loop).
+    writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     /// Receive task for this connection.
     recv_task: JoinHandle<()>,
 }
@@ -80,14 +262,23 @@ struct RfcommConnection {
 /// Shared connection pool.
 type ConnectionPool = Arc<Mutex<HashMap<TransportAddr, RfcommConnection>>>;
 
+/// Wrapper to use a raw fd with `AsyncFd`.
+struct RawFdWrapper(RawFd);
+
+impl AsRawFd for RawFdWrapper {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
 // ============================================================================
 // RFCOMM Transport
 // ============================================================================
 
-/// RFCOMM serial transport for FIPS.
+/// RFCOMM transport for FIPS.
 ///
 /// Provides connection-oriented, reliable byte stream delivery over
-/// Bluetooth Classic RFCOMM serial ports. Uses length-prefix framing
+/// Bluetooth Classic RFCOMM sockets. Uses length-prefix framing
 /// to recover packet boundaries.
 pub struct RfcommTransport {
     /// Unique transport identifier.
@@ -102,8 +293,10 @@ pub struct RfcommTransport {
     pool: ConnectionPool,
     /// Channel for delivering received packets to Node.
     packet_tx: PacketTx,
-    /// Server polling task handle (if in server mode).
-    poll_task: Option<JoinHandle<()>>,
+    /// Server accept loop task handle (if in server mode).
+    accept_task: Option<JoinHandle<()>>,
+    /// Listen socket fd (server mode) — closed on stop.
+    listen_fd: Option<RawFd>,
     /// Transport statistics.
     stats: Arc<RfcommStats>,
     /// Local node's Nostr public key (for pubkey exchange).
@@ -125,7 +318,8 @@ impl RfcommTransport {
             state: TransportState::Configured,
             pool: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
-            poll_task: None,
+            accept_task: None,
+            listen_fd: None,
             stats: Arc::new(RfcommStats::new()),
             local_pubkey: None,
         }
@@ -154,52 +348,12 @@ impl RfcommTransport {
 
         self.state = TransportState::Starting;
 
-        // In client mode, open the configured device immediately
         if self.config.mode() == "client" {
-            if let Some(ref device) = self.config.device {
-                match self.open_device(device).await {
-                    Ok(()) => {
-                        debug!(
-                            transport_id = %self.transport_id,
-                            device = %device,
-                            "RFCOMM client: opened device"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            transport_id = %self.transport_id,
-                            device = %device,
-                            error = %e,
-                            "RFCOMM client: failed to open device (will retry)"
-                        );
-                    }
-                }
-            }
+            self.start_client().await;
         }
 
-        // In server mode, start polling for new /dev/rfcommN devices
         if self.config.mode() == "server" {
-            let transport_id = self.transport_id;
-            let packet_tx = self.packet_tx.clone();
-            let pool = self.pool.clone();
-            let stats = self.stats.clone();
-            let local_pubkey = self.local_pubkey;
-            let poll_interval = std::time::Duration::from_secs(2);
-            let known_devices = self.collect_known_devices().await;
-
-            let poll_task = tokio::spawn(async move {
-                server_poll_loop(
-                    transport_id,
-                    packet_tx,
-                    pool,
-                    stats,
-                    local_pubkey,
-                    poll_interval,
-                    known_devices,
-                )
-                .await;
-            });
-            self.poll_task = Some(poll_task);
+            self.start_server().await?;
         }
 
         self.state = TransportState::Up;
@@ -222,16 +376,181 @@ impl RfcommTransport {
         Ok(())
     }
 
+    /// Client mode: connect to all configured peers.
+    async fn start_client(&self) {
+        let channel = self.config.channel();
+        if self.config.peers.is_empty() {
+            debug!(
+                transport_id = %self.transport_id,
+                "RFCOMM client: no peers configured"
+            );
+            return;
+        }
+
+        for peer in &self.config.peers {
+            match parse_mac_addr(&peer.mac) {
+                Ok(mac_le) => {
+                    let mac_str = format_mac_addr(&mac_le);
+                    match self.connect_to_peer(&mac_le, channel).await {
+                        Ok(()) => {
+                            debug!(
+                                transport_id = %self.transport_id,
+                                mac = %mac_str,
+                                channel,
+                                "RFCOMM client: connected to peer"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                transport_id = %self.transport_id,
+                                mac = %mac_str,
+                                error = %e,
+                                "RFCOMM client: failed to connect to peer"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        transport_id = %self.transport_id,
+                        mac = %peer.mac,
+                        error = %e,
+                        "RFCOMM client: invalid MAC address in config"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Connect to a single peer and register the connection in the pool.
+    async fn connect_to_peer(&self, mac_le: &[u8; 6], channel: u8) -> Result<(), TransportError> {
+        let mac_str = format_mac_addr(mac_le);
+        let addr = TransportAddr::from_string(&mac_str);
+
+        {
+            let pool = self.pool.lock().await;
+            if pool.contains_key(&addr) {
+                return Ok(());
+            }
+        }
+
+        let mac_copy = *mac_le;
+        let fd = tokio::task::spawn_blocking(move || rfcomm_socket_connect(&mac_copy, channel))
+            .await
+            .map_err(|e| TransportError::StartFailed(format!("connect task join: {}", e)))??;
+
+        self.register_socket(fd, addr).await
+    }
+
+    /// Wrap a connected socket fd and register it in the pool.
+    async fn register_socket(
+        &self,
+        fd: RawFd,
+        addr: TransportAddr,
+    ) -> Result<(), TransportError> {
+        // Double-check pool under lock to prevent duplicate registration
+        {
+            let pool = self.pool.lock().await;
+            if pool.contains_key(&addr) {
+                unsafe { libc::close(fd) };
+                return Ok(());
+            }
+        }
+
+        let stream = fd_to_tokio_stream(fd).map_err(|e| {
+            // fd is now owned by fd_to_tokio_stream; on error it closes the fd.
+            TransportError::StartFailed(format!("tokio UnixStream::from_std: {}", e))
+        })?;
+
+        let (read_half, write_half) = stream.into_split();
+        let writer = Arc::new(Mutex::new(write_half));
+
+        let transport_id = self.transport_id;
+        let packet_tx = self.packet_tx.clone();
+        let pool = self.pool.clone();
+        let stats = self.stats.clone();
+        let remote_addr = addr.clone();
+        let local_pubkey = self.local_pubkey;
+
+        let recv_writer = writer.clone();
+        let recv_task = tokio::spawn(async move {
+            rfcomm_receive_loop(
+                read_half,
+                recv_writer,
+                transport_id,
+                remote_addr.clone(),
+                packet_tx,
+                pool,
+                stats,
+                local_pubkey,
+            )
+            .await;
+        });
+
+        let conn = RfcommConnection {
+            writer,
+            recv_task,
+        };
+
+        let mut pool = self.pool.lock().await;
+        if let Some(old) = pool.insert(addr, conn) {
+            old.recv_task.abort();
+        }
+
+        self.stats.record_connection_established();
+
+        Ok(())
+    }
+
+    /// Server mode: bind, listen, and spawn accept loop.
+    async fn start_server(&mut self) -> Result<(), TransportError> {
+        let channel = self.config.channel();
+        let listen_fd = rfcomm_socket_listen(channel)?;
+        self.listen_fd = Some(listen_fd);
+
+        let transport_id = self.transport_id;
+        let packet_tx = self.packet_tx.clone();
+        let pool = self.pool.clone();
+        let stats = self.stats.clone();
+        let local_pubkey = self.local_pubkey;
+
+        let accept_task = tokio::spawn(async move {
+            server_accept_loop(
+                listen_fd,
+                transport_id,
+                packet_tx,
+                pool,
+                stats,
+                local_pubkey,
+            )
+            .await;
+        });
+        self.accept_task = Some(accept_task);
+
+        info!(
+            transport_id = %self.transport_id,
+            channel,
+            "RFCOMM server: listening on channel"
+        );
+
+        Ok(())
+    }
+
     /// Stop the transport asynchronously.
     pub async fn stop_async(&mut self) -> Result<(), TransportError> {
         if !self.state.is_operational() {
             return Err(TransportError::NotStarted);
         }
 
-        // Abort server poll task
-        if let Some(task) = self.poll_task.take() {
+        // Abort accept loop first so it stops using the listen fd
+        if let Some(task) = self.accept_task.take() {
             task.abort();
             let _ = task.await;
+        }
+
+        // Close listen socket
+        if let Some(fd) = self.listen_fd.take() {
+            unsafe { libc::close(fd) };
         }
 
         // Close all established connections
@@ -267,7 +586,6 @@ impl RfcommTransport {
             return Err(TransportError::NotStarted);
         }
 
-        // MTU check
         let mtu = self.config.mtu() as usize;
         if data.len() > mtu {
             return Err(TransportError::MtuExceeded {
@@ -276,7 +594,6 @@ impl RfcommTransport {
             });
         }
 
-        // Get connection writer
         let writer = {
             let pool = self.pool.lock().await;
             pool.get(addr)
@@ -284,7 +601,6 @@ impl RfcommTransport {
                 .ok_or_else(|| TransportError::SendFailed("no connection to address".into()))?
         };
 
-        // Write framed packet
         let mut w = writer.lock().await;
         match write_framed_packet(&mut *w, data).await {
             Ok(()) => {
@@ -300,7 +616,6 @@ impl RfcommTransport {
             Err(e) => {
                 self.stats.record_send_error();
                 drop(w);
-                // Remove failed connection from pool
                 let mut pool = self.pool.lock().await;
                 if let Some(conn) = pool.remove(addr) {
                     conn.recv_task.abort();
@@ -312,14 +627,13 @@ impl RfcommTransport {
 
     /// Initiate a non-blocking connection to a remote address.
     ///
-    /// For RFCOMM, this opens the configured device file and starts
-    /// the read loop. Returns Ok immediately if already connected.
+    /// The address must be a MAC address string ("AA:BB:CC:DD:EE:FF").
+    /// Returns Ok immediately if already connected.
     pub async fn connect_async(&self, addr: &TransportAddr) -> Result<(), TransportError> {
         if !self.state.is_operational() {
             return Err(TransportError::NotStarted);
         }
 
-        // Already connected?
         {
             let pool = self.pool.lock().await;
             if pool.contains_key(addr) {
@@ -327,12 +641,12 @@ impl RfcommTransport {
             }
         }
 
-        // For RFCOMM, the device file path IS the address
-        let device_path = addr
+        let mac_str = addr
             .as_str()
             .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?;
-
-        self.open_and_register_device(device_path, addr.clone()).await
+        let mac_le = parse_mac_addr(mac_str)?;
+        let channel = self.config.channel();
+        self.connect_to_peer(&mac_le, channel).await
     }
 
     /// Query the state of a connection to a remote address.
@@ -357,100 +671,6 @@ impl RfcommTransport {
                 "RFCOMM connection closed"
             );
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    /// Open a device file and register it in the connection pool.
-    async fn open_device(&self, device_path: &str) -> Result<(), TransportError> {
-        let addr = TransportAddr::from_string(device_path);
-        self.open_and_register_device(device_path, addr).await
-    }
-
-    /// Open a device, start read loop, and insert into pool.
-    async fn open_and_register_device(
-        &self,
-        device_path: &str,
-        addr: TransportAddr,
-    ) -> Result<(), TransportError> {
-        // Check if already connected
-        {
-            let pool = self.pool.lock().await;
-            if pool.contains_key(&addr) {
-                return Ok(());
-            }
-        }
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(device_path)
-            .await
-            .map_err(|e| {
-                TransportError::StartFailed(format!("failed to open {}: {}", device_path, e))
-            })?;
-
-        let file_std = file.into_std().await;
-        set_tty_raw(file_std.as_raw_fd())?;
-
-        let writer_std = file_std
-            .try_clone()
-            .map_err(|e| TransportError::StartFailed(format!("clone fd: {}", e)))?;
-
-        let reader = tokio::fs::File::from_std(file_std);
-        let writer = tokio::fs::File::from_std(writer_std);
-
-        let writer = Arc::new(Mutex::new(writer));
-
-        let transport_id = self.transport_id;
-        let packet_tx = self.packet_tx.clone();
-        let pool = self.pool.clone();
-        let stats = self.stats.clone();
-        let remote_addr = addr.clone();
-        let local_pubkey = self.local_pubkey;
-
-        let recv_writer = writer.clone();
-        let recv_task = tokio::spawn(async move {
-            rfcomm_receive_loop(
-                reader,
-                recv_writer,
-                transport_id,
-                remote_addr.clone(),
-                packet_tx,
-                pool,
-                stats,
-                local_pubkey,
-            )
-            .await;
-        });
-
-        let conn = RfcommConnection {
-            writer,
-            recv_task,
-        };
-
-        let mut pool = self.pool.lock().await;
-        pool.insert(addr, conn);
-
-        self.stats.record_connection_established();
-
-        debug!(
-            transport_id = %self.transport_id,
-            device = %device_path,
-            "RFCOMM connection established"
-        );
-
-        Ok(())
-    }
-
-    /// Collect currently known device files from the pool (for server poll dedup).
-    async fn collect_known_devices(&self) -> Vec<String> {
-        let pool = self.pool.lock().await;
-        pool.keys()
-            .filter_map(|addr| addr.as_str().map(|s| s.to_string()))
-            .collect()
     }
 }
 
@@ -490,8 +710,6 @@ impl Transport for RfcommTransport {
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredPeer>, TransportError> {
-        // RFCOMM has no discovery mechanism — devices are configured or
-        // appear via external rfcomm commands.
         Ok(Vec::new())
     }
 
@@ -505,116 +723,93 @@ impl Transport for RfcommTransport {
 }
 
 // ============================================================================
-// Server Poll Loop
+// Server Accept Loop
 // ============================================================================
 
-/// Server mode: periodically scan for new `/dev/rfcommN` device files.
+/// Server mode: accept connections on the listening socket.
 ///
-/// When a new device appears, opens it and starts a receive loop.
-/// This handles the case where `rfcomm watch` creates device files
-/// externally when Bluetooth peers connect.
-async fn server_poll_loop(
+/// Uses `AsyncFd` to wait for readability on the non-blocking listen fd,
+/// then calls `accept()` to get the client fd and MAC address.
+async fn server_accept_loop(
+    listen_fd: RawFd,
     transport_id: TransportId,
     packet_tx: PacketTx,
     pool: ConnectionPool,
     stats: Arc<RfcommStats>,
     local_pubkey: Option<[u8; 32]>,
-    poll_interval: std::time::Duration,
-    mut known_devices: Vec<String>,
 ) {
-    debug!(transport_id = %transport_id, "RFCOMM server poll loop starting");
+    debug!(transport_id = %transport_id, "RFCOMM server accept loop starting");
+
+    let async_fd = match AsyncFd::new(RawFdWrapper(listen_fd)) {
+        Ok(af) => af,
+        Err(e) => {
+            warn!(
+                transport_id = %transport_id,
+                error = %e,
+                "RFCOMM server: failed to create AsyncFd for listen socket"
+            );
+            return;
+        }
+    };
 
     loop {
-        tokio::time::sleep(poll_interval).await;
-
-        // Scan /dev for rfcommN device files
-        let mut current_devices = Vec::new();
-        if let Ok(entries) = std::fs::read_dir("/dev") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("rfcomm") {
-                    let path = format!("/dev/{}", name_str);
-                    current_devices.push(path);
-                }
-            }
-        }
-
-        // Find new devices
-        for device in &current_devices {
-            if !known_devices.contains(device) {
-                debug!(
+        let mut guard = match async_fd.readable().await {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
                     transport_id = %transport_id,
-                    device = %device,
-                    "RFCOMM server: new device detected"
+                    error = %e,
+                    "RFCOMM server: AsyncFd::readable() failed"
                 );
+                break;
+            }
+        };
 
-                let addr = TransportAddr::from_string(device);
+        match rfcomm_socket_accept(listen_fd) {
+            Ok((client_fd, client_mac)) => {
+                let mac_str = format_mac_addr(&client_mac);
+                let addr = TransportAddr::from_string(&mac_str);
 
-                // Check if already in pool
+                // Check if already connected
                 {
                     let pool_guard = pool.lock().await;
                     if pool_guard.contains_key(&addr) {
+                        debug!(
+                            transport_id = %transport_id,
+                            mac = %mac_str,
+                            "RFCOMM server: duplicate connection, closing"
+                        );
+                        unsafe { libc::close(client_fd) };
                         continue;
                     }
                 }
 
-                // Open device
-                let file = match OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(device)
-                    .await
-                {
-                    Ok(f) => f,
+                let stream = match fd_to_tokio_stream(client_fd) {
+                    Ok(s) => s,
                     Err(e) => {
                         warn!(
                             transport_id = %transport_id,
-                            device = %device,
+                            mac = %mac_str,
                             error = %e,
-                            "RFCOMM server: failed to open device"
+                            "RFCOMM server: failed to wrap client fd"
                         );
                         continue;
                     }
                 };
 
-                let file_std = file.into_std().await;
-                if let Err(e) = set_tty_raw(file_std.as_raw_fd()) {
-                    warn!(
-                        transport_id = %transport_id,
-                        device = %device,
-                        error = %e,
-                        "RFCOMM server: failed to set raw mode"
-                    );
-                    continue;
-                }
-
-                let writer_std = match file_std.try_clone() {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!(
-                            transport_id = %transport_id,
-                            device = %device,
-                            error = %e,
-                            "RFCOMM server: failed to clone fd"
-                        );
-                        continue;
-                    }
-                };
-
-                let reader = tokio::fs::File::from_std(file_std);
-                let writer = Arc::new(Mutex::new(tokio::fs::File::from_std(writer_std)));
-
-                let remote_addr = addr.clone();
-                let recv_stats = stats.clone();
-                let recv_packet_tx = packet_tx.clone();
-                let recv_pool = pool.clone();
-                let recv_pubkey = local_pubkey;
+                let (read_half, write_half) = stream.into_split();
+                let writer = Arc::new(Mutex::new(write_half));
 
                 let recv_writer = writer.clone();
+                let recv_packet_tx = packet_tx.clone();
+                let recv_pool = pool.clone();
+                let recv_stats = stats.clone();
+                let recv_pubkey = local_pubkey;
+                let remote_addr = addr.clone();
+
                 let recv_task = tokio::spawn(async move {
                     rfcomm_receive_loop(
-                        reader,
+                        read_half,
                         recv_writer,
                         transport_id,
                         remote_addr.clone(),
@@ -632,20 +827,35 @@ async fn server_poll_loop(
                 };
 
                 let mut pool_guard = pool.lock().await;
-                pool_guard.insert(addr, conn);
+                if let Some(old) = pool_guard.insert(addr, conn) {
+                    old.recv_task.abort();
+                }
 
                 stats.record_connection_accepted();
 
                 debug!(
                     transport_id = %transport_id,
-                    device = %device,
+                    mac = %mac_str,
                     "RFCOMM server: accepted connection"
                 );
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    transport_id = %transport_id,
+                    error = %e,
+                    "RFCOMM server: accept() error"
+                );
+                // Brief sleep to avoid tight loop on persistent errors
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
-
-        known_devices = current_devices;
     }
+
+    debug!(transport_id = %transport_id, "RFCOMM server accept loop stopped");
 }
 
 // ============================================================================
@@ -654,12 +864,12 @@ async fn server_poll_loop(
 
 /// Per-connection RFCOMM receive loop.
 ///
-/// Reads framed packets from the serial port, optionally performs pubkey
-/// exchange, and delivers packets to the node via the packet channel.
+/// Reads framed packets from the socket, optionally performs pubkey exchange,
+/// and delivers packets to the node via the packet channel.
 /// On error or EOF, removes the connection from the pool and exits.
 async fn rfcomm_receive_loop(
-    reader: tokio::fs::File,
-    writer: Arc<Mutex<tokio::fs::File>>,
+    reader: tokio::net::unix::OwnedReadHalf,
+    writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     transport_id: TransportId,
     remote_addr: TransportAddr,
     packet_tx: PacketTx,
@@ -677,7 +887,8 @@ async fn rfcomm_receive_loop(
 
     // Pubkey exchange: if we have a local pubkey, send it and wait for peer's
     if let Some(pubkey) = local_pubkey {
-        match pubkey_exchange(&mut buf_reader, &writer, &pubkey).await {
+        let mut w = writer.lock().await;
+        match pubkey_exchange(&mut buf_reader, &mut *w, &pubkey).await {
             Ok(_peer_pubkey) => {
                 debug!(
                     transport_id = %transport_id,
@@ -692,9 +903,10 @@ async fn rfcomm_receive_loop(
                     error = %e,
                     "RFCOMM pubkey exchange failed"
                 );
-                // Continue anyway — pubkey exchange is best-effort for RFCOMM
+                // Continue anyway — pubkey exchange is best-effort
             }
         }
+        drop(w);
     }
 
     loop {
@@ -755,25 +967,26 @@ struct PubkeyExchangeResult {
     peer_pubkey: XOnlyPublicKey,
 }
 
-/// Perform pubkey exchange over the RFCOMM serial connection.
+/// Perform pubkey exchange over the RFCOMM connection.
 ///
 /// Sends our 33-byte pubkey announcement (prefix 0x00 + 32-byte pubkey)
 /// and waits for the peer's response. Uses length-prefix framing for
 /// the exchange messages.
-async fn pubkey_exchange<R: tokio::io::AsyncRead + Unpin>(
+async fn pubkey_exchange<R, W>(
     reader: &mut R,
-    writer: &Arc<Mutex<tokio::fs::File>>,
+    writer: &mut W,
     local_pubkey: &[u8; 32],
-) -> Result<PubkeyExchangeResult, TransportError> {
+) -> Result<PubkeyExchangeResult, TransportError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut our_announce = vec![PUBKEY_EXCHANGE_PREFIX];
     our_announce.extend_from_slice(local_pubkey);
 
-    {
-        let mut w = writer.lock().await;
-        write_framed_packet(&mut *w, &our_announce)
-            .await
-            .map_err(|e| TransportError::SendFailed(format!("pubkey exchange send: {}", e)))?;
-    }
+    write_framed_packet(writer, &our_announce)
+        .await
+        .map_err(|e| TransportError::SendFailed(format!("pubkey exchange send: {}", e)))?;
 
     let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
 
