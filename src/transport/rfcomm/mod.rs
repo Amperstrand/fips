@@ -27,10 +27,9 @@ use stats::RfcommStats;
 
 use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
@@ -204,11 +203,6 @@ fn rfcomm_socket_listen(channel: u8) -> Result<RawFd, TransportError> {
         )));
     }
 
-    set_nonblocking(fd).map_err(|e| {
-        unsafe { libc::close(fd) };
-        TransportError::StartFailed(format!("fcntl(O_NONBLOCK) failed: {}", e))
-    })?;
-
     Ok(fd)
 }
 
@@ -261,15 +255,6 @@ struct RfcommConnection {
 
 /// Shared connection pool.
 type ConnectionPool = Arc<Mutex<HashMap<TransportAddr, RfcommConnection>>>;
-
-/// Wrapper to use a raw fd with `AsyncFd`.
-struct RawFdWrapper(RawFd);
-
-impl AsRawFd for RawFdWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
 
 // ============================================================================
 // RFCOMM Transport
@@ -726,10 +711,8 @@ impl Transport for RfcommTransport {
 // Server Accept Loop
 // ============================================================================
 
-/// Server mode: accept connections on the listening socket.
-///
-/// Uses `AsyncFd` to wait for readability on the non-blocking listen fd,
-/// then calls `accept()` to get the client fd and MAC address.
+/// Blocking accept via `spawn_blocking` — `AsyncFd`/`epoll` does not work with
+/// Bluetooth RFCOMM sockets. Accepted fds are sent to the async runtime.
 async fn server_accept_loop(
     listen_fd: RawFd,
     transport_id: TransportId,
@@ -738,124 +721,118 @@ async fn server_accept_loop(
     stats: Arc<RfcommStats>,
     local_pubkey: Option<[u8; 32]>,
 ) {
-    debug!(transport_id = %transport_id, "RFCOMM server accept loop starting");
+    info!(transport_id = %transport_id, "RFCOMM server accept loop starting");
 
-    let async_fd = match AsyncFd::new(RawFdWrapper(listen_fd)) {
-        Ok(af) => af,
-        Err(e) => {
-            warn!(
-                transport_id = %transport_id,
-                error = %e,
-                "RFCOMM server: failed to create AsyncFd for listen socket"
-            );
-            return;
-        }
-    };
+    let (accept_tx, mut accept_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    loop {
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(
-                    transport_id = %transport_id,
-                    error = %e,
-                    "RFCOMM server: AsyncFd::readable() failed"
-                );
-                break;
+    let blocking_transport_id = transport_id;
+    let blocking_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
+        loop {
+            match rfcomm_socket_accept(listen_fd) {
+                Ok((client_fd, client_mac)) => {
+                    if accept_tx.send((client_fd, client_mac)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        transport_id = %blocking_transport_id,
+                        error = %e,
+                        "RFCOMM server: blocking accept() error"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
             }
-        };
+        }
+    });
 
-        match rfcomm_socket_accept(listen_fd) {
-            Ok((client_fd, client_mac)) => {
-                let mac_str = format_mac_addr(&client_mac);
-                let addr = TransportAddr::from_string(&mac_str);
+    while let Some((client_fd, client_mac)) = accept_rx.recv().await {
+        let mac_str = format_mac_addr(&client_mac);
+        let addr = TransportAddr::from_string(&mac_str);
 
-                // Check if already connected
-                {
-                    let pool_guard = pool.lock().await;
-                    if pool_guard.contains_key(&addr) {
-                        debug!(
-                            transport_id = %transport_id,
-                            mac = %mac_str,
-                            "RFCOMM server: duplicate connection, closing"
-                        );
-                        unsafe { libc::close(client_fd) };
-                        continue;
-                    }
-                }
-
-                let stream = match fd_to_tokio_stream(client_fd) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(
-                            transport_id = %transport_id,
-                            mac = %mac_str,
-                            error = %e,
-                            "RFCOMM server: failed to wrap client fd"
-                        );
-                        continue;
-                    }
-                };
-
-                let (read_half, write_half) = stream.into_split();
-                let writer = Arc::new(Mutex::new(write_half));
-
-                let recv_writer = writer.clone();
-                let recv_packet_tx = packet_tx.clone();
-                let recv_pool = pool.clone();
-                let recv_stats = stats.clone();
-                let recv_pubkey = local_pubkey;
-                let remote_addr = addr.clone();
-
-                let recv_task = tokio::spawn(async move {
-                    rfcomm_receive_loop(
-                        read_half,
-                        recv_writer,
-                        transport_id,
-                        remote_addr.clone(),
-                        recv_packet_tx,
-                        recv_pool,
-                        recv_stats,
-                        recv_pubkey,
-                    )
-                    .await;
-                });
-
-                let conn = RfcommConnection {
-                    writer,
-                    recv_task,
-                };
-
-                let mut pool_guard = pool.lock().await;
-                if let Some(old) = pool_guard.insert(addr, conn) {
-                    old.recv_task.abort();
-                }
-
-                stats.record_connection_accepted();
-
+        // Check if already connected
+        {
+            let pool_guard = pool.lock().await;
+            if pool_guard.contains_key(&addr) {
                 debug!(
                     transport_id = %transport_id,
                     mac = %mac_str,
-                    "RFCOMM server: accepted connection"
+                    "RFCOMM server: duplicate connection, closing"
                 );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                guard.clear_ready();
+                unsafe { libc::close(client_fd) };
                 continue;
             }
+        }
+
+        if let Err(e) = set_nonblocking(client_fd) {
+            warn!(
+                transport_id = %transport_id,
+                mac = %mac_str,
+                error = %e,
+                "RFCOMM server: failed to set client fd non-blocking"
+            );
+            unsafe { libc::close(client_fd) };
+            continue;
+        }
+
+        let stream = match fd_to_tokio_stream(client_fd) {
+            Ok(s) => s,
             Err(e) => {
                 warn!(
                     transport_id = %transport_id,
+                    mac = %mac_str,
                     error = %e,
-                    "RFCOMM server: accept() error"
+                    "RFCOMM server: failed to wrap client fd"
                 );
-                // Brief sleep to avoid tight loop on persistent errors
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
             }
+        };
+
+        let (read_half, write_half) = stream.into_split();
+        let writer = Arc::new(Mutex::new(write_half));
+
+        let recv_writer = writer.clone();
+        let recv_packet_tx = packet_tx.clone();
+        let recv_pool = pool.clone();
+        let recv_stats = stats.clone();
+        let recv_pubkey = local_pubkey;
+        let remote_addr = addr.clone();
+
+        let recv_task = tokio::spawn(async move {
+            rfcomm_receive_loop(
+                read_half,
+                recv_writer,
+                transport_id,
+                remote_addr.clone(),
+                recv_packet_tx,
+                recv_pool,
+                recv_stats,
+                recv_pubkey,
+            )
+            .await;
+        });
+
+        let conn = RfcommConnection {
+            writer,
+            recv_task,
+        };
+
+        let mut pool_guard = pool.lock().await;
+        if let Some(old) = pool_guard.insert(addr, conn) {
+            old.recv_task.abort();
         }
+
+        stats.record_connection_accepted();
+
+        info!(
+            transport_id = %transport_id,
+            mac = %mac_str,
+            "RFCOMM server: accepted connection"
+        );
     }
 
-    debug!(transport_id = %transport_id, "RFCOMM server accept loop stopped");
+    blocking_handle.abort();
+    info!(transport_id = %transport_id, "RFCOMM server accept loop stopped");
 }
 
 // ============================================================================
