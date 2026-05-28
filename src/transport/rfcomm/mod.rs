@@ -60,6 +60,7 @@ fn set_tty_raw(fd: std::os::unix::io::RawFd) -> Result<(), TransportError> {
                 std::io::Error::last_os_error()
             )));
         }
+        libc::tcflush(fd, libc::TCIOFLUSH);
     }
     Ok(())
 }
