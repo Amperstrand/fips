@@ -697,6 +697,180 @@ impl BleConfig {
     }
 }
 
+// ============================================================================
+// RFCOMM Transport Configuration
+// ============================================================================
+
+/// Default RFCOMM channel (1-30).
+const DEFAULT_RFCOMM_CHANNEL: u8 = 1;
+
+/// Default RFCOMM MTU (practical limit for RFCOMM).
+const DEFAULT_RFCOMM_MTU: u16 = 1000;
+
+/// Default baud rate for serial communication.
+const DEFAULT_RFCOMM_BAUD_RATE: u32 = 115200;
+
+/// RFCOMM peer configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RfcommPeerConfig {
+    /// Peer Bluetooth MAC address (e.g., "AA:BB:CC:DD:EE:FF").
+    pub mac: String,
+
+    /// Optional specific /dev/rfcommN device to use for this peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+/// RFCOMM transport instance configuration.
+///
+/// RfcommConfig is always compiled (for config parsing on any platform),
+/// but the transport runtime requires the `rfcomm` feature.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RfcommConfig {
+    /// Operating mode: "server" or "client". Default: "server".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// Serial device path (e.g., "/dev/rfcomm0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+
+    /// RFCOMM channel (1-30). Default: 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+
+    /// MTU for RFCOMM frames. Default: 1000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+
+    /// Baud rate for serial communication. Default: 115200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud_rate: Option<u32>,
+
+    /// Configured peers for outbound connections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<RfcommPeerConfig>,
+
+    /// Auto-connect to discovered/configured peers. Default: false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_connect: Option<bool>,
+
+    /// Accept incoming connections (server mode). Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_connections: Option<bool>,
+}
+
+impl RfcommConfig {
+    /// Get the operating mode. Default: "server".
+    pub fn mode(&self) -> &str {
+        self.mode.as_deref().unwrap_or("server")
+    }
+
+    /// Get the RFCOMM channel. Default: 1.
+    pub fn channel(&self) -> u8 {
+        self.channel.unwrap_or(DEFAULT_RFCOMM_CHANNEL)
+    }
+
+    /// Get the MTU. Default: 1000.
+    pub fn mtu(&self) -> u16 {
+        self.mtu.unwrap_or(DEFAULT_RFCOMM_MTU)
+    }
+
+    /// Get the baud rate. Default: 115200.
+    pub fn baud_rate(&self) -> u32 {
+        self.baud_rate.unwrap_or(DEFAULT_RFCOMM_BAUD_RATE)
+    }
+
+    /// Whether to auto-connect to configured peers. Default: false.
+    pub fn auto_connect(&self) -> bool {
+        self.auto_connect.unwrap_or(false)
+    }
+
+    /// Whether to accept incoming connections. Default: true.
+    pub fn accept_connections(&self) -> bool {
+        self.accept_connections.unwrap_or(true)
+    }
+}
+
+// ============================================================================
+// TransportsConfig
+// ============================================================================
+
+/// Transports configuration section.
+///
+/// Each transport type can have either a single instance (config directly
+/// under the type name) or multiple named instances.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransportsConfig {
+    /// UDP transport instances.
+    #[serde(default, skip_serializing_if = "is_transport_empty")]
+    pub udp: TransportInstances<UdpConfig>,
+
+    /// Ethernet transport instances.
+    #[serde(default, skip_serializing_if = "is_transport_empty")]
+    pub ethernet: TransportInstances<EthernetConfig>,
+
+    /// TCP transport instances.
+    #[serde(default, skip_serializing_if = "is_transport_empty")]
+    pub tcp: TransportInstances<TcpConfig>,
+
+    /// Tor transport instances.
+    #[serde(default, skip_serializing_if = "is_transport_empty")]
+    pub tor: TransportInstances<TorConfig>,
+
+    /// BLE transport instances.
+    #[serde(default, skip_serializing_if = "is_transport_empty")]
+    pub ble: TransportInstances<BleConfig>,
+
+    /// RFCOMM serial transport instances.
+    #[serde(default, skip_serializing_if = "is_transport_empty")]
+    pub rfcomm: TransportInstances<RfcommConfig>,
+}
+
+/// Helper for skip_serializing_if on TransportInstances.
+fn is_transport_empty<T>(instances: &TransportInstances<T>) -> bool {
+    instances.is_empty()
+}
+
+impl TransportsConfig {
+    /// Check if any transports are configured.
+    pub fn is_empty(&self) -> bool {
+        self.udp.is_empty()
+            && self.ethernet.is_empty()
+            && self.tcp.is_empty()
+            && self.tor.is_empty()
+            && self.ble.is_empty()
+            && self.rfcomm.is_empty()
+    }
+
+    /// Merge another TransportsConfig into this one.
+    ///
+    /// Non-empty transport sections from `other` replace those in `self`.
+    pub fn merge(&mut self, other: TransportsConfig) {
+        if !other.udp.is_empty() {
+            self.udp = other.udp;
+        }
+        if !other.ethernet.is_empty() {
+            self.ethernet = other.ethernet;
+        }
+        if !other.tcp.is_empty() {
+            self.tcp = other.tcp;
+        }
+        if !other.tor.is_empty() {
+            self.tor = other.tor;
+        }
+        if !other.ble.is_empty() {
+            self.ble = other.ble;
+        }
+        if !other.rfcomm.is_empty() {
+            self.rfcomm = other.rfcomm;
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,73 +946,5 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert_eq!(config.mtu(), 2048);
         assert_eq!(config.max_connections(), 7);
-    }
-}
-
-// ============================================================================
-// TransportsConfig
-// ============================================================================
-
-/// Transports configuration section.
-///
-/// Each transport type can have either a single instance (config directly
-/// under the type name) or multiple named instances.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TransportsConfig {
-    /// UDP transport instances.
-    #[serde(default, skip_serializing_if = "is_transport_empty")]
-    pub udp: TransportInstances<UdpConfig>,
-
-    /// Ethernet transport instances.
-    #[serde(default, skip_serializing_if = "is_transport_empty")]
-    pub ethernet: TransportInstances<EthernetConfig>,
-
-    /// TCP transport instances.
-    #[serde(default, skip_serializing_if = "is_transport_empty")]
-    pub tcp: TransportInstances<TcpConfig>,
-
-    /// Tor transport instances.
-    #[serde(default, skip_serializing_if = "is_transport_empty")]
-    pub tor: TransportInstances<TorConfig>,
-
-    /// BLE transport instances.
-    #[serde(default, skip_serializing_if = "is_transport_empty")]
-    pub ble: TransportInstances<BleConfig>,
-}
-
-/// Helper for skip_serializing_if on TransportInstances.
-fn is_transport_empty<T>(instances: &TransportInstances<T>) -> bool {
-    instances.is_empty()
-}
-
-impl TransportsConfig {
-    /// Check if any transports are configured.
-    pub fn is_empty(&self) -> bool {
-        self.udp.is_empty()
-            && self.ethernet.is_empty()
-            && self.tcp.is_empty()
-            && self.tor.is_empty()
-            && self.ble.is_empty()
-    }
-
-    /// Merge another TransportsConfig into this one.
-    ///
-    /// Non-empty transport sections from `other` replace those in `self`.
-    pub fn merge(&mut self, other: TransportsConfig) {
-        if !other.udp.is_empty() {
-            self.udp = other.udp;
-        }
-        if !other.ethernet.is_empty() {
-            self.ethernet = other.ethernet;
-        }
-        if !other.tcp.is_empty() {
-            self.tcp = other.tcp;
-        }
-        if !other.tor.is_empty() {
-            self.tor = other.tor;
-        }
-        if !other.ble.is_empty() {
-            self.ble = other.ble;
-        }
     }
 }

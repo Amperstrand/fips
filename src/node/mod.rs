@@ -926,6 +926,38 @@ impl Node {
             }
         }
 
+        // Create RFCOMM transport instances
+        #[cfg(feature = "rfcomm")]
+        {
+            let rfcomm_instances: Vec<_> = self
+                .config
+                .transports
+                .rfcomm
+                .iter()
+                .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
+                .collect();
+
+            for (name, rfcomm_config) in rfcomm_instances {
+                let transport_id = self.allocate_transport_id();
+                let mut rfcomm = crate::transport::rfcomm::RfcommTransport::new(
+                    transport_id,
+                    name,
+                    rfcomm_config,
+                    packet_tx.clone(),
+                );
+                rfcomm.set_local_pubkey(self.identity.pubkey().serialize());
+                transports.push(TransportHandle::Rfcomm(rfcomm));
+            }
+        }
+
+        #[cfg(not(feature = "rfcomm"))]
+        if !self.config.transports.rfcomm.is_empty() {
+            tracing::warn!(
+                "RFCOMM transport configured in fips.yaml but this build lacks RFCOMM support — \
+                 build with --features rfcomm"
+            );
+        }
+
         transports
     }
 

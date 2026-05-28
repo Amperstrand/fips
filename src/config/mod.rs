@@ -39,8 +39,8 @@ pub use node::{
 };
 pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
 pub use transport::{
-    BleConfig, DirectoryServiceConfig, EthernetConfig, TcpConfig, TorConfig, TransportInstances,
-    TransportsConfig, UdpConfig,
+    BleConfig, DirectoryServiceConfig, EthernetConfig, RfcommConfig, RfcommPeerConfig, TcpConfig,
+    TorConfig, TransportInstances, TransportsConfig, UdpConfig,
 };
 
 /// Default config filename.

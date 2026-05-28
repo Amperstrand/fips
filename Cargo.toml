@@ -14,6 +14,7 @@ default = []
 # BLE transport on macOS via CoreBluetooth. Requires Xcode Command Line Tools.
 # Build with: cargo build --release --features ble-macos
 ble-macos = ["dep:bluest", "dep:objc2", "dep:objc2-core-bluetooth", "dep:objc2-foundation", "dep:dispatch2", "dep:uuid"]
+rfcomm = []
 
 [dependencies]
 ratatui = "0.30"
@@ -32,7 +33,7 @@ hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "net", "time", "process", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "net", "time", "process", "io-util", "fs"] }
 futures = "0.3"
 simple-dns = "0.11.2"
 socket2 = { version = "0.6.2", features = ["all"] }

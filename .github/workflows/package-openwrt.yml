@@ -92,6 +92,12 @@ jobs:
             rust_target: x86_64-unknown-linux-musl
             rust_channel: stable
             # x86 routers / VMs
+          - build_arch: arm
+            openwrt_arch: arm_cortex-a7_neon-vfpv4
+            rust_target: arm-unknown-linux-musleabihf
+            rust_channel: stable
+            extra_features: "rfcomm"
+            # 32-bit ARM Cortex-A7 (Asus Lyra, etc.)
 
     steps:
       - uses: actions/checkout@v4
@@ -198,7 +204,12 @@ jobs:
         env:
           PKG_VERSION: ${{ needs.determine-versioning.outputs.package_version }}
           LLVM_STRIP: llvm-strip
-        run: ./packaging/openwrt-ipk/build-ipk.sh --arch ${{ matrix.build_arch }}
+        run: |
+          BUILD_ARGS="--arch ${{ matrix.build_arch }}"
+          if [ -n "${{ matrix.extra_features }}" ]; then
+            BUILD_ARGS="$BUILD_ARGS --features ${{ matrix.extra_features }}"
+          fi
+          ./packaging/openwrt-ipk/build-ipk.sh $BUILD_ARGS
 
       - name: SHA-256 hashes
         run: |

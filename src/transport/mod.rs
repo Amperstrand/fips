@@ -14,8 +14,13 @@ pub mod ethernet;
 #[cfg(any(test, all(target_os = "linux", bluer_available), feature = "ble-macos"))]
 pub mod ble;
 
+#[cfg(feature = "rfcomm")]
+pub mod rfcomm;
+
 #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
 use ble::DefaultBleTransport;
+#[cfg(feature = "rfcomm")]
+use rfcomm::RfcommTransport;
 #[cfg(unix)]
 use ethernet::EthernetTransport;
 use secp256k1::XOnlyPublicKey;
@@ -886,6 +891,9 @@ pub enum TransportHandle {
     /// BLE L2CAP transport.
     #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
     Ble(DefaultBleTransport),
+    /// RFCOMM serial transport.
+    #[cfg(feature = "rfcomm")]
+    Rfcomm(RfcommTransport),
 }
 
 impl TransportHandle {
@@ -899,6 +907,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.start_async().await,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.start_async().await,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.start_async().await,
         }
     }
 
@@ -912,6 +922,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.stop_async().await,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.stop_async().await,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.stop_async().await,
         }
     }
 
@@ -925,6 +937,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.send_async(addr, data).await,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.send_async(addr, data).await,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.send_async(addr, data).await,
         }
     }
 
@@ -938,6 +952,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.transport_id(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.transport_id(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.transport_id(),
         }
     }
 
@@ -951,6 +967,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.name(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.name(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.name(),
         }
     }
 
@@ -964,6 +982,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.transport_type(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.transport_type(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.transport_type(),
         }
     }
 
@@ -977,6 +997,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.state(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.state(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.state(),
         }
     }
 
@@ -990,6 +1012,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.mtu(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.mtu(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.mtu(),
         }
     }
 
@@ -1006,6 +1030,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.link_mtu(addr),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.link_mtu(addr),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.link_mtu(addr),
         }
     }
 
@@ -1019,6 +1045,8 @@ impl TransportHandle {
             TransportHandle::Tor(_) => None,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(_) => None,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(_) => None,
         }
     }
 
@@ -1032,6 +1060,8 @@ impl TransportHandle {
             TransportHandle::Tor(_) => None,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(_) => None,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(_) => None,
         }
     }
 
@@ -1069,6 +1099,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.discover(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.discover(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.discover(),
         }
     }
 
@@ -1082,6 +1114,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.auto_connect(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.auto_connect(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.auto_connect(),
         }
     }
 
@@ -1095,6 +1129,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.accept_connections(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.accept_connections(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.accept_connections(),
         }
     }
 
@@ -1114,6 +1150,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.connect_async(addr).await,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.connect_async(addr).await,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.connect_async(addr).await,
         }
     }
 
@@ -1131,6 +1169,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.connection_state_sync(addr),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.connection_state_sync(addr),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.connection_state_sync(addr),
         }
     }
 
@@ -1147,6 +1187,8 @@ impl TransportHandle {
             TransportHandle::Tor(t) => t.close_connection_async(addr).await,
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.close_connection_async(addr).await,
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => t.close_connection_async(addr).await,
         }
     }
 
@@ -1169,6 +1211,8 @@ impl TransportHandle {
             TransportHandle::Tor(_) => TransportCongestion::default(),
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => t.congestion(),
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(_) => TransportCongestion::default(),
         }
     }
 
@@ -1246,6 +1290,10 @@ impl TransportHandle {
             }
             #[cfg(any(all(target_os = "linux", bluer_available), feature = "ble-macos"))]
             TransportHandle::Ble(t) => {
+                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
+            }
+            #[cfg(feature = "rfcomm")]
+            TransportHandle::Rfcomm(t) => {
                 serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
             }
         }

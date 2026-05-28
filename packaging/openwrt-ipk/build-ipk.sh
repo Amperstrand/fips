@@ -27,11 +27,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 ARCH="aarch64"
+FEATURES=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="$2"; shift 2 ;;
         --arch=*) ARCH="${1#*=}"; shift ;;
+        --features) FEATURES="$2"; shift 2 ;;
+        --features=*) FEATURES="${1#*=}"; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -58,7 +61,7 @@ case "$ARCH" in
         ;;
     arm)
         RUST_TARGET="arm-unknown-linux-musleabihf"
-        OPENWRT_ARCH="arm_cortex-a7"
+        OPENWRT_ARCH="arm_cortex-a7_neon-vfpv4"
         ;;
     x86_64)
         RUST_TARGET="x86_64-unknown-linux-musl"
@@ -106,13 +109,19 @@ fi
 
 echo "==> Compiling..."
 cd "$PROJECT_ROOT"
-cargo zigbuild \
-    --release \
-    --target "$RUST_TARGET" \
-    --bin fips \
-    --bin fipsctl \
-    --bin fipstop \
+CARGO_ARGS=(
+    zigbuild
+    --release
+    --target "$RUST_TARGET"
+    --bin fips
+    --bin fipsctl
+    --bin fipstop
     --bin fips-gateway
+)
+if [ -n "$FEATURES" ]; then
+    CARGO_ARGS+=(--features "$FEATURES")
+fi
+cargo "${CARGO_ARGS[@]}"
 
 RELEASE_DIR="$PROJECT_ROOT/target/$RUST_TARGET/release"
 
