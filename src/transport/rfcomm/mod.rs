@@ -867,7 +867,7 @@ async fn rfcomm_receive_loop(
         let mut w = writer.lock().await;
         match pubkey_exchange(&mut buf_reader, &mut *w, &pubkey).await {
             Ok(_peer_pubkey) => {
-                debug!(
+                info!(
                     transport_id = %transport_id,
                     remote_addr = %remote_addr,
                     "RFCOMM pubkey exchange complete"
@@ -885,6 +885,12 @@ async fn rfcomm_receive_loop(
         }
         drop(w);
     }
+
+    debug!(
+        transport_id = %transport_id,
+        remote_addr = %remote_addr,
+        "RFCOMM receive loop entering main read loop"
+    );
 
     loop {
         match read_framed_packet(&mut buf_reader).await {
