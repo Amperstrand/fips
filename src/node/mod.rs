@@ -1811,11 +1811,11 @@ impl Node {
         let dest_coords = match self.coord_cache.get_and_touch(dest_node_addr, now_ms) {
             Some(coords) => coords.clone(),
             None => {
-                // No cached coordinates — fall back to tree parent as default gateway.
-                // Root nodes (parent == self) have no gateway to fall back to.
-                let parent_id = self.tree_state.my_declaration().parent_id();
-                if parent_id != self.node_addr() {
-                    return self.peers.get(parent_id).filter(|p| p.can_send());
+                // No cached coordinates. If we have exactly one active peer
+                // (leaf node), use it as default gateway — there is no
+                // alternative path, so no routing loop is possible.
+                if self.peers.len() == 1 {
+                    return self.peers.values().next().filter(|p| p.can_send());
                 }
                 return None;
             }

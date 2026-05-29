@@ -212,9 +212,12 @@ fn test_routing_tree_no_coords_in_cache() {
     node.add_connection(conn).unwrap();
     node.promote_connection(link_id, id, 2000).unwrap();
 
-    // Destination not in bloom filters and not in coord cache
+    // Destination not in bloom filters and not in coord cache.
+    // Leaf node (1 peer) falls back to its only peer as default gateway.
     let dest = make_node_addr(99);
-    assert!(node.find_next_hop(&dest).is_none());
+    let result = node.find_next_hop(&dest);
+    assert!(result.is_some(), "Leaf node should fall back to its only peer");
+    assert_eq!(result.unwrap().node_addr(), id.node_addr());
 }
 
 // === Active routing refreshes coord_cache TTL ===
@@ -306,18 +309,29 @@ fn test_routing_discovery_coord_cache() {
     // Verify that find_next_hop() uses coord_cache entries populated by
     // discovery. initiate_lookup() populates coord_cache, and
     // find_next_hop() consults it.
+    //
+    // Uses 2 peers so the leaf-node fallback (peers.len() == 1) does
+    // not apply — we need to test the coord_cache path specifically.
     let mut node = make_node();
     let transport_id = TransportId::new(1);
     let my_addr = *node.node_addr();
 
-    // Create a peer
-    let link_id = LinkId::new(1);
-    let (conn, id) = make_completed_connection(&mut node, link_id, transport_id, 1000);
-    let peer_addr = *id.node_addr();
-    node.add_connection(conn).unwrap();
-    node.promote_connection(link_id, id, 2000).unwrap();
+    // Create first peer (the one with the bloom match)
+    let link_id1 = LinkId::new(1);
+    let (conn1, id1) = make_completed_connection(&mut node, link_id1, transport_id, 1000);
+    let peer_addr = *id1.node_addr();
+    node.add_connection(conn1).unwrap();
+    node.promote_connection(link_id1, id1, 2000).unwrap();
 
-    // Set up tree: we are root, peer is our child
+    // Create second peer (prevents leaf-node fallback)
+    let transport_id2 = TransportId::new(2);
+    let link_id2 = LinkId::new(2);
+    let (conn2, id2) = make_completed_connection(&mut node, link_id2, transport_id2, 1000);
+    let _peer2_addr = *id2.node_addr();
+    node.add_connection(conn2).unwrap();
+    node.promote_connection(link_id2, id2, 2001).unwrap();
+
+    // Set up tree: we are root, peer1 is our child
     let peer_coords = TreeCoordinate::from_addrs(vec![peer_addr, my_addr]).unwrap();
     node.tree_state_mut().update_peer(
         ParentDeclaration::new(peer_addr, my_addr, 1, 1000),
@@ -328,7 +342,7 @@ fn test_routing_discovery_coord_cache() {
     let dest = make_node_addr(99);
     let dest_coords = TreeCoordinate::from_addrs(vec![dest, peer_addr, my_addr]).unwrap();
 
-    // Put dest in peer's bloom filter so there's a candidate
+    // Put dest in peer1's bloom filter so there's a candidate
     let peer = node.get_peer_mut(&peer_addr).unwrap();
     let mut filter = BloomFilter::new();
     filter.insert(&dest);
@@ -341,7 +355,7 @@ fn test_routing_discovery_coord_cache() {
         .unwrap_or(0);
     assert!(node.coord_cache().get(&dest, now_ms).is_none());
 
-    // Without coord_cache entry, should return None
+    // Without coord_cache entry, should return None (2 peers, no leaf fallback)
     assert!(node.find_next_hop(&dest).is_none());
 
     // Now populate coord_cache (as discovery would do)
