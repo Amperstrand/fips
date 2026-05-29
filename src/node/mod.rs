@@ -1808,10 +1808,18 @@ impl Node {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let dest_coords = self
-            .coord_cache
-            .get_and_touch(dest_node_addr, now_ms)?
-            .clone();
+        let dest_coords = match self.coord_cache.get_and_touch(dest_node_addr, now_ms) {
+            Some(coords) => coords.clone(),
+            None => {
+                // No cached coordinates — fall back to tree parent as default gateway.
+                // Root nodes (parent == self) have no gateway to fall back to.
+                let parent_id = self.tree_state.my_declaration().parent_id();
+                if parent_id != self.node_addr() {
+                    return self.peers.get(parent_id).filter(|p| p.can_send());
+                }
+                return None;
+            }
+        };
 
         // 3. Bloom filter candidates — requires dest_coords for loop-free selection.
         //    If no candidate is strictly closer, fall through to tree routing.
