@@ -76,6 +76,12 @@ enum Commands {
         #[command(subcommand)]
         what: StatsCommands,
     },
+    /// Run benchmark tests against a peer
+    #[cfg(feature = "benchmark")]
+    Benchmark {
+        #[command(subcommand)]
+        what: BenchmarkCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -166,6 +172,47 @@ impl AclCommands {
             AclCommands::Show => "show_acl",
         }
     }
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Subcommand, Debug)]
+enum BenchmarkCommands {
+    /// Measure round-trip latency
+    Echo {
+        /// Peer identifier (npub or hostname)
+        #[arg(short, long)]
+        peer: String,
+        /// Number of echo requests to send
+        #[arg(short = 'n', long, default_value_t = 10)]
+        count: u32,
+        /// Payload size in bytes (0 for minimal)
+        #[arg(long, default_value_t = 0)]
+        payload_size: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure throughput
+    Throughput {
+        /// Peer identifier (npub or hostname)
+        #[arg(short, long)]
+        peer: String,
+        /// Direction: upload or download
+        #[arg(short, long, default_value = "upload")]
+        direction: String,
+        /// Test duration in seconds
+        #[arg(short = 'n', long, default_value_t = 5)]
+        duration: u8,
+        /// Frame size in bytes
+        #[arg(short, long, default_value_t = 256)]
+        frame_size: u16,
+        /// Target rate in bits per second
+        #[arg(short, long, default_value_t = 40000)]
+        rate: u32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn default_socket_path() -> PathBuf {
@@ -422,6 +469,12 @@ fn main() {
 
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
 
+    #[cfg(feature = "benchmark")]
+    if let Commands::Benchmark { what } = &cli.command {
+        handle_benchmark(&socket_path, what);
+        return;
+    }
+
     let request = match &cli.command {
         Commands::Show { what } => build_query(what.command_name()),
         Commands::Acl { what } => build_query(what.command_name()),
@@ -471,6 +524,8 @@ fn main() {
                 build_command("show_stats_history", params)
             }
         },
+        #[cfg(feature = "benchmark")]
+        Commands::Benchmark { .. } => unreachable!(),
         Commands::Keygen { .. } => unreachable!(),
     };
 
@@ -499,6 +554,208 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(feature = "benchmark")]
+fn handle_benchmark(socket_path: &Path, what: &BenchmarkCommands) {
+    match what {
+        BenchmarkCommands::Echo {
+            peer,
+            count,
+            payload_size,
+            json,
+        } => {
+            let npub = resolve_peer(peer);
+            let fire_cmd = build_command(
+                "benchmark_echo",
+                serde_json::json!({
+                    "npub": npub,
+                    "count": count,
+                    "payload_size": payload_size,
+                }),
+            );
+            match send_request(socket_path, &fire_cmd) {
+                Ok(value) => {
+                    let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if status == "error" {
+                        print_response(&value);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            let wait_secs = (*count as f64 * 0.15).ceil().max(1.0) as u64;
+            std::thread::sleep(Duration::from_secs(wait_secs));
+            let query_cmd = build_command("show_benchmark_echo_results", serde_json::json!({"npub": npub}));
+            match send_request(socket_path, &query_cmd) {
+                Ok(value) => {
+                    if *json {
+                        print_response(&value);
+                    } else {
+                        print_echo_results(&value);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        BenchmarkCommands::Throughput {
+            peer,
+            direction,
+            duration,
+            frame_size,
+            rate,
+            json,
+        } => {
+            let npub = resolve_peer(peer);
+            let fire_cmd = build_command(
+                "benchmark_throughput",
+                serde_json::json!({
+                    "npub": npub,
+                    "direction": direction,
+                    "duration": duration,
+                    "frame_size": frame_size,
+                    "rate": rate,
+                }),
+            );
+            match send_request(socket_path, &fire_cmd) {
+                Ok(value) => {
+                    let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if status == "error" {
+                        print_response(&value);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(*duration as u64 + 2));
+            let query_cmd = build_command(
+                "show_benchmark_throughput_results",
+                serde_json::json!({"npub": npub}),
+            );
+            match send_request(socket_path, &query_cmd) {
+                Ok(value) => {
+                    if *json {
+                        print_response(&value);
+                    } else {
+                        print_throughput_results(&value);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "benchmark")]
+fn print_echo_results(value: &serde_json::Value) {
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    if status == "error" {
+        let msg = value
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        eprintln!("error: {msg}");
+        std::process::exit(1);
+    }
+
+    let data = value.get("data").unwrap_or(value);
+    let result_status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+    if result_status == "pending" {
+        println!("Echo test still in progress, try again shortly.");
+        return;
+    }
+    if result_status == "no_test" {
+        println!("No echo test has been run for this peer.");
+        return;
+    }
+
+    let min = data.get("min_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let max = data.get("max_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mean = data.get("mean_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let median = data.get("median_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let p95 = data.get("p95_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let jitter = data.get("jitter_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let loss = data.get("loss_count").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let results = data
+        .get("results")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    println!("Echo Results: {results} samples");
+    println!(
+        "  min={:.2}ms  max={:.2}ms  mean={:.2}ms  median={:.2}ms",
+        min as f64 / 1000.0,
+        max as f64 / 1000.0,
+        mean as f64 / 1000.0,
+        median as f64 / 1000.0,
+    );
+    println!(
+        "  p95={:.2}ms  jitter={:.2}ms  lost={loss}",
+        p95 as f64 / 1000.0,
+        jitter as f64 / 1000.0,
+    );
+}
+
+#[cfg(feature = "benchmark")]
+fn print_throughput_results(value: &serde_json::Value) {
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    if status == "error" {
+        let msg = value
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        eprintln!("error: {msg}");
+        std::process::exit(1);
+    }
+
+    let data = value.get("data").unwrap_or(value);
+    let result_status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+    if result_status == "pending" {
+        println!("Throughput test still in progress, try again shortly.");
+        return;
+    }
+
+    let bps = data.get("achieved_bps").and_then(|v| v.as_u64()).unwrap_or(0);
+    let loss = data
+        .get("frame_loss_rate")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let bytes = data.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dur_us = data.get("duration_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let sent = data.get("frames_sent").and_then(|v| v.as_u64()).unwrap_or(0);
+    let recv = data.get("frames_recv").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let kbps = bps as f64 / 1000.0;
+    let dur_s = dur_us as f64 / 1_000_000.0;
+
+    println!("Throughput Results:");
+    println!("  {kbps:.2} kbps ({:.2} KB/s)", bps as f64 / 8000.0);
+    println!("  {sent} frames sent, {recv} received ({:.1}% loss)", loss * 100.0);
+    println!("  {bytes} bytes in {dur_s:.2}s");
 }
 
 /// Render the response as a Unicode block sparkline plot.

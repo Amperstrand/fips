@@ -25,11 +25,25 @@ pub mod pool;
 pub mod psm;
 pub mod stats;
 
-// The Android backend (radio in Kotlin, bytes over a bridge). Compiled on
-// Android, and under `cfg(test)` on any host so its channel logic is unit-tested
-// without a device. Not built into non-test desktop builds.
+#[cfg(feature = "ble-macos")]
+pub mod io_macos;
+#[cfg(feature = "ble-macos")]
+pub mod rate_limit;
+
 #[cfg(any(target_os = "android", test))]
 pub mod android_io;
+
+#[cfg(feature = "ble-macos")]
+trait Unpoison<T> {
+    fn unpoison(self) -> T;
+}
+
+#[cfg(feature = "ble-macos")]
+impl<T> Unpoison<T> for Result<T, std::sync::PoisonError<T>> {
+    fn unpoison(self) -> T {
+        self.unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 use super::{
     ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
@@ -66,8 +80,14 @@ pub type DefaultBleTransport = BleTransport<io::BluerIo>;
 #[cfg(all(target_os = "android", not(test)))]
 pub type DefaultBleTransport = BleTransport<android_io::AndroidIo>;
 
-// Everything else (macOS/musl/host) and all test builds: the in-memory mock.
-#[cfg(any(all(not(bluer_available), not(target_os = "android")), test))]
+#[cfg(all(target_os = "macos", feature = "ble-macos", not(test)))]
+pub type DefaultBleTransport = BleTransport<io_macos::BluestIo>;
+
+// Everything else (musl/host) and all test builds: the in-memory mock.
+#[cfg(any(
+    all(not(bluer_available), not(target_os = "android"), not(all(target_os = "macos", feature = "ble-macos"))),
+    test,
+))]
 pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
 
 // ============================================================================

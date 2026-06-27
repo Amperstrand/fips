@@ -568,6 +568,10 @@ pub struct Node {
     #[cfg(unix)]
     pub(crate) decrypt_fallback_tx:
         tokio::sync::mpsc::UnboundedSender<decrypt_worker::DecryptWorkerEvent>,
+
+    // === Benchmark ===
+    #[cfg(feature = "benchmark")]
+    benchmark: crate::benchmark::BenchmarkManager,
 }
 
 impl Node {
@@ -735,6 +739,8 @@ impl Node {
             decrypt_fallback_rx: Some(decrypt_fallback_rx),
             #[cfg(unix)]
             decrypt_fallback_tx,
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -894,6 +900,8 @@ impl Node {
             decrypt_fallback_rx: Some(decrypt_fallback_rx),
             #[cfg(unix)]
             decrypt_fallback_tx,
+            #[cfg(feature = "benchmark")]
+            benchmark: crate::benchmark::BenchmarkManager::new(),
         })
     }
 
@@ -2871,6 +2879,29 @@ impl Node {
         plaintext: &[u8],
     ) -> Result<(), NodeError> {
         self.send_encrypted_link_message_with_ce(node_addr, plaintext, false)
+            .await
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn benchmark_mut(&mut self) -> &mut crate::benchmark::BenchmarkManager {
+        &mut self.benchmark
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn benchmark(&self) -> &crate::benchmark::BenchmarkManager {
+        &self.benchmark
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub async fn api_send_benchmark_message(
+        &mut self,
+        node_addr: &NodeAddr,
+        msg_type: u8,
+        payload: &[u8],
+    ) -> Result<(), NodeError> {
+        let mut plaintext = vec![msg_type];
+        plaintext.extend_from_slice(payload);
+        self.send_encrypted_link_message(node_addr, &plaintext)
             .await
     }
 

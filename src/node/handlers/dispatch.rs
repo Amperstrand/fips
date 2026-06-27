@@ -58,8 +58,36 @@ impl Node {
                 // Heartbeat — no-op, last_recv_time already updated by record_recv()
                 trace!(peer = %self.peer_display_name(from), "Received heartbeat");
             }
+            #[cfg(feature = "benchmark")]
+            0xFF | 0xFE | 0xFD | 0xFC | 0xFB => {
+                self.benchmark_mut()
+                    .handle_link_message(from, msg_type, payload);
+            }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");
+            }
+        }
+
+        #[cfg(feature = "benchmark")]
+        {
+            if let Some((peer, frame)) = self.benchmark_mut().take_echo_response() {
+                let msg_type = frame[0];
+                let body = &frame[1..];
+                let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+            }
+            if let Some((peer, frame)) = self.benchmark_mut().take_throughput_report() {
+                let msg_type = frame[0];
+                let body = &frame[1..];
+                let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+            }
+            if let Some((peer, config)) = self.benchmark_mut().take_throughput_config() {
+                self.benchmark_mut().start_throughput_sends(
+                    peer,
+                    config.test_id,
+                    config.frame_size,
+                    config.rate_bps,
+                    config.duration_secs,
+                );
             }
         }
     }

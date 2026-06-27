@@ -36,6 +36,21 @@ pub trait BleStream: Send + Sync {
 
     /// Get the remote device address.
     fn remote_addr(&self) -> &BleAddr;
+
+    fn set_rate_bps(&self, _rate_bps: u64) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
+    fn send_urgent(
+        &self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
+        self.send(data)
+    }
+
+    fn supports_bidirectional_pubkey_exchange(&self) -> bool {
+        false
+    }
 }
 
 /// An acceptor that yields inbound L2CAP connections.
@@ -103,6 +118,153 @@ pub trait BleIo: Send + Sync + 'static {
 
     /// Get the adapter name (e.g., "hci0").
     fn adapter_name(&self) -> &str;
+
+    fn disconnect_device(
+        &self,
+        _addr: &BleAddr,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
+    fn discover_gatt_psm(
+        &self,
+        _addr: &BleAddr,
+    ) -> impl std::future::Future<Output = Result<u16, TransportError>> + Send {
+        async {
+            Err(TransportError::Io(std::io::Error::other(
+                "GATT PSM discovery not supported",
+            )))
+        }
+    }
+}
+
+// ============================================================================
+// Shared BLE Constants
+// ============================================================================
+
+#[cfg(feature = "ble-macos")]
+pub(super) const FIPS_SERVICE_UUID_RAW: u128 = 0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c;
+#[cfg(feature = "ble-macos")]
+pub(super) const FIPS_GATT_PSM_SERVICE_UUID_RAW: u128 =
+    0x0e2c_43b1_51b9_4667_a1d1_a95e_a79f_d19b;
+#[cfg(feature = "ble-macos")]
+pub(super) const FIPS_GATT_PSM_CHAR_UUID_RAW: u128 =
+    0x250c_88dd_3dff_4c41_83b2_f1b4_e3d8_20cc;
+
+#[cfg(feature = "ble-macos")]
+pub(super) const BLE_DEFAULT_QUEUE_DEPTH: usize = 32;
+
+#[cfg(feature = "ble-macos")]
+pub(super) const GATT_PSM_DISCOVER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+#[cfg(feature = "ble-macos")]
+pub(super) mod gatt_err {
+    use super::super::addr::BleAddr;
+
+    pub fn enum_services(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
+        format!(
+            "discover_gatt_psm: failed to enumerate services for {}: {}",
+            addr, e
+        )
+    }
+    pub fn service_not_found(addr: &BleAddr) -> String {
+        format!(
+            "discover_gatt_psm: FIPS GATT PSM service not found on {}",
+            addr
+        )
+    }
+    pub fn enum_chars(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
+        format!(
+            "discover_gatt_psm: failed to enumerate characteristics for {}: {}",
+            addr, e
+        )
+    }
+    pub fn char_not_found(addr: &BleAddr) -> String {
+        format!(
+            "discover_gatt_psm: PSM characteristic not found on {}",
+            addr
+        )
+    }
+    pub fn read_psm(addr: &BleAddr, e: &(impl std::fmt::Display + ?Sized)) -> String {
+        format!(
+            "discover_gatt_psm: failed to read PSM characteristic on {}: {}",
+            addr, e
+        )
+    }
+    pub fn timeout(addr: &BleAddr) -> String {
+        format!("discover_gatt_psm: timed out discovering PSM for {}", addr)
+    }
+}
+
+#[cfg(feature = "ble-macos")]
+pub(super) fn frame_payload(data: &[u8]) -> Result<Vec<u8>, TransportError> {
+    if data.len() > u16::MAX as usize - 2 {
+        return Err(TransportError::SendFailed(format!(
+            "payload too large for framing: {} bytes (max {})",
+            data.len(),
+            u16::MAX as usize - 2
+        )));
+    }
+    let framed_len = 2 + data.len();
+    let mut framed = Vec::with_capacity(framed_len);
+    framed.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    framed.extend_from_slice(data);
+    Ok(framed)
+}
+
+#[cfg(feature = "ble-macos")]
+pub(super) fn try_take_framed_payload(
+    recv_buf: &mut Vec<u8>,
+    buf: &mut [u8],
+    max_payload_len: usize,
+) -> Result<Option<usize>, TransportError> {
+    if recv_buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let payload_len = u16::from_be_bytes([recv_buf[0], recv_buf[1]]) as usize;
+    if payload_len > max_payload_len {
+        return Err(TransportError::RecvFailed(format!(
+            "BLE recv: invalid frame header {} exceeds max payload {}",
+            payload_len, max_payload_len
+        )));
+    }
+
+    if payload_len == 0 {
+        recv_buf.drain(..2);
+        return Err(TransportError::RecvFailed(
+            "BLE recv: framed message too short (0 bytes)".into(),
+        ));
+    }
+
+    if recv_buf.len() < 2 + payload_len {
+        return Ok(None);
+    }
+
+    let copy_len = payload_len.min(buf.len());
+    buf[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
+    recv_buf.drain(..2 + payload_len);
+    Ok(Some(copy_len))
+}
+
+#[cfg(feature = "ble-macos")]
+pub(super) fn parse_psm_value(value: &[u8], addr: &BleAddr) -> Result<u16, TransportError> {
+    if value.len() != 2 {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "discover_gatt_psm: expected 2-byte PSM value, got {} bytes from {}",
+            value.len(),
+            addr
+        ))));
+    }
+    let psm = u16::from_le_bytes([value[0], value[1]]);
+    if psm == 0 {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "discover_gatt_psm: invalid PSM value 0 from {}",
+            addr
+        ))));
+    }
+    Ok(psm)
 }
 
 // ============================================================================

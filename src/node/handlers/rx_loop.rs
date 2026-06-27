@@ -68,6 +68,14 @@ impl Node {
         let mut tick =
             tokio::time::interval(Duration::from_secs(self.config().node.tick_interval_secs));
 
+        // tokio::select! does not support cfg-gated arms, so the interval is
+        // always declared. Without the benchmark feature the tick fires daily
+        // and the arm body is empty.
+        #[cfg(feature = "benchmark")]
+        let mut benchmark_tick = tokio::time::interval(Duration::from_millis(25));
+        #[cfg(not(feature = "benchmark"))]
+        let mut benchmark_tick = tokio::time::interval(Duration::from_secs(86400));
+
         // Set up control socket channel
         let (control_tx, mut control_rx) =
             tokio::sync::mpsc::channel::<crate::control::ControlMessage>(32);
@@ -284,6 +292,21 @@ impl Node {
                     self.sample_transport_congestion();
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.activate_connected_udp_sessions().await;
+                }
+                _ = benchmark_tick.tick() => {
+                    #[cfg(feature = "benchmark")]
+                    {
+                        if let Some((peer, payload)) = self.benchmark_mut().poll_echo_sends() {
+                            let msg_type = payload[0];
+                            let body = &payload[1..];
+                            let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+                        }
+                        for (peer, payload) in self.benchmark_mut().poll_throughput_sends() {
+                            let msg_type = payload[0];
+                            let body = &payload[1..];
+                            let _ = self.api_send_benchmark_message(&peer, msg_type, body).await;
+                        }
+                    }
                 }
             }
         }
