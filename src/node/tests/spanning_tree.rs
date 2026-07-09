@@ -738,6 +738,15 @@ pub(super) async fn run_tree_test(
         );
     }
 
+    // Set all peers to Full forwarding for transit tests (TollGate default is LocalOnly)
+    for tn in &mut nodes {
+        let peer_addrs: Vec<NodeAddr> = tn.node.peers().map(|p| *p.node_addr()).collect();
+        for addr in peer_addrs {
+            if let Some(peer) = tn.node.get_peer_mut(&addr) {
+                peer.set_forwarding_policy(crate::peer::ForwardingPolicy::Full);
+            }
+        }
+    }
     nodes
 }
 
@@ -781,6 +790,15 @@ pub(super) async fn run_tree_test_with_mtus(
         );
     }
 
+    // Set all peers to Full forwarding for transit tests (TollGate default is LocalOnly)
+    for tn in &mut nodes {
+        let peer_addrs: Vec<NodeAddr> = tn.node.peers().map(|p| *p.node_addr()).collect();
+        for addr in peer_addrs {
+            if let Some(peer) = tn.node.get_peer_mut(&addr) {
+                peer.set_forwarding_policy(crate::peer::ForwardingPolicy::Full);
+            }
+        }
+    }
     nodes
 }
 
