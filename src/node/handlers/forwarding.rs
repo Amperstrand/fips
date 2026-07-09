@@ -78,7 +78,21 @@ impl Node {
         let mut datagram = datagram_ref.into_owned();
         datagram.ttl = forwarded_ttl;
 
-        // Find next hop toward destination
+        if let Some(src_peer) = self.peers.get(&datagram.src_addr) {
+            if !src_peer.forwarding_policy().allows_transit() {
+                self.metrics()
+                    .forwarding
+                    .record_reject_bytes(ForwardingReject::NoRoute, payload.len());
+                debug!(
+                    src = %self.peer_display_name(&datagram.src_addr),
+                    dest = %self.peer_display_name(&datagram.dest_addr),
+                    policy = %src_peer.forwarding_policy(),
+                    "Dropping transit: source has local_only policy"
+                );
+                return;
+            }
+        }
+
         let next_hop_addr = match self.find_next_hop(&datagram.dest_addr) {
             Some(peer) => *peer.node_addr(),
             None => {

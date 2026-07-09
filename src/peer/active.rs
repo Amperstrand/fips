@@ -16,6 +16,28 @@ use secp256k1::XOnlyPublicKey;
 use std::fmt;
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForwardingPolicy {
+    #[default]
+    LocalOnly,
+    Full,
+}
+
+impl ForwardingPolicy {
+    pub fn allows_transit(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+impl fmt::Display for ForwardingPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalOnly => write!(f, "local_only"),
+            Self::Full => write!(f, "full"),
+        }
+    }
+}
+
 /// Draw a fresh per-session rekey jitter from `[-REKEY_JITTER_SECS, +REKEY_JITTER_SECS]`.
 fn draw_rekey_jitter() -> i64 {
     rand::rng().random_range(-REKEY_JITTER_SECS..=REKEY_JITTER_SECS)
@@ -214,6 +236,9 @@ pub struct ActivePeer {
     /// buffer fills. Drop signals shutdown via self-pipe.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     peer_recv_drain: Option<crate::transport::udp::peer_drain::PeerRecvDrain>,
+
+    // === TollGate Forwarding Policy ===
+    forwarding_policy: ForwardingPolicy,
 }
 
 impl ActivePeer {
@@ -271,6 +296,7 @@ impl ActivePeer {
             connected_udp: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             peer_recv_drain: None,
+            forwarding_policy: ForwardingPolicy::default(),
         }
     }
 
@@ -357,10 +383,9 @@ impl ActivePeer {
             connected_udp: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             peer_recv_drain: None,
+            forwarding_policy: ForwardingPolicy::default(),
         }
     }
-
-    // === Connected-UDP fast path ===
 
     /// Refcount the per-peer `connect()`-ed UDP socket if installed.
     /// Encrypt-worker send path uses this to bypass the wildcard
@@ -712,6 +737,22 @@ impl ActivePeer {
     /// When this peer was last seen.
     pub fn last_seen(&self) -> u64 {
         self.last_seen
+    }
+
+    pub fn forwarding_policy(&self) -> ForwardingPolicy {
+        self.forwarding_policy
+    }
+
+    pub fn set_forwarding_policy(&mut self, policy: ForwardingPolicy) {
+        if self.forwarding_policy != policy {
+            tracing::info!(
+                peer = %self.npub(),
+                old = %self.forwarding_policy,
+                new = %policy,
+                "forwarding policy changed"
+            );
+            self.forwarding_policy = policy;
+        }
     }
 
     /// Time since last activity.

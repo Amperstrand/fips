@@ -5,14 +5,15 @@
 
 use super::protocol::Response;
 use crate::node::Node;
+use crate::peer::ForwardingPolicy;
 use serde_json::Value;
 use tracing::debug;
 
-/// Dispatch a mutating command to the appropriate handler.
 pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) -> Response {
     match command {
         "connect" => connect(node, params).await,
         "disconnect" => disconnect(node, params).await,
+        "set_peer_policy" => set_peer_policy(node, params).await,
         #[cfg(feature = "benchmark")]
         "benchmark_echo" => benchmark_echo(node, params).await,
         #[cfg(feature = "benchmark")]
@@ -72,6 +73,42 @@ async fn disconnect(node: &mut Node, params: Option<&Value>) -> Response {
     match node.api_disconnect(npub).await {
         Ok(data) => Response::ok(data),
         Err(msg) => Response::error(msg),
+    }
+}
+
+async fn set_peer_policy(node: &mut Node, params: Option<&Value>) -> Response {
+    let Some(params) = params else {
+        return Response::error("missing params for set_peer_policy");
+    };
+    let npub = match params.get("npub").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return Response::error("missing 'npub' parameter"),
+    };
+    let policy_str = match params.get("policy").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return Response::error("missing 'policy' parameter (expected 'full' or 'local_only')"),
+    };
+    let policy = match policy_str {
+        "full" => ForwardingPolicy::Full,
+        "local_only" => ForwardingPolicy::LocalOnly,
+        _ => return Response::error(format!("invalid policy '{policy_str}': expected 'full' or 'local_only'")),
+    };
+    let peer_identity = match crate::identity::PeerIdentity::from_npub(npub) {
+        Ok(id) => id,
+        Err(e) => return Response::error(format!("invalid npub: {e}")),
+    };
+    let node_addr = *peer_identity.node_addr();
+    match node.get_peer_mut(&node_addr) {
+        Some(peer) => {
+            let old: ForwardingPolicy = peer.forwarding_policy();
+            peer.set_forwarding_policy(policy);
+            Response::ok(serde_json::json!({
+                "npub": npub,
+                "old_policy": format!("{}", old),
+                "new_policy": format!("{}", policy),
+            }))
+        }
+        None => Response::error(format!("peer {npub} not found or not authenticated")),
     }
 }
 

@@ -268,6 +268,7 @@ pub fn show_peers(node: &Node) -> Value {
                 "display_name": node.peer_display_name(&node_addr),
                 "ipv6_addr": format!("{}", peer.address()),
                 "connectivity": format!("{}", peer.connectivity()),
+                "forwarding_policy": format!("{}", peer.forwarding_policy()),
                 "link_id": peer.link_id().as_u64(),
                 "authenticated_at_ms": peer.authenticated_at(),
                 "last_seen_ms": peer.last_seen(),
