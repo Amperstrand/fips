@@ -1,0 +1,32 @@
+# Test D: Performance run (iperf3 via TUN)
+#
+# Purpose: Measure sustained BLE throughput.
+#          Log level info to reduce overhead.
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /tmp/fips-control.sock
+  log_level: trace
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "default"
+    mtu: 512
+    accept_connections: true
+    auto_connect: true
+    scan: true
+    advertise: true
+    send_rate_bps: 0
+    probe_cooldown_secs: 10

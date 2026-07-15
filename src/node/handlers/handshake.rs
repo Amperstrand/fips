@@ -1041,14 +1041,7 @@ impl Node {
                 })
             }
         } else {
-            // No existing promoted peer. There may be a pending outbound
-            // connection to the same peer (cross-connection in progress).
-            // Do NOT clean it up yet — we need the outbound to stay alive
-            // so that when the peer's msg2 arrives, we can learn the peer's
-            // inbound session index and update their_index on the promoted
-            // peer. The outbound will be cleaned up in handle_msg2 or by
-            // the 30s handshake timeout.
-            let pending_to_same_peer: Vec<LinkId> = self
+            let mut pending_to_same_peer: Vec<LinkId> = self
                 .connections
                 .iter()
                 .filter(|(_, conn)| {
@@ -1057,6 +1050,36 @@ impl Node {
                         .unwrap_or(false)
                 })
                 .map(|(lid, _)| *lid)
+                .collect();
+
+            pending_to_same_peer.extend(
+                self.pending_connects
+                    .iter()
+                    .filter(|pending| *pending.peer_identity.node_addr() == peer_node_addr)
+                    .map(|pending| pending.link_id),
+            );
+
+            let pending_to_same_peer: Vec<LinkId> = pending_to_same_peer
+                .into_iter()
+                .filter(|pending_link_id| {
+                    let keep_pending = cross_connection_winner(
+                        self.identity.node_addr(),
+                        &peer_node_addr,
+                        true,
+                    );
+
+                    if !keep_pending {
+                        self.cleanup_pending_handshake_link(*pending_link_id);
+                        debug!(
+                            peer = %self.peer_display_name(&peer_node_addr),
+                            pending_link_id = %pending_link_id,
+                            promoted_link_id = %link_id,
+                            "Cleaned up losing pending outbound after inbound promotion"
+                        );
+                    }
+
+                    keep_pending
+                })
                 .collect();
 
             for pending_link_id in &pending_to_same_peer {

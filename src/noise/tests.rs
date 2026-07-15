@@ -17,6 +17,10 @@ fn generate_epoch() -> [u8; 8] {
     epoch
 }
 
+fn parse_debug_record(line: &str) -> IkDebugRecord {
+    IkDebugRecord::from_json_line(line).expect("valid IK debug record")
+}
+
 #[test]
 fn test_full_handshake() {
     let initiator_keypair = generate_keypair();
@@ -254,6 +258,54 @@ fn test_responder_identity_discovery() {
     assert_eq!(discovered_initiator, &initiator_keypair.public_key());
 
     // The discovered key can be used to look up peer config, verify against allow-list, etc.
+}
+
+#[test]
+fn test_reconstruct_ik_session_from_debug_record_responder_msg2() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    set_ik_debug_ephemeral_key_log_path(Some(temp.path().to_path_buf()));
+
+    let initiator_keypair = generate_keypair();
+    let responder_keypair = generate_keypair();
+    let initiator_epoch = generate_epoch();
+    let responder_epoch = generate_epoch();
+
+    let mut initiator =
+        HandshakeState::new_initiator(initiator_keypair, responder_keypair.public_key());
+    initiator.set_local_epoch(initiator_epoch);
+    let mut responder = HandshakeState::new_responder(responder_keypair);
+    responder.set_local_epoch(responder_epoch);
+
+    let msg1 = initiator.write_message_1().unwrap();
+    responder.read_message_1(&msg1).unwrap();
+    let msg2 = responder.write_message_2().unwrap();
+    let debug_log = std::fs::read_to_string(temp.path()).unwrap();
+    let responder_debug_line = debug_log
+        .lines()
+        .find(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value.get("event").and_then(|v| v.as_str()) == Some("ik_msg2_write")
+        })
+        .unwrap();
+    let responder_debug = parse_debug_record(responder_debug_line);
+
+    initiator.read_message_2(&msg2).unwrap();
+    set_ik_debug_ephemeral_key_log_path(None);
+
+    let mut initiator_session = initiator.into_session().unwrap();
+    let mut responder_session = responder.into_session().unwrap();
+    let mut reconstructed =
+        HandshakeState::reconstruct_ik_session_from_debug(responder_keypair, &responder_debug)
+            .unwrap();
+
+    let plaintext = b"decrypt-me";
+    let ciphertext = initiator_session.encrypt(plaintext).unwrap();
+
+    let direct = responder_session.decrypt(&ciphertext).unwrap();
+    let rebuilt = reconstructed.decrypt(&ciphertext).unwrap();
+
+    assert_eq!(direct, plaintext);
+    assert_eq!(rebuilt, plaintext);
 }
 
 // ===== ReplayWindow Tests =====

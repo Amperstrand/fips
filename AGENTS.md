@@ -37,6 +37,14 @@ See `.sisyphus/notepad/ble-framing-architecture.md` for the full history.
 4. **Upstream (`jmcorgan/master`) does NOT use framing.** This branch is
    wire-incompatible with upstream. Acceptable — upstream BLE was not in production.
 
+## GitHub Conventions
+
+- **Issues**: Always create on `Amperstrand/fips`, NEVER on `jmcorgan/fips` (upstream).
+- **Comments**: Same rule — only comment on `Amperstrand/fips` or the user's own repos.
+- **PRs**: Target `jmcorgan/fips` only when explicitly asked to upstream a change.
+- **Push**: `origin` is `Amperstrand/fips`. Upstream remote is `jmcorgan/fips`.
+- When using `gh` commands, always pass `--repo Amperstrand/fips` unless upstreaming.
+
 ## Branch: linux-ble-stability-v2
 
 Based on `jmcorgan/master` (merged at `0442117`) with BLE stability fixes and
@@ -49,10 +57,13 @@ packaging, bloom filter routing fix, MMP interval tuning, rustfmt, toolchain
 - `BleConnection.is_static`: Always set to `false` — unimplemented
 - Leaf proxy commits (15+): Experimental feature, separate from BLE fixes
 - Wire-incompatible with upstream (we use 2-byte prefix, upstream doesn't)
+- xHCI controller death after `systemctl restart bluetooth` (Amperstrand/fips#63)
+- CoreBluetooth peripheral mode rejects SMP pairing (Amperstrand/fips#64)
+- GATT-first connect sometimes aborts on first attempt (Amperstrand/fips#65)
 
 ### PR Planning
 
-See GitHub issue #39 for the recommended PR split. Key point: BLE fixes should
+See GitHub issue Amperstrand/fips#39 for the recommended PR split. Key point: BLE fixes should
 be separate from leaf proxy feature.
 
 ## Linux Node Operations
@@ -76,7 +87,9 @@ be separate from leaf proxy feature.
 ## macOS Node Operations
 
 - macOS FIPS is managed by the user (launchd or manual). Do not attempt to start/stop remotely.
-- macOS BLE is central-only (CoreBluetooth limitation) — cannot accept inbound L2CAP.
+- macOS BLE supports both central and peripheral roles on this branch.
+- macOS BLE peripheral mode works but requires unencrypted L2CAP + dedicated NSRunLoop thread + dynamic PSM discovery via GATT (Amperstrand/fips#64).
+- Mac restart script: `sudo bash /tmp/fips-mac.sh`
 
 ## ESP32-S3 Known Limitations
 
@@ -84,4 +97,4 @@ be separate from leaf proxy feature.
 - FilterAnnounce (1071 bytes wire) exceeds ESP32 MTU — FMP has no fragmentation
 - Bloom filter MTU skip fix deployed (`9b86483`) — ESP32 receives data but
   `their_index=00000000` (firmware never sends data back)
-- See GitHub issue #43 for ESP32 firmware action items
+- See GitHub issue Amperstrand/fips#66 for ESP32 firmware action items

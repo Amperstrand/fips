@@ -81,6 +81,23 @@ impl Node {
         self.remove_link(&link_id);
     }
 
+    pub(in crate::node) fn cleanup_pending_handshake_link(&mut self, link_id: LinkId) {
+        if self.connections.contains_key(&link_id) {
+            self.cleanup_stale_connection(link_id, 0);
+            return;
+        }
+
+        if let Some(pos) = self
+            .pending_connects
+            .iter()
+            .position(|pending| pending.link_id == link_id)
+        {
+            self.pending_connects.remove(pos);
+        }
+
+        self.remove_link(&link_id);
+    }
+
     /// Resend handshake messages for pending connections.
     ///
     /// For outbound connections in SentMsg1 state, resends the stored msg1

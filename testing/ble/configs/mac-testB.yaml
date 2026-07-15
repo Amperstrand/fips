@@ -1,0 +1,40 @@
+# Test B: macOS outbound → Linux inbound (Mac central, Linux peripheral)
+#
+# Purpose: Prove Mac can initiate outbound L2CAP to Linux.
+#          This is the "original" direction that should already work.
+#
+# Mac: central-only (scan, no accept)
+# Linux: full dual-role (accept_connections)
+#
+# Expected: Mac scans, finds Linux, GATT PSM discovery on Linux fails
+#           (Linux has no GATT PSM service), falls back to 0x0085,
+#           L2CAP connect succeeds.
+
+node:
+  identity:
+    persistent: true
+  control:
+    enabled: true
+    socket_path: /tmp/fips-control.sock
+  log_level: debug
+
+tun:
+  enabled: true
+  mtu: 1280
+
+dns:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  port: 5354
+
+transports:
+  ble:
+    adapter: "default"
+    mtu: 512
+    accept_connections: false
+    auto_connect: true
+    scan: true
+    advertise: false
+    send_rate_bps: 0
+    debug_ephemeral_key_log_path: "/tmp/fips-ik-ephemeral-testB.jsonl"
+    probe_cooldown_secs: 10

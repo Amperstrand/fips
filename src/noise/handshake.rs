@@ -172,6 +172,121 @@ pub struct HandshakeState {
     remote_epoch: Option<[u8; 8]>,
 }
 
+#[derive(Clone, Debug)]
+pub struct IkDebugRecord {
+    pub role: HandshakeRole,
+    pub local_static_pubkey: PublicKey,
+    pub remote_static_pubkey: Option<PublicKey>,
+    pub local_ephemeral_pubkey: PublicKey,
+    pub local_ephemeral_privkey: SecretKey,
+    pub remote_ephemeral_pubkey: Option<PublicKey>,
+    pub local_epoch: Option<[u8; EPOCH_SIZE]>,
+    pub remote_epoch: Option<[u8; EPOCH_SIZE]>,
+    pub handshake_hash: [u8; 32],
+}
+
+impl IkDebugRecord {
+    pub fn from_json_line(line: &str) -> Result<Self, NoiseError> {
+        #[derive(serde::Deserialize)]
+        struct RawIkDebugRecord {
+            role: String,
+            local_static_pubkey: String,
+            remote_static_pubkey: Option<String>,
+            local_ephemeral_pubkey: String,
+            local_ephemeral_privkey: String,
+            remote_ephemeral_pubkey: Option<String>,
+            local_epoch: Option<String>,
+            remote_epoch: Option<String>,
+            handshake_hash: String,
+        }
+
+        fn parse_pubkey(hex_str: &str) -> Result<PublicKey, NoiseError> {
+            let bytes = hex::decode(hex_str).map_err(|_| NoiseError::InvalidPublicKey)?;
+            PublicKey::from_slice(&bytes).map_err(|_| NoiseError::InvalidPublicKey)
+        }
+
+        fn parse_secret_key(hex_str: &str) -> Result<SecretKey, NoiseError> {
+            let bytes = hex::decode(hex_str).map_err(|_| NoiseError::InvalidPublicKey)?;
+            SecretKey::from_slice(&bytes).map_err(NoiseError::Secp256k1)
+        }
+
+        fn parse_epoch(hex_str: Option<String>) -> Result<Option<[u8; EPOCH_SIZE]>, NoiseError> {
+            let Some(hex_str) = hex_str else {
+                return Ok(None);
+            };
+            let bytes = hex::decode(hex_str).map_err(|_| NoiseError::MessageTooShort {
+                expected: EPOCH_SIZE,
+                got: 0,
+            })?;
+            if bytes.len() != EPOCH_SIZE {
+                return Err(NoiseError::MessageTooShort {
+                    expected: EPOCH_SIZE,
+                    got: bytes.len(),
+                });
+            }
+            let mut epoch = [0u8; EPOCH_SIZE];
+            epoch.copy_from_slice(&bytes);
+            Ok(Some(epoch))
+        }
+
+        let raw: RawIkDebugRecord =
+            serde_json::from_str(line).map_err(|_| NoiseError::MessageTooShort {
+                expected: 1,
+                got: 0,
+            })?;
+
+        let role = match raw.role.as_str() {
+            "initiator" => HandshakeRole::Initiator,
+            "responder" => HandshakeRole::Responder,
+            _ => {
+                return Err(NoiseError::WrongState {
+                    expected: "initiator|responder".to_string(),
+                    got: raw.role,
+                });
+            }
+        };
+
+        let handshake_hash_bytes =
+            hex::decode(raw.handshake_hash).map_err(|_| NoiseError::MessageTooShort {
+                expected: 32,
+                got: 0,
+            })?;
+        if handshake_hash_bytes.len() != 32 {
+            return Err(NoiseError::MessageTooShort {
+                expected: 32,
+                got: handshake_hash_bytes.len(),
+            });
+        }
+        let mut handshake_hash = [0u8; 32];
+        handshake_hash.copy_from_slice(&handshake_hash_bytes);
+
+        Ok(Self {
+            role,
+            local_static_pubkey: parse_pubkey(&raw.local_static_pubkey)?,
+            remote_static_pubkey: raw
+                .remote_static_pubkey
+                .as_deref()
+                .map(parse_pubkey)
+                .transpose()?,
+            local_ephemeral_pubkey: parse_pubkey(&raw.local_ephemeral_pubkey)?,
+            local_ephemeral_privkey: parse_secret_key(&raw.local_ephemeral_privkey)?,
+            remote_ephemeral_pubkey: raw
+                .remote_ephemeral_pubkey
+                .as_deref()
+                .map(parse_pubkey)
+                .transpose()?,
+            local_epoch: parse_epoch(raw.local_epoch)?,
+            remote_epoch: parse_epoch(raw.remote_epoch)?,
+            handshake_hash,
+        })
+    }
+
+    pub fn event_from_json_line(line: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        value.get("event")?.as_str().map(str::to_string)
+    }
+}
+
 impl HandshakeState {
     fn maybe_dump_ik_ephemeral_key(
         &self,
@@ -962,6 +1077,91 @@ impl HandshakeState {
     /// Get the handshake hash (for channel binding, available after complete).
     pub fn handshake_hash(&self) -> [u8; 32] {
         self.symmetric.handshake_hash()
+    }
+
+    pub fn reconstruct_ik_session_from_debug(
+        local_static_keypair: Keypair,
+        debug_record: &IkDebugRecord,
+    ) -> Result<NoiseSession, NoiseError> {
+        let secp = Secp256k1::new();
+        let local_ephemeral =
+            Keypair::from_secret_key(&secp, &debug_record.local_ephemeral_privkey);
+
+        let mut state = match debug_record.role {
+            HandshakeRole::Initiator => HandshakeState::new_initiator(
+                local_static_keypair,
+                debug_record
+                    .remote_static_pubkey
+                    .ok_or(NoiseError::InvalidPublicKey)?,
+            ),
+            HandshakeRole::Responder => HandshakeState::new_responder(local_static_keypair),
+        };
+
+        let remote_static = debug_record
+            .remote_static_pubkey
+            .ok_or(NoiseError::InvalidPublicKey)?;
+        let remote_ephemeral = debug_record
+            .remote_ephemeral_pubkey
+            .ok_or(NoiseError::InvalidPublicKey)?;
+
+        state.ephemeral_keypair = Some(local_ephemeral);
+        state.remote_static = Some(remote_static);
+        state.remote_ephemeral = Some(remote_ephemeral);
+
+        match debug_record.role {
+            HandshakeRole::Initiator => {
+                let es = state.ecdh(
+                    &state.ephemeral_keypair.as_ref().unwrap().secret_key(),
+                    &remote_static,
+                );
+                state.symmetric.mix_key(&es);
+
+                let ss = state.ecdh(&state.static_keypair.secret_key(), &remote_static);
+                state.symmetric.mix_key(&ss);
+
+                let ee = state.ecdh(
+                    &state.ephemeral_keypair.as_ref().unwrap().secret_key(),
+                    &remote_ephemeral,
+                );
+                state.symmetric.mix_key(&ee);
+
+                let se = state.ecdh(
+                    &state.ephemeral_keypair.as_ref().unwrap().secret_key(),
+                    &remote_static,
+                );
+                state.symmetric.mix_key(&se);
+            }
+            HandshakeRole::Responder => {
+                let es = state.ecdh(&state.static_keypair.secret_key(), &remote_ephemeral);
+                state.symmetric.mix_key(&es);
+
+                let ss = state.ecdh(&state.static_keypair.secret_key(), &remote_static);
+                state.symmetric.mix_key(&ss);
+
+                let ee = state.ecdh(
+                    &state.ephemeral_keypair.as_ref().unwrap().secret_key(),
+                    &remote_ephemeral,
+                );
+                state.symmetric.mix_key(&ee);
+
+                let se = state.ecdh(&state.static_keypair.secret_key(), &remote_ephemeral);
+                state.symmetric.mix_key(&se);
+            }
+        }
+
+        let (c1, c2) = state.symmetric.split();
+        let (send_cipher, recv_cipher) = match debug_record.role {
+            HandshakeRole::Initiator => (c1, c2),
+            HandshakeRole::Responder => (c2, c1),
+        };
+
+        Ok(NoiseSession::from_handshake(
+            debug_record.role,
+            send_cipher,
+            recv_cipher,
+            debug_record.handshake_hash,
+            remote_static,
+        ))
     }
 }
 

@@ -529,6 +529,12 @@ const DEFAULT_BLE_CONNECT_TIMEOUT_MS: u64 = 10_000;
 /// (success or failure), wait this long before probing it again.
 const DEFAULT_BLE_PROBE_COOLDOWN_SECS: u64 = 30;
 
+/// Default BLE receive timeout in seconds.
+///
+/// Must leave enough slack above normal heartbeat cadence so quiet but healthy
+/// links are not dropped spuriously.
+const DEFAULT_BLE_RECV_TIMEOUT_SECS: u64 = 45;
+
 /// BLE transport instance configuration.
 ///
 /// BleConfig is always compiled (for config parsing on any platform),
@@ -576,6 +582,11 @@ pub struct BleConfig {
     /// this long before probing the same address again. Default: 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_cooldown_secs: Option<u64>,
+
+    /// Maximum time to wait for a BLE frame before declaring the link dead.
+    /// Default: 45.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_timeout_secs: Option<u64>,
 
     /// Send rate limit in bits per second. 0 = unlimited. Default: 150_000 (150 Kbps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -659,6 +670,12 @@ impl BleConfig {
     pub fn probe_cooldown_secs(&self) -> u64 {
         self.probe_cooldown_secs
             .unwrap_or(DEFAULT_BLE_PROBE_COOLDOWN_SECS)
+    }
+
+    /// Get the BLE receive timeout in seconds. Default: 45.
+    pub fn recv_timeout_secs(&self) -> u64 {
+        self.recv_timeout_secs
+            .unwrap_or(DEFAULT_BLE_RECV_TIMEOUT_SECS)
     }
 
     /// Get the send rate limit in bits per second. Default: 150_000.
@@ -769,5 +786,21 @@ mod tests {
             config.debug_ephemeral_key_log_path(),
             Some("/tmp/fips-ik-ephemeral.jsonl")
         );
+    }
+
+    #[test]
+    fn ble_recv_timeout_secs_defaults_to_45() {
+        let config = BleConfig::default();
+        assert_eq!(config.recv_timeout_secs(), 45);
+    }
+
+    #[test]
+    fn ble_recv_timeout_secs_returns_configured_value() {
+        let config = BleConfig {
+            recv_timeout_secs: Some(90),
+            ..Default::default()
+        };
+
+        assert_eq!(config.recv_timeout_secs(), 90);
     }
 }

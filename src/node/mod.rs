@@ -15,7 +15,7 @@ mod rate_limit;
 mod routing_error_rate_limit;
 pub(crate) mod session;
 pub(crate) mod session_wire;
-pub(crate) mod wire;
+pub mod wire;
 pub(crate) mod stats;
 mod tree;
 #[cfg(test)]
@@ -877,6 +877,7 @@ impl Node {
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
                 let accept_connections = ble_config.accept_connections();
+                let scan_enabled = ble_config.scan();
                 match crate::transport::ble::io::BluestIo::new(&adapter, mtu, ble_config.send_rate_bps(), ble_config.send_burst_bytes()).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
@@ -891,6 +892,10 @@ impl Node {
                         if !accept_connections {
                             ble.set_local_capabilities(
                                 crate::transport::ble::PeerCapabilities::central_only(),
+                            );
+                        } else if !scan_enabled {
+                            ble.set_local_capabilities(
+                                crate::transport::ble::PeerCapabilities::peripheral_only(),
                             );
                         } else {
                             ble.set_local_capabilities(
@@ -1142,11 +1147,22 @@ impl Node {
     /// Get the transport MTU for a specific transport.
     ///
     /// When called without a specific transport context, returns the MTU
-    /// of the first operational transport, or 1280 (IPv6 minimum) as
-    /// fallback. This is used for initial TUN configuration where a
-    /// specific transport isn't yet known.
+    /// of the smallest sendable connected link when available, otherwise the
+    /// first operational transport, or 1280 (IPv6 minimum) as fallback. This
+    /// is used for TUN-side PMTU checks when a specific transport isn't yet
+    /// known.
     pub fn transport_mtu(&self) -> u16 {
-        // Prefer the MTU from the first operational transport
+        let connected_link_mtu = self.links.values()
+            .filter(|link| link.state().is_operational())
+            .filter_map(|link| {
+                let transport = self.transports.get(&link.transport_id())?;
+                Some(transport.link_mtu(link.remote_addr()))
+            })
+            .min();
+
+        if let Some(mtu) = connected_link_mtu {
+            return mtu;
+        }
         for handle in self.transports.values() {
             if handle.is_operational() {
                 return handle.mtu();
