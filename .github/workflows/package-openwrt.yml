@@ -241,7 +241,7 @@ jobs:
           set -euo pipefail
           BUILD_STD=""
           case "$RUST_CHANNEL" in
-            nightly) export RUSTUP_TOOLCHAIN=nightly; BUILD_STD="-Z build-std=core,alloc,std" ;;
+            nightly) export RUSTUP_TOOLCHAIN=nightly; BUILD_STD="-Z build-std=core,alloc,std"; export RUSTFLAGS="-C link-arg=-msoft-float -C target-feature=-crt-static" ;;
           esac
           cargo zigbuild $BUILD_STD --release --target "$RUST_TARGET" \
             --bin fips --bin fipsctl --bin fipstop --bin fips-gateway
