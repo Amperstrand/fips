@@ -239,6 +239,7 @@ jobs:
           RUST_CHANNEL: ${{ matrix.rust_channel }}
         run: |
           set -euo pipefail
+          rustup default "$RUST_CHANNEL"
           BUILD_STD=""
           case "$RUST_CHANNEL" in
             nightly) BUILD_STD="-Z build-std=core,alloc,std" ;;
