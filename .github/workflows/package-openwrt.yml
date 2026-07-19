@@ -138,17 +138,9 @@ jobs:
         run: cargo install cargo-zigbuild --version 0.19.8 --locked
 
       - name: Install zig (required by cargo-zigbuild)
-        run: |
-          ZIG_VERSION="0.13.0"
-          ARCH=$(uname -m)
-          case "$ARCH" in
-            x86_64|amd64) ZIG_ARCH="x86_64" ;;
-            aarch64|arm64) ZIG_ARCH="aarch64" ;;
-            *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-          esac
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" | sudo tar xJ -C /opt
-          sudo ln -sf /opt/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}/zig /usr/local/bin/zig
-          zig version
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.13.0"
 
       - name: Install llvm-strip
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
