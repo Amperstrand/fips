@@ -119,7 +119,15 @@ else
 
     echo "==> Compiling..."
     cd "$PROJECT_ROOT"
+
+    # Tier 3 targets (mipsel, mips) have no prebuilt std — build from source
+    BUILD_STD=""
+    case "$ARCH" in
+        mipsel|mips) BUILD_STD="-Z build-std=core,alloc,std" ;;
+    esac
+
     cargo zigbuild \
+        $BUILD_STD \
         --release \
         --target "$RUST_TARGET" \
         --bin fips \
