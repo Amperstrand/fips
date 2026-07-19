@@ -125,3 +125,6 @@ path = "src/bin/fipstop/main.rs"
 name = "routing_next_hop"
 path = "benches/routing_next_hop.rs"
 harness = false
+
+[patch.crates-io]
+nostr-relay-pool = { path = "vendor/nostr-relay-pool" }
