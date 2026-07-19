@@ -152,3 +152,6 @@ path = "src/bin/fips-gateway.rs"
 [[bin]]
 name = "fipstop"
 path = "src/bin/fipstop/main.rs"
+
+[patch.crates-io]
+nostr-relay-pool = { path = "vendor/nostr-relay-pool" }

@@ -89,14 +89,14 @@ jobs:
           # MIPS disabled: nostr-relay-pool 0.44 uses std::sync::atomic::AtomicU64
           # directly (fips's own atomics already use portable_atomic). Re-enable
           # once an upstream portable-atomic patch lands (or via [patch.crates-io]).
-          # - build_arch: mipsel
-          #   openwrt_arch: mipsel_24kc
-          #   rust_target: mipsel-unknown-linux-musl
-          #   rust_channel: nightly
+          - build_arch: mipsel
+            openwrt_arch: mipsel_24kc
+            rust_target: mipsel-unknown-linux-musl
+            rust_channel: nightly
           # - build_arch: mips
           #   openwrt_arch: mips_24kc
           #   rust_target: mips-unknown-linux-musl
-          #   rust_channel: nightly
+            rust_channel: nightly
           - build_arch: x86_64
             openwrt_arch: x86_64
             rust_target: x86_64-unknown-linux-musl
