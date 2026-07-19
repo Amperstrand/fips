@@ -237,12 +237,11 @@ jobs:
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
           RUST_CHANNEL: ${{ matrix.rust_channel }}
-          RUSTUP_TOOLCHAIN: ${{ matrix.rust_channel }}
         run: |
           set -euo pipefail
           BUILD_STD=""
           case "$RUST_CHANNEL" in
-            nightly) BUILD_STD="-Z build-std=core,alloc,std" ;;
+            nightly) export RUSTUP_TOOLCHAIN=nightly; BUILD_STD="-Z build-std=core,alloc,std" ;;
           esac
           cargo zigbuild $BUILD_STD --release --target "$RUST_TARGET" \
             --bin fips --bin fipsctl --bin fipstop --bin fips-gateway
