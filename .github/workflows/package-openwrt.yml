@@ -237,9 +237,9 @@ jobs:
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
           RUST_CHANNEL: ${{ matrix.rust_channel }}
+          RUSTUP_TOOLCHAIN: ${{ matrix.rust_channel }}
         run: |
           set -euo pipefail
-          rustup default "$RUST_CHANNEL"
           BUILD_STD=""
           case "$RUST_CHANNEL" in
             nightly) BUILD_STD="-Z build-std=core,alloc,std" ;;
