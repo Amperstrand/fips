@@ -39,3 +39,11 @@ __pycache__/
 /fips.key
 /fips.pub
 /fips.yaml
+/.sisyphus/
+/vtremblay-bccmd/
+.cargo/
+
+# Local tooling
+.cargo/
+.sisyphus/
+vtremblay-bccmd
