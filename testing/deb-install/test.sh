@@ -32,7 +32,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CACHE_DIR="$SCRIPT_DIR/.cache"
 DEB_CACHE_DIR="$CACHE_DIR/deb"
 
-# Timeouts
+# Timeouts. Each wait loop below exits as soon as its condition is met.
 BOOT_TIMEOUT=30
 SERVICE_TIMEOUT=20
 DAEMON_TIMEOUT=15
@@ -75,11 +75,19 @@ start_systemd_container_with_tun() {
 }
 
 wait_for_systemd() {
-    local name="$1"
+    local name="$1" state
     for _i in $(seq 1 "$BOOT_TIMEOUT"); do
-        if docker exec "$name" systemctl is-system-running --wait 2>/dev/null | grep -qE 'running|degraded'; then
-            return 0
-        fi
+        # `is-system-running` exits non-zero for `degraded` (a unit failed to
+        # start -- e.g. systemd-modules-load, which cannot load kernel modules
+        # inside a container -- even though the system did finish booting). This
+        # script runs `set -o pipefail`, so a piped `grep` would inherit that
+        # non-zero exit and reject an acceptable state, which timed out the
+        # newest distros (they reach `degraded`, older ones reach `running`).
+        # Capture the state string and test it directly instead of the pipe.
+        state=$(docker exec "$name" systemctl is-system-running --wait 2>/dev/null || true)
+        case "$state" in
+            running | degraded) return 0 ;;
+        esac
         sleep 1
     done
     # A boot that never reached `running` or `degraded` is not a warning: every
