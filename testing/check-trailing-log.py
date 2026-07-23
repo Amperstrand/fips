@@ -195,8 +195,8 @@ def main() -> int:
         print(f"    last statement: {stmt[:100]}")
         print(f"    status consumed by: {', '.join(callers)}")
         print(f"    fix: add an explicit `return 0` as the last statement. Its "
-              f"success value is currently whatever the log call returned, "
-              f"which is 0 whatever the function did.")
+              f"success value is currently the trailing command's, which is 0 "
+              f"whatever the function did.")
 
     print(f"trailing-log check: {scanned} function(s) scanned, "
           f"{shaped} end in a logging call, {len(ALLOWED)} allowed, "
