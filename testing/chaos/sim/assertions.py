@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from .control import snapshot_all_bloom
 from .scenario import (
     BloomSendRateAssertion,
+    CongestionSignalsAssertion,
     MaxErrorsAssertion,
     MaxParentSwitchesAssertion,
     MinParentSwitchesAssertion,
@@ -168,6 +169,70 @@ def evaluate_max_parent_switches(
             f"cost change smaller than the hysteresis margin is still "
             f"triggering a switch."
         ),
+    )
+
+
+_CONGESTION_FLOORS = (
+    ("min_nodes_detected", "congestion_detected"),
+    ("min_nodes_ce_forwarded", "ce_forwarded"),
+    ("min_nodes_ce_received", "ce_received"),
+)
+
+
+def evaluate_congestion_signals(
+    cfg: CongestionSignalsAssertion,
+    snapshot: dict | None,
+) -> AssertionOutcome:
+    """Floors on how many nodes observed each congestion counter.
+
+    ``snapshot`` is the final congestion snapshot keyed by node id. None
+    means the snapshot never ran, which fails: a missing snapshot and a
+    mesh that observed no congestion produce the same zero counts, and
+    treating them alike is how an assertion comes to pass on an absence
+    of evidence.
+    """
+    if not snapshot:
+        return AssertionOutcome(
+            name="congestion_signals",
+            passed=False,
+            detail=(
+                "FAIL congestion_signals: no final congestion snapshot was "
+                "taken, so no node was observed at all. This is a harness "
+                "failure, not a statement about congestion."
+            ),
+        )
+
+    parts, failures = [], []
+    for attr, counter in _CONGESTION_FLOORS:
+        floor = getattr(cfg, attr)
+        if floor is None:
+            continue
+        hits = sorted(
+            nid for nid, data in snapshot.items()
+            if (data.get("congestion") or {}).get(counter, 0) > 0
+        )
+        parts.append(f"{counter}: {len(hits)} node(s) >0 (floor {floor})")
+        if len(hits) < floor:
+            failures.append(
+                f"{counter} non-zero on {len(hits)} node(s), need {floor}"
+            )
+        else:
+            parts[-1] += f" [{', '.join(hits)}]"
+
+    summary = "; ".join(parts)
+    if failures:
+        return AssertionOutcome(
+            name="congestion_signals",
+            passed=False,
+            detail=(
+                f"FAIL congestion_signals: {'; '.join(failures)} — across "
+                f"{len(snapshot)} node(s) sampled. Full counts: {summary}"
+            ),
+        )
+    return AssertionOutcome(
+        name="congestion_signals",
+        passed=True,
+        detail=f"PASS congestion_signals: {summary}",
     )
 
 

@@ -219,6 +219,26 @@ class MaxParentSwitchesAssertion:
 
 
 @dataclass
+class CongestionSignalsAssertion:
+    """Floors on how many nodes observed each congestion signal.
+
+    Each floor is the number of nodes whose final congestion snapshot
+    reports a non-zero counter, not the counter's own magnitude: the
+    scenario's written criteria are about *whether* a signal reached a
+    class of node, and a single node with a huge count would satisfy a
+    magnitude test while proving the signal never propagated.
+
+    A floor left unset is not asserted. At least one must be set, since a
+    block that asserts nothing is the failure this assertion exists to
+    remove.
+    """
+
+    min_nodes_detected: int | None = None
+    min_nodes_ce_forwarded: int | None = None
+    min_nodes_ce_received: int | None = None
+
+
+@dataclass
 class MaxErrorsAssertion:
     """Ceiling on ERROR-level lines across every node's log.
 
@@ -248,6 +268,7 @@ class AssertionsConfig:
     min_parent_switches: MinParentSwitchesAssertion | None = None
     max_parent_switches: MaxParentSwitchesAssertion | None = None
     max_errors: MaxErrorsAssertion | None = None
+    congestion_signals: CongestionSignalsAssertion | None = None
 
 
 @dataclass
@@ -324,7 +345,7 @@ _SECTION_KEYS = {
     "link_swap.edges[]": {"edge", "policy"},
     "assertions": {
         "bloom_send_rate", "min_parent_switches", "max_parent_switches",
-        "max_errors",
+        "max_errors", "congestion_signals",
     },
     "logging": {"rust_log", "output_dir"},
 }
@@ -333,6 +354,9 @@ _ASSERTION_KEYS = {
     "min_parent_switches": {"min_total"},
     "max_parent_switches": {"max_total", "node"},
     "max_errors": {"max_total"},
+    "congestion_signals": {
+        "min_nodes_detected", "min_nodes_ce_forwarded", "min_nodes_ce_received",
+    },
 }
 _NETEM_POLICY_KEYS = {
     "delay_ms", "jitter_ms", "loss_pct", "duplicate_pct", "reorder_pct",
@@ -642,6 +666,37 @@ def load_scenario(path: str) -> Scenario:
         # run means, and a scenario that has to opt in is a scenario that
         # can forget to.
         s.assertions.max_errors = MaxErrorsAssertion()
+    if "congestion_signals" in asrt:
+        cs = asrt["congestion_signals"]
+        _reject_unknown(
+            cs, _ASSERTION_KEYS["congestion_signals"],
+            "assertions.congestion_signals",
+        )
+        floors = {}
+        for key in _ASSERTION_KEYS["congestion_signals"]:
+            if key not in cs:
+                continue
+            val = cs[key]
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(
+                    f"assertions.congestion_signals.{key}: must be a positive "
+                    f"integer number of nodes, got {val!r}"
+                )
+            if val < 1:
+                raise ValueError(
+                    f"assertions.congestion_signals.{key}: must be at least 1, "
+                    f"got {val}. A floor of 0 is satisfied by a mesh that "
+                    f"observed nothing, which is the case this assertion exists "
+                    f"to catch; omit the key instead."
+                )
+            floors[key] = val
+        if not floors:
+            raise ValueError(
+                "assertions.congestion_signals: set at least one floor "
+                "(min_nodes_detected, min_nodes_ce_forwarded, "
+                "min_nodes_ce_received); a block with none asserts nothing"
+            )
+        s.assertions.congestion_signals = CongestionSignalsAssertion(**floors)
 
     # Logging section
     lg = raw.get("logging", {})
