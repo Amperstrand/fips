@@ -24,6 +24,7 @@ from .scenario import (
     MaxErrorsAssertion,
     MaxParentSwitchesAssertion,
     MinParentSwitchesAssertion,
+    TreeParentsAssertion,
 )
 from .topology import SimTopology
 
@@ -169,6 +170,81 @@ def evaluate_max_parent_switches(
             f"cost change smaller than the hysteresis margin is still "
             f"triggering a switch."
         ),
+    )
+
+
+def evaluate_tree_parents(
+    cfg: TreeParentsAssertion,
+    snapshot: dict | None,
+) -> AssertionOutcome:
+    """Check each node's parent in the final tree snapshot.
+
+    Parents are compared by node address, resolved from the snapshot's own
+    ``my_node_addr`` fields, so the check does not depend on the display
+    name a node happened to publish.
+
+    Every way of not knowing the answer is a failure: no snapshot, the
+    node absent from it, the expected parent absent from it, or the node
+    still claiming to be its own root. Each of those produces the same
+    "no match" that a genuinely wrong parent does, and only saying so
+    separately keeps a harness problem from reading as a routing verdict.
+    """
+    if not snapshot:
+        return AssertionOutcome(
+            name="tree_parents",
+            passed=False,
+            detail=(
+                "FAIL tree_parents: no final tree snapshot was taken, so no "
+                "node's parent was observed. This is a harness failure, not "
+                "a statement about the tree."
+            ),
+        )
+
+    addr_of = {
+        nid: data.get("my_node_addr")
+        for nid, data in snapshot.items()
+        if data.get("my_node_addr")
+    }
+    id_of = {addr: nid for nid, addr in addr_of.items()}
+
+    good, bad = [], []
+    for child, want_parent in sorted(cfg.expected.items()):
+        entry = snapshot.get(child)
+        if entry is None:
+            bad.append(
+                f"{child} is absent from the snapshot ({len(snapshot)} node(s) "
+                f"present: {', '.join(sorted(snapshot))})"
+            )
+            continue
+        want_addr = addr_of.get(want_parent)
+        if want_addr is None:
+            bad.append(
+                f"{child}: expected parent {want_parent} is absent from the "
+                f"snapshot, so its address cannot be resolved"
+            )
+            continue
+        got_addr = entry.get("parent")
+        if got_addr == entry.get("my_node_addr"):
+            bad.append(
+                f"{child} is its own parent — it still believes it is root, "
+                f"so the tree never converged around it (wanted {want_parent})"
+            )
+            continue
+        if got_addr == want_addr:
+            good.append(f"{child}->{want_parent}")
+            continue
+        got_id = id_of.get(got_addr) or entry.get("parent_display_name") or got_addr
+        bad.append(f"{child} chose {got_id}, wanted {want_parent}")
+
+    if bad:
+        detail = f"FAIL tree_parents: {'; '.join(bad)}"
+        if good:
+            detail += f". Correct: {', '.join(good)}"
+        return AssertionOutcome(name="tree_parents", passed=False, detail=detail)
+    return AssertionOutcome(
+        name="tree_parents",
+        passed=True,
+        detail=f"PASS tree_parents: {', '.join(good)}",
     )
 
 

@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 
 import yaml
+
+# Node ids are rendered nNN by the topology generator, zero-padded to two
+# digits. Matching the shape here keeps a typo such as "no4" or "n4x" from
+# reaching an assertion as a node that simply never appears.
+_NODE_ID_RE = re.compile(r"n\d+")
 
 
 @dataclass
@@ -219,6 +225,24 @@ class MaxParentSwitchesAssertion:
 
 
 @dataclass
+class TreeParentsAssertion:
+    """Expected parent per node in the final tree snapshot.
+
+    ``expected`` maps a node id to the node id its parent must be, e.g.
+    ``{"n04": "n03"}``. Both sides are node ids rather than node
+    addresses: an address is a per-run key derived from the generated
+    identity, so a scenario could not name one ahead of time.
+
+    A node absent from the snapshot fails rather than being skipped. That
+    case is not hypothetical — more than half the archived runs of these
+    scenarios have no entry for the node under test, and a skip would
+    have reported those as satisfied.
+    """
+
+    expected: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class CongestionSignalsAssertion:
     """Floors on how many nodes observed each congestion signal.
 
@@ -269,6 +293,7 @@ class AssertionsConfig:
     max_parent_switches: MaxParentSwitchesAssertion | None = None
     max_errors: MaxErrorsAssertion | None = None
     congestion_signals: CongestionSignalsAssertion | None = None
+    tree_parents: TreeParentsAssertion | None = None
 
 
 @dataclass
@@ -304,10 +329,13 @@ class Scenario:
 # YAML still looks correct — a mistyped "assertion:" disarms a scenario's only
 # assertions, a mistyped "link_flap:" turns off the chaos it was meant to inject.
 #
-# Three mappings are deliberately NOT listed, because their keys are names the
+# Four mappings are deliberately NOT listed, because their keys are names the
 # scenario author chooses rather than a schema: netem.mutation.policies,
-# link_swap.policies and topology.transport_mix. Two sub-trees are passed through
-# whole and are likewise not checked: fips_overrides and topology.params.
+# link_swap.policies, topology.transport_mix and assertions.tree_parents (whose
+# keys are node ids). Two sub-trees are passed through whole and are likewise
+# not checked: fips_overrides and topology.params. tree_parents is not thereby
+# unchecked -- both sides of every entry are validated as node ids that exist in
+# this scenario's topology, which is the check that matters for it.
 #
 # NOTE: adding a new assertion type means registering it in TWO places below —
 # _SECTION_KEYS["assertions"] (so the block accepts its name) and _ASSERTION_KEYS
@@ -345,7 +373,7 @@ _SECTION_KEYS = {
     "link_swap.edges[]": {"edge", "policy"},
     "assertions": {
         "bloom_send_rate", "min_parent_switches", "max_parent_switches",
-        "max_errors", "congestion_signals",
+        "max_errors", "congestion_signals", "tree_parents",
     },
     "logging": {"rust_log", "output_dir"},
 }
@@ -697,6 +725,39 @@ def load_scenario(path: str) -> Scenario:
                 "min_nodes_ce_received); a block with none asserts nothing"
             )
         s.assertions.congestion_signals = CongestionSignalsAssertion(**floors)
+    if "tree_parents" in asrt:
+        tp = asrt["tree_parents"]
+        if not isinstance(tp, dict) or not tp:
+            raise ValueError(
+                "assertions.tree_parents: give it at least one "
+                "'<node>: <expected parent>' entry; an empty block asserts "
+                "nothing"
+            )
+        expected = {}
+        for child, parent in tp.items():
+            for role, val in (("node", child), ("parent", parent)):
+                if not isinstance(val, str) or not _NODE_ID_RE.fullmatch(val):
+                    raise ValueError(
+                        f"assertions.tree_parents: {role} {val!r} is not a node "
+                        f"id of the form 'n04'"
+                    )
+                idx = int(val[1:])
+                if idx < 1 or idx > s.topology.num_nodes:
+                    raise ValueError(
+                        f"assertions.tree_parents: {role} '{val}' is outside "
+                        f"this scenario's {s.topology.num_nodes} nodes. An "
+                        f"assertion about a node that cannot exist would fail "
+                        f"for the wrong reason every run."
+                    )
+            if child == parent:
+                raise ValueError(
+                    f"assertions.tree_parents: '{child}' is given itself as "
+                    f"its parent. A node is its own parent only when it "
+                    f"believes it is root, which is what an unconverged tree "
+                    f"looks like; assert that some other way."
+                )
+            expected[child] = parent
+        s.assertions.tree_parents = TreeParentsAssertion(expected=expected)
 
     # Logging section
     lg = raw.get("logging", {})

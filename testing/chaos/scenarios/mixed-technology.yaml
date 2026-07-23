@@ -30,6 +30,25 @@
 #   - n08 has fiber (n03) and Bluetooth (n04) parents — should pick n03
 #
 # Netem mutation shifts fiber-only links between normal and degraded.
+#
+# NEITHER TEST SUBJECT IS ASSERTED, because the implementation does not do
+# what the two lines above say. Across the five archived runs that carry a
+# status.txt and are therefore provably completed, n06's parent is n10 in
+# three and n03 in two, and n08's is n04 in four and n03 in one. Encoding
+# either as written would red the scenario most runs; encoding what it
+# actually does would pin behaviour nobody specified and would silently
+# bless it.
+#
+# So this is an open question rather than a missing assertion: either
+# cost-based selection is not preferring fiber here, or the criteria were
+# written for a topology this file no longer has. n06 taking n10 is the
+# more interesting half — n10 reaches n06 by fiber, so the choice may be
+# defensible and the comment simply stale. It needs someone to work out
+# which, and until then this scenario proves nothing about parent choice.
+#
+# That leaves this scenario asserting nothing about its own subject. The
+# baseline convergence assertion is the right floor for it and is tracked
+# separately; this note is here so the gap is visible until that lands.
 
 scenario:
   name: "mixed-technology"

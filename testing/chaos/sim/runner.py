@@ -17,6 +17,7 @@ from .assertions import (
     BloomSendRateMonitor,
     evaluate_congestion_signals,
     evaluate_max_errors,
+    evaluate_tree_parents,
     evaluate_max_parent_switches,
     evaluate_min_parent_switches,
 )
@@ -80,6 +81,7 @@ class SimRunner:
         # which the congestion assertion must treat as a failure rather
         # than as an absence of congestion.
         self.final_congestion: dict | None = None
+        self.final_tree: dict | None = None
 
     def _evaluate_max_parent_switches(
         self, cfg, parent_switches: list[tuple[str, str]]
@@ -622,6 +624,15 @@ class SimRunner:
                 else:
                     log.error("%s", outcome.detail)
 
+            tp_cfg = self.scenario.assertions.tree_parents
+            if tp_cfg is not None:
+                outcome = evaluate_tree_parents(tp_cfg, self.final_tree)
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
             cong_cfg = self.scenario.assertions.congestion_signals
             if cong_cfg is not None:
                 outcome = evaluate_congestion_signals(
@@ -698,6 +709,7 @@ class SimRunner:
         # failure present as an assertion that saw nothing.
         if label == "final":
             self.final_congestion = congestion_snap
+            self.final_tree = tree_snap
         os.makedirs(self.output_dir, exist_ok=True)
         with open(tree_path, "w") as f:
             json.dump(tree_snap, f, indent=2)
