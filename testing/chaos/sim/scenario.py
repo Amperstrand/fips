@@ -219,12 +219,35 @@ class MaxParentSwitchesAssertion:
 
 
 @dataclass
+class MaxErrorsAssertion:
+    """Ceiling on ERROR-level lines across every node's log.
+
+    Unlike the other assertions this one is applied to every scenario
+    whether or not the YAML asks for it, because it is a floor on what a
+    green run means rather than a property of one scenario: without it a
+    run in which every node errors on every line still exits 0.
+
+    ``max_total`` defaults to 0, which is what the archived corpus
+    supports. Across 2416 archived run directories no node log contains a
+    single ERROR-level line, while the sibling WARN counter extracted by
+    the same code path ranges from 0 to 1135 — so 0 is an observed value
+    and not an aspiration, and the counter is known to discriminate.
+
+    A scenario that legitimately induces errors raises the ceiling in its
+    own YAML and must say at that site why the errors are expected.
+    """
+
+    max_total: int = 0
+
+
+@dataclass
 class AssertionsConfig:
     """Optional post-run assertions evaluated against control-socket data."""
 
     bloom_send_rate: BloomSendRateAssertion | None = None
     min_parent_switches: MinParentSwitchesAssertion | None = None
     max_parent_switches: MaxParentSwitchesAssertion | None = None
+    max_errors: MaxErrorsAssertion | None = None
 
 
 @dataclass
@@ -301,6 +324,7 @@ _SECTION_KEYS = {
     "link_swap.edges[]": {"edge", "policy"},
     "assertions": {
         "bloom_send_rate", "min_parent_switches", "max_parent_switches",
+        "max_errors",
     },
     "logging": {"rust_log", "output_dir"},
 }
@@ -308,6 +332,7 @@ _ASSERTION_KEYS = {
     "bloom_send_rate": {"window_secs", "max_per_node"},
     "min_parent_switches": {"min_total"},
     "max_parent_switches": {"max_total", "node"},
+    "max_errors": {"max_total"},
 }
 _NETEM_POLICY_KEYS = {
     "delay_ms", "jitter_ms", "loss_pct", "duplicate_pct", "reorder_pct",
@@ -589,6 +614,34 @@ def load_scenario(path: str) -> Scenario:
             max_total=max_total,
             node=node,
         )
+    if "max_errors" in asrt:
+        mev = asrt["max_errors"]
+        _reject_unknown(
+            mev, _ASSERTION_KEYS["max_errors"], "assertions.max_errors",
+        )
+        if "max_total" not in mev:
+            raise ValueError(
+                "assertions.max_errors: max_total is required (the point of "
+                "overriding the default ceiling is to name the new number)"
+            )
+        err_total = mev["max_total"]
+        if isinstance(err_total, bool) or not isinstance(err_total, int):
+            raise ValueError(
+                f"assertions.max_errors: max_total must be a non-negative "
+                f"integer, got {err_total!r}"
+            )
+        if err_total < 0:
+            raise ValueError(
+                f"assertions.max_errors: max_total must be non-negative, "
+                f"got {err_total}"
+            )
+        s.assertions.max_errors = MaxErrorsAssertion(max_total=err_total)
+    else:
+        # Default-on. See MaxErrorsAssertion for why this one assertion is
+        # applied without being asked for: it is the floor on what a green
+        # run means, and a scenario that has to opt in is a scenario that
+        # can forget to.
+        s.assertions.max_errors = MaxErrorsAssertion()
 
     # Logging section
     lg = raw.get("logging", {})
@@ -639,9 +692,31 @@ def _validate_parent_switch_observability(s: Scenario):
         )
 
 
+def _validate_error_observability(s: Scenario):
+    """Refuse an error ceiling the log level cannot observe.
+
+    Narrower than the parent-switch guard on purpose: ERROR lines survive
+    every level except ``off``, so ``off`` is the only setting that turns
+    this assertion into one that counts zero whatever the mesh did. Since
+    the ceiling is applied by default, a scenario silencing its logs would
+    otherwise acquire an assertion that cannot fail.
+    """
+    if s.assertions.max_errors is None:
+        return
+    default_level = s.logging.rust_log.split(",")[0].strip().lower()
+    if default_level == "off":
+        raise ValueError(
+            "logging.rust_log is 'off', which suppresses the ERROR-level "
+            "lines the max_errors assertion counts. The assertion would see "
+            "zero errors regardless of what the mesh did. Raise the level, "
+            "or state a deliberate override in assertions.max_errors."
+        )
+
+
 def _validate(s: Scenario):
     """Validate scenario constraints."""
     _validate_parent_switch_observability(s)
+    _validate_error_observability(s)
     if s.topology.num_nodes < 2:
         raise ValueError("topology.num_nodes must be >= 2")
     if s.topology.num_nodes > 250:

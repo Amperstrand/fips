@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from .control import snapshot_all_bloom
 from .scenario import (
     BloomSendRateAssertion,
+    MaxErrorsAssertion,
     MaxParentSwitchesAssertion,
     MinParentSwitchesAssertion,
 )
@@ -166,6 +167,47 @@ def evaluate_max_parent_switches(
             f"more than the hysteresis band should allow. Check whether a "
             f"cost change smaller than the hysteresis margin is still "
             f"triggering a switch."
+        ),
+    )
+
+
+def evaluate_max_errors(
+    cfg: MaxErrorsAssertion,
+    errors: list[tuple[str, str]],
+) -> AssertionOutcome:
+    """Ceiling on ERROR-level log lines across the whole mesh.
+
+    ``errors`` is the ``AnalysisResult.errors`` list of ``(source, line)``
+    pairs rather than a bare count, so a failure can name the nodes and
+    quote the lines. A ceiling breach that only reports a number sends the
+    reader back to the logs it was supposed to save them reading.
+    """
+    count = len(errors)
+    if count <= cfg.max_total:
+        return AssertionOutcome(
+            name="max_errors",
+            passed=True,
+            detail=(
+                f"PASS max_errors: {count} ERROR line(s) mesh-wide <= "
+                f"ceiling {cfg.max_total}"
+            ),
+        )
+
+    per_node: dict[str, int] = {}
+    for source, _line in errors:
+        per_node[source] = per_node.get(source, 0) + 1
+    worst = sorted(per_node.items(), key=lambda kv: -kv[1])
+    breakdown = ", ".join(f"{src}={n}" for src, n in worst)
+    samples = "\n".join(
+        f"    [{src}] {line.strip()}" for src, line in errors[:5]
+    )
+    return AssertionOutcome(
+        name="max_errors",
+        passed=False,
+        detail=(
+            f"FAIL max_errors: {count} ERROR line(s) mesh-wide > ceiling "
+            f"{cfg.max_total} — per node: {breakdown}. First "
+            f"{min(5, count)}:\n{samples}"
         ),
     )
 

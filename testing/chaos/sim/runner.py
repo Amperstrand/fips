@@ -15,6 +15,7 @@ from datetime import datetime
 from .assertions import (
     AssertionOutcome,
     BloomSendRateMonitor,
+    evaluate_max_errors,
     evaluate_max_parent_switches,
     evaluate_min_parent_switches,
 )
@@ -598,6 +599,18 @@ class SimRunner:
                 outcome = self._evaluate_max_parent_switches(
                     xps_cfg, result.parent_switches
                 )
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            # Applied to every scenario by default, so this is the one
+            # assertion that is present even when the YAML declares no
+            # assertions block at all.
+            err_cfg = self.scenario.assertions.max_errors
+            if err_cfg is not None:
+                outcome = evaluate_max_errors(err_cfg, result.errors)
                 self.assertion_outcomes.append(outcome)
                 if outcome.passed:
                     log.info("%s", outcome.detail)
