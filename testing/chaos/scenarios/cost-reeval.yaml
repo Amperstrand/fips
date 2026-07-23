@@ -50,10 +50,19 @@
 # `topology.pin_root` (default true) now assigns identities in NodeAddr order
 # so n01 is root and n04 is the depth-1 subject this file describes.
 #
-# STILL TO DO: this scenario has no assertion about its own subject, and that
-# was a consequence rather than an omission — none could have passed. With the
-# subject now reachable, decide whether the switch is reliable enough across
-# seeds to assert, and encode it if so. Tracked in ISSUE-2026-0085.
+# MEASURED after the fix, 2026-07-23: the periodic switch now happens, in 2 of
+# 3 runs on n04 (0, 1, 1 occurrences). Before the fix it was 0 in 5 of 5, and
+# structurally impossible rather than merely rare. So the subject is exercised
+# for the first time.
+#
+# STILL NOT ASSERTED, deliberately. A "at least one periodic switch" assertion
+# would red roughly one run in three on this evidence, and a single run reading
+# zero is an argument against asserting rather than for it. Two ways forward,
+# neither taken here: gather enough runs to know whether 2-in-3 is the real
+# rate, or reduce the variance -- the mutation is stochastic with fraction=0.5,
+# so a deterministic link-degradation schedule would make the asymmetry this
+# scenario needs occur every run and the outcome assertable.
+# Tracked in ISSUE-2026-0085.
 
 scenario:
   name: "cost-reeval"
