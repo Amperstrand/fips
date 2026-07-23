@@ -187,13 +187,15 @@ impl Node {
                 false
             };
 
-            if sent && let Some(conn) = self.connections.get_mut(&link) {
+            if let Some(conn) = self.connections.get_mut(&link) {
                 conn.record_resend(next_resend_at_ms);
-                debug!(
-                    link_id = %link,
-                    resend = conn.resend_count(),
-                    "Resent handshake msg1"
-                );
+                if sent {
+                    debug!(
+                        link_id = %link,
+                        resend = conn.resend_count(),
+                        "Resent handshake msg1"
+                    );
+                }
             }
         }
     }
@@ -263,15 +265,17 @@ impl Node {
                 }
             };
 
-            if sent && let Some(entry) = self.sessions.get_mut(&dest_addr) {
+            if let Some(entry) = self.sessions.get_mut(&dest_addr) {
                 let count = entry.resend_count() + 1;
                 let next = now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
                 entry.record_resend(next);
-                debug!(
-                    dest = %self.peer_display_name(&dest_addr),
-                    resend = count,
-                    "Resent session handshake"
-                );
+                if sent {
+                    debug!(
+                        dest = %self.peer_display_name(&dest_addr),
+                        resend = count,
+                        "Resent session handshake"
+                    );
+                }
             }
         }
     }
