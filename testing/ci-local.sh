@@ -1069,6 +1069,22 @@ run_log_strings() {
     record "log-strings" $rc
 }
 
+# Unit tests for the convergence gate every static suite waits on. Hermetic —
+# synthetic ping functions against the same SECONDS clock, no containers — but
+# it drives real timeouts, so it costs about 45 seconds rather than the "few
+# seconds" its own header used to claim.
+#
+# It is here with the other two rather than in the integration stage because it
+# needs nothing built. Note what that buys: wait_until_connected decides whether
+# every static suite proceeds or gives up, so a regression in it turns those
+# suites' verdicts into noise, and until now nothing ran this at all.
+run_wait_converge() {
+    local rc=0
+    info "[wait-converge] Running convergence-gate unit tests"
+    bash "$SCRIPT_DIR/lib/wait-converge-test.sh" || rc=$?
+    record "wait-converge" $rc
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1082,6 +1098,7 @@ main() {
     # local run means what a GitHub run means, whichever subset was asked for.
     run_ci_parity
     run_log_strings
+    run_wait_converge
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests
