@@ -44,8 +44,8 @@
 #
 # Netem mutation shifts fiber-only links between normal and degraded.
 #
-# NEITHER TEST SUBJECT IS ASSERTED YET, and the reason has been found and
-# fixed at the root rather than papered over here.
+# n08 IS now asserted (below); n06 is not, and both reasons trace to the root,
+# which was found and fixed rather than papered over here.
 #
 # The diagram above puts n01 at the top, and both test subjects only make
 # sense in a tree rooted there. The mesh does not root by topology: it roots
@@ -64,13 +64,15 @@
 #
 # `topology.pin_root` (default true) now assigns identities in NodeAddr order,
 # so n01 holds the smallest and the diagram describes the tree that forms.
-# Both criteria should therefore become reachable and assertable.
+# Under that root n08 takes fiber n03 as its subject assertion (below) now
+# checks. n06 stays unasserted: its "fiber n03" was a WiFi link (see the
+# corrected note above), so it was never a founded criterion. Tracked in
+# ISSUE-2026-0085.
 #
-# STILL TO DO: run this under the pinned root, confirm n06 and n08 both take
-# n03, and encode `tree_parents` for them. Until then the baseline block below
-# is a floor and not a substitute — it holds the mesh to forming a tree and
-# carrying traffic, and nothing here yet checks that the tree is the one these
-# comments describe. Tracked in ISSUE-2026-0085.
+# The n08 assertion is made reliable, not merely reachable: the Bluetooth
+# contrast is widened (netem below) and the two links n08 chooses between are
+# excluded from the netem mutation, so neither host load nor a random
+# degradation can flip the asserted comparison.
 
 scenario:
   name: "mixed-technology"
@@ -105,11 +107,15 @@ netem:
     jitter_ms: [0, 1]
     loss_pct: [0, 0.5]
   link_policies:
-    # Bluetooth (L2CAP) links
+    # Bluetooth (L2CAP) links. Delay widened to 150-250ms so the
+    # fiber-vs-Bluetooth cost margin on n08's choice (fiber n03 vs Bluetooth
+    # n04) dwarfs any load-induced srtt spike on the fiber probe, matching
+    # cost-avoidance. Combined with excluding n03-n08/n04-n08 from the mutation
+    # (below), n08's asserted comparison is robust to both load and churn.
     - edges: ["n02-n06", "n04-n08"]
       policy:
-        delay_ms: [15, 40]
-        jitter_ms: [5, 15]
+        delay_ms: [150, 250]
+        jitter_ms: [15, 30]
         loss_pct: [2, 8]
     # WiFi links (moderate latency, low loss)
     - edges: ["n03-n06", "n08-n10"]
@@ -120,6 +126,12 @@ netem:
   mutation:
     interval_secs: {min: 30, max: 60}
     fraction: 0.2
+    # Never mutate the two links n08's tree_parents assertion depends on: the
+    # degraded policy (50-100ms) could otherwise slow the fiber n03-n08 link
+    # enough to flip n08 to n04 independently of the widened Bluetooth contrast,
+    # making the assertion a coin toss. The mutation still churns the other ten
+    # links, so the dynamic behaviour it exists to exercise is unchanged.
+    exclude_edges: ["n03-n08", "n04-n08"]
     policies:
       normal:
         delay_ms: [1, 10]

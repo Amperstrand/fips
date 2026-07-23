@@ -73,6 +73,11 @@ class NetemMutationConfig:
     interval_secs: Range = field(default_factory=lambda: Range(15, 30))
     fraction: float = 0.3
     policies: dict[str, NetemPolicy] = field(default_factory=dict)
+    # Edges the periodic mutation must never touch, "nXX-nYY" strings. Use it
+    # to pin the links a tree_parents assertion depends on so a random
+    # degradation cannot flip the very comparison being asserted. Validated
+    # against the topology in NetemManager — an unknown edge is a hard error.
+    exclude_edges: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -388,7 +393,7 @@ _SECTION_KEYS = {
     },
     "netem": {"enabled", "default_policy", "link_policies", "mutation"},
     "netem.link_policies[]": {"edges", "policy", "policy_name"},
-    "netem.mutation": {"interval_secs", "fraction", "policies"},
+    "netem.mutation": {"interval_secs", "fraction", "policies", "exclude_edges"},
     "link_flaps": {
         "enabled", "interval_secs", "max_down_links", "down_duration_secs",
         "protect_connectivity",
@@ -549,6 +554,7 @@ def load_scenario(path: str) -> Scenario:
             mc.get("interval_secs", {"min": 15, "max": 30}), "netem.mutation.interval_secs"
         )
         s.netem.mutation.fraction = float(mc.get("fraction", 0.3))
+        s.netem.mutation.exclude_edges = list(mc.get("exclude_edges", []))
         if "policies" in mc:
             s.netem.mutation.policies = {
                 name: _parse_netem_policy(pdata, f"netem.mutation.policies.{name}")
