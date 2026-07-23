@@ -28,8 +28,8 @@
 # Integration suites (default coverage):
 #   static-mesh, static-chain, rekey, rekey-accept-off,
 #   rekey-outbound-only, gateway,
-#   acl-allowlist, firewall, nat-cone, nat-symmetric, nat-lan,
-#   nostr-publish-consume, stun-faults,
+#   acl-allowlist, admission-cap, firewall, nat-cone, nat-symmetric,
+#   nat-lan, nostr-publish-consume, stun-faults,
 #   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-bottleneck-parent,
 #   chaos-cost-avoidance, chaos-cost-reeval, chaos-cost-stability,
