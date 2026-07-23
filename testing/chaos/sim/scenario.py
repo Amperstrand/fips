@@ -52,6 +52,10 @@ class TopologyConfig:
     # unreachable. Set false where election from an arbitrary key distribution
     # is itself the subject.
     pin_root: bool = True
+    # Set by --subnet to opt out of claiming a free range. Not a scenario-file
+    # key: a scenario that hardcoded its range would reintroduce the collision
+    # claiming exists to remove.
+    pinned_subnet: str | None = None
 
 
 @dataclass

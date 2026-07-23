@@ -905,7 +905,6 @@ run_integration() {
         local pids=()
         local suite_names=()
         local running=0
-        local chaos_idx=0
 
         for entry in "${CHAOS_SUITES[@]}"; do
             # Parse: "display-name scenario [flags...]"
@@ -913,14 +912,15 @@ run_integration() {
             local name="${parts[0]}"
             local args=("${parts[@]:1}")
 
-            # Give each chaos child a unique, non-overlapping /24 in 10.30.x so
-            # parallel children never collide with each other, and so a chaos
-            # net can never swallow a fixed-subnet suite (sidecar/static/nat in
-            # 172.x). 10.30.x sits outside docker's default-address-pool range
-            # (172.17-31 / 192.168), so auto-assigned nets can't land on it
-            # either. Node IPs derive from this subnet inside the sim.
-            args+=("--subnet" "10.30.${chaos_idx}.0/24")
-            chaos_idx=$((chaos_idx + 1))
+            # No --subnet: the sim claims a free /24 itself (sim/netclaim.py).
+            # This used to pass 10.30.${chaos_idx}.0/24, which uniquified the
+            # children of ONE run against each other and was byte-identical
+            # between runs -- so two concurrent ci-local runs both walked
+            # 10.30.0 through 10.30.12 and collided on every one. A claim makes
+            # the daemon the arbiter, so an overlap is impossible rather than
+            # merely unlikely. The range still sits in 10.30.0.0/16, clear of
+            # docker's default pool (172.17-31 / 192.168) and of the
+            # fixed-subnet suites in 172.x.
 
             # Throttle: wait for a slot
             while [[ $running -ge $PARALLEL_JOBS ]]; do
