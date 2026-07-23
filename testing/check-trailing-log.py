@@ -133,6 +133,15 @@ def status_tested(name: str, all_text: str, defining_file: Path) -> list[str]:
         (rf"^\s*{re.escape(name)}\s+[^\n|&]*&&", "<fn> &&"),
         (rf"^\s*{re.escape(name)}\s*&&", "<fn> &&"),
         (rf"\bif\s+\S*\s*{re.escape(name)}\b.*;\s*then", "if ... <fn> ; then"),
+        # Command substitution. Found 2026-07-23 while fixing a function this
+        # check reported clean: `total=$(count_log_pattern "$p") || { ... }`
+        # consumes the status, but the line begins with the variable, so none
+        # of the patterns above match it. That is not an exotic form — it is
+        # how a shell function returns a *value*, and it is the shape of the
+        # `|| true`-swallowed-failure family this check exists to catch.
+        (rf"=\$\(\s*{re.escape(name)}\b", "<var>=$(<fn>)"),
+        (rf"\bif\s+!?\s*\S*=?\$\(\s*{re.escape(name)}\b", "if <var>=$(<fn>)"),
+        (rf"\[\s+\"?\$\(\s*{re.escape(name)}\b", "[ $(<fn>) ]"),
     ]
     hits = []
     for pat, label in patterns:

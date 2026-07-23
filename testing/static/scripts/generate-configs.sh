@@ -74,6 +74,7 @@ docker_host_name() {
     local host
     host=$(get_node_attr "$topology_file" "$node_id" "docker_host")
     echo "${host:-node-$node_id}"
+    return 0
 }
 
 # Get peers list from topology
@@ -118,6 +119,7 @@ get_default_transport() {
     local topology_file="$1"
     local transport=$(grep "^default_transport:" "$topology_file" | head -1 | sed 's/.*: *\([a-z]*\).*/\1/')
     echo "${transport:-udp}"
+    return 0
 }
 
 # Get the port for a given transport type
