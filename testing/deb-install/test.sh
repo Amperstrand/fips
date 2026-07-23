@@ -82,8 +82,11 @@ wait_for_systemd() {
         fi
         sleep 1
     done
-    echo "  WARNING: systemd did not reach running state in ${BOOT_TIMEOUT}s (may still work)"
-    return 0
+    # A boot that never reached `running` or `degraded` is not a warning: every
+    # check after this point reads a system that may not have started its units,
+    # and returning 0 here made the timeout indistinguishable from a clean boot.
+    echo "  ERROR: systemd did not reach running state in ${BOOT_TIMEOUT}s" >&2
+    return 1
 }
 
 wait_for_service_active() {
@@ -229,18 +232,32 @@ DOCKERFILE
     rm -f "$CACHE_DIR/deb-for-image"
 
     start_systemd_container_with_tun "$name" "$image"
-    wait_for_systemd "$name"
+    wait_for_systemd "$name" || {
+        fail "systemd did not boot in $name; the install checks below would read an unstarted system"
+        cleanup_container "$name"
+        return
+    }
 
     # Install the .deb. apt handles dependencies (libc6, systemd,
     # libdbus-1-3) and runs the maintainer scripts (postinst →
     # systemctl enable fips.service; fips-dns.service starts and
     # runs fips-dns-setup).
     log "Installing .deb (apt install /opt/fips-deb/${deb_basename})"
-    local install_output
+    # `|| true` here used to discard apt's exit status, and an empty capture (a
+    # failed `docker exec`) matches neither error pattern below, so a install
+    # that never ran reached `pass "apt install completed"`. Keep the capture on
+    # failure so the diagnostics below can print it, but remember the status.
+    local install_output install_rc=0
     install_output=$(docker exec "$name" bash -c "
         apt-get update >/dev/null 2>&1
         cd /opt/fips-deb && apt-get install -y --no-install-recommends ./${deb_basename} 2>&1
-    ") || true
+    ") || install_rc=$?
+    if [ "$install_rc" -ne 0 ]; then
+        fail "apt install exited $install_rc"
+        echo "$install_output" | tail -20
+        cleanup_container "$name"
+        return
+    fi
     if echo "$install_output" | grep -qE "^E:|errors? were encountered"; then
         fail "apt install reported errors"
         echo "$install_output" | tail -20
