@@ -274,6 +274,16 @@ generate_topology() {
         echo "${var_name}=$(get_key RESOLVED_NPUB "$node_id")" >> "$env_file"
     done
     echo "  ✓ Generated $env_file"
+
+    # Phase 4 (gateway only): write the LAN-client resolv.conf. Its nameserver
+    # is the gateway's LAN address, which must be a literal known before the
+    # client starts. run_gateway claims a per-run /64 and exports
+    # FIPS_GW_LAN6_PREFIX before calling this; unset (standalone / GitHub) it
+    # renders the base compose's fd02::10.
+    if [ "$topology_name" = "gateway" ]; then
+        echo "nameserver ${FIPS_GW_LAN6_PREFIX:-fd02}::10" > "$output_dir/resolv.conf"
+        echo "  ✓ Generated $output_dir/resolv.conf"
+    fi
 }
 
 main() {
