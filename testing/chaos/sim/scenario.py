@@ -44,6 +44,14 @@ class TopologyConfig:
     # When set, each edge is randomly assigned a transport based on weights.
     # Only valid for non-explicit algorithms (explicit uses per-edge syntax).
     transport_mix: dict[str, float] | None = None
+    # Assign derived identities in NodeAddr order so n01 holds the smallest and
+    # is therefore the root every scenario diagram draws. Default on: without it
+    # the root is effectively arbitrary, which left `cost-reeval` rooted at its
+    # own designated test subject — so the parent switch it exists to observe
+    # could not occur — and made `mixed-technology`'s parent criteria
+    # unreachable. Set false where election from an arbitrary key distribution
+    # is itself the subject.
+    pin_root: bool = True
 
 
 @dataclass
@@ -372,7 +380,7 @@ _SECTION_KEYS = {
     "scenario": {"name", "seed", "duration_secs"},
     "topology": {
         "num_nodes", "algorithm", "params", "ensure_connected", "subnet",
-        "ip_start", "default_transport", "transport_mix",
+        "ip_start", "default_transport", "transport_mix", "pin_root",
     },
     "netem": {"enabled", "default_policy", "link_policies", "mutation"},
     "netem.link_policies[]": {"edges", "policy", "policy_name"},
@@ -494,6 +502,13 @@ def load_scenario(path: str) -> Scenario:
     s.topology.subnet = tc.get("subnet", "172.20.0.0/24")
     s.topology.ip_start = int(tc.get("ip_start", 10))
     s.topology.default_transport = tc.get("default_transport", "udp")
+    if "pin_root" in tc:
+        pin = tc["pin_root"]
+        if not isinstance(pin, bool):
+            raise ValueError(
+                f"topology.pin_root must be a boolean, got {pin!r}"
+            )
+        s.topology.pin_root = pin
     if "transport_mix" in tc:
         mix = tc["transport_mix"]
         if not isinstance(mix, dict) or not mix:
