@@ -1092,6 +1092,19 @@ run_log_strings() {
     record "log-strings" $rc
 }
 
+# A shell function's exit status is its last command's. One ending in a log
+# call returns 0 whatever it did, so a caller testing that status has a dead
+# gate — the run_chaos and build_fips_for_e2e defects, one of which certified
+# unbuilt code as green. This enforces an explicit terminal return wherever a
+# caller consumes the status, which makes the class unreachable rather than
+# repairing instances of it.
+run_trailing_log() {
+    local rc=0
+    info "[trailing-log] Checking for functions whose status is a log call's"
+    python3 "$SCRIPT_DIR/check-trailing-log.py" || rc=$?
+    record "trailing-log" $rc
+}
+
 # Unit tests for the convergence gate every static suite waits on. Hermetic —
 # synthetic ping functions against the same SECONDS clock, no containers — but
 # it drives real timeouts, so it costs about 45 seconds rather than the "few
@@ -1121,6 +1134,7 @@ main() {
     # local run means what a GitHub run means, whichever subset was asked for.
     run_ci_parity
     run_log_strings
+    run_trailing_log
     run_wait_converge
 
     if [[ "$TEST_ONLY" == true ]]; then

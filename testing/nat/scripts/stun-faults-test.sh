@@ -126,6 +126,7 @@ apply_delay() {
     docker exec "$SHIM" tc qdisc add dev "$DEV" root netem delay 5000ms 2>/dev/null \
         || { echo "  delay: tc netem unavailable, skipping" >&2; return 1; }
     echo "  delay: tc netem 5000ms applied"
+    return 0
 }
 
 clear_delay() {
@@ -139,6 +140,7 @@ assert_process_alive() {
         return 1
     fi
     echo "  $NODE: fips daemon alive"
+    return 0
 }
 
 assert_no_panic() {
