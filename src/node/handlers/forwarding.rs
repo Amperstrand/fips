@@ -417,13 +417,10 @@ impl Node {
         for (&tid, transport) in &self.transports {
             let congestion = transport.congestion();
             let state = self.transport_drops.entry(tid).or_default();
-            if let Some(current) = congestion.recv_drops {
-                let new_drops = current > state.prev_drops;
-                if new_drops && !state.dropping {
-                    new_drop_events.push(tid);
-                }
-                state.dropping = new_drops;
-                state.prev_drops = current;
+            if let Some(current) = congestion.recv_drops
+                && state.observe_drops(current)
+            {
+                new_drop_events.push(tid);
             }
         }
         for tid in new_drop_events {

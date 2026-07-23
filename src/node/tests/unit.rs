@@ -1995,3 +1995,40 @@ async fn handle_msg1_admits_existing_peer_at_cap() {
         "rate limiter must rebalance after the (bypass-admitted) handler returns"
     );
 }
+
+// ===== Transport kernel-drop detection (sans-IO) =====
+//
+// The drop-detection edge-detector, tested directly. It replaces the
+// congestion-drops docker scenario, which could not provoke SO_RXQ_OVFL
+// deterministically (a fresh daemon reader keeps up with container-speed
+// traffic, so the kernel never overflows the socket queue). The kernel
+// dropping datagrams is not FIPS behaviour to test; the FIPS behaviour is
+// reading the SO_RXQ_OVFL counter and firing kernel_drop_events on the
+// transition into a new drop burst, which is exactly this decision.
+
+#[test]
+fn test_transport_drop_state_fires_on_edge_and_rearms() {
+    let mut s = TransportDropState::default();
+    // Cumulative counter still 0: no rise, no event.
+    assert!(!s.observe_drops(0));
+    // First rise (0 -> 5): a new drop burst is observed, so it fires.
+    assert!(s.observe_drops(5));
+    // Counter keeps rising (5 -> 9) but we are already dropping: this is
+    // the "first observed" contract, so it must NOT fire again.
+    assert!(!s.observe_drops(9));
+    // A sample with no further rise clears the dropping flag (no event).
+    assert!(!s.observe_drops(9));
+    // A later rise (9 -> 12) is a fresh burst and fires again.
+    assert!(s.observe_drops(12));
+}
+
+#[test]
+fn test_transport_drop_state_steady_counter_fires_once() {
+    let mut s = TransportDropState::default();
+    // A cumulative counter that jumps once and then holds steady must
+    // register exactly one event, not one per sample — otherwise a single
+    // historical drop burst would report congestion forever.
+    assert!(s.observe_drops(7));
+    assert!(!s.observe_drops(7));
+    assert!(!s.observe_drops(7));
+}

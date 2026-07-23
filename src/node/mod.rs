@@ -266,6 +266,32 @@ struct TransportDropState {
     dropping: bool,
 }
 
+impl TransportDropState {
+    /// Fold a new cumulative `recv_drops` sample into the state and report
+    /// whether it marks the *transition* into a dropping condition.
+    ///
+    /// Returns true only on the edge where the cumulative `SO_RXQ_OVFL`
+    /// counter rose since the previous sample **and** the transport was not
+    /// already flagged as dropping. That edge is what `kernel_drop_events`
+    /// counts: a first observation of a new drop burst, not every sample in
+    /// which the counter happens to be non-zero. A sample with no rise
+    /// clears the flag, so a later rise counts as a fresh event.
+    ///
+    /// Pure and sans-IO by design: the tick handler reads the kernel
+    /// counter from the socket and does the logging, but the detection
+    /// decision lives here so it can be tested without a socket, a
+    /// transport, or a running node — which is the only way it can be
+    /// tested at all, since the kernel drop itself cannot be provoked
+    /// deterministically.
+    fn observe_drops(&mut self, current: u64) -> bool {
+        let rose = current > self.prev_drops;
+        let new_event = rose && !self.dropping;
+        self.dropping = rose;
+        self.prev_drops = current;
+        new_event
+    }
+}
+
 /// State for a link waiting for transport-level connection establishment.
 ///
 /// For connection-oriented transports (TCP, Tor), the transport connect runs

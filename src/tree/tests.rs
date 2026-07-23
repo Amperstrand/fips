@@ -536,6 +536,172 @@ fn test_evaluate_parent_picks_loop_free_over_loopy() {
     assert_eq!(result, Some(peer2));
 }
 
+// ===== Cost-based parent selection =====
+//
+// These exercise evaluate_parent's MMP-cost path directly, as a sans-IO
+// unit test of the exact decision. They replace six Docker chaos
+// scenarios — cost-reeval, cost-avoidance, cost-stability, depth-vs-cost,
+// mixed-technology and bottleneck-parent — whose subject was this
+// decision but which could not test it reliably: the mesh's root is
+// whichever node holds the smallest NodeAddr, MMP costs take several
+// measurement windows to settle, and hold-down plus hysteresis timing all
+// confounded the assertion. Here the peer ancestry, depths and costs are
+// constructed directly, so the decision is deterministic and each check
+// can fail on a real regression.
+
+#[test]
+fn test_evaluate_parent_cost_prefers_cheaper_link_at_equal_depth() {
+    // mixed-technology / cost-avoidance subject: two candidate parents at
+    // the SAME depth, one over a cheap (fiber) link and one over an
+    // expensive (Bluetooth) link. The cheaper link must win.
+    //
+    // The cheap peer is given the LARGER NodeAddr on purpose: with cost
+    // ignored the two candidates tie on depth and the NodeAddr tiebreak
+    // would pick the expensive, smaller-addr peer. Only a cost-aware
+    // decision picks the cheaper, larger-addr one, so the assertion
+    // discriminates.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+
+    let expensive = make_node_addr(2); // smaller addr, high cost (Bluetooth)
+    let cheap = make_node_addr(3); // larger addr, low cost (fiber)
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(expensive, root, 1, 1000),
+        make_coords(&[2, 0]), // depth 1
+    );
+    state.update_peer(
+        ParentDeclaration::new(cheap, root, 1, 1000),
+        make_coords(&[3, 0]), // depth 1
+    );
+
+    // eff_depth(expensive) = 1 + 4.0 = 5.0; eff_depth(cheap) = 1 + 1.0 = 2.0
+    let costs = HashMap::from([(expensive, 4.0_f64), (cheap, 1.0_f64)]);
+    assert_eq!(state.evaluate_parent(&costs), Some(cheap));
+}
+
+#[test]
+fn test_evaluate_parent_cost_switches_when_link_to_parent_degrades() {
+    // cost-reeval subject: the node is parented to A over a cheap link;
+    // that link then degrades so the alternative B is strictly cheaper.
+    // Re-evaluation must switch to B. This is the periodic-reeval decision,
+    // taken here without any timer, netem or MMP-measurement latency.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+
+    let peer_a = make_node_addr(2);
+    let peer_b = make_node_addr(3);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[2, 0]), // depth 1
+    );
+    state.update_peer(
+        ParentDeclaration::new(peer_b, root, 1, 1000),
+        make_coords(&[3, 0]), // depth 1
+    );
+
+    // Adopt A as parent (both links cheap at first).
+    state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+    assert!(!state.is_root());
+
+    // A's link degrades: eff(A) = 1 + 5.0 = 6.0, eff(B) = 1 + 1.0 = 2.0.
+    // Default hysteresis is zero, so the strictly-cheaper B wins.
+    let costs = HashMap::from([(peer_a, 5.0_f64), (peer_b, 1.0_f64)]);
+    assert_eq!(state.evaluate_parent(&costs), Some(peer_b));
+}
+
+#[test]
+fn test_evaluate_parent_hysteresis_suppresses_marginal_cost_change() {
+    // cost-stability subject: a cost change smaller than the hysteresis
+    // band must NOT trigger a reparent. This is the property the scenario
+    // was named for and could only approximate with a switch-count ceiling.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+    state.set_parent_hysteresis(0.2);
+
+    let peer_a = make_node_addr(2);
+    let peer_b = make_node_addr(3);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(peer_b, root, 1, 1000),
+        make_coords(&[3, 0]),
+    );
+    state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+
+    // eff(A) = 1 + 1.0 = 2.0; eff(B) = 1 + 0.9 = 1.9. B is cheaper, but
+    // 1.9 is not below 2.0 * (1 - 0.2) = 1.6, so hysteresis holds the parent.
+    let costs = HashMap::from([(peer_a, 1.0_f64), (peer_b, 0.9_f64)]);
+    assert_eq!(state.evaluate_parent(&costs), None);
+}
+
+#[test]
+fn test_evaluate_parent_hysteresis_allows_significant_cost_change() {
+    // cost-stability healthy-path companion: a change LARGER than the band
+    // must still switch, so the hysteresis test above is not passing merely
+    // because the node never reparents.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+    state.set_parent_hysteresis(0.2);
+
+    let peer_a = make_node_addr(2);
+    let peer_b = make_node_addr(3);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(peer_b, root, 1, 1000),
+        make_coords(&[3, 0]),
+    );
+    state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+
+    // eff(A) = 2.0; eff(B) = 1 + 0.3 = 1.3 < 1.6 threshold → switch to B.
+    let costs = HashMap::from([(peer_a, 1.0_f64), (peer_b, 0.3_f64)]);
+    assert_eq!(state.evaluate_parent(&costs), Some(peer_b));
+}
+
+#[test]
+fn test_evaluate_parent_effective_depth_weighs_depth_against_cost() {
+    // depth-vs-cost / bottleneck-parent subject: a shallow parent reached
+    // over an expensive (bottleneck) link versus a deeper parent over a
+    // cheap link. effective_depth = depth + link_cost decides, and here the
+    // deeper-but-cheaper path wins — the outcome the depth-vs-cost scenario
+    // named no falsifiable answer for.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+
+    let shallow = make_node_addr(2); // depth 1, bottleneck link
+    let deep = make_node_addr(3); // depth 3, cheap link
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(shallow, root, 1, 1000),
+        make_coords(&[2, 0]), // depth 1
+    );
+    state.update_peer(
+        ParentDeclaration::new(deep, make_node_addr(6), 1, 1000),
+        make_coords(&[3, 6, 7, 0]), // depth 3
+    );
+
+    // eff(shallow) = 1 + 3.0 = 4.0; eff(deep) = 3 + 0.5 = 3.5 → pick deep.
+    // A depth-only decision would take the shallow bottleneck instead.
+    let costs = HashMap::from([(shallow, 3.0_f64), (deep, 0.5_f64)]);
+    assert_eq!(state.evaluate_parent(&costs), Some(deep));
+}
+
 #[test]
 fn test_handle_parent_lost_finds_alternative() {
     let my_node = make_node_addr(5);
