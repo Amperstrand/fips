@@ -15,11 +15,12 @@ from datetime import datetime
 from .assertions import (
     AssertionOutcome,
     BloomSendRateMonitor,
+    evaluate_baseline,
     evaluate_congestion_signals,
     evaluate_max_errors,
-    evaluate_tree_parents,
     evaluate_max_parent_switches,
     evaluate_min_parent_switches,
+    evaluate_tree_parents,
 )
 from .compose import generate_compose
 from .config_gen import write_configs
@@ -618,6 +619,17 @@ class SimRunner:
             err_cfg = self.scenario.assertions.max_errors
             if err_cfg is not None:
                 outcome = evaluate_max_errors(err_cfg, result.errors)
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            bl_cfg = self.scenario.assertions.baseline
+            if bl_cfg is not None:
+                outcome = evaluate_baseline(
+                    bl_cfg, self.final_tree, len(result.sessions_established)
+                )
                 self.assertion_outcomes.append(outcome)
                 if outcome.passed:
                     log.info("%s", outcome.detail)

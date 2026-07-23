@@ -225,6 +225,28 @@ class MaxParentSwitchesAssertion:
 
 
 @dataclass
+class BaselineAssertion:
+    """Floor on the mesh having formed at all.
+
+    Deliberately weak and deliberately universal. It does not describe any
+    scenario's subject; it says the nodes came up, agreed on a root, and
+    took parents. Its value is that a scenario with no other assertion
+    still cannot pass while the mesh is dead, which is the state twelve of
+    thirteen scenarios were previously unable to distinguish from success.
+
+    ``max_roots`` is how many distinct root values the snapshot may carry.
+    One means the whole mesh agreed; a churn scenario that partitions on
+    purpose needs a higher number, and setting it above one is a statement
+    that partition is expected rather than an oversight.
+    """
+
+    min_nodes_reporting: int | None = None
+    max_roots: int | None = None
+    min_nodes_parented: int | None = None
+    min_sessions: int | None = None
+
+
+@dataclass
 class TreeParentsAssertion:
     """Expected parent per node in the final tree snapshot.
 
@@ -294,6 +316,7 @@ class AssertionsConfig:
     max_errors: MaxErrorsAssertion | None = None
     congestion_signals: CongestionSignalsAssertion | None = None
     tree_parents: TreeParentsAssertion | None = None
+    baseline: BaselineAssertion | None = None
 
 
 @dataclass
@@ -373,7 +396,7 @@ _SECTION_KEYS = {
     "link_swap.edges[]": {"edge", "policy"},
     "assertions": {
         "bloom_send_rate", "min_parent_switches", "max_parent_switches",
-        "max_errors", "congestion_signals", "tree_parents",
+        "max_errors", "congestion_signals", "tree_parents", "baseline",
     },
     "logging": {"rust_log", "output_dir"},
 }
@@ -384,6 +407,9 @@ _ASSERTION_KEYS = {
     "max_errors": {"max_total"},
     "congestion_signals": {
         "min_nodes_detected", "min_nodes_ce_forwarded", "min_nodes_ce_received",
+    },
+    "baseline": {
+        "min_nodes_reporting", "max_roots", "min_nodes_parented", "min_sessions",
     },
 }
 _NETEM_POLICY_KEYS = {
@@ -758,6 +784,42 @@ def load_scenario(path: str) -> Scenario:
                 )
             expected[child] = parent
         s.assertions.tree_parents = TreeParentsAssertion(expected=expected)
+    if "baseline" in asrt:
+        bl = asrt["baseline"]
+        _reject_unknown(bl, _ASSERTION_KEYS["baseline"], "assertions.baseline")
+        vals = {}
+        for key in _ASSERTION_KEYS["baseline"]:
+            if key not in bl:
+                continue
+            val = bl[key]
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(
+                    f"assertions.baseline.{key}: must be an integer, "
+                    f"got {val!r}"
+                )
+            floor = 1 if key == "max_roots" else 0
+            if val < floor:
+                raise ValueError(
+                    f"assertions.baseline.{key}: must be at least {floor}, "
+                    f"got {val}"
+                )
+            vals[key] = val
+        if not vals:
+            raise ValueError(
+                "assertions.baseline: set at least one of "
+                + ", ".join(sorted(_ASSERTION_KEYS["baseline"]))
+                + "; a block with none asserts nothing"
+            )
+        if vals.get("min_nodes_parented", 0) > 0 or vals.get("max_roots"):
+            n = s.topology.num_nodes
+            if vals.get("min_nodes_parented", 0) > n - 1:
+                raise ValueError(
+                    f"assertions.baseline.min_nodes_parented: "
+                    f"{vals['min_nodes_parented']} exceeds {n - 1}, the most a "
+                    f"{n}-node mesh can reach — the root is its own parent, so "
+                    f"this could never pass"
+                )
+        s.assertions.baseline = BaselineAssertion(**vals)
 
     # Logging section
     lg = raw.get("logging", {})

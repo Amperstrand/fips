@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from .control import snapshot_all_bloom
 from .scenario import (
+    BaselineAssertion,
     BloomSendRateAssertion,
     CongestionSignalsAssertion,
     MaxErrorsAssertion,
@@ -170,6 +171,63 @@ def evaluate_max_parent_switches(
             f"cost change smaller than the hysteresis margin is still "
             f"triggering a switch."
         ),
+    )
+
+
+def evaluate_baseline(
+    cfg: BaselineAssertion,
+    snapshot: dict | None,
+    sessions: int,
+) -> AssertionOutcome:
+    """Floor on the mesh having formed: nodes answered, agreed a root, took parents."""
+    if not snapshot:
+        return AssertionOutcome(
+            name="baseline",
+            passed=False,
+            detail=(
+                "FAIL baseline: no final tree snapshot was taken, so nothing "
+                "about the mesh was observed. This is a harness failure."
+            ),
+        )
+
+    reporting = len(snapshot)
+    roots = {v.get("root") for v in snapshot.values() if v.get("root")}
+    parented = sum(
+        1 for v in snapshot.values()
+        if v.get("parent") and v.get("parent") != v.get("my_node_addr")
+    )
+
+    parts, failures = [], []
+
+    def note(ok, text):
+        parts.append(text)
+        if not ok:
+            failures.append(text)
+
+    if cfg.min_nodes_reporting is not None:
+        note(reporting >= cfg.min_nodes_reporting,
+             f"{reporting} node(s) answered (need {cfg.min_nodes_reporting})")
+    if cfg.max_roots is not None:
+        note(len(roots) <= cfg.max_roots and len(roots) >= 1,
+             f"{len(roots)} distinct root(s) (allowed {cfg.max_roots})")
+    if cfg.min_nodes_parented is not None:
+        note(parented >= cfg.min_nodes_parented,
+             f"{parented} node(s) have a parent (need {cfg.min_nodes_parented})")
+    if cfg.min_sessions is not None:
+        note(sessions >= cfg.min_sessions,
+             f"{sessions} session(s) established (need {cfg.min_sessions})")
+
+    summary = "; ".join(parts)
+    if failures:
+        return AssertionOutcome(
+            name="baseline",
+            passed=False,
+            detail=(
+                f"FAIL baseline: {'; '.join(failures)}. Full: {summary}"
+            ),
+        )
+    return AssertionOutcome(
+        name="baseline", passed=True, detail=f"PASS baseline: {summary}"
     )
 
 

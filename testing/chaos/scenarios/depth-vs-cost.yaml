@@ -83,6 +83,21 @@ traffic:
   duration_secs: {min: 5, max: 10}
   parallel_streams: 2
 
+# Baseline: the mesh came up, agreed on a root, and took parents. This
+# asserts nothing about which parent n04 chooses, which is unspecified;
+# it exists so that a run in which the mesh never formed cannot report
+# success, which until now it could,
+# because this scenario carried no assertions at all.
+#
+# Four nodes, one root, three parented and four sessions in all five
+# provably-completed archived runs.
+assertions:
+  baseline:
+    min_nodes_reporting: 4
+    max_roots: 1
+    min_nodes_parented: 3
+    min_sessions: 2
+
 logging:
   rust_log: "info"
   output_dir: "./sim-results"
