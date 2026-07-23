@@ -31,25 +31,33 @@
 #
 # Netem mutation shifts fiber-only links between normal and degraded.
 #
-# NEITHER TEST SUBJECT IS ASSERTED, because the implementation does not do
-# what the two lines above say. Across the five archived runs that carry a
-# status.txt and are therefore provably completed, n06's parent is n10 in
-# three and n03 in two, and n08's is n04 in four and n03 in one. Encoding
-# either as written would red the scenario most runs; encoding what it
-# actually does would pin behaviour nobody specified and would silently
-# bless it.
+# NEITHER TEST SUBJECT IS ASSERTED YET, and the reason has been found and
+# fixed at the root rather than papered over here.
 #
-# So this is an open question rather than a missing assertion: either
-# cost-based selection is not preferring fiber here, or the criteria were
-# written for a topology this file no longer has. n06 taking n10 is the
-# more interesting half — n10 reaches n06 by fiber, so the choice may be
-# defensible and the comment simply stale. It needs someone to work out
-# which, and until then this scenario proves nothing about parent choice.
+# The diagram above puts n01 at the top, and both test subjects only make
+# sense in a tree rooted there. The mesh does not root by topology: it roots
+# at the numerically smallest NodeAddr (src/tree/state.rs:363-390), which is a
+# hash of the node's key and bears no relation to the numbering. Until
+# 2026-07-23 this scenario rooted at **n09** in every run, which put both
+# criteria out of reach. Under that root n08's two candidates were not at
+# equal depth, so its choice was settled by depth long before link technology
+# could matter, and n08 taking n04 was CORRECT behaviour that these comments
+# made look like a defect.
 #
-# That leaves this scenario asserting nothing about its own subject. The
-# baseline block further down holds it to forming a tree and carrying
-# traffic, which is a floor and not a substitute: nothing here checks that
-# the tree it forms is the one these comments describe.
+# What the archive shows, for anyone re-deriving this later: across the five
+# runs under the old root, n06's parent is n10 in three and n03 in two, and
+# n08's is n04 in four and n03 in one. Those numbers describe a tree rooted at
+# n09 and must not be used to calibrate anything now.
+#
+# `topology.pin_root` (default true) now assigns identities in NodeAddr order,
+# so n01 holds the smallest and the diagram describes the tree that forms.
+# Both criteria should therefore become reachable and assertable.
+#
+# STILL TO DO: run this under the pinned root, confirm n06 and n08 both take
+# n03, and encode `tree_parents` for them. Until then the baseline block below
+# is a floor and not a substitute — it holds the mesh to forming a tree and
+# carrying traffic, and nothing here yet checks that the tree is the one these
+# comments describe. Tracked in ISSUE-2026-0085.
 
 scenario:
   name: "mixed-technology"
