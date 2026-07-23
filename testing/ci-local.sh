@@ -40,6 +40,29 @@
 # Opt-in (require --with-tor; depend on live Tor network):
 #   tor-socks5, tor-directory
 #
+# Deliberately not run by either runner, with the reason for each. Recorded
+# here so that "not in the suite list" stops being indistinguishable from
+# "forgotten", which is what it was until 2026-07-23:
+#   interop/         Manual. Driven by interop-stress.sh, which runs N
+#                    repetitions serially under netem and takes far longer
+#                    than a CI slot. No CI-sized entry point exists yet;
+#                    writing one is the work, not adding a line here.
+#   boringtun/       Comparative benchmark against a non-FIPS implementation.
+#                    Measures rather than asserts, and needs a boringtun
+#                    build CI does not have.
+#   iperf-test.sh    Bandwidth measurement, no pass/fail. Driven manually by
+#                    iperf-compare-refs.sh.
+#   ecn-ab-compare.sh  Manual A/B comparison, renamed from ecn-ab-test.sh
+#                    because it asserts nothing. Making it gateable needs a
+#                    calibration corpus that does not exist; see its header.
+#   mesh-lab/        Long-running multi-host lab, not a suite.
+#   ecn-ab-on, ecn-ab-off, maelstrom, maelstrom-sparse
+#                    Chaos scenarios excluded from CHAOS_SUITES. The two
+#                    ecn-ab ones are halves of the manual comparison above.
+#                    The two maelstrom ones are 600 s stress runs kept for
+#                    manual investigation. All four still load-check and
+#                    carry the default max_errors ceiling if run by hand.
+#
 # Exit codes:
 #   0   — all stages passed
 #   1   — one or more stages failed
