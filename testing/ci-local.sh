@@ -28,7 +28,7 @@
 # Integration suites (default coverage):
 #   static-mesh, static-chain, rekey, rekey-accept-off,
 #   rekey-outbound-only, gateway,
-#   admission-cap, firewall, nat-cone, nat-symmetric,
+#   firewall, nat-cone, nat-symmetric,
 #   nat-lan, nostr-publish-consume, stun-faults,
 #   chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-congestion-stress,
@@ -64,6 +64,16 @@
 #                    coverage was real-UDP admission, exercised by every other
 #                    real-transport suite. Still runnable by hand:
 #                    bash testing/acl-allowlist/test.sh
+#   admission-cap    Retired from CI 2026-07-24 as redundant, not unrunnable.
+#                    The inbound max_peers early-gate in handle_msg1 is unit-
+#                    tested over a real UDP socket by
+#                    handle_msg1_silent_drops_at_cap_for_new_peer in
+#                    src/node/tests/unit.rs: it sends a Msg1 from a fresh
+#                    identity at saturation and polls the sender socket to
+#                    assert no Msg2 returns — the same wire-observable
+#                    discriminator the Docker tcpdump used — plus a sibling
+#                    test for the existing-peer bypass. Still runnable by hand:
+#                    bash testing/static/scripts/admission-cap-test.sh
 #   ecn-ab-on, ecn-ab-off, maelstrom, maelstrom-sparse
 #                    Chaos scenarios excluded from CHAOS_SUITES. The two
 #                    ecn-ab ones are halves of the manual comparison above.
@@ -124,7 +134,6 @@ ONLY_SUITE=""
 # All integration suites matching ci.yml
 STATIC_SUITES=(static-mesh static-chain)
 REKEY_SUITES=(rekey rekey-accept-off rekey-outbound-only)
-ADMISSION_SUITES=(admission-cap)
 # Each entry: "display-name scenario [--flag value ...]"
 CHAOS_SUITES=(
     "churn-mixed-10 churn-mixed --nodes 10 --duration 120"
@@ -191,9 +200,6 @@ list_suites() {
     echo ""
     echo "  Rekey:"
     for s in "${REKEY_SUITES[@]}"; do echo "    $s"; done
-    echo ""
-    echo "  Admission cap:"
-    for s in "${ADMISSION_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Gateway:"
     for s in "${GATEWAY_SUITES[@]}"; do echo "    $s"; done
@@ -568,35 +574,6 @@ run_rekey() {
     record "rekey" $rc
 }
 
-# Run the admission-cap integration test
-# Verifies the inbound max_peers early-gate silent-drops at scale by
-# lowering node.max_peers on one mesh node and asserting via tcpdump
-# that no Msg2 responses go to the sustained-retrying denied peers.
-run_admission_cap() {
-    local compose="testing/static/docker-compose.yml"
-    local rc=0
-    export COMPOSE_PROJECT_NAME="$(ci_project static)"
-
-    info "[admission-cap] Generating configs"
-    bash testing/static/scripts/generate-configs.sh mesh || { record "admission-cap" 1; return; }
-    bash testing/static/scripts/admission-cap-test.sh inject-config || { record "admission-cap" 1; return; }
-
-    info "[admission-cap] Starting containers (mesh profile)"
-    docker compose -f "$compose" --profile mesh up -d || { record "admission-cap" 1; return; }
-
-    info "[admission-cap] Running admission-cap test"
-    if bash testing/static/scripts/admission-cap-test.sh; then
-        rc=0
-    else
-        rc=1
-        info "[admission-cap] Collecting failure logs"
-        docker compose -f "$compose" --profile mesh logs --no-color 2>&1 | tail -100
-    fi
-
-    docker compose -f "$compose" --profile mesh down --volumes --remove-orphans 2>/dev/null
-    record "admission-cap" $rc
-}
-
 # Run a chaos scenario
 run_chaos() {
     local name="$1"
@@ -925,11 +902,6 @@ run_integration() {
     run_rekey_accept_off
     run_rekey_outbound_only
 
-    # Admission cap (mesh profile, max_peers=1 on one node)
-    for _suite in "${ADMISSION_SUITES[@]}"; do
-        run_admission_cap
-    done
-
     # Gateway
     run_gateway
 
@@ -1043,8 +1015,6 @@ run_suite() {
             run_rekey_accept_off ;;
         rekey-outbound-only)
             run_rekey_outbound_only ;;
-        admission-cap)
-            run_admission_cap ;;
         gateway)
             run_gateway ;;
         firewall)
