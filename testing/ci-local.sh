@@ -30,7 +30,7 @@
 #   rekey-outbound-only, gateway,
 #   acl-allowlist, admission-cap, firewall, nat-cone, nat-symmetric,
 #   nat-lan, nostr-publish-consume, stun-faults,
-#   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
+#   chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-congestion-stress,
 #   chaos-bloom-storm,
 #   sidecar, dns-resolver, deb-install
@@ -117,7 +117,6 @@ REKEY_SUITES=(rekey rekey-accept-off rekey-outbound-only)
 ADMISSION_SUITES=(admission-cap)
 # Each entry: "display-name scenario [--flag value ...]"
 CHAOS_SUITES=(
-    "smoke-10 smoke-10"
     "churn-mixed-10 churn-mixed --nodes 10 --duration 120"
     "ethernet-mesh ethernet-mesh"
     "ethernet-only ethernet-only"
@@ -137,6 +136,15 @@ CHAOS_SUITES=(
 #     detection logic is now unit-tested in src/node/tests/unit.rs.
 # congestion-stress stays: it exercises the ECN/MMP congestion signals,
 # which do need the real shaped bottleneck queue.
+#
+# Retired 2026-07-24 for a different reason — redundant, not unreliable:
+#   - smoke-10: a no-stressor 10-node tree-convergence sanity check (netem
+#     off, no ping). The convergence logic it exercised is covered in-process,
+#     faster and deterministically, by the loopback spanning-tree harness
+#     (src/node/tests/spanning_tree.rs: ring/star/chain/100-node/disconnected)
+#     plus end-to-end datagram delivery (src/node/tests/forwarding.rs). Real-
+#     UDP convergence smoke still runs via static-mesh and the other chaos
+#     scenarios' baseline assertions, so no Docker coverage is lost.
 GATEWAY_SUITES=(gateway)
 SIDECAR_SUITES=(sidecar)
 ACL_SUITES=(acl-allowlist)

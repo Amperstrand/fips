@@ -396,9 +396,6 @@ jobs:
             type: gateway
             topology: gateway
           # ── Chaos / stochastic scenarios ───────────────────────────────────
-          - suite: chaos-smoke-10
-            type: chaos
-            scenario: smoke-10
           - suite: churn-mixed-10
             type: chaos
             scenario: churn-mixed
