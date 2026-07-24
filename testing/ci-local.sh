@@ -28,7 +28,7 @@
 # Integration suites (default coverage):
 #   static-mesh, static-chain, rekey, rekey-accept-off,
 #   rekey-outbound-only, gateway,
-#   acl-allowlist, admission-cap, firewall, nat-cone, nat-symmetric,
+#   admission-cap, firewall, nat-cone, nat-symmetric,
 #   nat-lan, nostr-publish-consume, stun-faults,
 #   chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-congestion-stress,
@@ -54,6 +54,16 @@
 #                    because it asserts nothing. Making it gateable needs a
 #                    calibration corpus that does not exist; see its header.
 #   mesh-lab/        Long-running multi-host lab, not a suite.
+#   acl-allowlist/   Retired from CI 2026-07-24 as redundant, not unrunnable.
+#                    The ACL decision is exhaustively unit-tested per npub over
+#                    real loaded allow/deny files (src/node/acl.rs mod tests:
+#                    allow-wins, allowlist-miss, deny-only, deny-all,
+#                    allow_all-override), and the inbound/outbound handshake-
+#                    admission path is covered in-process over loopback
+#                    (src/node/tests/acl.rs). The Docker suite's only unique
+#                    coverage was real-UDP admission, exercised by every other
+#                    real-transport suite. Still runnable by hand:
+#                    bash testing/acl-allowlist/test.sh
 #   ecn-ab-on, ecn-ab-off, maelstrom, maelstrom-sparse
 #                    Chaos scenarios excluded from CHAOS_SUITES. The two
 #                    ecn-ab ones are halves of the manual comparison above.
@@ -147,7 +157,6 @@ CHAOS_SUITES=(
 #     scenarios' baseline assertions, so no Docker coverage is lost.
 GATEWAY_SUITES=(gateway)
 SIDECAR_SUITES=(sidecar)
-ACL_SUITES=(acl-allowlist)
 FIREWALL_SUITES=(firewall)
 NAT_SUITES=(cone symmetric lan)
 NOSTR_RELAY_SUITES=(nostr-publish-consume)
@@ -188,9 +197,6 @@ list_suites() {
     echo ""
     echo "  Gateway:"
     for s in "${GATEWAY_SUITES[@]}"; do echo "    $s"; done
-    echo ""
-    echo "  ACL allowlist:"
-    for s in "${ACL_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Firewall baseline:"
     for s in "${FIREWALL_SUITES[@]}"; do echo "    $s"; done
@@ -785,17 +791,6 @@ run_rekey_outbound_only() {
     record "rekey-outbound-only" $rc
 }
 
-# Run ACL allowlist integration test
-run_acl_allowlist() {
-    export COMPOSE_PROJECT_NAME="$(ci_project acl)"
-    info "[acl-allowlist] Running integration test"
-    if bash testing/acl-allowlist/test.sh --skip-build 2>&1; then
-        record "acl-allowlist" 0
-    else
-        record "acl-allowlist" 1
-    fi
-}
-
 # Run firewall baseline integration test
 run_firewall() {
     export COMPOSE_PROJECT_NAME="$(ci_project firewall)"
@@ -938,9 +933,6 @@ run_integration() {
     # Gateway
     run_gateway
 
-    # ACL allowlist
-    run_acl_allowlist
-
     # Firewall baseline
     run_firewall
 
@@ -1055,8 +1047,6 @@ run_suite() {
             run_admission_cap ;;
         gateway)
             run_gateway ;;
-        acl-allowlist)
-            run_acl_allowlist ;;
         firewall)
             run_firewall ;;
         nat-cone|nat-symmetric|nat-lan)
