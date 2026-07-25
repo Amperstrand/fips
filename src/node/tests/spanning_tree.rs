@@ -19,7 +19,7 @@ static LARGE_NETWORK_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 /// address. Each node gets a unique synthetic address (`loopback:{n}`) from
 /// `LOOPBACK_ADDR_COUNTER`, so addresses never collide across concurrently
 /// running tests and stale entries from finished tests are harmless.
-static LOOPBACK_REGISTRY: std::sync::LazyLock<LoopbackRegistry> =
+pub(super) static LOOPBACK_REGISTRY: std::sync::LazyLock<LoopbackRegistry> =
     std::sync::LazyLock::new(new_registry);
 
 static LOOPBACK_ADDR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

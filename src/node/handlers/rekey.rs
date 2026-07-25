@@ -317,8 +317,8 @@ impl Node {
 
         let wire_msg1 = build_msg1(our_index, &noise_msg1);
 
-        // Send msg1 on the existing link (same transport + address)
-        if let Some(transport) = self.transports.get(&transport_id) {
+        // Send msg1 on the existing link (same transport + address).
+        let sent = if let Some(transport) = self.transports.get(&transport_id) {
             match transport.send(&remote_addr, &wire_msg1).await {
                 Ok(_) => {
                     debug!(
@@ -326,6 +326,7 @@ impl Node {
                         our_index = %our_index,
                         "Rekey initiated, sent msg1 on existing link"
                     );
+                    true
                 }
                 Err(e) => {
                     warn!(
@@ -333,17 +334,26 @@ impl Node {
                         error = %e,
                         "Failed to send rekey msg1"
                     );
-                    let _ = self.index_allocator.free(our_index);
-                    return;
+                    false
                 }
             }
-        }
+        } else {
+            false
+        };
 
-        // Store handshake state on the ActivePeer (not a separate PeerConnection)
+        // Store handshake state on the ActivePeer EVEN on send failure.
+        // Without this, rekey_in_progress() returns false and check_rekey()
+        // re-triggers initiate_rekey() every tick (1s), permanently
+        // congesting the drain queue (issue #103).
+        // The resend_pending_rekeys path handles retry with backoff.
         let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
         let now_ms = Self::now_ms();
         if let Some(peer) = self.peers.get_mut(node_addr) {
             peer.set_rekey_state(hs, our_index, wire_msg1, now_ms + resend_interval);
+        }
+
+        if !sent {
+            return;
         }
 
         // Register in pending_outbound for msg2 dispatch (maps to existing link)
@@ -402,14 +412,25 @@ impl Node {
                         false
                     };
 
-                    if sent && let Some(peer) = self.peers.get_mut(&node_addr) {
+                    // Always advance the resend timer, even on send failure.
+                    // Without this, needs_msg1_resend() returns true every
+                    // tick, creating a tight retry loop with no backoff
+                    // (issue #103).
+                    if let Some(peer) = self.peers.get_mut(&node_addr) {
                         peer.record_rekey_msg1_resend(next_resend_at_ms);
-                        let count = peer.rekey_msg1_resend_count();
-                        trace!(
-                            peer = %self.peer_display_name(&node_addr),
-                            resend = count,
-                            "Resent rekey msg1"
-                        );
+                        if sent {
+                            let count = peer.rekey_msg1_resend_count();
+                            trace!(
+                                peer = %self.peer_display_name(&node_addr),
+                                resend = count,
+                                "Resent rekey msg1"
+                            );
+                        } else {
+                            debug!(
+                                peer = %self.peer_display_name(&node_addr),
+                                "Rekey msg1 resend deferred (send failed)"
+                            );
+                        }
                     }
                 }
                 #[allow(unreachable_patterns)]
@@ -507,16 +528,24 @@ impl Node {
                         }
                     };
 
-                    if sent && let Some(entry) = self.sessions.get_mut(&addr) {
+                    // Always advance the resend timer, even on send failure (#103).
+                    if let Some(entry) = self.sessions.get_mut(&addr) {
                         let count = entry.rekey_msg3_resend_count() + 1;
                         let next =
                             now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
                         entry.record_rekey_msg3_resend(next);
-                        trace!(
-                            peer = %self.peer_display_name(&addr),
-                            resend = count,
-                            "Resent FSP rekey msg3"
-                        );
+                        if sent {
+                            trace!(
+                                peer = %self.peer_display_name(&addr),
+                                resend = count,
+                                "Resent FSP rekey msg3"
+                            );
+                        } else {
+                            debug!(
+                                peer = %self.peer_display_name(&addr),
+                                "FSP rekey msg3 resend deferred (send failed)"
+                            );
+                        }
                     }
                 }
                 #[allow(unreachable_patterns)]
