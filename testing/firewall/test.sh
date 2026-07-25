@@ -230,14 +230,20 @@ log "Case (b): node-b initiates outbound TCP, expects reply via conntrack"
 # node-b → node-a:8000 on the fips overlay. node-a has http.server on
 # [::]:8000 and is NOT firewalled, so this is purely a test of node-b's
 # outbound + ct state established,related path on the way back.
+#
+# mktemp rather than a fixed /tmp name: two concurrent runs of this suite
+# would otherwise share one host file, and either one's `rm` between the
+# other's write and read leaves an empty read that fails the http_code check
+# for a reason that has nothing to do with the firewall.
+CURL_OUT="$(mktemp)"
 set +e
 docker exec "$CONTAINER_B" curl -6 --silent --max-time 5 \
     --output /dev/null --write-out '%{http_code}' \
-    "http://[${ADDR_A}]:${OUTBOUND_TARGET_PORT}/" >/tmp/fw_b_rc 2>/dev/null
+    "http://[${ADDR_A}]:${OUTBOUND_TARGET_PORT}/" >"$CURL_OUT" 2>/dev/null
 RC=$?
 set -e
-HTTP_CODE="$(cat /tmp/fw_b_rc 2>/dev/null || true)"
-rm -f /tmp/fw_b_rc
+HTTP_CODE="$(cat "$CURL_OUT" 2>/dev/null || true)"
+rm -f "$CURL_OUT"
 if [ "$RC" -ne 0 ]; then
     fail "(b) outbound from node-b failed (curl rc=$RC, http=$HTTP_CODE) — conntrack reply path broken"
 fi
