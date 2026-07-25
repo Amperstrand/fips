@@ -81,21 +81,46 @@ wait_for_fips0() {
     fail "$container fips0 did not come up within ${timeout}s"
 }
 
+# Connected-peer count for a container, or the empty string if it did not
+# answer.
+#
+# Empty is deliberately distinct from a real 0. An `|| echo 0` fallback here
+# would make "the container is unreachable, or its daemon never came up" and
+# "the daemon answered, and the answer was zero" the same value, so any caller
+# expecting zero would be satisfied on the first iteration without the
+# property it is checking ever being observed. No caller in this file expects
+# zero today, which is exactly why the fallback has to go now rather than when
+# one is added. Same shape as the acl-allowlist suite's read_connected_peers.
+read_connected_peers() {
+    local container="$1"
+    docker exec "$container" fipsctl show peers 2>/dev/null \
+        | python3 -c 'import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data.get("peers", []) if p.get("connectivity") == "connected"))' 2>/dev/null \
+        || true
+}
+
 # Wait for the peer count on a container to reach the expected value.
 wait_for_peers_exact() {
     local container="$1"
     local expected_count="$2"
     local timeout="${3:-30}"
+
+    local count="" answered=false
     for _ in $(seq 1 "$timeout"); do
-        local count
-        count=$(docker exec "$container" fipsctl show peers 2>/dev/null \
-            | python3 -c 'import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data.get("peers", []) if p.get("connectivity") == "connected"))' 2>/dev/null || echo 0)
-        if [ "$count" -eq "$expected_count" ]; then
-            return 0
+        count=$(read_connected_peers "$container")
+        if [ -n "$count" ]; then
+            answered=true
+            if [ "$count" -eq "$expected_count" ]; then
+                return 0
+            fi
         fi
         sleep 1
     done
-    fail "$container did not reach $expected_count connected peers in ${timeout}s"
+
+    if [ "$answered" = false ]; then
+        fail "$container never answered a peer query in ${timeout}s, so a count of $expected_count was never actually observed"
+    fi
+    docker exec "$container" fipsctl show peers >&2 || true
+    fail "$container did not reach $expected_count connected peers in ${timeout}s (last answer: $count)"
 }
 
 # Resolve `<npub>.fips` inside a container and print the AAAA answer.
