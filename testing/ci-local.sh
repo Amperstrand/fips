@@ -32,7 +32,6 @@
 #   nat-lan, nostr-publish-consume, stun-faults,
 #   chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-congestion-stress,
-#   chaos-bloom-storm,
 #   sidecar, dns-resolver, deb-install
 #
 # Opt-in (require --with-tor; depend on live Tor network):
@@ -141,7 +140,6 @@ CHAOS_SUITES=(
     "ethernet-only ethernet-only"
     "tcp-mesh tcp-mesh"
     "congestion-stress congestion-stress"
-    "bloom-storm bloom-storm"
 )
 # Scenarios retired 2026-07-23 because their subject was a pure decision the
 # Docker harness could not test reliably, now covered by sans-IO unit tests:
@@ -164,6 +162,24 @@ CHAOS_SUITES=(
 #     plus end-to-end datagram delivery (src/node/tests/forwarding.rs). Real-
 #     UDP convergence smoke still runs via static-mesh and the other chaos
 #     scenarios' baseline assertions, so no Docker coverage is lost.
+#
+# Retired 2026-07-26 for a third reason — the guard's power was never
+# established, and unlike the two blocks above this one DOES lose coverage:
+#   - bloom-storm: guarded the regression in 0caef2a (fixed by 4cdf382), where
+#     a mid-chain tree update changing neither root nor depth leaked downstream
+#     as a sustained bloom announce storm. It was never once run against that
+#     regressed binary; its ceiling was inferred from a separate post-mortem
+#     harness that no longer exists in the tree. On the only regressed
+#     measurement that survives, the tail node's rate scales to ~7 sends per
+#     30s, well under the scenario's ceiling of 40 — so it is not established
+#     that the assertion could ever have fired on its own bug class. The
+#     ceiling is also uniform per node, calibrated against the flap target
+#     (legitimately ~24) while the storm's actual signature is at the tail,
+#     which sits at 0 on fixed code. COVERAGE GAP: nothing now exercises
+#     downstream containment of a mid-chain ancestor swap. The scenario, its
+#     README, the link_swap sim primitive and the mesh-lab dispatch all stay
+#     on disk and it remains runnable by hand via
+#     testing/chaos/scripts/chaos.sh bloom-storm.
 GATEWAY_SUITES=(gateway)
 SIDECAR_SUITES=(sidecar)
 FIREWALL_SUITES=(firewall)
