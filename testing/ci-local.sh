@@ -318,6 +318,14 @@ CI_LABEL_RUN="com.corganlabs.fips-ci.run=${CI_RUN_ID}"
 export FIPS_CI_RUN_ID="$CI_RUN_ID"
 export FIPS_TEST_IMAGE="$CI_IMAGE_TEST"
 export FIPS_TEST_APP_IMAGE="$CI_IMAGE_APP"
+# The build context is this run's too. testing/docker/ is a single directory in
+# the working tree, so two runs racing on its CONTENTS produce a per-run-tagged
+# image built from the other run's binaries — scoping the tag alone does not
+# close that. Absolute, and it has to be: compose interpolates this into
+# build.context but resolves a relative result against the compose FILE's
+# directory, not the working directory.
+CI_BUILD_CONTEXT="$SCRIPT_DIR/docker-${CI_RUN_ID}"
+export FIPS_BUILD_CONTEXT="$CI_BUILD_CONTEXT"
 # Docker container names are GLOBAL — a compose project name does not scope
 # them — so the suite compose files append this suffix to every explicit
 # container_name, and the suite scripts append it wherever they address a
@@ -404,6 +412,15 @@ ci_teardown() {
     if [[ $run_status -eq 0 && -n "${CI_RUN_NAME_SUFFIX:-}" ]]; then
         rm -rf "$SCRIPT_DIR/static/generated-configs${CI_RUN_NAME_SUFFIX}"
         rm -rf "$SCRIPT_DIR/firewall/generated-configs${CI_RUN_NAME_SUFFIX}"
+    fi
+
+    # 4. This run's build context. Unlike the generated configs it is removed
+    #    on a red run too: it holds the binaries and the Dockerfiles, both
+    #    reproducible from the commit, so it is never the evidence of a
+    #    failure. Guarded on the path having been derived at all, so an early
+    #    exit cannot turn this into `rm -rf $SCRIPT_DIR/docker-`.
+    if [[ -n "${CI_BUILD_CONTEXT:-}" && "$CI_BUILD_CONTEXT" != "$SCRIPT_DIR/docker-" ]]; then
+        rm -rf "$CI_BUILD_CONTEXT"
     fi
 }
 
@@ -871,22 +888,39 @@ run_tor_directory() {
 run_integration() {
     stage "Stage 3: Integration Tests"
 
-    # Install binaries to shared docker context
+    # Populate THIS run's build context, then install the binaries into it.
+    # Everything but the binaries is copied from the tracked context directory;
+    # the binaries are installed fresh, and a previous run's are deliberately
+    # not carried over, since inheriting them is the failure this scoping
+    # exists to prevent.
+    info "Preparing build context $CI_BUILD_CONTEXT"
+    rm -rf "$CI_BUILD_CONTEXT"
+    mkdir -p "$CI_BUILD_CONTEXT" || { record "docker-build" 1; return; }
+    local _f
+    for _f in "$SCRIPT_DIR"/docker/*; do
+        case "$(basename "$_f")" in
+            fips|fipsctl|fipstop|fips-gateway) continue ;;
+        esac
+        cp -a "$_f" "$CI_BUILD_CONTEXT/" || { record "docker-build" 1; return; }
+    done
+
     info "Installing release binaries"
-    install_binaries testing/docker
+    install_binaries "$CI_BUILD_CONTEXT"
 
     # Build unified test image once (used by all harnesses). Tag per-run
     # (fips-test:${run}) so a build killed mid-flight never wedges the next
     # run's rebuild, and concurrent runs never clobber each other's image.
-    # Then retag :latest for the compose files / harness scripts that still
-    # reference fips-test:latest directly; the retag happens only after BOTH
-    # builds succeed, so :latest never points at a half-built image.
     info "Building $CI_IMAGE_TEST Docker image"
-    docker build -t "$CI_IMAGE_TEST" --label "$CI_LABEL" --label "$CI_LABEL_RUN" testing/docker --quiet \
+    docker build -t "$CI_IMAGE_TEST" --label "$CI_LABEL" --label "$CI_LABEL_RUN" "$CI_BUILD_CONTEXT" --quiet \
         || { record "docker-build" 1; return; }
     docker build -t "$CI_IMAGE_APP" --label "$CI_LABEL" --label "$CI_LABEL_RUN" \
-        -f testing/docker/Dockerfile.app testing/docker --quiet \
+        -f "$CI_BUILD_CONTEXT/Dockerfile.app" "$CI_BUILD_CONTEXT" --quiet \
         || { record "docker-build-app" 1; return; }
+    # The remaining bridge back to the shared mutable tag, for any consumer not
+    # yet reading FIPS_TEST_IMAGE. Removed in the following commit, which is the
+    # step that makes a missed consumer fail loudly instead of silently
+    # resolving another run's binaries. Both builds have succeeded by here, so
+    # :latest never points at a half-built image.
     docker tag "$CI_IMAGE_TEST" fips-test:latest
     docker tag "$CI_IMAGE_APP" fips-test-app:latest
 

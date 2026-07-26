@@ -247,6 +247,27 @@ reap_images() {
     timeout "$TMO" docker rmi -f "${imgs[@]}" >/dev/null 2>&1 || true
 }
 
+# Per-run build contexts left in the working tree. ci-local.sh removes its own
+# from the EXIT trap, but the CI worker sends SIGKILL after SIGTERM and a
+# SIGKILL runs no trap, so a preempted run can leave an 18 MB directory behind
+# with nothing else that would ever notice it.
+#
+# Scoped mode takes only the named run's. Broad mode cannot tell a live run's
+# context from an abandoned one by name, so it goes by age instead: a run lasts
+# well under an hour, and a day is far outside that.
+reap_build_contexts() {
+    local dir
+    if [[ -n "$RUN_ID" ]]; then
+        dir="$SCRIPT_DIR/docker-$RUN_ID"
+        [[ -d "$dir" ]] && rm -rf "$dir"
+        return 0
+    fi
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] && rm -rf "$dir"
+    done < <(find "$SCRIPT_DIR" -maxdepth 1 -type d -name 'docker-*' -mtime +0 2>/dev/null)
+    return 0
+}
+
 # Order matters: containers reference networks/volumes, so drop them first, and
 # the veth sweep needs an image to run ip(8) in, so it precedes the image reap.
 reap_containers
@@ -254,5 +275,6 @@ reap_networks
 reap_volumes
 reap_veths
 reap_images
+reap_build_contexts
 
 exit 0
