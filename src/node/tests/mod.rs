@@ -13,8 +13,6 @@ mod bootstrap;
 mod decrypt_failure;
 mod disconnect;
 mod discovery;
-#[cfg(target_os = "linux")]
-mod ethernet;
 mod forwarding;
 mod handshake;
 mod heartbeat;
