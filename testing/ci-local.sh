@@ -280,8 +280,9 @@ record() {
 #
 # This script may be preempted (a CI worker sends SIGTERM, waits ~30s, then
 # SIGKILL) so it can restart on a newer tip. To make that safe:
-#   * every docker resource is namespaced to THIS run (compose project prefix
-#     + per-run image tags) so a restart never collides with a dying run;
+#   * every docker resource is namespaced to THIS run (compose project prefix,
+#     per-run image tags, per-run build context) so a restart never collides
+#     with a dying run, and neither does a concurrent one;
 #   * a trap tears down everything this run created on signal/exit, bounded by
 #     `timeout` so a stuck `down` cannot wedge the trap (SIGKILL is the backstop).
 
@@ -916,13 +917,11 @@ run_integration() {
     docker build -t "$CI_IMAGE_APP" --label "$CI_LABEL" --label "$CI_LABEL_RUN" \
         -f "$CI_BUILD_CONTEXT/Dockerfile.app" "$CI_BUILD_CONTEXT" --quiet \
         || { record "docker-build-app" 1; return; }
-    # The remaining bridge back to the shared mutable tag, for any consumer not
-    # yet reading FIPS_TEST_IMAGE. Removed in the following commit, which is the
-    # step that makes a missed consumer fail loudly instead of silently
-    # resolving another run's binaries. Both builds have succeeded by here, so
-    # :latest never points at a half-built image.
-    docker tag "$CI_IMAGE_TEST" fips-test:latest
-    docker tag "$CI_IMAGE_APP" fips-test-app:latest
+    # Deliberately NOT retagged to fips-test:latest. Every consumer reads
+    # FIPS_TEST_IMAGE, and a bridge back to the shared mutable name would let a
+    # consumer that does not keep working silently — resolving whichever
+    # concurrent run wrote the tag last, and recording that run's binaries under
+    # this run's commit. Without the bridge a missed consumer fails loudly.
 
     # Single suite mode
     if [[ -n "$ONLY_SUITE" ]]; then
@@ -1141,6 +1140,17 @@ run_ci_parity() {
     record "ci-parity" $rc
 }
 
+# Nothing may resolve the shared mutable test image. This run does not write
+# fips-test:latest, so a consumer naming it fails loudly here and now — but only
+# on a host with no hand-built copy lying around, which is not a property to
+# rely on. This is the static half of that.
+run_image_scoping() {
+    local rc=0
+    info "[image-scoping] Checking that nothing names the shared test image"
+    "$SCRIPT_DIR/check-image-scoping.sh" || rc=$?
+    record "image-scoping" $rc
+}
+
 # Every daemon log string a test matches on must still be emitted by src/.
 # A stale one does not fail — it stops observing, and an expect-zero assertion
 # built on it then passes for the wrong reason.
@@ -1194,6 +1204,7 @@ main() {
     run_ci_parity
     run_log_strings
     run_trailing_log
+    run_image_scoping
     run_wait_converge
 
     if [[ "$TEST_ONLY" == true ]]; then

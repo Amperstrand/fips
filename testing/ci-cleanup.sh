@@ -66,9 +66,15 @@ RUN_ID=""                  # broad default: every CI run
 IMAGES=""
 VETH_SUFFIXES=""           # empty AND no --run-id: every simulation veth name
 # ip(8) runs inside this image, the same way the simulation creates the
-# interfaces, so the reap works wherever the simulation does. The chaos
-# simulation builds it, and it carries iproute2.
-VETH_IMAGE="fips-test:latest"
+# interfaces, so the reap works wherever the simulation does. Any fips test
+# image will do; it is wanted only for its iproute2.
+#
+# Empty here and resolved after the argument loop, because the resolution has
+# to consider --veth-image. The old default of fips-test:latest is no longer
+# safe on its own: ci-local.sh does not write that tag, so on a host that has
+# only ever run the harness it need not exist at all, and the reap this script
+# advertises as the remedy for orphaned interfaces would be a permanent no-op.
+VETH_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -77,10 +83,25 @@ while [[ $# -gt 0 ]]; do
         --run-id)         RUN_ID="$2"; shift 2 ;;
         --images)         IMAGES="$2"; shift 2 ;;
         --veth-suffixes)  VETH_SUFFIXES="$2"; shift 2 ;;
+        --veth-image)     VETH_IMAGE="$2"; shift 2 ;;
         -h|--help)        sed -n '2,/^set /{ /^set /d; s/^# \?//; p }' "$0"; exit 0 ;;
         *)                echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+# Resolve the image to run ip(8) in: the caller's choice, then the run's own
+# image, then any surviving fips test image. That last fallback is what keeps
+# an unscoped `ci-local.sh --reap` working — it execs this script from inside
+# its own argument loop, before the run identity is exported, so it can pass
+# neither. The empty case is handled at the point of use, which already warns
+# and skips rather than failing the sweep.
+if [[ -z "$VETH_IMAGE" ]]; then
+    VETH_IMAGE="${FIPS_TEST_IMAGE:-}"
+fi
+if [[ -z "$VETH_IMAGE" ]] && command -v docker >/dev/null 2>&1; then
+    VETH_IMAGE="$(timeout 10 docker image ls --format '{{.Repository}}:{{.Tag}}' fips-test 2>/dev/null | head -n1)"
+fi
+[[ -z "$VETH_IMAGE" ]] && VETH_IMAGE="fips-test:latest"
 
 if ! command -v docker >/dev/null 2>&1; then
     # No docker, nothing to reap.
@@ -217,8 +238,8 @@ reap_veths() {
     [[ -z "$pattern" ]] && return 0
     # Without the image there is no way to run ip(8). Orphans can outlive it —
     # `docker image prune -a`, a build host that prunes between runs, or a run
-    # aborted before ci-local.sh retags :latest all remove it while interfaces
-    # are still up — so this is a real skip, not "nothing was ever run here".
+    # whose per-run image was already reaped all remove it while interfaces are
+    # still up — so this is a real skip, not "nothing was ever run here".
     if ! docker image inspect "$VETH_IMAGE" >/dev/null 2>&1; then
         veth_warn "image $VETH_IMAGE not present, cannot run ip(8)"
         return 0
