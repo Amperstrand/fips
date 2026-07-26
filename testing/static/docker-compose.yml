@@ -365,40 +365,6 @@ services:
     networks:
       fips-net:
 
-  # ── TCP chain topology (A-B-C) ───────────────────────────────
-  tcp-a:
-    <<: *fips-common
-    profiles: ["tcp-chain"]
-    container_name: fips-node-a${FIPS_CI_NAME_SUFFIX:-}
-    hostname: node-a
-    volumes:
-      - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/tcp-chain/node-a.yaml:/etc/fips/fips.yaml:ro
-    networks:
-      fips-net:
-
-  tcp-b:
-    <<: *fips-common
-    profiles: ["tcp-chain"]
-    container_name: fips-node-b${FIPS_CI_NAME_SUFFIX:-}
-    hostname: node-b
-    volumes:
-      - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/tcp-chain/node-b.yaml:/etc/fips/fips.yaml:ro
-    networks:
-      fips-net:
-
-  tcp-c:
-    <<: *fips-common
-    profiles: ["tcp-chain"]
-    container_name: fips-node-c${FIPS_CI_NAME_SUFFIX:-}
-    hostname: node-c
-    volumes:
-      - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/tcp-chain/node-c.yaml:/etc/fips/fips.yaml:ro
-    networks:
-      fips-net:
-
   # ── Gateway integration test (gateway + server + non-FIPS client) ─
   gw-gateway:
     <<: *fips-common

@@ -16,7 +16,6 @@ configurations.
 | ----------- | ----- | --------- | -------------------------------- |
 | mesh        | 5     | UDP       | Sparse mesh, 6 links, multi-hop  |
 | chain       | 5     | UDP       | Linear chain, max 4-hop paths    |
-| tcp-chain   | 3     | TCP       | Linear chain over TCP (port 8443) |
 | rekey       | 5     | UDP       | Rekey integration test topology  |
 
 ### [tor/](tor/) -- Tor Transport Integration
