@@ -20,7 +20,7 @@ networks:
 x-fips-common: &fips-common
   build:
     context: ../docker
-  image: fips-test:latest
+  image: ${FIPS_TEST_IMAGE:-fips-test:latest}
   entrypoint: ["/usr/local/bin/entrypoint.sh"]
   cap_add:
     - NET_ADMIN
