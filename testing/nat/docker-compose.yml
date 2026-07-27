@@ -126,7 +126,7 @@ services:
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
       - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
-      - ./generated-configs/cone/node-a.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/cone/node-a.yaml:/etc/fips/fips.yaml:ro
     network_mode: none
 
   cone-b:
@@ -152,7 +152,7 @@ services:
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
       - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
-      - ./generated-configs/cone/node-b.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/cone/node-b.yaml:/etc/fips/fips.yaml:ro
     network_mode: none
 
   symmetric-a:
@@ -178,7 +178,7 @@ services:
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
       - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
-      - ./generated-configs/symmetric/node-a.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/symmetric/node-a.yaml:/etc/fips/fips.yaml:ro
     network_mode: none
 
   symmetric-b:
@@ -204,7 +204,7 @@ services:
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
       - ./node/entrypoint.sh:/usr/local/bin/nat-node-entrypoint.sh:ro
-      - ./generated-configs/symmetric/node-b.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/symmetric/node-b.yaml:/etc/fips/fips.yaml:ro
     network_mode: none
 
   lan-a:
@@ -217,7 +217,7 @@ services:
       - stun
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs/lan/node-a.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/lan/node-a.yaml:/etc/fips/fips.yaml:ro
     networks:
       shared-lan:
         ipv4_address: 172.31.10.10
@@ -232,7 +232,7 @@ services:
       - stun
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs/lan/node-b.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/lan/node-b.yaml:/etc/fips/fips.yaml:ro
     networks:
       shared-lan:
         ipv4_address: 172.31.10.11
@@ -254,7 +254,7 @@ services:
       - stun
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs/nostr-publish-consume/node-a.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/nostr-publish-consume/node-a.yaml:/etc/fips/fips.yaml:ro
     networks:
       shared-lan:
         ipv4_address: 172.31.10.20
@@ -269,7 +269,7 @@ services:
       - stun
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs/nostr-publish-consume/node-b.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/nostr-publish-consume/node-b.yaml:/etc/fips/fips.yaml:ro
     networks:
       shared-lan:
         ipv4_address: 172.31.10.21
@@ -298,7 +298,7 @@ services:
       - stun
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs/stun-faults/stun-fault-node.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/stun-faults/stun-fault-node.yaml:/etc/fips/fips.yaml:ro
     networks:
       shared-lan:
         ipv4_address: 172.31.10.50
@@ -319,7 +319,7 @@ services:
       - stun
     volumes:
       - ../docker/resolv.conf:/etc/resolv.conf:ro
-      - ./generated-configs/stun-faults/stun-fault-peer.yaml:/etc/fips/fips.yaml:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/stun-faults/stun-fault-peer.yaml:/etc/fips/fips.yaml:ro
     networks:
       shared-lan:
         ipv4_address: 172.31.10.51

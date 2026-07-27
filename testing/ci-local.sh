@@ -429,6 +429,7 @@ ci_teardown() {
     if [[ $run_status -eq 0 && -n "${CI_RUN_NAME_SUFFIX:-}" ]]; then
         rm -rf "$SCRIPT_DIR/static/generated-configs${CI_RUN_NAME_SUFFIX}"
         rm -rf "$SCRIPT_DIR/firewall/generated-configs${CI_RUN_NAME_SUFFIX}"
+        rm -rf "$SCRIPT_DIR/nat/generated-configs${CI_RUN_NAME_SUFFIX}"
     fi
 
     # 4. This run's build context. Unlike the generated configs it is removed

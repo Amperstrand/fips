@@ -21,6 +21,8 @@ ROOT_DIR="$(cd "$NAT_DIR/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 WAIT_LIB="$ROOT_DIR/testing/lib/wait-converge.sh"
+# Must track generate-configs.sh's OUTPUT_DIR and the compose bind-mounts.
+CONFIG_DIR="$NAT_DIR/generated-configs${FIPS_CI_NAME_SUFFIX:-}"
 
 PROFILE="nostr-publish-consume"
 SCENARIO="$PROFILE"
@@ -342,7 +344,7 @@ run_test() {
     fi
 
     # shellcheck disable=SC1090
-    source "$NAT_DIR/generated-configs/$SCENARIO/npubs.env"
+    source "$CONFIG_DIR/$SCENARIO/npubs.env"
     echo "  NPUB_A=$NPUB_A"
     echo "  NPUB_B=$NPUB_B"
 

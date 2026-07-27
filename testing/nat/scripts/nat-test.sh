@@ -9,6 +9,10 @@ BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 TOPOLOGY_SCRIPT="$SCRIPT_DIR/setup-topology.sh"
 WAIT_LIB="$ROOT_DIR/testing/lib/wait-converge.sh"
+# Must track generate-configs.sh's OUTPUT_DIR and the compose bind-mounts: the
+# npubs are read back here after the containers are up, so reading a different
+# directory than the one the generator wrote pings an npub no node owns.
+CONFIG_DIR="$NAT_DIR/generated-configs${FIPS_CI_NAME_SUFFIX:-}"
 
 SCENARIO="${1:-all}"
 COMPOSE=(docker compose -f "$NAT_DIR/docker-compose.yml")
@@ -358,7 +362,7 @@ run_cone() {
     assert_link_path fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} 172.31.254.
     assert_link_path fips-nat-cone-b${FIPS_CI_NAME_SUFFIX:-} 172.31.254.
     # shellcheck disable=SC1090
-    source "$NAT_DIR/generated-configs/cone/npubs.env"
+    source "$CONFIG_DIR/cone/npubs.env"
     ping_peer fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B"
     ping_peer fips-nat-cone-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A"
     cleanup
@@ -385,7 +389,7 @@ run_symmetric() {
     require_bootstrap_activity fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-}
     require_bootstrap_activity fips-nat-symmetric-b${FIPS_CI_NAME_SUFFIX:-}
     # shellcheck disable=SC1090
-    source "$NAT_DIR/generated-configs/symmetric/npubs.env"
+    source "$CONFIG_DIR/symmetric/npubs.env"
     ping_peer fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B"
     ping_peer fips-nat-symmetric-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A"
     cleanup
@@ -409,7 +413,7 @@ run_lan() {
     assert_link_path fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} 172.31.10.
     assert_link_path fips-nat-lan-b${FIPS_CI_NAME_SUFFIX:-} 172.31.10.
     # shellcheck disable=SC1090
-    source "$NAT_DIR/generated-configs/lan/npubs.env"
+    source "$CONFIG_DIR/lan/npubs.env"
     ping_peer fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B"
     ping_peer fips-nat-lan-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A"
     # Skip the final teardown when the mesh-lab harness wraps this
