@@ -191,7 +191,7 @@ pub(crate) fn stop() -> Result<serde_json::Value, String> {
     }))
 }
 
-/// Report capture state. Distinguishes all three states.
+/// Report capture state. Distinguishes all four states.
 pub(crate) fn status() -> serde_json::Value {
     let state = STATE.load(Ordering::Acquire);
     serde_json::json!({

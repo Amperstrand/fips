@@ -52,7 +52,36 @@ pub(crate) fn spawn(file: File) -> std::io::Result<Handle> {
     Ok(Handle { stop_tx, join })
 }
 
-fn run(mut file: File, stop_rx: Receiver<()>) {
+/// What one flush cycle decided. Separated from [`run`] so the terminal paths
+/// can be driven in a test with a failing sink: the loop below owns the waiting
+/// and the state transition, this owns the decision.
+#[derive(Debug, PartialEq, Eq)]
+enum Cycle {
+    Continue,
+    CapReached,
+    WriteFailed,
+}
+
+/// Drain one interval into the sink and decide whether the capture goes on.
+fn flush_cycle<W: Write>(file: &mut W) -> Cycle {
+    if flush(file).is_err() {
+        // The sink is gone or full; stop rather than spinning on a broken file
+        // for the rest of the run.
+        let _ = note(file, "capture stopped: write error");
+        return Cycle::WriteFailed;
+    }
+    if capture::bytes_written() >= BYTE_CAP {
+        let _ = note(
+            file,
+            &format!("capture stopped: byte cap {BYTE_CAP} reached"),
+        );
+        let _ = file.flush();
+        return Cycle::CapReached;
+    }
+    Cycle::Continue
+}
+
+fn run<W: Write>(mut file: W, stop_rx: Receiver<()>) {
     loop {
         match stop_rx.recv_timeout(INTERVAL) {
             // Stop requested, or the owner went away: final drain, then exit.
@@ -61,15 +90,13 @@ fn run(mut file: File, stop_rx: Receiver<()>) {
                 let _ = file.flush();
                 return;
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if flush(&mut file).is_err() {
-                    // The sink is gone or full; stop the capture rather than
-                    // spinning on a broken file for the rest of the run.
-                    let _ = note(&mut file, "capture stopped: write error");
-                    // The trailer above goes to the same failing file, so it is
-                    // not a signal that survives. `stop` and a subsequent `on`
-                    // both clear the state without surfacing it, so an operator
-                    // would otherwise never learn the window was truncated.
+            Err(RecvTimeoutError::Timeout) => match flush_cycle(&mut file) {
+                Cycle::Continue => {}
+                Cycle::WriteFailed => {
+                    // The trailer went to the same failing file, so it is not a
+                    // signal that survives. `stop` and a subsequent `on` both
+                    // clear the state without surfacing it, so an operator would
+                    // otherwise never learn the window was truncated.
                     tracing::warn!(
                         target: "fips::instr",
                         "profile capture stopped: write error on the sink"
@@ -77,22 +104,17 @@ fn run(mut file: File, stop_rx: Receiver<()>) {
                     capture::mark_stopped(capture::STOPPED_BY_ERROR);
                     return;
                 }
-                if capture::bytes_written() >= BYTE_CAP {
-                    let _ = note(
-                        &mut file,
-                        &format!("capture stopped: byte cap {BYTE_CAP} reached"),
-                    );
-                    let _ = file.flush();
+                Cycle::CapReached => {
                     capture::mark_stopped(capture::STOPPED_BY_CAP);
                     return;
                 }
-            }
+            },
         }
     }
 }
 
 /// Append a `#`-prefixed trailer line.
-fn note(file: &mut File, text: &str) -> std::io::Result<()> {
+fn note<W: Write>(file: &mut W, text: &str) -> std::io::Result<()> {
     let line = format!("# {text}\n");
     file.write_all(line.as_bytes())?;
     capture::add_bytes(line.len() as u64);
@@ -105,7 +127,7 @@ fn note(file: &mut File, text: &str) -> std::io::Result<()> {
 /// "this step did not run" is visible rather than absent. The two steps whose
 /// call sites are conditionally compiled are excluded in builds that do not
 /// have them, so no row is structurally zero forever.
-fn flush(file: &mut File) -> std::io::Result<()> {
+fn flush<W: Write>(file: &mut W) -> std::io::Result<()> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -146,4 +168,51 @@ fn flush(file: &mut File) -> std::io::Result<()> {
     file.write_all(out.as_bytes())?;
     capture::add_bytes(out.len() as u64);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sink that fails every write, so the writer's error path is driven by a
+    /// real `Err` rather than asserted about.
+    struct AlwaysFails;
+
+    impl Write for AlwaysFails {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "no space left on device",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A failing sink ends the capture as a write error, which `run` turns into
+    /// `STOPPED_BY_ERROR` — not into a byte-cap stop. The distinction is what
+    /// tells an operator that a window is truncated rather than complete.
+    ///
+    /// **Coverage note.** This drives the decision, not the filesystem
+    /// condition. The mesh rehearsal cannot produce one: removing the file
+    /// leaves the writer's descriptor valid and writes keep succeeding into the
+    /// unlinked inode, and mounting a tiny filesystem inside the test container
+    /// is refused. So "a real ENOSPC reaches this branch" stays unexercised;
+    /// what is covered is that an `Err` from the sink produces the error
+    /// outcome and not the cap outcome.
+    #[test]
+    fn a_failing_sink_ends_the_cycle_as_an_error_not_a_cap() {
+        let _guard = crate::instr::test_serial();
+        assert_eq!(flush_cycle(&mut AlwaysFails), Cycle::WriteFailed);
+    }
+
+    /// The healthy path must not be reported as either terminal state, or the
+    /// test above would pass for a writer that always stops.
+    #[test]
+    fn a_working_sink_continues() {
+        let _guard = crate::instr::test_serial();
+        let mut sink: Vec<u8> = Vec::new();
+        assert_eq!(flush_cycle(&mut sink), Cycle::Continue);
+    }
 }
