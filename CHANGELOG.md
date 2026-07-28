@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An optional tick-body profiler behind the new `profiling` Cargo feature,
+  **off by default**. When enabled, `fipsctl profile tick on [--dir PATH]` /
+  `off` / `status` starts and stops a capture at runtime with no restart. Each
+  capture writes one tab-separated file (default `/var/log/fips`, capped at
+  32 MB) carrying, per ten-second interval, the exact count, max and total for
+  every step of the rx-loop tick arm, the whole-tick span, and gauges for ticks,
+  peer count, the gap between successive tick-arm entries and the resulting
+  arm-starvation delay. With the feature off the instrumentation macro is a pure
+  pass-through, so a default build contains no timing code on the tick path.
+  `LogsDirectory=fips` was added to the packaged systemd units so the capture
+  directory is created and cleaned up declaratively.
+
 ### Changed
 
 - The Ethernet transport's per-interface `discovery` flag was renamed to
