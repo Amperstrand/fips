@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LogsDirectory=fips` was added to the packaged systemd units so the capture
   directory is created and cleaned up declaratively.
 
+- `packaging/debian/build-deb.sh --features <list>` builds the `.deb` with a
+  Cargo feature list, which is how an instrumented package is produced for a
+  measurement run. The auto-derived dev Version gains a matching `+<features>`
+  marker, so a feature build and a default build of the same commit are no
+  longer indistinguishable: without it the two carry byte-identical versions,
+  an install of one over the other is an apt no-op, and the running node offers
+  no way to tell which one it has. The marker sorts above the unmarked build, so
+  installing a feature build is an upgrade and reverting to the default build is
+  a downgrade — revert with `dpkg -i` rather than `apt install`. `--features` is
+  refused together with `--no-build`, which would stamp the marker onto binaries
+  the features never reached.
+
 ### Changed
 
 - The Ethernet transport's per-interface `discovery` flag was renamed to
