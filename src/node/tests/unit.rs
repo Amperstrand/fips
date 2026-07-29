@@ -2119,3 +2119,49 @@ fn test_transport_drop_state_steady_counter_fires_once() {
     assert!(!s.observe_drops(7));
     assert!(!s.observe_drops(7));
 }
+
+#[test]
+fn test_peer_display_name_uses_cached_short_npub() {
+    // Path 3 of `peer_display_name` (no host entry, no alias) reads the
+    // per-peer cached short npub; it must still equal the value derived
+    // from the peer's identity.
+    let mut node = make_node();
+    let peer_identity_full = Identity::generate();
+    let peer_addr = *peer_identity_full.node_addr();
+    let peer_identity = PeerIdentity::from_pubkey(peer_identity_full.pubkey());
+    node.peers
+        .insert(peer_addr, ActivePeer::new(peer_identity, LinkId::new(1), 0));
+
+    assert_eq!(
+        node.peer_display_name(&peer_addr),
+        peer_identity.short_npub()
+    );
+}
+
+#[test]
+fn test_peer_display_name_tracks_alias_change() {
+    // The display name is NOT cached on the peer: `peer_aliases` is a
+    // runtime-mutable map (`update_peers` inserts and removes entries), so
+    // a cached name would go stale. Caching only the immutable short npub
+    // must leave that tracking intact.
+    let mut node = make_node();
+    let peer_identity_full = Identity::generate();
+    let peer_addr = *peer_identity_full.node_addr();
+    let peer_identity = PeerIdentity::from_pubkey(peer_identity_full.pubkey());
+    node.peers
+        .insert(peer_addr, ActivePeer::new(peer_identity, LinkId::new(1), 0));
+
+    assert_eq!(
+        node.peer_display_name(&peer_addr),
+        peer_identity.short_npub()
+    );
+
+    node.peer_aliases.insert(peer_addr, "gateway".to_string());
+    assert_eq!(node.peer_display_name(&peer_addr), "gateway");
+
+    node.peer_aliases.remove(&peer_addr);
+    assert_eq!(
+        node.peer_display_name(&peer_addr),
+        peer_identity.short_npub()
+    );
+}
