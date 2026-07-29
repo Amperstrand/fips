@@ -1861,6 +1861,18 @@ impl NostrDiscovery {
         }
     }
 
+    /// Point the test instance's advert relays at explicit URLs. Unit tests
+    /// that exercise `refetch_advert_for_stale_check` use this to replace the
+    /// default public relay list with a local blackhole, so the refetch runs
+    /// its full 2s timeout without touching the network.
+    pub(crate) async fn set_advert_relays_for_test(&mut self, relays: Vec<String>) {
+        for url in &relays {
+            let _ = self.client.add_relay(url.as_str()).await;
+        }
+        self.client.connect().await;
+        self.config.advert_relays = relays;
+    }
+
     /// Insert a cached advert directly into the in-memory cache. Used by
     /// unit tests to set up consumer-side state without needing live relays.
     pub(crate) async fn insert_advert_for_test(&self, npub: String, advert: CachedOverlayAdvert) {

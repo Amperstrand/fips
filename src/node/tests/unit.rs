@@ -1707,6 +1707,93 @@ async fn process_pending_retries_gated_at_capacity() {
     );
 }
 
+/// A TCP listener that accepts connections and then never speaks. A relay
+/// URL pointed at it makes the nostr client's websocket handshake hang, so
+/// `refetch_advert_for_stale_check` burns its full 2s fetch timeout without
+/// any network egress.
+fn spawn_blackhole_relay() -> String {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind blackhole listener");
+    let port = listener.local_addr().expect("blackhole local addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            held.push(stream);
+        }
+    });
+    format!("ws://127.0.0.1:{port}")
+}
+
+/// The per-tick retry loop must not await the pre-dial advert refetch.
+///
+/// `process_pending_retries` runs inline on the node's 1s rx-loop tick. Each
+/// due peer's refetch carries a 2s relay-fetch timeout, so awaiting it stalls
+/// the whole tick by 2s per peer — up to `MAX_RETRY_CONNECTIONS_PER_TICK`
+/// times in one tick body. The refresh is fire-and-forget: it exists to make
+/// the *next* retry dial a fresh endpoint, and retries are backoff-paced.
+///
+/// Discriminator: wall-clock duration of one `process_pending_retries` call
+/// with several due peers whose refetches all hang. Awaited, the call takes
+/// `2s * peers`; spawned, it returns without waiting on any of them.
+#[tokio::test]
+async fn process_pending_retries_does_not_await_advert_refetch() {
+    use std::time::Instant;
+
+    const DUE_PEERS: usize = 4;
+    // Awaited: >= 8s (4 x 2s). Spawned: milliseconds. A 3s bound sits far
+    // from both, so neither machine load nor the 2s timeout's own slack can
+    // flip the verdict.
+    const MAX_TICK_MS: u128 = 3_000;
+
+    let mut node = make_node_with_max_peers(64);
+
+    let mut bootstrap = NostrDiscovery::new_for_test();
+    bootstrap
+        .set_advert_relays_for_test(vec![spawn_blackhole_relay()])
+        .await;
+    node.nostr_discovery = Some(Arc::new(bootstrap));
+
+    let mut queued = Vec::new();
+    for _ in 0..DUE_PEERS {
+        let peer_npub = Identity::generate().npub();
+        let peer_node_addr = *PeerIdentity::from_npub(&peer_npub).unwrap().node_addr();
+        let mut state = super::super::retry::RetryState::new(crate::config::PeerConfig::new(
+            peer_npub,
+            "udp",
+            "127.0.0.1:9",
+        ));
+        state.retry_after_ms = 0;
+        state.reconnect = true;
+        node.retry_pending.insert(peer_node_addr, state);
+        queued.push(peer_node_addr);
+    }
+
+    let started = Instant::now();
+    node.process_pending_retries(1_000).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed.as_millis() < MAX_TICK_MS,
+        "retry tick must not block on the advert refetch: took {}ms for {} due peers \
+         (a per-peer 2s relay-fetch timeout awaited inline is the fingerprint)",
+        elapsed.as_millis(),
+        DUE_PEERS
+    );
+
+    // The rest of the loop body is unchanged: every due peer was still
+    // attempted, failed for want of a transport, and was rescheduled.
+    for addr in &queued {
+        let state = node
+            .retry_pending
+            .get(addr)
+            .expect("due peer must remain queued after a failed attempt");
+        assert_eq!(
+            state.retry_count, 1,
+            "each due peer must still have been attempted and rescheduled"
+        );
+    }
+}
+
 #[tokio::test]
 async fn poll_nostr_discovery_established_gated_at_capacity() {
     use crate::discovery::EstablishedTraversal;

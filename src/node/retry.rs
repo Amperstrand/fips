@@ -279,7 +279,7 @@ impl Node {
 
             let peer_config = state.peer_config.clone();
 
-            // Refresh the peer's overlay advert before retrying. The cache is
+            // Kick off a refresh of the peer's overlay advert. The cache is
             // read-only on hit (see fetch_advert), so every retry without a
             // refetch dials the same cached endpoint — and the most common
             // reason a peer ended up in retry_pending is that the cached
@@ -289,13 +289,21 @@ impl Node {
             //
             // refetch_advert_for_stale_check uses the relay's advert as
             // ground truth: replaces the cache if there's a newer one,
-            // evicts if the relay has nothing, otherwise leaves it. Cheap
-            // (one Filter fetch with 2s timeout) and bounded by the retry
-            // backoff cadence.
+            // evicts if the relay has nothing, otherwise leaves it.
+            //
+            // Fire-and-forget, NOT awaited: this runs inline on the 1s
+            // rx-loop tick, and the fetch carries a 2s relay timeout that
+            // would stall the tick — and every other rx-loop arm with it —
+            // by up to 2s per due peer, MAX_RETRY_CONNECTIONS_PER_TICK times
+            // over. So the dial below uses whatever advert is cached now and
+            // the refreshed one lands for the *next* retry of this peer.
+            // Retries are backoff-paced, so that defers the benefit by one
+            // backoff interval rather than losing it.
             if let Some(bootstrap) = self.nostr_discovery.clone() {
-                let _ = bootstrap
-                    .refetch_advert_for_stale_check(&peer_config.npub)
-                    .await;
+                let npub = peer_config.npub.clone();
+                tokio::spawn(async move {
+                    let _ = bootstrap.refetch_advert_for_stale_check(&npub).await;
+                });
             }
 
             match self.initiate_peer_connection(&peer_config).await {
