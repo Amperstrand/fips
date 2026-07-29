@@ -560,17 +560,25 @@ async fn test_node_rx_loop_takes_channel() {
 
 #[test]
 fn test_rate_limiter_initialized() {
+    use crate::node::rate_limit::Msg1Class;
+
     let mut node = make_node();
 
     // Rate limiter should allow handshakes initially
-    assert!(node.msg1_rate_limiter.can_start_handshake());
+    assert!(
+        node.msg1_rate_limiter
+            .can_start_handshake(Msg1Class::Stranger)
+    );
 
     // Start a handshake
-    assert!(node.msg1_rate_limiter.start_handshake());
+    let slot = node
+        .msg1_rate_limiter
+        .start_handshake(Msg1Class::Stranger)
+        .expect("fresh limiter admits");
     assert_eq!(node.msg1_rate_limiter.pending_count(), 1);
 
     // Complete it
-    node.msg1_rate_limiter.complete_handshake();
+    drop(slot);
     assert_eq!(node.msg1_rate_limiter.pending_count(), 0);
 }
 
@@ -1990,8 +1998,8 @@ async fn handle_msg1_silent_drops_at_cap_for_new_peer() {
     assert_eq!(
         node.msg1_rate_limiter.pending_count(),
         before_pending,
-        "rate limiter must rebalance: start_handshake() then \
-         complete_handshake() before silent-drop return"
+        "rate limiter must rebalance: the pending slot start_handshake() \
+         took is released by its guard before the silent-drop return"
     );
 
     // Wire-observable discriminator: with the early gate in place, no
@@ -2080,6 +2088,354 @@ async fn handle_msg1_admits_existing_peer_at_cap() {
         node.msg1_rate_limiter.pending_count(),
         before_pending,
         "rate limiter must rebalance after the (bypass-admitted) handler returns"
+    );
+}
+
+/// Every reject arm of `handle_msg1` releases *its own* pending slot and
+/// nothing else.
+///
+/// The failure this guards is invisible by construction: a slot released
+/// by a path that never took one frees a slot belonging to a **different**
+/// in-flight handshake, lifting effective concurrency above `max_pending`
+/// with no counter moving, no log firing, and no underflow (the release
+/// saturates at zero). The only way to observe it is to hold a *foreign*
+/// slot across the calls and watch whether it survives — which is what
+/// `seed` is. A borrow-based guard could not be held here at all, since
+/// `handle_msg1` needs `&mut node` throughout.
+///
+/// Each arm additionally asserts the reject counter it is supposed to
+/// bump, so a setup that silently failed to reach the arm (wrong addr,
+/// packet rejected earlier) shows up as a red rather than as a
+/// vacuously-stable pending count.
+#[tokio::test]
+async fn msg1_reject_arms_do_not_release_another_handshakes_slot() {
+    use crate::config::UdpConfig;
+    use crate::node::rate_limit::Msg1Class;
+    use crate::node::wire::build_msg1;
+    use crate::noise::HANDSHAKE_MSG1_SIZE;
+    use crate::utils::index::SessionIndex;
+
+    // max_peers 2 so the early-cap arm is reachable on the *same* node the
+    // foreign slot is seeded on. That would otherwise derive a 2-token
+    // established bucket, which refuses the third arm before it runs, so
+    // both buckets are overridden to sizes this test never approaches:
+    // the subject here is slot accounting, not admission.
+    let mut config = Config::new();
+    config.node.limits.max_peers = 2;
+    config.node.rate_limit.handshake_burst = 100;
+    config.node.rate_limit.established_handshake_burst = Some(100);
+    let mut node = make_node_with(config);
+
+    let transport_id = TransportId::new(1);
+    let udp_config = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        mtu: Some(1280),
+        ..Default::default()
+    };
+    let (packet_tx, mut packet_rx) = packet_channel(64);
+    let mut transport = UdpTransport::new(transport_id, None, udp_config, packet_tx);
+    transport.start_async().await.unwrap();
+    let node_udp_addr = transport.local_addr().unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+
+    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind sender socket");
+    let wire_addr = TransportAddr::from_string(&socket_a.local_addr().unwrap().to_string());
+
+    // A foreign in-flight handshake's slot, held for the whole test.
+    let seed = node
+        .msg1_rate_limiter
+        .start_handshake(Msg1Class::Stranger)
+        .expect("fresh limiter admits the seed");
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        1,
+        "baseline: exactly one foreign slot outstanding"
+    );
+
+    // Both source tuples are established links, so the msg1s below are in
+    // the exempted class. The link ids are deliberately absent from
+    // `node.links` for now, so the duplicate-msg1 branch is skipped.
+    let hand_addr = TransportAddr::from_string("198.51.100.7:2121");
+    let hand_link_id = node.allocate_link_id();
+    let wire_link_id = node.allocate_link_id();
+    node.addr_to_link
+        .insert((transport_id, hand_addr.clone()), hand_link_id);
+    node.addr_to_link
+        .insert((transport_id, wire_addr.clone()), wire_link_id);
+
+    let hand_packet = |data: Vec<u8>| ReceivedPacket {
+        transport_id,
+        remote_addr: hand_addr.clone(),
+        data,
+        timestamp_ms: 1000,
+    };
+    let garbage_msg1 = build_msg1(SessionIndex::new(0x4242), &[0u8; HANDSHAKE_MSG1_SIZE]);
+
+    // Arm 1: invalid header (truncated body).
+    let before = node.stats().handshake.bad_state;
+    node.handle_msg1(hand_packet(vec![0u8; 8])).await;
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        before + 1,
+        "arm 1 must reach the invalid-header reject"
+    );
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        1,
+        "invalid-header arm must not release the foreign slot"
+    );
+
+    // Arm 2: well-formed header, unusable Noise payload.
+    let before = node.stats().handshake.bad_state;
+    node.handle_msg1(hand_packet(garbage_msg1.clone())).await;
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        before + 1,
+        "arm 2 must reach the receive_handshake_init reject"
+    );
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        1,
+        "handshake-init-failure arm must not release the foreign slot"
+    );
+
+    // Arm 3: duplicate msg1 on a pending inbound link with no stored msg2.
+    node.links.insert(
+        hand_link_id,
+        Link::connectionless(
+            hand_link_id,
+            transport_id,
+            hand_addr.clone(),
+            LinkDirection::Inbound,
+            Duration::from_millis(100),
+        ),
+    );
+    let before = node.stats().handshake.unknown_connection;
+    node.handle_msg1(hand_packet(garbage_msg1)).await;
+    assert_eq!(
+        node.stats().handshake.unknown_connection,
+        before + 1,
+        "arm 3 must reach the duplicate-msg1-no-stored-msg2 reject"
+    );
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        1,
+        "duplicate-msg1 arm must not release the foreign slot"
+    );
+
+    // Arm 4: the early max_peers cap gate, on a genuine crafted msg1 that
+    // gets all the way through the Noise step.
+    inject_dummy_peers(&mut node, 2);
+    assert_eq!(node.peer_count(), 2, "precondition: at cap");
+    let sender = Identity::generate();
+    let sender_node_addr =
+        craft_and_send_msg1(&node, &sender, &socket_a, node_udp_addr, 2000).await;
+    let before = node.stats().handshake.bad_state;
+    pump_one_msg1_into_node(&mut node, &mut packet_rx, 1000)
+        .await
+        .expect("crafted msg1 must reach packet_rx");
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        before + 1,
+        "arm 4 must reach the max_peers cap reject"
+    );
+    assert!(
+        !node.peers.contains_key(&sender_node_addr),
+        "arm 4 must not admit the new identity"
+    );
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        1,
+        "max_peers-cap arm must not release the foreign slot"
+    );
+
+    // The foreign slot was still ours to release all along.
+    drop(seed);
+    assert_eq!(node.msg1_rate_limiter.pending_count(), 0);
+}
+
+/// The established-link bucket is wired from config at construction:
+/// derived from `max_peers` by default, overridden when the operator sets
+/// the key. This is the only test covering the config → limiter path.
+#[test]
+fn node_established_bucket_is_derived_then_overridable() {
+    let mut config = Config::new();
+    config.node.limits.max_peers = 300;
+    let node = make_node_with(config);
+    assert_eq!(
+        node.msg1_rate_limiter.established_bucket().capacity(),
+        300,
+        "derived burst tracks max_peers"
+    );
+
+    let mut config = Config::new();
+    config.node.limits.max_peers = 300;
+    config.node.rate_limit.established_handshake_burst = Some(7);
+    let node = make_node_with(config);
+    assert_eq!(
+        node.msg1_rate_limiter.established_bucket().capacity(),
+        7,
+        "an explicit key wins over the derivation"
+    );
+}
+
+/// Build a node whose *stranger* msg1 bucket holds exactly one token and
+/// never refills, with a UDP transport bound and started. Returns the node,
+/// its transport id, its wire address and its packet receiver.
+///
+/// The established-link bucket is left at its derived size (128 burst at
+/// default `max_peers`), which is the whole point: the two classes are
+/// metered separately.
+async fn node_with_single_stranger_token() -> (
+    Node,
+    TransportId,
+    std::net::SocketAddr,
+    crate::transport::PacketRx,
+) {
+    use crate::config::UdpConfig;
+
+    let mut config = Config::new();
+    config.node.rate_limit.handshake_burst = 1;
+    config.node.rate_limit.handshake_rate = 0.0;
+    let mut node = make_node_with(config);
+
+    let transport_id = TransportId::new(1);
+    let udp_config = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        mtu: Some(1280),
+        ..Default::default()
+    };
+    let (packet_tx, packet_rx) = packet_channel(64);
+    let mut transport = UdpTransport::new(transport_id, None, udp_config, packet_tx);
+    transport.start_async().await.unwrap();
+    let wire_addr = transport.local_addr().unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+
+    (node, transport_id, wire_addr, packet_rx)
+}
+
+/// Poll a sender socket for a msg2 reply. `None` means nothing arrived
+/// within 300 ms, the same wire-observable discriminator the max_peers cap
+/// tests use.
+async fn poll_for_msg2(socket: &tokio::net::UdpSocket) -> Option<usize> {
+    use tokio::time::{Duration, timeout};
+    let mut buf = [0u8; 2048];
+    timeout(Duration::from_millis(300), socket.recv_from(&mut buf))
+        .await
+        .ok()
+        .and_then(|inner| inner.ok())
+        .map(|(n, _)| n)
+}
+
+/// An established link's rekey/restart msg1 is admitted even when the
+/// stranger bucket is empty, because it draws on its own bucket.
+///
+/// This is the symptom the whole change exists to fix: before it, one
+/// drained global bucket refused an established peer's maintenance traffic
+/// on exactly the same terms as a stranger's first packet.
+#[tokio::test]
+async fn established_link_msg1_admitted_when_stranger_bucket_drained() {
+    use crate::node::rate_limit::Msg1Class;
+
+    let (mut node, transport_id, wire_addr, mut packet_rx) =
+        node_with_single_stranger_token().await;
+
+    // Spend the one stranger token, so any msg1 classed as a stranger is
+    // refused from here on.
+    drop(
+        node.msg1_rate_limiter
+            .start_handshake(Msg1Class::Stranger)
+            .expect("the single stranger token is available at t=0"),
+    );
+
+    for attempt in 0..3 {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sender socket");
+        let sender_addr = TransportAddr::from_string(&socket.local_addr().unwrap().to_string());
+
+        // Mark the source as an established link. The link id is
+        // deliberately absent from `node.links`, so the duplicate-msg1
+        // branch is skipped and the msg1 is processed as a fresh
+        // connection that answers with msg2.
+        let link_id = node.allocate_link_id();
+        node.addr_to_link
+            .insert((transport_id, sender_addr), link_id);
+
+        let sender = Identity::generate();
+        craft_and_send_msg1(&node, &sender, &socket, wire_addr, 1000 + attempt).await;
+        pump_one_msg1_into_node(&mut node, &mut packet_rx, 1000)
+            .await
+            .expect("msg1 must reach packet_rx");
+
+        assert!(
+            poll_for_msg2(&socket).await.is_some(),
+            "attempt {attempt}: established-link msg1 must be answered with \
+             msg2 while the stranger bucket is empty"
+        );
+    }
+}
+
+/// The twin of the test above: a stranger is still refused once the
+/// stranger bucket is drained. The second bucket must not become a way in
+/// for sources that match no established link.
+///
+/// The first sender is a **positive control** on the same node, transport
+/// and code path: it proves the setup really delivers a msg1 and really
+/// produces a msg2 on the wire, so the second sender's silence is
+/// attributable to the drained bucket rather than to a msg1 that never
+/// arrived.
+#[tokio::test]
+async fn stranger_msg1_still_refused_when_bucket_drained() {
+    let (mut node, _transport_id, wire_addr, mut packet_rx) =
+        node_with_single_stranger_token().await;
+
+    // Positive control: one token is available, so this stranger is
+    // admitted and answered.
+    let socket_ok = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind sender socket");
+    craft_and_send_msg1(&node, &Identity::generate(), &socket_ok, wire_addr, 1000).await;
+    pump_one_msg1_into_node(&mut node, &mut packet_rx, 1000)
+        .await
+        .expect("control msg1 must reach packet_rx");
+    assert!(
+        poll_for_msg2(&socket_ok).await.is_some(),
+        "positive control: a stranger with a token available must be \
+         answered with msg2 — without this the silence below proves nothing"
+    );
+    assert_eq!(node.peer_count(), 1, "control msg1 was fully processed");
+
+    // The bucket is now empty and never refills. A second stranger, at a
+    // different source addr and with no established link, gets nothing.
+    let socket_refused = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind second sender socket");
+    craft_and_send_msg1(
+        &node,
+        &Identity::generate(),
+        &socket_refused,
+        wire_addr,
+        2000,
+    )
+    .await;
+    pump_one_msg1_into_node(&mut node, &mut packet_rx, 1000)
+        .await
+        .expect("refused msg1 must still reach packet_rx");
+    let bytes = poll_for_msg2(&socket_refused).await;
+    assert!(
+        bytes.is_none(),
+        "stranger msg1 must stay refused once the stranger bucket is \
+         drained; observed {bytes:?} wire bytes"
+    );
+    assert_eq!(
+        node.peer_count(),
+        1,
+        "the refused stranger must not have been admitted"
     );
 }
 

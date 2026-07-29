@@ -134,6 +134,21 @@ Handshake rate limiting protects against DoS on the Noise IK handshake path.
 | `node.rate_limit.handshake_resend_interval_ms` | u64 | `1000` | Initial handshake message resend interval |
 | `node.rate_limit.handshake_resend_backoff` | f64 | `2.0` | Resend backoff multiplier (1s, 2s, 4s, 8s, 16s with defaults) |
 | `node.rate_limit.handshake_max_resends` | u32 | `5` | Max resends per handshake attempt |
+| `node.rate_limit.established_handshake_burst` | u32 | derived | Burst capacity of the established-link bucket. Derived default is `node.limits.max_peers` (128) |
+| `node.rate_limit.established_handshake_rate` | f64 | derived | Refill rate of that bucket. Derived default is `(max_peers / max(node.rekey.after_secs, 1)) * (1 + handshake_max_resends)`, floored at 1.0/s — 6.4/s at shipped defaults |
+
+Msg1 whose source matches an established link (rekey and restart
+maintenance traffic) draws on a second bucket rather than competing with
+stranger admission. Both keys are optional; leaving them unset keeps the
+derived sizing, which tracks `max_peers` and the rekey period
+automatically instead of becoming a constant nobody revisits.
+`max_peers: 0` (unlimited) has no peer-count-derived size, so the
+derivation falls back to `handshake_burst` / `handshake_rate`.
+
+The node's total admitted msg1 rate is the **sum** of the two buckets: 228
+burst and 16.4/s at shipped defaults, of which the established half is
+reachable only by a source that already matches a live link. Size against
+the sum when budgeting handshake crypto load for a host.
 
 ### Retry / Backoff (`node.retry.*`)
 
