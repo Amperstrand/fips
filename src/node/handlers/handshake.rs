@@ -4,6 +4,7 @@ use crate::NodeAddr;
 use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
+use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
 use crate::peer::ActivePeer;
@@ -117,13 +118,14 @@ impl Node {
         }
     }
 
-    /// Returns true if an inbound msg1 should be admitted past the
-    /// `accept_connections` gate.
+    /// Returns true if an inbound msg1's source matches an established
+    /// link, i.e. it is rekey/restart maintenance traffic rather than a
+    /// stranger's fresh handshake.
     ///
-    /// Rekey/restart msg1 from an established peer is always admitted (the
-    /// gate is meant to filter fresh handshakes from strangers, not
-    /// maintenance traffic on established sessions). Two predicates cover
-    /// "established peer at this transport+addr":
+    /// This is deliberately separate from the `accept_connections` gate:
+    /// it is the only half of `should_admit_msg1` that is a safe basis
+    /// for exempting traffic from stranger-class treatment. Two
+    /// predicates cover "established peer at this transport+addr":
     ///
     /// 1. `addr_to_link` has an entry for `(transport_id, remote_addr)`.
     ///    This is the fast path and matches when the peer registered with
@@ -141,9 +143,14 @@ impl Node {
     ///    with `udp.accept_connections: false` or `udp.outbound_only: true`
     ///    (the production trigger for the 2026-04-30 bug).
     ///
-    /// Otherwise the transport's `accept_connections` config decides;
-    /// absence of a registered transport admits (no gate to apply).
-    pub(in crate::node) fn should_admit_msg1(
+    /// Cost: predicate 1 is O(1), predicate 2 is O(peers). Because
+    /// `handle_msg1` classifies before rate limiting, predicate 2 runs on
+    /// every inbound msg1 including those about to be refused, so a msg1
+    /// flood costs O(peers) per dropped packet rather than O(1). Predicate 2
+    /// exists only because `addr_to_link` is keyed on the *unresolved* dial
+    /// address; if that keying is corrected, this becomes a single O(1)
+    /// lookup and the flood cost returns to O(1).
+    pub(in crate::node) fn is_established_link_msg1(
         &self,
         transport_id: crate::transport::TransportId,
         remote_addr: &crate::transport::TransportAddr,
@@ -159,6 +166,26 @@ impl Node {
         }) {
             return true;
         }
+        false
+    }
+
+    /// Returns true if an inbound msg1 should be admitted past the
+    /// `accept_connections` gate.
+    ///
+    /// Rekey/restart msg1 from an established peer is always admitted (the
+    /// gate is meant to filter fresh handshakes from strangers, not
+    /// maintenance traffic on established sessions).
+    ///
+    /// Otherwise the transport's `accept_connections` config decides;
+    /// absence of a registered transport admits (no gate to apply).
+    pub(in crate::node) fn should_admit_msg1(
+        &self,
+        transport_id: crate::transport::TransportId,
+        remote_addr: &crate::transport::TransportAddr,
+    ) -> bool {
+        if self.is_established_link_msg1(transport_id, remote_addr) {
+            return true;
+        }
         self.transports
             .get(&transport_id)
             .is_none_or(|t| t.accept_connections())
@@ -168,23 +195,56 @@ impl Node {
     ///
     /// This creates a new inbound connection. Rate limiting is applied
     /// before any expensive crypto operations.
+    ///
+    /// Classifying the source costs no crypto (two map/scan lookups), so it
+    /// happens first and selects which bucket the msg1 draws on: rekey and
+    /// restart traffic from an established link stops competing with
+    /// stranger admission, while still being metered.
     pub(in crate::node) async fn handle_msg1(&mut self, packet: ReceivedPacket) {
-        // === RATE LIMITING (before any processing) ===
-        if !self.msg1_rate_limiter.start_handshake() {
-            debug!(
-                transport_id = %packet.transport_id,
-                remote_addr = %packet.remote_addr,
-                "Msg1 rate limited"
-            );
-            return;
-        }
+        // === CLASSIFY, THEN RATE LIMIT (both before any crypto) ===
+        // Classification is two map lookups; the second is O(peers) and now
+        // runs on every inbound msg1, including refused ones. See the
+        // `is_established_link_msg1` doc comment for why the scan is still
+        // needed and what would retire it.
+        //
+        // `_slot` is an RAII guard: it releases the limiter's pending slot on
+        // drop, which is every return path below and the end of the function.
+        let established = self.is_established_link_msg1(packet.transport_id, &packet.remote_addr);
+        let class = if established {
+            Msg1Class::EstablishedLink
+        } else {
+            Msg1Class::Stranger
+        };
+        // The binding name matters. `_slot` holds the guard until this
+        // function returns, and that is what releases the pending slot on
+        // every exit path. Renaming it to a bare `_` drops the guard right
+        // here instead, releasing the slot at acquire time — silently, with
+        // no test and no clippy lint catching the difference. Do not "tidy"
+        // this binding.
+        let _slot = match self.msg1_rate_limiter.start_handshake(class) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                debug!(
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
+                    refused_by = %reason,
+                    "Msg1 rate limited"
+                );
+                return;
+            }
+        };
 
         // accept_connections gate. Rekey/restart msg1 on an existing link
         // is always admitted; the gate only filters truly-fresh connections
         // from strangers. Without this carve-out, the dual-init tie-breaker
         // deadlocks when the larger-NodeAddr side has accept_connections=false.
-        if !self.should_admit_msg1(packet.transport_id, &packet.remote_addr) {
-            self.msg1_rate_limiter.complete_handshake();
+        //
+        // `!established &&` is not a behaviour change: `should_admit_msg1`
+        // is `is_established_link_msg1() || accept_connections()`, so the
+        // short-circuit only skips a second evaluation of the `peers` scan
+        // on the hot path. The call is left in place so the two predicates
+        // cannot drift apart.
+        if !established && !self.should_admit_msg1(packet.transport_id, &packet.remote_addr) {
             self.stats_mut()
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;
@@ -194,7 +254,6 @@ impl Node {
         let header = match Msg1Header::parse(&packet.data) {
             Some(h) => h,
             None => {
-                self.msg1_rate_limiter.complete_handshake();
                 debug!("Invalid msg1 header");
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
@@ -243,7 +302,6 @@ impl Node {
                             HandshakeReject::UnknownConnection,
                         ));
                     }
-                    self.msg1_rate_limiter.complete_handshake();
                     return;
                 }
             } else {
@@ -286,7 +344,6 @@ impl Node {
         ) {
             Ok(m) => m,
             Err(e) => {
-                self.msg1_rate_limiter.complete_handshake();
                 debug!(
                     error = %e,
                     "Failed to process msg1"
@@ -302,7 +359,6 @@ impl Node {
         let peer_identity = match machine.conn_expected_identity() {
             Some(id) => *id,
             None => {
-                self.msg1_rate_limiter.complete_handshake();
                 warn!("Identity not learned from msg1");
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
@@ -363,7 +419,6 @@ impl Node {
                         reason: FailReason::Rejected
                     }
                 ));
-                self.msg1_rate_limiter.complete_handshake();
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             }
@@ -387,7 +442,6 @@ impl Node {
                 }
                 // `conn`/`link_id` were never inserted into the registry, so the
                 // local drop suffices — no cleanup needed.
-                self.msg1_rate_limiter.complete_handshake();
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             }
@@ -411,7 +465,6 @@ impl Node {
                         ),
                     }
                 }
-                self.msg1_rate_limiter.complete_handshake();
             }
             InboundDecision::RekeyRespond {
                 peer,
@@ -446,7 +499,6 @@ impl Node {
                     Ok(idx) => idx,
                     Err(e) => {
                         warn!(error = %e, "Failed to allocate index for rekey");
-                        self.msg1_rate_limiter.complete_handshake();
                         self.stats_mut()
                             .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                         return;
@@ -458,7 +510,6 @@ impl Node {
                     None => {
                         warn!("Rekey msg1: no session from handshake");
                         let _ = self.index_allocator.free(our_new_index);
-                        self.msg1_rate_limiter.complete_handshake();
                         self.stats_mut()
                             .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                         return;
@@ -483,7 +534,6 @@ impl Node {
                                 "Failed to send rekey msg2"
                             );
                             let _ = self.index_allocator.free(our_new_index);
-                            self.msg1_rate_limiter.complete_handshake();
                             self.stats_mut()
                                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                             return;
@@ -505,7 +555,6 @@ impl Node {
                 // original link so future msg1s from this address are recognized
                 // as rekeys (not new connections). The temporary `conn`/`link_id`
                 // were never inserted into the registry, so no cleanup is needed.
-                self.msg1_rate_limiter.complete_handshake();
             }
             InboundDecision::RestartThenPromote { peer } => {
                 // === Restart inbound establish, driven by the machine. ===
@@ -588,7 +637,6 @@ impl Node {
                         packet.timestamp_ms,
                         &mut self.index_allocator,
                     );
-                    self.msg1_rate_limiter.complete_handshake();
                     self.stats_mut()
                         .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                     return;
@@ -609,7 +657,6 @@ impl Node {
                         // pre-refactor arm, which also removed the stale peer before
                         // hitting the shared allocate-failure return.
                         warn!("Failed to allocate session index for inbound");
-                        self.msg1_rate_limiter.complete_handshake();
                         self.stats_mut()
                             .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                         return;
@@ -691,8 +738,6 @@ impl Node {
                     self.bloom_state.mark_update_needed(peer_node_addr);
                     self.reset_lookup_backoff();
                 }
-
-                self.msg1_rate_limiter.complete_handshake();
             }
             InboundDecision::Promote => {
                 // === Net-new inbound establish, driven by the machine. ===
@@ -737,7 +782,6 @@ impl Node {
                         packet.timestamp_ms,
                         &mut self.index_allocator,
                     );
-                    self.msg1_rate_limiter.complete_handshake();
                     self.stats_mut()
                         .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                     return;
@@ -757,7 +801,6 @@ impl Node {
                         // allocator error is consumed inside `on_authorized`, so the
                         // restored warn! carries the pre-refactor message text only.
                         warn!("Failed to allocate session index for inbound");
-                        self.msg1_rate_limiter.complete_handshake();
                         self.stats_mut()
                             .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                         return;
@@ -825,8 +868,6 @@ impl Node {
                     self.bloom_state.mark_update_needed(peer_node_addr);
                     self.reset_lookup_backoff();
                 }
-
-                self.msg1_rate_limiter.complete_handshake();
             }
         }
     }
