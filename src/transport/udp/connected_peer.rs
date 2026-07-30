@@ -1,8 +1,3 @@
-// The connected-UDP fast path is infra-ready but not yet wired into the
-// encrypt-worker dispatch site (a follow-up PR will refcount-clone the
-// socket into each FmpSendJob). Keep the API surface in tree.
-#![allow(dead_code)]
-
 //! Connected per-peer UDP socket.
 //!
 //! One of the levers boringtun uses to hit 2.5–3.2 Gbps on a real
