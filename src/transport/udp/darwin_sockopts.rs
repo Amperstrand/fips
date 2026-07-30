@@ -1,6 +1,6 @@
-// Applied at `ConnectedPeerSocket::open` (dormant in this PR; see
-// `connected_peer.rs`). Linux toolchain only checks gates — keep
-// the module visible on Linux so clippy doesn't lose track.
+// Applied at `ConnectedPeerSocket::open`. The full `NET_SERVICE_TYPE_*`
+// table is kept for reference although only `OAM` is selected, so most
+// of these constants are deliberately unreferenced.
 #![allow(dead_code)]
 
 //! Darwin UDP socket tuning.
