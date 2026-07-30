@@ -803,11 +803,6 @@ pub use platform::{AsyncUdpSocket, UdpRawSocket};
 /// is libc-syscall + `sockopts_macos` specific.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod connected {
-    // The connected-UDP fast path is infra-ready but not yet wired into
-    // the encrypt-worker dispatch site (a follow-up PR will refcount-clone
-    // the socket into each FmpSendJob). Keep the API surface in tree.
-    #![allow(dead_code)]
-
     use std::io;
     use std::net::SocketAddr;
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
