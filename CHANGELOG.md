@@ -64,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the wildcard UDP receive path instead of issuing one `recv(2)`
   syscall per queued datagram.
 
+- Routing next-hop selection now visits borrowed peers and coordinates instead
+  of allocating candidate snapshots for each forwarded packet.
+
 - The Ethernet transport's per-interface `discovery` flag was renamed to
   `listen` (`transports.ethernet.*`) to match the symmetric `announce`
   (transmit) / `listen` (receive) neighbor-beacon vocabulary. The old
