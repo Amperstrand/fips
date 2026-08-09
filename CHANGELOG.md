@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Connected UDP peer drains now batch macOS receives with `recvmsg_x(2)`,
+  matching the wildcard UDP receive path instead of issuing one `recv(2)`
+  syscall per queued datagram.
+
 - The Ethernet transport's per-interface `discovery` flag was renamed to
   `listen` (`transports.ethernet.*`) to match the symmetric `announce`
   (transmit) / `listen` (receive) neighbor-beacon vocabulary. The old

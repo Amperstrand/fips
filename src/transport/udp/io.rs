@@ -64,6 +64,56 @@ mod platform {
         ) -> isize;
     }
 
+    /// Drain a connected Darwin UDP socket with one `recvmsg_x(2)` call.
+    ///
+    /// Connected sockets do not need source-address storage, so this is the
+    /// compact counterpart to [`UdpRawSocket::recv_batch`] used by per-peer
+    /// receive threads.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn recvmsg_x_drain(
+        fd: RawFd,
+        backing: &mut [Vec<u8>],
+        lens: &mut [usize],
+    ) -> std::io::Result<usize> {
+        let n = backing.len().min(lens.len()).min(BATCH_SIZE);
+        if n == 0 {
+            return Ok(0);
+        }
+
+        let mut iovs: [libc::iovec; BATCH_SIZE] = unsafe { std::mem::zeroed() };
+        let mut msgs: [msghdr_x; BATCH_SIZE] = unsafe { std::mem::zeroed() };
+
+        for i in 0..n {
+            iovs[i].iov_base = backing[i].as_mut_ptr() as *mut libc::c_void;
+            iovs[i].iov_len = backing[i].len();
+            msgs[i].msg_iov = &mut iovs[i];
+            msgs[i].msg_iovlen = 1;
+        }
+
+        let received = loop {
+            let received = unsafe { recvmsg_x(fd, msgs.as_ptr(), n as libc::c_uint, 0) };
+            if received >= 0 {
+                break received;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        };
+
+        let count = received as usize;
+        if count > n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "recvmsg_x reported more datagrams than requested",
+            ));
+        }
+        for i in 0..count {
+            lens[i] = msgs[i].msg_datalen;
+        }
+        Ok(count)
+    }
+
     /// Wrapper around a `socket2::Socket` providing sync send/recv with
     /// `SO_RXQ_OVFL` ancillary data parsing.
     pub struct UdpRawSocket {
@@ -782,6 +832,8 @@ mod platform {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use platform::recvmsg_x_drain;
 pub use platform::{AsyncUdpSocket, UdpRawSocket};
 
 /// Per-peer connected-UDP fast-path fd construction.
