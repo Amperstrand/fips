@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fd00::/8`-destined packets and clamp TCP MSS on outbound SYNs. Desktop
   builds are unchanged and no Cargo features are introduced.
 
+- `Node::dns_local_addr()`, the DNS companion to the app-owned TUN seam above.
+  An embedder whose resolver is pointed into the tunnel has no system socket
+  aimed at the built-in `.fips` responder, so the accessor reports the address
+  read back off the bound socket: `dns.port = 0` therefore yields the
+  kernel-assigned port, and it returns `Some` only while the responder is up.
+  Read it once, after `start()` returns and before the node is moved into a
+  background task; it is not a liveness feed (#136).
+
 - A bounded graceful-shutdown drain phase, controlled by the new
   `node.drain_timeout_secs` (default 2s). On the shutdown signal the node
   broadcasts Disconnect to all peers and then keeps serving for that window,
