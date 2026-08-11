@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- OpenWrt 802.11s open-mesh backhaul: router-to-router radio links with FIPS
+  providing all encryption, authentication and routing over bare L2 neighbor
+  links. The mesh runs open with `mesh_fwding 0`, since SAE would duplicate the
+  Noise layer and force ath10k raw mode, and FIPS's spanning tree is the
+  routing layer. `fips-mesh-setup` is an opt-in UCI helper creating a per-radio
+  mesh point (`radio0` to `fips-mesh0`, `radio1` to `fips-mesh1`, with a
+  free-index fallback and a collision guard); radio setup stays opt-in because
+  a package must not commandeer radios on install. A dual-band router gets one
+  instance per radio, and FIPS treats the two paths as failover rather than
+  multipath: cross-connection resolution keeps one active link per peer and the
+  second band stands by, re-establishing after keepalive timeout. The shipped
+  `fips.yaml` carries the `mesh0`/`mesh1` Ethernet-transport entries commented
+  out, so a stock install that never creates them logs no per-boot
+  interface-missing warning; the helper uncomments the matching block when it
+  creates the interface and re-comments it on remove (#123).
+
+- OpenWrt open `!FIPS` access SSID, stacked on the mesh backhaul above: every
+  FIPS router broadcasts the same open SSID, forming one standard ESS that
+  phones and laptops save once and roam between natively, with the Noise IK
+  handshake as the only security layer. The leading `!` sorts it to the top of
+  alphabetically ordered network pickers, and the encryption type must be
+  uniform across routers or clients treat the ESS as different saved networks.
+  `fips-ap-setup` is an opt-in UCI helper creating the `fips-ap0` open AP on an
+  isolated network with a static ULA /64 and RA-only odhcpd addressing —
+  stateless SLAAC with no DHCP, the minimum that satisfies Android's
+  provisioning check — behind a locked-down `fips_ap` firewall zone with no
+  path to `br-lan` or the WAN, reaching only ICMPv6, mDNS and the FIPS
+  transports. There is no internet by design, so phones keep cellular as their
+  default route (#126).
+
+- Android-ready core: the daemon's desktop transports and TUN operations are
+  gated by `target_os` rather than by Cargo features, so a plain `cargo build`
+  compiles for every target with no flags and Android self-excludes the raw
+  Ethernet transport as Windows already did. `Node::enable_app_owned_tun()`
+  gives an embedder that owns the TUN file descriptor — an Android
+  `VpnService`, for instance — a channel pair for exchanging IPv6 packet bytes
+  with FIPS instead of FIPS creating a system TUN device, and `start()` then
+  performs no system-TUN or `CAP_NET_ADMIN` operations. Packets entering this
+  way bypass `handle_tun_packet`, so the embedder must push only
+  `fd00::/8`-destined packets and clamp TCP MSS on outbound SYNs. Desktop
+  builds are unchanged and no Cargo features are introduced.
+
+- A bounded graceful-shutdown drain phase, controlled by the new
+  `node.drain_timeout_secs` (default 2s). On the shutdown signal the node
+  broadcasts Disconnect to all peers and then keeps serving for that window,
+  exiting early once all peers are gone, so in-flight traffic settles and peers
+  observe the disconnect before the transports close, where previously teardown
+  was immediate. The published node state gains a `Draining` variant visible
+  via control queries during the window. The immediate stop path used by
+  non-daemon callers is unchanged.
+
 - FreeBSD support for the daemon, `fipsctl`, and `fipstop`: native TUN
   datapath (TUNSIFHEAD address-family framing, kernel-assigned `tunN`
   device name as with `utun` on macOS), clean service teardown,
@@ -59,6 +110,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the features never reached.
 
 ### Changed
+
+- Node health is determined at start completion instead of unconditionally
+  reaching a single running state. **Zero transports up is now fatal**: the
+  node tears down cleanly and the daemon exits with an error, where it
+  previously came up and served nothing. Any configured optional child that
+  failed to start — a transport beyond the first, Nostr, mDNS, TUN, DNS, or a
+  worker pool — leaves the node degraded but serving, with a warning naming
+  what failed, and all configured children up is full health. A child the node
+  was never asked to run does not count against it. The published node state
+  gains `Degraded` and `Failed`, both visible via control queries, with
+  degraded operational and failed not. Exit detection for the DNS task, the two
+  TUN threads, mDNS and Nostr also re-evaluates health at runtime, so a child
+  that dies after a healthy start now shows as degraded; transports and worker
+  pools expose no runtime-exit signal yet and are unchanged.
+
+- A connected UDP socket that cannot open now names the syscall that failed and
+  the address it was operating on, the local address for `bind` and the peer
+  address for `connect`. Both paths previously returned a bare OS error that
+  the caller wrapped identically, so a field report of `Address already in use`
+  could not be attributed to either, and the two have entirely different
+  causes: on Linux a UDP `connect(2)` to a 4-tuple another socket already holds
+  returns `EADDRINUSE`, which is not the same fault as `bind` refusing the
+  local address. A node at roughly 245 peers was emitting this three times a
+  second across nine peers with no way to diagnose it.
 
 - Connected UDP peer drains now batch macOS receives with `recvmsg_x(2)`,
   matching the wildcard UDP receive path instead of issuing one `recv(2)`
