@@ -594,6 +594,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "already on this exact path and it is fresh". `connect` stays ephemeral: the
   peer is not written to configuration and gets no auto-reconnect.
 
+- A path MTU measured on one link no longer clamps a peer that has moved to
+  another. Every writer of the per-destination path-MTU cache keeps the
+  smaller of the existing and incoming value, which is right while a peer
+  stays put, but the entry is keyed by destination alone. So a peer first
+  reached over a narrow link stayed clamped to that link's ceiling for the
+  lifetime of the process: when it later became reachable over a wider
+  transport, promotion re-seeded, the seed saw a tighter existing value and
+  declined, and traffic kept running at the old link's ceiling on a link that
+  could carry far more, with nothing reporting it because the clamp was doing
+  exactly what it was told. The node now records which transport last seeded
+  each destination and treats a seed from a different one as authoritative
+  rather than as a loosening to refuse. Re-seeding the same transport still
+  keeps the tighter value, so repeated promotion does not reset discovery, and
+  a destination with no prior seed is unchanged.
+
 ### Security
 
 - The influence a remote party has over path MTU is now bounded, and the
