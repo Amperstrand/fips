@@ -3167,6 +3167,15 @@ impl Node {
     /// Creates an ephemeral peer connection (not persisted to config, no
     /// auto-reconnect). Reuses the same connection path as auto-connect
     /// peers. Returns JSON data on success or an error message.
+    ///
+    /// For a peer the node is already connected to, the supplied address is
+    /// tried as an *alternate path* rather than ignored — the same treatment
+    /// [`Node::update_peers`] gives a refreshed runtime peer. The handshake
+    /// runs in parallel with the live link and promotion happens only once it
+    /// authenticates, so an address the caller got wrong cannot displace a
+    /// healthy path. The response's `refreshed` field reports whether such a
+    /// handshake was started; it is `false` when the peer is already on this
+    /// exact path and that path is fresh.
     pub(crate) async fn api_connect(
         &mut self,
         npub: &str,
@@ -3182,11 +3191,41 @@ impl Node {
             via_nostr: false,
         };
 
-        // Pre-seed identity cache (same as initiate_peer_connections does)
-        if let Ok(identity) = PeerIdentity::from_npub(npub) {
+        // Pre-seed identity cache (same as initiate_peer_connections does).
+        // An unparseable npub is left to `initiate_peer_connection` below,
+        // which reports it as `InvalidPeerNpub`.
+        let peer_identity = PeerIdentity::from_npub(npub).ok();
+        if let Some(identity) = peer_identity.as_ref() {
             self.peer_aliases
                 .insert(*identity.node_addr(), identity.short_npub());
             self.register_identity(*identity.node_addr(), identity.pubkey_full());
+        }
+
+        // A peer we already hold a session to must not fall through to
+        // `initiate_peer_connection`: that returns Ok(()) the moment the peer
+        // is in `self.peers`, so the command would report success without ever
+        // trying the address it was handed. Route it through the same
+        // alternate-path helper `update_peers` uses instead.
+        if let Some(identity) = peer_identity
+            && self.peers.contains_key(identity.node_addr())
+        {
+            let refreshed = self
+                .try_active_peer_alternative_addresses(&peer_config, identity)
+                .await
+                .map_err(|e| e.to_string())?;
+            info!(
+                npub = %npub,
+                address = %address,
+                transport = %transport,
+                refreshed = refreshed,
+                "API connect resolved against an already-connected peer"
+            );
+            return Ok(serde_json::json!({
+                "npub": npub,
+                "address": address,
+                "transport": transport,
+                "refreshed": refreshed,
+            }));
         }
 
         self.initiate_peer_connection(&peer_config)
@@ -3202,6 +3241,7 @@ impl Node {
                     "npub": npub,
                     "address": address,
                     "transport": transport,
+                    "refreshed": false,
                 })
             })
             .map_err(|e| e.to_string())
@@ -3209,15 +3249,27 @@ impl Node {
 
     /// Disconnect a peer via the control API.
     ///
-    /// Notifies the peer, removes it locally, and suppresses auto-reconnect.
+    /// Notifies the peer, removes it locally, closes the transport connection
+    /// it was using, and suppresses auto-reconnect.
     pub(crate) async fn api_disconnect(&mut self, npub: &str) -> Result<serde_json::Value, String> {
         let peer_identity =
             PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub '{npub}': {e}"))?;
         let node_addr = *peer_identity.node_addr();
 
-        if !self.peers.contains_key(&node_addr) {
+        let Some(peer) = self.peers.get(&node_addr) else {
             return Err(format!("peer not found: {npub}"));
-        }
+        };
+
+        // Read the transport path the peer is actually sending over BEFORE the
+        // teardown below drops the peer and its link — afterwards there is
+        // nothing left to derive it from. `current_addr` rather than the
+        // link's remote address, because roaming updates the former and it is
+        // the address the pool entry (and its inbound-slot accounting) is
+        // keyed by.
+        let transport_path = match (peer.transport_id(), peer.current_addr()) {
+            (Some(transport_id), Some(addr)) => Some((transport_id, addr.clone())),
+            _ => None,
+        };
 
         // Notify the peer before we tear down the link, so it drops its own
         // session and re-handshakes symmetrically rather than holding a stale
@@ -3229,6 +3281,22 @@ impl Node {
 
         // Remove the peer (full cleanup: sessions, indices, links, tree, bloom)
         self.remove_active_peer(&node_addr);
+
+        // Tear down the transport connection, not just the node-side state.
+        // `remove_active_peer` frees every node-side structure but never
+        // touches the transport, so on a connection-oriented transport the
+        // pool entry, the socket and its inbound-slot accounting would
+        // otherwise survive the peer the node has just forgotten — an operator
+        // who disconnects a peer to free a slot would not free the slot. This
+        // mirrors `cleanup_stale_connection`, and the reasoning there applies
+        // verbatim: closing twice is harmless, because every
+        // `close_connection` implementation is `if let Some(conn) =
+        // pool.remove(addr)` and the connectionless default is a no-op.
+        if let Some((transport_id, addr)) = transport_path
+            && let Some(transport) = self.transports.get(&transport_id)
+        {
+            transport.close_connection(&addr).await;
+        }
 
         // Suppress any pending auto-reconnect
         self.peering.reconciler.retry_pending.remove(&node_addr);

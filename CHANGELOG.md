@@ -191,7 +191,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folded into the new tables with a one-time deprecation warning; migrate your
   `fips.yaml` to the new keys.
 
-
 - Inbound traversal offers are now admitted against a per-sender allowance as
   well as the global pool. The intake path previously took a permit from a
   single semaphore before any identity check, with the sender's npub used only
@@ -565,6 +564,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does on its own; no version mix delivers less far. The `TtlExhausted` reject
   counter now charges at the node that makes the decision rather than at the
   hop after it.
+
+- `disconnect` on the control socket now closes the transport connection
+  rather than only the peer. It notified the peer and freed every node-side
+  structure, sessions, indices, links, address mapping, tree and bloom state,
+  and never touched the transport, so on a connection-oriented transport (TCP,
+  Tor, Nym, BLE) the pool entry, the socket and its inbound-slot accounting
+  survived the peer the node had just forgotten, until the far end closed or
+  the receive loop errored. An operator who disconnected a peer to free a slot
+  did not free the slot. No effect on UDP, Ethernet or loopback, whose
+  `close_connection` is the connectionless no-op. Still not addressed:
+  `disconnect` reports `peer not found` for an identity that is only
+  mid-handshake, so withdrawing a peer during its handshake leaves that leg
+  resending msg1 until the handshake timeout bounds it.
+
+- `connect` on the control socket now tries the address it was given for a
+  peer the node is already connected to, instead of reporting success without
+  doing anything. The command built an ephemeral peer configuration and handed
+  it to the ordinary dial path, which returns success the moment the peer is
+  already held, so `fipsctl connect` printed success and the node never
+  attempted the path. An operator moving a peer onto a freshly provisioned
+  link, or a supervising process that has just seen a second path come up, had
+  no way to make the node use it: the peer stayed where it first authenticated
+  until that path died. The address is now tried as an alternate path
+  alongside the live one, through the same helper a runtime peer refresh uses,
+  so promotion happens only after the alternate handshake authenticates and a
+  wrong address cannot displace a healthy link. The response gains an additive
+  `refreshed` field distinguishing "started an alternate-path handshake" from
+  "already on this exact path and it is fresh". `connect` stays ephemeral: the
+  peer is not written to configuration and gets no auto-reconnect.
 
 ### Security
 
