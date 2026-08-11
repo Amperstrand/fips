@@ -99,7 +99,16 @@ async fn run_daemon(
         _ => filter,
     };
 
-    fmt().with_env_filter(filter).with_target(true).init();
+    // Never let a failed log write panic the thread that logged. The default
+    // is to report a write failure with `eprintln!`, which itself panics when
+    // stderr fails too — and the shipped supervisor configs point stdout and
+    // stderr at the same place, so one full disk satisfies both. A worker
+    // thread killed that way takes its share of the peer space with it.
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .log_internal_errors(false)
+        .init();
 
     info!("FIPS {} starting", version::short_version());
 
