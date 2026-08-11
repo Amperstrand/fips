@@ -86,6 +86,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folded into the new tables with a one-time deprecation warning; migrate your
   `fips.yaml` to the new keys.
 
+- Config validation now rejects two `node.rekey` settings that appear to
+  disable the trigger and in fact fire it continuously. `after_messages` of
+  zero makes the message-count arm true on every poll, because the trigger
+  compares the counter with greater-or-equal. `after_secs` at or below the
+  per-session jitter bound is the same trap on the timer arm: each session
+  offsets the interval by a random value within plus or minus that bound, so a
+  smaller interval saturates to zero on a negative draw and rekeys on sight,
+  for roughly half of sessions. Both are checked whether or not rekey is
+  enabled, so switching it on later cannot surface the error at a surprising
+  moment, and neither gains an upper bound — a very large value remains the
+  supported way to disable one arm. A config carrying either setting now fails
+  to load instead of starting a node that rekeys constantly.
+
+- Peer bloom filters are computed for every recipient in one prefix and suffix
+  union sweep rather than rebuilt per recipient. Announcing to R peers
+  previously did R full map builds and R by T merges; at 240 peers that was
+  20.6 ms per tick, roughly half the tick body, with a median per-interval
+  maximum of 34.5 ms. The result is exactly equal rather than approximately:
+  merging is a bytewise OR, so regrouping the unions cannot change it. The
+  trade-off, measured rather than assumed, is that the sweep does its full work
+  regardless of how many peers are ready, so a tick announcing to one or two
+  peers now costs about twice what it did; break-even is around three ready
+  peers. Cadence, the debounce, the sequence rule and the fill-ratio cap are
+  unchanged.
+
+- Each peer's npub is derived once at construction instead of once per tick.
+  The per-tick stats snapshot ran a bech32 encode for every tracked peer, and a
+  second one for the common peer with no hosts-file entry and no alias, since
+  the display-name fallback bottoms out in the same encode: 14.1 ms per tick at
+  240 peers. The display name itself is deliberately not cached, because the
+  alias map and the host map both mutate at runtime.
+
+- The peer-retry tick no longer awaits the Nostr advert refetch. It ran inline
+  on the 1-second rx-loop tick, awaiting a fetch with a 2-second timeout for
+  each due peer and discarding the result; with up to sixteen due peers the
+  timeouts stacked, and field profiling measured single 2.00 s stalls as the
+  common case and a worst tick of 12.4 s against a 1 s period, delaying every
+  other rx-loop arm by as much as 4.2 s. The refetch is now spawned, so a dial
+  uses the advert cached at that moment and the refreshed one lands for that
+  peer's next retry.
+
+- The `Adopted NAT traversal socket` log line now carries the transport id and
+  the local address alongside the peer npub. Without the local address an
+  operator cannot join a host socket table against adoption events, and without
+  the transport id several peers sharing one adopted transport are
+  indistinguishable from several separate adopted transports.
+
 - Inbound msg1 is classified before it is rate limited, and rekey or restart
   msg1 arriving on an established link now draws on its own token bucket
   instead of competing with stranger admission for a single shared one. On a
@@ -115,6 +162,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alias and will be removed at the v2 cutover; migrate to `listen`.
 
 ### Fixed
+
+- Nostr NAT traversal signals are now sent only to relays the client pool
+  actually holds. A signal is addressed to the merge of the peer's NIP-17 inbox
+  relays, the relays its advert nominates for signaling, and our own DM relays,
+  but the pool is built once at startup from the configured relays and the send
+  is rejected outright, before anything is contacted, if any single URL in that
+  list is outside it. One unconfigured relay anywhere in the merge therefore
+  killed the whole attempt, including the sends to relays both sides shared. On
+  a public node in open mode this made discovery non-functional: 309 traversal
+  attempts, 290 explicit failures, zero successes, every failure on `relay not
+  found`. Configured peers were unaffected, since they run a matching relay
+  set. Comparison is on the normalized relay URL rather than the raw string, so
+  a configured relay spelled with a trailing slash or different host case is
+  not discarded. Two smaller fixes ride along: the responder resolves its
+  relays before binding a socket and running STUN, rather than spending a STUN
+  round trip and holding an offer slot only to find it has nowhere to answer,
+  and it gained the empty-relay-list guard the initiator already had.
+
+- A failed log write can no longer panic the thread or task that logged. The
+  subscriber was built with the default internal-error reporting, which sends a
+  failed write to `eprintln!`, and that macro panics when stderr has also
+  failed. The shipped supervisor configurations make that a single condition
+  rather than two: the macOS plist points both standard streams at one
+  unrotated file, and the systemd units route both to journald, so one full
+  disk fails both sinks together. In the daemon a crypto worker was the case
+  that mattered — it logs a warning on send backpressure, and a worker that
+  dies takes its share of the peer space with it permanently, while the panic
+  message is discarded along the same broken path. In `fips-gateway`, which
+  built its subscriber the same way, the casualty is a spawned task: the DNS
+  resolver, the control accept loop or the pool tick, none of which is observed
+  until shutdown, so the process would keep running and reporting healthy with
+  mesh name resolution or lease expiry and NAT cleanup silently stopped.
 
 - macOS: `peers.allow`, `peers.deny`, and the `hosts` file are now read
   from `/usr/local/etc/fips/`, matching the install layout the macOS
@@ -192,6 +271,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does on its own; no version mix delivers less far. The `TtlExhausted` reject
   counter now charges at the node that makes the decision rather than at the
   hop after it.
+
+### Security
+
+- The FSP session address is now bound to the peer key the Noise handshake
+  authenticated, on both the initial and the rekey path. The responder recorded
+  a session under the source address carried in the datagram without ever
+  checking that address against the static key it had just authenticated, so a
+  peer could complete a genuine handshake while claiming another node's
+  address, and the identity cache, the session map and the address the IPv6
+  shim reconstructs on delivery would all attribute its traffic to the node it
+  named. The address is now derived from the authenticated key at the point it
+  first becomes available in msg3, and a mismatch drops the half-open session
+  without recording either the identity or the session. The rekey responder
+  needed its own check: it returns before that code is reached and never read
+  the peer's static key at all, so a rekey could complete under an established
+  session with a different key than the one that opened it. It now requires the
+  key to be unchanged and abandons the rekey while leaving the existing session
+  intact, rather than tearing the session down, which would have handed an
+  attacker a way to kill established sessions. Both comparisons are on x-only
+  keys, because a stored key may carry a synthesized parity while the handshake
+  learns the true point. The two rejections are counted separately in the
+  session reject statistics.
 
 ## [0.4.1] - 2026-07-19
 
