@@ -11,7 +11,7 @@ impl Node {
     ///
     /// Called periodically by the RX event loop. Removes connections that have
     /// been idle longer than the configured handshake timeout or are in Failed state.
-    pub(in crate::node) fn check_timeouts(&mut self) {
+    pub(in crate::node) async fn check_timeouts(&mut self) {
         if self.connections.is_empty() {
             return;
         }
@@ -53,16 +53,21 @@ impl Node {
                     self.schedule_retry(*identity.node_addr(), now_ms);
                 }
             }
-            self.cleanup_stale_connection(link_id, now_ms);
+            self.cleanup_stale_connection(link_id, now_ms).await;
         }
     }
 
     /// Remove a handshake connection and all associated state.
     ///
-    /// Frees the session index, removes pending_outbound entry, and cleans up
-    /// the link and address mapping. Does not log — callers provide context-appropriate
-    /// log messages.
-    pub(in crate::node) fn cleanup_stale_connection(&mut self, link_id: LinkId, _now_ms: u64) {
+    /// Frees the session index, removes pending_outbound entry, closes the
+    /// underlying transport connection, and cleans up the link and address
+    /// mapping. Does not log — callers provide context-appropriate log
+    /// messages.
+    pub(in crate::node) async fn cleanup_stale_connection(
+        &mut self,
+        link_id: LinkId,
+        _now_ms: u64,
+    ) {
         let conn = match self.connections.remove(&link_id) {
             Some(c) => c,
             None => return,
@@ -75,6 +80,23 @@ impl Node {
                 self.pending_outbound.remove(&(tid, idx.as_u32()));
             }
             let _ = self.index_allocator.free(idx);
+        }
+
+        // Tear down the transport connection, not just the node-side state.
+        // A connection-oriented transport otherwise keeps the socket, its
+        // pool entry and its inbound-slot accounting alive after the node
+        // has forgotten the handshake that socket belonged to, so a peer
+        // that sends msg1 and then stalls holds an inbound slot forever.
+        // Closing twice is harmless: every `close_connection` implementation
+        // is `if let Some(conn) = pool.remove(addr)` and the connectionless
+        // default is a no-op, so the handshake paths that already close and
+        // then drop a link cannot be disturbed by this.
+        if let Some(link) = self.links.get(&link_id) {
+            let tid = link.transport_id();
+            let addr = link.remote_addr().clone();
+            if let Some(transport) = self.transports.get(&tid) {
+                transport.close_connection(&addr).await;
+            }
         }
 
         // Remove link and addr_to_link

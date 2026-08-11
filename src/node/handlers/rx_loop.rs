@@ -250,7 +250,7 @@ impl Node {
                     let _ = response_tx.send(response);
                 }
                 _ = tick.tick() => {
-                    self.check_timeouts();
+                    self.check_timeouts().await;
                     let now_ms = Self::now_ms();
                     self.reload_peer_acl().await;
                     // The host map hot-reloads on the same tick as the ACL. It

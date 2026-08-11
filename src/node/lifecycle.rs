@@ -754,7 +754,7 @@ impl Node {
                                 .map(|(link_id, _)| *link_id)
                                 .collect();
                             for link_id in stale {
-                                self.cleanup_stale_connection(link_id, now_ms);
+                                self.cleanup_stale_connection(link_id, now_ms).await;
                             }
                         }
                     }
