@@ -54,7 +54,7 @@ pub const FIPS_SERVICE_UUID_U128: u128 = 0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f
 
 /// BLE stream backed by a `bluest` L2CAP channel.
 ///
-/// TODO: implement. Hold the channel + remote address + MTUs. Mirror
+/// TODO: implement. Hold the channel + remote address + MTUs. Mirror (trigger CI)
 /// [`super::bluer_impl::BluerStream`]. `bluest::l2cap::L2capStream` is the
 /// likely underlying type.
 pub struct BluestStream {
