@@ -1,0 +1,136 @@
+name: Upstream sync
+
+# Fork-local workflow: keeps origin/master fast-forwarded to upstream/master.
+# This file lives only on Amperstrand/fips; never PR'd upstream.
+# Self-heals: each run, resets to upstream/master and re-applies this file.
+# See AGENTS.md "Upstream tracking workflow" for context.
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/jmcorgan/fips.git
+
+      - name: Fetch upstream
+        run: git fetch upstream --prune --tags
+
+      - name: Classify commits unique to origin/master
+        id: classify
+        run: |
+          # Every commit unique to origin/master (relative to upstream/master)
+          UNIQUE_SHAS=$(git rev-list upstream/master..origin/master)
+          FORK_INFRA_OK=true
+          OTHER_COUNT=0
+          for sha in $UNIQUE_SHAS; do
+            # Files this commit touched, excluding this workflow file
+            FILES=$(git show --name-only --format='' "$sha" | grep -v '^\.github/workflows/upstream-sync\.yml$' || true)
+            if [ -n "$FILES" ]; then
+              FORK_INFRA_OK=false
+              OTHER_COUNT=$((OTHER_COUNT + 1))
+              echo "Non-infra commit: $sha"
+              echo "$FILES" | sed 's/^/  /'
+            fi
+          done
+          echo "fork_infra_ok=$FORK_INFRA_OK" >> "$GITHUB_OUTPUT"
+          echo "other_count=$OTHER_COUNT" >> "$GITHUB_OUTPUT"
+          AHEAD=$(git rev-list --count origin/master..upstream/master || echo 0)
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Sync (fast-forward + restore workflow file)
+        if: steps.classify.outputs.fork_infra_ok == 'true' && steps.classify.outputs.ahead != '0'
+        run: |
+          cp .github/workflows/upstream-sync.yml /tmp/upstream-sync.yml
+          git checkout master
+          git reset --hard upstream/master
+          mkdir -p .github/workflows
+          cp /tmp/upstream-sync.yml .github/workflows/upstream-sync.yml
+          git add .github/workflows/upstream-sync.yml
+          git commit -m "ci: add daily upstream-sync workflow (auto-restored by sync job)
+
+          Fork-local workflow. See AGENTS.md."
+          git push origin master
+          git push origin --force-with-lease upstream/master:main
+          echo "::notice::Synced ${{ steps.classify.outputs.ahead }} commit(s) from upstream/master, restored sync workflow"
+
+      - name: Open issue if non-infra divergence detected
+        if: steps.classify.outputs.fork_infra_ok == 'false'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const otherCount = '${{ steps.classify.outputs.other_count }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream',
+              per_page: 5
+            });
+            const dup = existing.data.find(i => i.title.includes('upstream sync blocked'));
+            if (dup) {
+              core.info(`Issue #${dup.number} already open, adding comment instead`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: dup.number,
+                body: `## Sync still blocked (${{ new Date().toISOString() }})\n\nRun: ${runUrl}\n\n\`origin/master\` still carries ${otherCount} non-infra commit(s).`
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'upstream sync blocked: origin/master has non-infra commits',
+              body: [
+                '## Upstream sync blocked',
+                '',
+                `The daily upstream sync could not run because \`origin/master\` has **${otherCount} non-infra commit(s)** not present upstream.`,
+                '',
+                'The sync workflow only auto-manages its own file (`.github/workflows/upstream-sync.yml`). Any other divergence requires human review.',
+                '',
+                '### Action required',
+                '',
+                'A human needs to decide:',
+                `1. Reset \`origin/master\` to \`upstream/master\` (drops ${otherCount} commit(s), verify they are preserved elsewhere first)`,
+                '2. Rebase the unique commits onto `upstream/master` (preserves them)',
+                '3. Accept permanent divergence (the fork stops tracking upstream HEAD)',
+                '',
+                '### Run details',
+                '',
+                `- Run: ${runUrl}`,
+                `- Triggered: ${new Date().toISOString()}`,
+                '',
+                'Close this issue once resolved.'
+              ].join('\n'),
+              labels: ['upstream', 'bug']
+            });
+
+      - name: Report clean sync
+        if: steps.classify.outputs.fork_infra_ok == 'true' && steps.classify.outputs.ahead == '0'
+        run: echo "::notice::origin/master is in sync with upstream/master (ahead=0), nothing to do"
