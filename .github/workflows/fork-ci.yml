@@ -43,6 +43,9 @@ jobs:
         with:
           components: clippy
 
+      - name: Install system deps (Linux BLE needs dbus)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test
@@ -63,6 +66,9 @@ jobs:
           fetch-depth: 1
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system deps (Linux BLE needs dbus)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - uses: Swatinem/rust-cache@v2
 
