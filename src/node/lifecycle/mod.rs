@@ -2434,7 +2434,7 @@ impl Node {
                     }
                 }
             } else if addr.transport == "ble" {
-                #[cfg(bluer_available)]
+                #[cfg(ble_available)]
                 {
                     match self.resolve_ble_addr(&addr.addr) {
                         Ok(result) => result,
@@ -2449,7 +2449,7 @@ impl Node {
                         }
                     }
                 }
-                #[cfg(not(bluer_available))]
+                #[cfg(not(ble_available))]
                 {
                     debug!(transport = %addr.transport, "BLE transport not available on this build");
                     continue;
