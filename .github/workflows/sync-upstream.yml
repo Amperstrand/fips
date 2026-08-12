@@ -1,4 +1,4 @@
-name: Upstream sync
+name: Sync upstream
 
 # Fork-local workflow: keeps origin/master fast-forwarded to upstream/master.
 # This file lives only on Amperstrand/fips; never PR'd upstream.
