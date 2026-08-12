@@ -1,0 +1,70 @@
+name: Fork CI
+
+# Fork-local CI: runs cargo test + cargo clippy on pushes to feature branches
+# and master. Catches breakage from rebases and syncs.
+# This file lives only on Amperstrand/fips; never PR'd upstream.
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+      - 'feat/**'
+      - 'fix/**'
+      - 'master'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  checks: write
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: Test (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --no-fail-fast --locked
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Release-mode compile check (does NOT run tests, because upstream has
+  # pre-existing release-mode test compile bugs around debug_assert_peer_maps_coherent).
+  # Catches: features that compile in debug but break in release.
+  release-check:
+    name: Release compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --release
+        run: cargo check --release --locked
