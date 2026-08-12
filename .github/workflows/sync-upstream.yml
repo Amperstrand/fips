@@ -99,7 +99,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: dup.number,
-                body: `## Sync still blocked (${{ new Date().toISOString() }})\n\nRun: ${runUrl}\n\n\`origin/master\` still carries ${otherCount} non-infra commit(s).`
+                body: `## Sync still blocked (${new Date().toISOString()})\n\nRun: ${runUrl}\n\n\`origin/master\` still carries ${otherCount} non-infra commit(s).`
               });
               return;
             }
