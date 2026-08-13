@@ -1,0 +1,81 @@
+name: Fork MIPS cross-compile
+
+# Fork-local: cross-compile fips for mipsel-unknown-linux-musl on every push
+# to feature/mipsel. Catches regressions in the portable_atomic substitution
+# and the [patch.crates-io] nostr-relay-pool wiring.
+# This file lives only on Amperstrand/fips; never PR'd upstream.
+
+on:
+  push:
+    branches:
+      - 'feature/mipsel'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-mipsel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mipsel-cross-compile:
+    name: mipsel-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install nightly Rust (minimal — mipsel is Tier 3, no prebuilt std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Add mipsel target metadata (cargo needs the spec, not rust-std)
+        run: rustup target add mipsel-unknown-linux-musl --toolchain nightly || true
+
+      - name: Install zig (required by cargo-zigbuild) — pinned download
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION="0.13.0"
+          ZIG_SHA256="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+          NAME="zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${NAME}"
+          curl -fsSL "$URL" -o "/tmp/${NAME}"
+          echo "${ZIG_SHA256}  /tmp/${NAME}" | sha256sum -c -
+          tar -xJf "/tmp/${NAME}" -C /tmp
+          echo "/tmp/zig-linux-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --version 0.19.8 --locked
+
+      - name: Install system deps (Linux BLE needs dbus, even for cross-compile check)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mipsel
+
+      - name: Cross-compile fips for mipsel-unknown-linux-musl
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          CARGO_UNSTABLE_BUILD_STD: core,alloc,std
+        run: |
+          cargo zigbuild \
+            --target mipsel-unknown-linux-musl \
+            -Z build-std=core,alloc,std \
+            --release \
+            --locked
+
+      - name: Verify binary exists
+        run: |
+          ls -la target/mipsel-unknown-linux-musl/release/fips
+          file target/mipsel-unknown-linux-musl/release/fips
