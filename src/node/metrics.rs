@@ -453,6 +453,33 @@ impl CongestionMetrics {
     }
 }
 
+/// Routing signals refused by the sender-binding admission gate, split by
+/// signal type.
+///
+/// The sibling counters on `ErrorMetrics` count arrivals, incremented before
+/// the gate runs; these count the subset that was refused. Read together they
+/// give the refused fraction per signal type, which is what separates a node
+/// nobody is talking to from a node with a genuinely broken path from a node
+/// being fed forged signals.
+#[derive(Default)]
+pub struct UnboundSignals {
+    /// `CoordsRequired` refused because this node has not bound the
+    /// destination address the signal names.
+    pub coords: Counter,
+    /// `PathBroken` refused because this node has not bound the destination
+    /// address the signal names.
+    pub broken: Counter,
+    /// `MtuExceeded` refused because this node has not bound the destination
+    /// address the signal names.
+    pub mtu: Counter,
+    /// Subset of the above whose src/dest pairing is structurally impossible
+    /// for a legitimate emitter: the signal names this node as the
+    /// destination, or claims a source equal to the destination it names.
+    /// Neither can arise from an honest on-path forwarder, so any count here
+    /// is a fabricated signal rather than ordinary session churn.
+    pub forged: Counter,
+}
+
 /// Error-signal metric counters.
 #[derive(Default)]
 pub struct ErrorMetrics {
@@ -474,6 +501,7 @@ pub struct ErrorMetrics {
     /// count means a forwarder on the reverse path is mangling the unsigned
     /// annotation.
     pub lookup_resp_mtu_below_floor: Counter,
+    pub unbound: UnboundSignals,
 }
 
 impl ErrorMetrics {
@@ -486,6 +514,10 @@ impl ErrorMetrics {
             path_mtu_notif_below_floor: self.path_mtu_notif_below_floor.get(),
             mtu_exceeded_below_floor: self.mtu_exceeded_below_floor.get(),
             lookup_resp_mtu_below_floor: self.lookup_resp_mtu_below_floor.get(),
+            unbound_coords: self.unbound.coords.get(),
+            unbound_broken: self.unbound.broken.get(),
+            unbound_mtu: self.unbound.mtu.get(),
+            unbound_forged: self.unbound.forged.get(),
         }
     }
 }

@@ -346,6 +346,10 @@ pub struct ErrorSignalStatsSnapshot {
     pub path_mtu_notif_below_floor: u64,
     pub mtu_exceeded_below_floor: u64,
     pub lookup_resp_mtu_below_floor: u64,
+    pub unbound_coords: u64,
+    pub unbound_broken: u64,
+    pub unbound_mtu: u64,
+    pub unbound_forged: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

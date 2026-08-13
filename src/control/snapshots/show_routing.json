@@ -37,7 +37,11 @@
       "mtu_exceeded": 0,
       "mtu_exceeded_below_floor": 0,
       "path_broken": 0,
-      "path_mtu_notif_below_floor": 0
+      "path_mtu_notif_below_floor": 0,
+      "unbound_broken": 0,
+      "unbound_coords": 0,
+      "unbound_forged": 0,
+      "unbound_mtu": 0
     },
     "forwarding": {
       "decode_error_bytes": 0,

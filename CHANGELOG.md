@@ -376,6 +376,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download now checks a per-architecture pinned SHA-256, with the hash
   provenance recorded honestly, upstream publishing no checksum document.
 
+- The three routing signals (`CoordsRequired`, `PathBroken`, `MtuExceeded`) are
+  no longer acted on unless this node has itself bound the destination address
+  they name, either by initiating a session toward it or by completing the
+  Noise handshake that binds an address to a peer's static key. These signals
+  carry no end-to-end authentication, so until now any admitted mesh member
+  could send one naming any address and have its effects applied: a path-MTU
+  clamp written for an arbitrary address, a cached-coordinate flush for an
+  arbitrary address, and a discovery and warmup cycle for an arbitrary address.
+  The `MtuExceeded` case was the sharpest, because its write into the
+  address-keyed path-MTU lookup that the TUN reader consults at TCP MSS clamp
+  time sat outside the session guard and so required no session, no peer
+  relationship and no prior state at all. A half-open session created by an
+  inbound handshake that has not yet proved its address does not admit these
+  signals, so a forged session opening cannot be used to unlock them. Signals
+  from a genuine on-path forwarder are unaffected: the reporter may be any node
+  at any distance. This does not make the sender authentic, which nothing
+  short of a wire format change can do. Rejected signals are counted as
+  unknown-session rejections, and additionally on four new error-signal
+  counters visible through `show routing`, `show metrics` and the fipstop
+  routing pane: `unbound_coords`, `unbound_broken` and `unbound_mtu` give the
+  refused count per signal type, against the existing per-type arrival
+  counters as the denominator, and `unbound_forged` counts the subset whose
+  claimed source and destination pairing no honest forwarder could produce.
+  The drop log line now carries the signal type and the refusal class.
+
 ## [0.4.1] - 2026-07-19
 
 ### Changed
