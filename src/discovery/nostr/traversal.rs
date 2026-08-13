@@ -474,8 +474,11 @@ pub(super) fn nonce() -> String {
 /// that delay instead and can cost a single punch attempt, which retries. Early
 /// eviction from the replay window cannot admit a replay under the shipped
 /// defaults, because the freshness window a replayed offer would also have to
-/// satisfy (`signal_ttl_secs` plus `FRESHNESS_SKEW_TOLERANCE_MS`, 180s) is
-/// strictly narrower than the replay window itself (`replay_window_secs`, 300s).
+/// satisfy (`signal_ttl_secs` plus `FRESHNESS_SKEW_TOLERANCE_MS` on each side,
+/// 240s under the shipped defaults) is strictly narrower than the replay window
+/// itself (`replay_window_secs`, 300s). The margin holds while
+/// `signal_ttl_secs + 120 < replay_window_secs`; nothing in config validation
+/// enforces that relation today.
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

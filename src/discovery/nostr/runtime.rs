@@ -46,6 +46,20 @@ fn short_npub(npub: &str) -> String {
         .unwrap_or_else(|| npub.to_string())
 }
 
+/// Whether an inbound-offer rejection belongs to a class that cannot be
+/// explained by ordinary relay delivery lag, and therefore warrants a warning
+/// on a node running at the default log level. A stale offer is benign and is
+/// deliberately excluded.
+pub(super) fn adversarial_offer_reject(err: &BootstrapError) -> bool {
+    matches!(
+        err,
+        BootstrapError::Protocol(reason)
+            if reason == "future-dated-offer"
+                || reason == "identity-mismatch"
+                || reason == "invalid-offer"
+    )
+}
+
 /// Shorten a peer-supplied identifier for logging.
 ///
 /// Truncates on a character boundary rather than a byte index. The input is a
@@ -821,13 +835,35 @@ impl NostrDiscovery {
                             continue;
                         };
                         let runtime = Arc::clone(&self);
+                        let peer_short = short_npub(&sender_npub);
+                        let session_short = short_id(&offer.session_id);
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Err(err) = runtime
                                 .handle_incoming_offer(offer, unwrapped.sender, sender_npub)
                                 .await
                             {
-                                debug!(error = %err, "failed to handle traversal offer");
+                                // An offer arriving stale is the expected
+                                // consequence of relay lag and stays at debug.
+                                // The remaining classes cannot arise from lag,
+                                // so they are the operator's only evidence that
+                                // a node is being fed malformed or forged
+                                // signals, and must clear the default level.
+                                if adversarial_offer_reject(&err) {
+                                    warn!(
+                                        peer = %peer_short,
+                                        session = %session_short,
+                                        error = %err,
+                                        "rejected traversal offer"
+                                    );
+                                } else {
+                                    debug!(
+                                        peer = %peer_short,
+                                        session = %session_short,
+                                        error = %err,
+                                        "failed to handle traversal offer"
+                                    );
+                                }
                             }
                         });
                     }
@@ -1212,7 +1248,9 @@ impl NostrDiscovery {
             debug!(
                 peer = %peer_short,
                 session = %short_id(&offer.session_id),
-                "traversal: answer accepted within clock-skew tolerance"
+                answer_issued_at = answer.payload.issued_at,
+                answer_expires_at = answer.payload.expires_at,
+                "traversal: answer accepted within freshness tolerance"
             );
         }
         if !answer.payload.accepted {
@@ -1296,8 +1334,9 @@ impl NostrDiscovery {
                 peer = %peer_short,
                 session = %short_id(&offer.session_id),
                 offer_issued_at = offer.issued_at,
+                offer_expires_at = offer.expires_at,
                 offer_received_at = offer_received_at,
-                "traversal: offer accepted within clock-skew tolerance"
+                "traversal: offer accepted within freshness tolerance"
             );
         }
         // Collapse the dual-`auto_connect` four-socket dance to a single

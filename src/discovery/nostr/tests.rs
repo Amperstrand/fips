@@ -4,8 +4,8 @@ use std::net::{IpAddr, SocketAddr};
 use nostr::prelude::{EventBuilder, Kind, RelayUrl, Tag, Timestamp};
 
 use super::runtime::{
-    NostrDiscovery, is_unroutable_direct_advert_ip, short_id, signal_relays,
-    suppress_responder_for_own_initiator,
+    NostrDiscovery, adversarial_offer_reject, is_unroutable_direct_advert_ip, short_id,
+    signal_relays, suppress_responder_for_own_initiator,
 };
 use super::signal::{
     FreshnessOutcome, build_signal_event, create_traversal_answer, create_traversal_offer,
@@ -16,6 +16,7 @@ use super::traversal::{
     PunchStrategy, build_punch_packet, is_doc_ip, is_never_punchable_ip, is_private_ip, now_ms,
     parse_punch_packet, plan_punch_targets, planned_remote_endpoints, session_hash,
 };
+use super::types::BootstrapError;
 use super::{
     ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, OverlayAdvert, OverlayEndpointAdvert,
     OverlayTransportKind, PunchHint, PunchPacketKind, TraversalAddress,
@@ -767,6 +768,240 @@ fn freshness_responder_clock_far_ahead_is_rejected() {
     )
     .expect_err("offer past tolerated expiry should be rejected");
     assert!(err.to_string().contains("expired-offer"), "{}", err);
+}
+
+/// An offer dated far ahead of the local clock is rejected. The age term
+/// saturates to zero for any future stamp, so nothing but the forward bound
+/// can catch this.
+#[test]
+fn freshness_offer_dated_far_in_the_future_is_rejected() {
+    let offer = create_traversal_offer(
+        "sess-1".to_string(),
+        1_700_000_600_000,
+        60_000,
+        "offer-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+        Some(addr("203.0.113.10", 62000)),
+        vec![addr("192.168.1.10", 62000)],
+        None,
+    );
+
+    // Issued ten minutes ahead of the validating clock.
+    let err = validate_offer_freshness(
+        &offer,
+        1_700_000_000_000,
+        60_000,
+        "npub1client",
+        "npub1server",
+    )
+    .expect_err("offer dated far in the future should be rejected");
+    assert!(err.to_string().contains("future-dated-offer"), "{}", err);
+}
+
+/// An offer dated slightly ahead of the local clock is accepted, but reports
+/// the skew outcome so the operator-facing clock-skew log fires. It must not
+/// report strict freshness.
+#[test]
+fn freshness_offer_dated_slightly_in_the_future_reports_skew_tolerance() {
+    let offer = create_traversal_offer(
+        "sess-1".to_string(),
+        1_700_000_010_000,
+        60_000,
+        "offer-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+        Some(addr("203.0.113.10", 62000)),
+        vec![addr("192.168.1.10", 62000)],
+        None,
+    );
+
+    // Issued 10s ahead, inside the 60s tolerance.
+    let result = validate_offer_freshness(
+        &offer,
+        1_700_000_000_000,
+        60_000,
+        "npub1client",
+        "npub1server",
+    )
+    .expect("offer inside the forward tolerance should be accepted");
+    assert_eq!(result, FreshnessOutcome::FreshWithinSkewTolerance);
+}
+
+/// The wire `expires_at` cannot widen the window past the issuer's own stamp
+/// plus our configured TTL. A sender declaring a 600s expiry gets the same
+/// treatment at our 60s TTL boundary as one declaring 60s.
+#[test]
+fn freshness_ignores_an_expires_at_inflated_beyond_issued_at_plus_ttl() {
+    let offer = create_traversal_offer(
+        "sess-1".to_string(),
+        1_700_000_000_000,
+        600_000, // expires_at = 1_700_000_600_000, ten times our TTL
+        "offer-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+        Some(addr("203.0.113.10", 62000)),
+        vec![addr("192.168.1.10", 62000)],
+        None,
+    );
+
+    // Age exactly our TTL: the clamped expiry equals now, so strict freshness
+    // cannot fire and the tolerated branch accepts.
+    let result = validate_offer_freshness(
+        &offer,
+        1_700_000_060_000,
+        60_000,
+        "npub1client",
+        "npub1server",
+    )
+    .expect("offer at the clamped expiry should still be tolerated");
+    assert_eq!(result, FreshnessOutcome::FreshWithinSkewTolerance);
+}
+
+/// Pins the forward bound to `FRESHNESS_SKEW_TOLERANCE_MS` exactly: 60_000ms
+/// ahead is accepted, 60_001ms ahead is not.
+#[test]
+fn freshness_offer_at_the_forward_skew_limit_is_accepted_and_one_ms_beyond_is_rejected() {
+    let now = 1_700_000_000_000;
+    let build = |issued: u64| {
+        create_traversal_offer(
+            "sess-1".to_string(),
+            issued,
+            60_000,
+            "offer-1".to_string(),
+            "npub1client".to_string(),
+            "npub1server".to_string(),
+            Some(addr("203.0.113.10", 62000)),
+            vec![addr("192.168.1.10", 62000)],
+            None,
+        )
+    };
+
+    let at_limit = build(now + 60_000);
+    let result = validate_offer_freshness(&at_limit, now, 60_000, "npub1client", "npub1server")
+        .expect("offer exactly at the forward tolerance should be accepted");
+    assert_eq!(result, FreshnessOutcome::FreshWithinSkewTolerance);
+
+    let past_limit = build(now + 60_001);
+    let err = validate_offer_freshness(&past_limit, now, 60_000, "npub1client", "npub1server")
+        .expect_err("offer one millisecond past the forward tolerance should be rejected");
+    assert!(err.to_string().contains("future-dated-offer"), "{}", err);
+}
+
+/// The forward bound covers the answer path too. The initiator is the side
+/// that binds a socket and punches on an accepted answer, so a future-dated
+/// answer is the more consequential half.
+#[test]
+fn freshness_answer_dated_far_in_the_future_is_rejected() {
+    let offer = create_traversal_offer(
+        "sess-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "offer-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+        Some(addr("203.0.113.10", 62000)),
+        vec![addr("192.168.1.10", 62000)],
+        Some("stun:example.org:3478".to_string()),
+    );
+    let answer = create_traversal_answer(
+        "sess-1".to_string(),
+        1_700_000_600_000, // ten minutes ahead of the validating clock
+        60_000,
+        "answer-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "offer-1".to_string(),
+        true,
+        Some(addr("198.51.100.20", 63000)),
+        vec![addr("192.168.1.20", 63000)],
+        Some("stun:example.org:3478".to_string()),
+        Some(PunchHint {
+            start_at_ms: 1_700_000_002_000,
+            interval_ms: 200,
+            duration_ms: 10_000,
+        }),
+        None,
+        Some(1_700_000_000_400),
+    );
+
+    let err = validate_traversal_answer_for_offer(
+        &offer,
+        &answer,
+        1_700_000_000_900,
+        60_000,
+        "npub1server",
+        "npub1client",
+    )
+    .expect_err("answer dated far in the future should be rejected");
+    assert!(err.to_string().contains("future-dated-answer"), "{}", err);
+}
+
+/// The answer path re-checks our own offer, and a failure there must be
+/// reported as the offer's, not the answer's, so the operator can tell a
+/// backwards local clock step from a bad reply.
+#[test]
+fn answer_validation_reports_a_stale_offer_as_the_offers_own_failure() {
+    let offer = create_traversal_offer(
+        "sess-1".to_string(),
+        1_700_000_000_000,
+        60_000,
+        "offer-1".to_string(),
+        "npub1client".to_string(),
+        "npub1server".to_string(),
+        Some(addr("203.0.113.10", 62000)),
+        vec![addr("192.168.1.10", 62000)],
+        None,
+    );
+    // The answer is issued now; only the offer is beyond TTL + tolerance.
+    let now = 1_700_000_130_000;
+    let answer = create_traversal_answer(
+        "sess-1".to_string(),
+        now,
+        60_000,
+        "answer-1".to_string(),
+        "npub1server".to_string(),
+        "npub1client".to_string(),
+        "offer-1".to_string(),
+        true,
+        Some(addr("198.51.100.20", 63000)),
+        vec![addr("192.168.1.20", 63000)],
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let err = validate_traversal_answer_for_offer(
+        &offer,
+        &answer,
+        now,
+        60_000,
+        "npub1server",
+        "npub1client",
+    )
+    .expect_err("an offer past tolerated expiry should reject the round trip");
+    assert!(
+        err.to_string().contains("expired-offer-in-answer"),
+        "{}",
+        err
+    );
+}
+
+/// Only the inbound-offer rejection classes that cannot be produced by relay
+/// delivery lag escalate to a warning; a stale offer stays quiet.
+#[test]
+fn only_the_non_lag_offer_rejections_escalate_to_a_warning() {
+    let protocol = |reason: &str| BootstrapError::Protocol(reason.to_string());
+
+    assert!(adversarial_offer_reject(&protocol("future-dated-offer")));
+    assert!(adversarial_offer_reject(&protocol("identity-mismatch")));
+    assert!(adversarial_offer_reject(&protocol("invalid-offer")));
+
+    assert!(!adversarial_offer_reject(&protocol("expired-offer")));
+    assert!(!adversarial_offer_reject(&BootstrapError::Nostr(
+        "relay unreachable".to_string()
+    )));
 }
 
 /// B5a: the NTP-style skew estimator returns the responder's apparent

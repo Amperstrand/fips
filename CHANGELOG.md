@@ -334,6 +334,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and at debug level for the routine off-subnet case. Same-LAN and
   reflexive traversal are otherwise unaffected.
 
+- Traversal offers and answers dated in the future are now rejected. The
+  freshness check measured a message's age with a saturating subtraction, which
+  yields zero for any timestamp ahead of the local clock, so the age test could
+  not fail for a future-dated signal and no other term bounded the issue time
+  from above. A signal claiming to be issued arbitrarily far in the future was
+  accepted as strictly fresh, which voided the property that the freshness
+  window is narrower than the session-id replay window (300s by default) and
+  left the replay cache as the sole defence against a captured offer being
+  replayed. Forward-dating is now tolerated only up to the same 60s of clock
+  skew already allowed in the other direction, and a signal accepted under that
+  grace reports the skew outcome, so the existing clock-skew log fires for a
+  peer whose clock is ahead just as it does for one whose clock is behind. The
+  declared expiry timestamp is also no longer trusted beyond the issue time plus
+  the configured TTL, so a sender cannot widen its own acceptance window by
+  inflating that field. A single timestamp is now acceptable over at most the
+  signalling TTL plus 60s on each side, 240s under the shipped defaults.
+  Rejections are also now distinguishable in the log: a stale signal and a
+  future-dated one no longer share one reason string, and the inbound-offer
+  path, whose only surface was an unattributed debug line below the default log
+  level, now names the peer and the session and warns for the rejection classes
+  that relay delivery lag cannot produce (future-dated, identity-mismatch and
+  malformed offers), leaving an ordinary stale offer quiet. As with the existing
+  inbound rate-limit warning, an unauthenticated remote peer can drive that
+  line. A failure of our own offer's freshness during answer validation is
+  reported against the offer rather than mislabelled as the answer's, and the
+  tolerated-acceptance log now carries the issue and expiry stamps and no longer
+  attributes the acceptance to clock skew, since a peer configured with a longer
+  signalling TTL than ours now reaches it too.
+
 - The FSP session address is now bound to the peer key the Noise handshake
   authenticated, on both the initial and the rekey path. The responder recorded
   a session under the source address carried in the datagram without ever
