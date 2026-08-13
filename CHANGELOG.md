@@ -263,9 +263,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime directory.
 
 - The maintainer address published in package metadata no longer bounces. The
-  crate authors field, the Debian package maintainer and upstream contact, and
-  both AUR PKGBUILD maintainer lines carried an address that no longer accepts
-  mail, so the contact of record in every artifact we ship was unreachable.
+  crate authors field, the Debian package maintainer and upstream contact,
+  both AUR PKGBUILD maintainer lines and the FreeBSD package manifest carried
+  an address that no longer accepts mail, so the contact of record in every
+  artifact we ship was unreachable.
 
 - Nostr NAT traversal signals are now sent only to relays the client pool
   actually holds. A signal is addressed to the merge of the peer's NIP-17 inbox
