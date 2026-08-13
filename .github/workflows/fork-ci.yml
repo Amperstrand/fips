@@ -5,6 +5,7 @@ name: Fork CI
 # This file lives only on Amperstrand/fips; never PR'd upstream.
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'feature/**'
