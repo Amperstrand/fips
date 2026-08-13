@@ -153,11 +153,15 @@ pub(crate) struct SessionEntry {
     rekey_initiator: bool,
     /// Dampening: last time peer sent us a rekey msg1 (Unix ms).
     last_peer_rekey_ms: u64,
-    /// When the FSP rekey handshake completed (initiator sent msg3, Unix ms).
-    /// Drives the initiator's liveness-bound cutover timer. Cleared on
-    /// cutover. The timer is no longer safety-critical: overlapping-epoch
-    /// trial-decrypt covers any cutover skew. It only bounds how long the
-    /// initiator advertises the old K-bit.
+    /// When this side's FSP rekey handshake completed and produced the
+    /// `pending` session (Unix ms): the initiator sending msg3, or the
+    /// responder accepting it. Cleared on cutover.
+    ///
+    /// On the initiator it drives the liveness-bound cutover timer, which
+    /// is no longer safety-critical: overlapping-epoch trial-decrypt covers
+    /// any cutover skew, so it only bounds how long the initiator
+    /// advertises the old K-bit. On the responder it dates the wait for the
+    /// peer's cut-over (`pending_stale`) and never expires the keys.
     rekey_completed_ms: u64,
     /// Encoded SessionMsg3 payload retained for retransmission (initiator).
     /// Set when the rekey initiator sends msg3; cleared once the responder
@@ -435,6 +439,14 @@ impl SessionEntry {
         now_ms.saturating_sub(self.last_peer_rekey_ms) < dampening_ms
     }
 
+    /// When the peer last initiated a rekey, or 0 if it never has.
+    ///
+    /// Bounds the age of any rekey state armed by the peer's setup message,
+    /// including a pending session derived from it.
+    pub(crate) fn last_peer_rekey_ms(&self) -> u64 {
+        self.last_peer_rekey_ms
+    }
+
     /// Record that the peer initiated a rekey (for dampening).
     pub(crate) fn record_peer_rekey(&mut self, now_ms: u64) {
         self.last_peer_rekey_ms = now_ms;
@@ -453,7 +465,8 @@ impl SessionEntry {
         }
     }
 
-    /// When the FSP rekey handshake completed (initiator sent msg3).
+    /// When this side's FSP rekey handshake completed: the initiator
+    /// sending msg3, or the responder accepting it.
     pub(crate) fn rekey_completed_ms(&self) -> u64 {
         self.rekey_completed_ms
     }
@@ -468,7 +481,8 @@ impl SessionEntry {
         self.rekey_jitter_secs
     }
 
-    /// Record when the FSP rekey handshake completed (initiator side).
+    /// Record when this side's FSP rekey handshake completed and the
+    /// `pending` session appeared.
     pub(crate) fn set_rekey_completed_ms(&mut self, ms: u64) {
         self.rekey_completed_ms = ms;
     }
@@ -740,6 +754,39 @@ impl SessionEntry {
         self.previous_noise_session = None;
         self.drain_started_ms = 0;
         self.previous_last_used_ms = 0;
+    }
+
+    /// Whether a completed rekey session has waited longer than `stale_ms`
+    /// for the cut-over that would consume it.
+    ///
+    /// This is a staleness question about the *wait*, never a licence to
+    /// drop the keys: the peer may be on this epoch and simply silent, so
+    /// the pending slot is retained regardless. It answers only whether a
+    /// fresh setup message from that peer still has to yield to the
+    /// cut-over that has not arrived.
+    ///
+    /// False when no pending session is held, and false while the entry
+    /// carries no completion stamp, so an unstamped pending is treated as
+    /// freshly completed.
+    pub(crate) fn pending_stale(&self, now_ms: u64, stale_ms: u64) -> bool {
+        self.pending_new_session.is_some()
+            && self.rekey_completed_ms != 0
+            && now_ms.saturating_sub(self.rekey_completed_ms) > stale_ms
+    }
+
+    /// Abandon an in-progress rekey handshake, keeping any completed
+    /// session already waiting for cut-over.
+    ///
+    /// Used when a handshake the peer armed times out without its msg3.
+    /// The handshake holds no key material either endpoint can be using,
+    /// so dropping it costs nothing; a `pending` session alongside it is
+    /// the epoch the peer may already have moved to and must survive.
+    ///
+    /// `rekey_initiator` is deliberately left alone: it describes whichever
+    /// rekey artefact the entry still holds, and every reader gates on a
+    /// live handshake or a pending session first.
+    pub(crate) fn abandon_handshake(&mut self) {
+        self.rekey_state = None;
     }
 
     /// Abandon an in-progress rekey.

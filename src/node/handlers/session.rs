@@ -501,85 +501,116 @@ impl Node {
                 }
                 return;
             } else if existing.is_established() {
-                // Rekey: if rekey enabled, treat as rekey for key rotation.
-                // The existing established session remains active for traffic.
-                if self.config().node.rekey.enabled {
-                    let rekey_in_progress = existing.has_rekey_in_progress();
-                    let has_pending = existing.pending_new_session().is_some();
+                // A SessionSetup naming an already-established peer is
+                // unauthenticated: msg1 is a bare ephemeral and the source
+                // address is an envelope field, so anyone able to reach us
+                // can claim it. It may therefore only arm a handshake
+                // alongside the running session, never replace it. The new
+                // keys are adopted in `handle_session_msg3` and only when the
+                // authenticated static key matches the key this session was
+                // opened with, and the cut-over waits for a frame that
+                // authenticates against the pending epoch. Every exit below
+                // returns, so an established entry never reaches the
+                // re-establishment path that replaces it.
+                let rekey_in_progress = existing.has_rekey_in_progress();
+                // A completed rekey outranks a fresh setup message while the
+                // cut-over it is waiting for can still arrive. Once it has
+                // waited a full idle timeout for a peer that never appeared
+                // on the new epoch, it stops vetoing: a peer that restarted,
+                // or one whose own cycle lapsed, would otherwise be refused
+                // for as long as our own sends kept the session from idling
+                // out. The pending keys are not discarded here either way —
+                // only an authenticated msg3 replaces them.
+                let pending_outranks = existing.pending_new_session().is_some()
+                    && !existing.pending_stale(
+                        Self::now_ms(),
+                        self.config().node.session.idle_timeout_secs * 1000,
+                    );
 
-                    // Dual-initiation detection: both sides sent SessionSetup
-                    // simultaneously. Apply tie-breaker — smaller NodeAddr
-                    // wins as initiator (same as initial session setup).
-                    if rekey_in_progress {
-                        if self.identity().node_addr() < src_addr {
-                            // We win as initiator — drop their msg1.
-                            debug!(
-                                src = %self.peer_display_name(src_addr),
-                                "Dual FSP rekey initiation: we win (smaller addr), dropping their msg1"
-                            );
-                            return;
-                        }
-                        // We lose — abandon our rekey, become responder below.
+                // Dual-initiation detection: both sides sent SessionSetup
+                // simultaneously. Apply tie-breaker — smaller NodeAddr
+                // wins as initiator (same as initial session setup).
+                if rekey_in_progress {
+                    if self.identity().node_addr() < src_addr {
+                        // We win as initiator — drop their msg1.
                         debug!(
                             src = %self.peer_display_name(src_addr),
-                            "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
+                            "Dual FSP rekey initiation: we win (smaller addr), dropping their msg1"
                         );
-                        let entry = self.sessions.get_mut(src_addr).unwrap();
-                        entry.abandon_rekey();
-                    } else if has_pending {
-                        // Guard: already have a pending session waiting for K-bit cutover
-                        debug!(
-                            src = %self.peer_display_name(src_addr),
-                            "FSP rekey msg1 received but already have pending session, dropping"
-                        );
+                        self.stats_mut()
+                            .record_reject(RejectReason::Session(SessionReject::RekeyTiebreak));
                         return;
                     }
-                    let our_keypair = self.identity().keypair();
-                    let mut handshake = HandshakeState::new_xk_responder(our_keypair);
-                    handshake.set_local_epoch(self.startup_epoch());
-
-                    if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
-                        debug!(error = %e, "Failed to process rekey XK msg1");
-                        return;
-                    }
-
-                    // Generate msg2
-                    let msg2 = match handshake.write_xk_message_2() {
-                        Ok(m) => m,
-                        Err(e) => {
-                            debug!(error = %e, "Failed to generate rekey XK msg2");
-                            return;
-                        }
-                    };
-
-                    // Build and send SessionAck
-                    let our_coords = self.tree_state.my_coords().clone();
-                    let ack = SessionAck::new(our_coords, setup.src_coords).with_handshake(msg2);
-                    let ack_payload = ack.encode();
-                    let my_addr = *self.node_addr();
-                    let mut datagram = SessionDatagram::new(my_addr, *src_addr, ack_payload)
-                        .with_ttl(self.config().node.session.default_ttl);
-
-                    if let Err(e) = self.send_session_datagram(&mut datagram).await {
-                        debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionAck");
-                        return;
-                    }
-
-                    // Store rekey state on the existing entry
-                    let now_ms = Self::now_ms();
-                    let entry = self.sessions.get_mut(src_addr).unwrap();
-                    entry.set_rekey_state(handshake, false);
-                    entry.record_peer_rekey(now_ms);
-
+                    // We lose — abandon our rekey, become responder below.
                     debug!(
                         src = %self.peer_display_name(src_addr),
-                        "FSP rekey: processed peer's msg1, sent msg2, awaiting msg3"
+                        "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
+                    );
+                    let entry = self.sessions.get_mut(src_addr).unwrap();
+                    entry.abandon_rekey();
+                    self.stats_mut()
+                        .record_reject(RejectReason::Session(SessionReject::RekeyYielded));
+                } else if pending_outranks {
+                    // Guard: already have a pending session waiting for K-bit cutover
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        "FSP rekey msg1 received but already have pending session, dropping"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Session(SessionReject::RekeyPending));
+                    return;
+                }
+                let our_keypair = self.identity().keypair();
+                let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+                handshake.set_local_epoch(self.startup_epoch());
+
+                if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        error = %e,
+                        "Failed to process rekey XK msg1"
                     );
                     return;
                 }
 
-                // Re-establishment: replace existing session below
-                debug!(src = %self.peer_display_name(src_addr), "Session re-establishment from peer");
+                // Generate msg2
+                let msg2 = match handshake.write_xk_message_2() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(
+                            src = %self.peer_display_name(src_addr),
+                            error = %e,
+                            "Failed to generate rekey XK msg2"
+                        );
+                        return;
+                    }
+                };
+
+                // Build and send SessionAck
+                let our_coords = self.tree_state.my_coords().clone();
+                let ack = SessionAck::new(our_coords, setup.src_coords).with_handshake(msg2);
+                let ack_payload = ack.encode();
+                let my_addr = *self.node_addr();
+                let mut datagram = SessionDatagram::new(my_addr, *src_addr, ack_payload)
+                    .with_ttl(self.config().node.session.default_ttl);
+
+                if let Err(e) = self.send_session_datagram(&mut datagram).await {
+                    debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionAck");
+                    return;
+                }
+
+                // Store rekey state on the existing entry
+                let now_ms = Self::now_ms();
+                let entry = self.sessions.get_mut(src_addr).unwrap();
+                entry.set_rekey_state(handshake, false);
+                entry.record_peer_rekey(now_ms);
+                self.stats_mut().session.rekey_armed += 1;
+
+                debug!(
+                    src = %self.peer_display_name(src_addr),
+                    "FSP rekey: processed peer's msg1, sent msg2, awaiting msg3"
+                );
+                return;
             }
         }
 
@@ -858,7 +889,11 @@ impl Node {
 
             // Process XK msg3
             if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg3");
+                debug!(
+                    src = %self.peer_display_name(src_addr),
+                    error = %e,
+                    "Failed to process rekey XK msg3"
+                );
                 entry.abandon_rekey();
                 self.sessions.insert(*src_addr, entry);
                 return;
@@ -900,8 +935,22 @@ impl Node {
                 }
             };
 
+            // A pending session already held for this peer is superseded
+            // here rather than by any timer: only a msg3 carrying the
+            // session's own peer key can replace the epoch that peer moved
+            // to. The keys it displaces may still be in use, so the event is
+            // counted and logged rather than silent.
+            let superseded = entry.pending_new_session().is_some();
             entry.set_pending_session(session);
+            entry.set_rekey_completed_ms(Self::now_ms());
             self.sessions.insert(*src_addr, entry);
+            if superseded {
+                self.stats_mut().session.pending_replaced += 1;
+                warn!(
+                    src = %self.peer_display_name(src_addr),
+                    "FSP rekey: newly completed session replaced one still awaiting cutover"
+                );
+            }
 
             debug!(
                 src = %self.peer_display_name(src_addr),

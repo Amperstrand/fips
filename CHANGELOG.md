@@ -267,6 +267,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seed or at the clamp. Legitimate narrow paths are unaffected: adaptation to
   hops well below the IPv6 minimum, which the mesh does use, continues to work.
 
+- A session setup message naming an already-established peer no longer replaces
+  that peer's session. The handler did this whenever `node.rekey.enabled` was
+  false: it ran a fresh responder handshake and overwrote the entry, discarding
+  the live keys. The message carries no authenticator and its source address is
+  an envelope field, so anyone able to reach a node could name an established
+  peer and take that session down, repeatedly, and hold it down by repeating
+  the message. The established case now always arms the handshake alongside the
+  running session and adopts the new keys only after a msg3 whose authenticated
+  static key matches the key the session was opened with, which is the check
+  the rekey path already applied; a peer that genuinely restarted still
+  re-establishes, and a forged setup leaves the session carrying traffic. This
+  changes no wire format and adds no configuration: a node with rekey disabled
+  already answered such a message, it simply destroyed the session afterwards.
+
+- The session drain sweep and the cut-over that retires an old key epoch now
+  run whether or not periodic rekey is enabled. Both sat behind the
+  periodic-rekey gate, so a node with rekey disabled that adopted new keys held
+  the superseded ones for the life of the session.
+
+- A session rekey armed by a peer's setup message is now abandoned if the
+  matching msg3 never arrives, rather than persisting for the life of the
+  session. A stuck one made the node treat a later genuine setup message as a
+  simultaneous initiation and drop it, which would otherwise have turned the
+  fix above into a lasting block on re-establishment for roughly half of peer
+  pairs. Only the armed handshake expires, and only it: a rekey that completed
+  is the key epoch the peer has already moved to, since it exists only because
+  a msg3 carrying that peer's authenticated key arrived and the sender of that
+  msg3 promotes the new epoch on an unconditional two-second timer. Expiring
+  those keys on any timer would drop every later frame from that peer, so they
+  are now held until the peer's own frame promotes them, a newer completed
+  rekey replaces them, or the session goes away. What the wait does bound is
+  precedence, not the keys: a completed rekey outranks a fresh setup message
+  from that peer only until it has waited a full idle timeout, after which the
+  setup is answered normally, so a peer that restarted while we held such a
+  session is no longer refused for as long as our own sends keep the session
+  from idling out. The handshake timeout logs at INFO, since it costs nothing,
+  and a completed session displaced by a newer one at WARN, since that does
+  throw away keys the peer may hold. Session counters record the arming of a
+  handshake by a setup message, each of the three ways such a message is
+  refused, and each displaced session, so a node under a sustained spray of
+  setup messages shows a rate rather than nothing; the per-message log lines
+  stay at DEBUG because an unauthenticated sender can drive them at line rate.
+  These counters are not yet readable through the control socket.
+
 - The FSP session address is now bound to the peer key the Noise handshake
   authenticated, on both the initial and the rekey path. The responder recorded
   a session under the source address carried in the datagram without ever

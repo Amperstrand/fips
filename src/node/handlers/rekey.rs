@@ -10,7 +10,7 @@ use crate::node::Node;
 use crate::node::wire::build_msg1;
 use crate::noise::HandshakeState;
 use crate::protocol::{SessionDatagram, SessionSetup};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Keep previous session alive for this long after cutover.
 const DRAIN_WINDOW_SECS: u64 = 10;
@@ -419,15 +419,22 @@ impl Node {
     ///   timer, perform the K-bit cutover (overlapping-epoch decrypt
     ///   makes this safe on any schedule — see `FSP_CUTOVER_DELAY_MS`)
     /// - If the drain window has expired, clean up the previous session
+    /// - If a responder-side handshake the peer never finished has aged
+    ///   out, abandon it (the handshake only — a completed rekey session
+    ///   is never discarded on a timer, see below)
     /// - If the rekey timer/counter fires, initiate a new XK handshake
+    ///   (this last one only when `node.rekey.enabled`)
     ///
     /// msg3 retransmission is handled separately by
     /// `resend_pending_session_msg3`; its lifetime is tied to the
     /// responder receiving msg3, not to this initiator's cutover.
     pub(in crate::node) async fn check_session_rekey(&mut self) {
-        if !self.config().node.rekey.enabled {
-            return;
-        }
+        // The cutover, drain and abandoned-rekey sweeps run whether or not
+        // periodic rekey is enabled: a peer's setup message is answered in
+        // either configuration, so both a superseded key epoch and an
+        // abandoned handshake can exist with rekey disabled. Only the
+        // trigger that starts a rekey of our own is gated.
+        let rekey_enabled = self.config().node.rekey.enabled;
 
         let rekey_after_secs = self.config().node.rekey.after_secs;
         let rekey_after_messages = self.config().node.rekey.after_messages;
@@ -438,6 +445,26 @@ impl Node {
         let mut sessions_to_cutover: Vec<NodeAddr> = Vec::new();
         let mut sessions_to_drain: Vec<NodeAddr> = Vec::new();
         let mut sessions_to_rekey: Vec<NodeAddr> = Vec::new();
+        let mut handshakes_to_abandon: Vec<(NodeAddr, u64)> = Vec::new();
+
+        // Bound for a responder-side handshake the peer armed and never
+        // finished. A parked handshake blocks a later genuine setup message
+        // through the dual-initiation tie-break, so it clears on the
+        // handshake timeout. Nothing is lost with it: an armed handshake
+        // holds no key material either side can be using.
+        //
+        // A *completed* rekey has no such bound, and must not acquire one.
+        // A responder-side pending session exists only because a msg3
+        // authenticated by the session's own peer key arrived, and the
+        // initiator that sent that msg3 promotes the new epoch on an
+        // unconditional timer (`FSP_CUTOVER_DELAY_MS`, branch 1 below).
+        // The pending slot is therefore the epoch the peer has already
+        // moved to, not key material it abandoned, and discarding it on a
+        // timer makes every later frame from that peer undecryptable. It is
+        // released only by the events that supersede it: the peer's own
+        // frame promoting it (`handle_peer_kbit_flip`), a newer completed
+        // rekey replacing it, or the session going away.
+        let stale_handshake_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
 
         for (node_addr, entry) in &self.sessions {
             if !entry.is_established() {
@@ -466,7 +493,25 @@ impl Node {
                 sessions_to_drain.push(*node_addr);
             }
 
-            // 3. Rekey trigger
+            // 3. Abandon a responder-side handshake the peer never finished.
+            //    Anchored on the peer's last accepted setup message, which is
+            //    the only stamp this path writes. A pending session alongside
+            //    it survives: only the handshake is dropped.
+            if !entry.is_rekey_initiator()
+                && entry.has_rekey_in_progress()
+                && entry.last_peer_rekey_ms() != 0
+            {
+                let age = now_ms.saturating_sub(entry.last_peer_rekey_ms());
+                if age > stale_handshake_ms {
+                    handshakes_to_abandon.push((*node_addr, age));
+                    continue;
+                }
+            }
+
+            // 4. Rekey trigger
+            if !rekey_enabled {
+                continue;
+            }
             if entry.has_rekey_in_progress() {
                 continue;
             }
@@ -515,6 +560,20 @@ impl Node {
                 trace!(
                     peer = %self.peer_display_name(&node_addr),
                     "FSP drain complete, previous session erased"
+                );
+            }
+        }
+
+        // Abandon a handshake the peer armed and never finished. Cheap: no
+        // key material is lost, and the slot was blocking re-establishment.
+        for (node_addr, age_ms) in handshakes_to_abandon {
+            if let Some(entry) = self.sessions.get_mut(&node_addr) {
+                entry.abandon_handshake();
+                self.stats_mut().session.rekey_expired += 1;
+                info!(
+                    peer = %self.peer_display_name(&node_addr),
+                    age_ms,
+                    "FSP rekey armed by peer expired without msg3, session retained"
                 );
             }
         }

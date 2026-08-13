@@ -78,7 +78,16 @@ pub(super) async fn make_test_node() -> TestNode {
 /// mirroring UDP, so heterogeneous-MTU / PMTUD tests still exercise the
 /// forward-path bottleneck.
 pub(super) async fn make_test_node_with_mtu(mtu: u16) -> TestNode {
-    let mut node = make_node();
+    make_test_node_with_config(Config::new(), mtu).await
+}
+
+/// Create a test node with a specific `Config` and transport MTU.
+///
+/// Node configuration is immutable after construction (see `make_node_with`),
+/// so a test that needs a non-default setting must supply the `Config` here
+/// rather than poking the node afterwards.
+pub(super) async fn make_test_node_with_config(config: Config, mtu: u16) -> TestNode {
+    let mut node = make_node_with(config);
     let transport_id = TransportId::new(1);
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReceivedPacket>();
@@ -754,6 +763,29 @@ pub(super) async fn run_tree_test_with_mtus(
         nodes.push(make_test_node_with_mtu(mtu).await);
     }
 
+    converge_nodes(nodes, edges).await
+}
+
+/// Like `run_tree_test` but with a per-node `Config`.
+///
+/// `configs` must have one entry per node. Used by tests that need a
+/// non-default setting on a node in a routable mesh, which cannot be produced
+/// any other way because node config is immutable after construction.
+pub(super) async fn run_tree_test_with_configs(
+    configs: Vec<Config>,
+    edges: &[(usize, usize)],
+) -> Vec<TestNode> {
+    let mut nodes = Vec::new();
+    for config in configs {
+        nodes.push(make_test_node_with_config(config, 1280).await);
+    }
+
+    converge_nodes(nodes, edges).await
+}
+
+/// Drive the given nodes to convergence over `edges` and assert every edge
+/// established a bidirectional peer.
+async fn converge_nodes(mut nodes: Vec<TestNode>, edges: &[(usize, usize)]) -> Vec<TestNode> {
     for &(i, j) in edges {
         initiate_handshake(&mut nodes, i, j).await;
     }
