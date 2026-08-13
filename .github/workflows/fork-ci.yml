@@ -74,3 +74,19 @@ jobs:
 
       - name: cargo check --release
         run: cargo check --release --locked
+
+  deny:
+    name: cargo-deny (advisories + licenses + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo deny check
+        run: cargo deny check --locked
