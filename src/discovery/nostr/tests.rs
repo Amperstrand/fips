@@ -1,16 +1,20 @@
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 
 use nostr::prelude::{EventBuilder, Kind, RelayUrl, Tag, Timestamp};
 
-use super::runtime::{NostrDiscovery, signal_relays, suppress_responder_for_own_initiator};
+use super::runtime::{
+    NostrDiscovery, is_unroutable_direct_advert_ip, short_id, signal_relays,
+    suppress_responder_for_own_initiator,
+};
 use super::signal::{
     FreshnessOutcome, build_signal_event, create_traversal_answer, create_traversal_offer,
     estimate_clock_skew, validate_offer_freshness, validate_traversal_answer_for_offer,
 };
 use super::stun::{parse_stun_binding_success, parse_stun_url};
 use super::traversal::{
-    PunchStrategy, build_punch_packet, now_ms, parse_punch_packet, plan_punch_targets,
-    planned_remote_endpoints, session_hash,
+    PunchStrategy, build_punch_packet, is_doc_ip, is_never_punchable_ip, is_private_ip, now_ms,
+    parse_punch_packet, plan_punch_targets, planned_remote_endpoints, session_hash,
 };
 use super::{
     ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, OverlayAdvert, OverlayEndpointAdvert,
@@ -383,7 +387,7 @@ fn rejects_answer_with_mismatched_actual_sender() {
 
 #[test]
 fn plans_reflexive_targets_before_lan() {
-    let planned = plan_punch_targets(
+    let (planned, _tally) = plan_punch_targets(
         &[addr("192.168.1.10", 62000)],
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
@@ -396,7 +400,7 @@ fn plans_reflexive_targets_before_lan() {
 
 #[test]
 fn simulated_lan_scenario_includes_lan_target_and_succeeds() {
-    let planned = plan_punch_targets(
+    let (planned, _tally) = plan_punch_targets(
         &[addr("192.168.1.10", 62000)],
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
@@ -413,7 +417,7 @@ fn simulated_lan_scenario_includes_lan_target_and_succeeds() {
 
 #[test]
 fn simulated_symmetric_nat_scenario_requires_fallback() {
-    let planned = plan_punch_targets(
+    let (planned, _tally) = plan_punch_targets(
         &[addr("10.0.0.10", 62000)],
         Some(&addr("203.0.113.10", 62000)),
         &[addr("10.0.1.10", 63000)],
@@ -430,7 +434,7 @@ fn simulated_symmetric_nat_scenario_requires_fallback() {
 
 #[test]
 fn planned_remote_endpoints_include_private_and_reflexive_paths() {
-    let endpoints = planned_remote_endpoints(
+    let (endpoints, _tally) = planned_remote_endpoints(
         &[addr("192.168.1.10", 62000)],
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
@@ -440,6 +444,245 @@ fn planned_remote_endpoints_include_private_and_reflexive_paths() {
 
     assert!(endpoints.contains(&"192.168.1.20:63000".parse().unwrap()));
     assert!(endpoints.contains(&"198.51.100.20:63000".parse().unwrap()));
+}
+
+#[test]
+fn planned_remote_endpoints_reject_never_punchable_remote_candidates() {
+    // An empty local list is the shipped `share_local_candidates=false`
+    // shape, where every non-reflexive target comes from the ungated
+    // reflexive-to-remote-candidate pairing.
+    let (endpoints, _tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[
+            addr("127.0.0.1", 63000),
+            addr("224.0.0.1", 63000),
+            addr("169.254.1.1", 63000),
+            addr("255.255.255.255", 63000),
+            addr("0.0.0.0", 63000),
+            addr("100.64.1.2", 63000),
+            addr("8.8.8.8", 0),
+        ],
+        Some(&addr("198.51.100.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert_eq!(
+        endpoints,
+        vec!["198.51.100.20:63000".parse::<SocketAddr>().unwrap()]
+    );
+}
+
+#[test]
+fn planned_remote_endpoints_drop_private_candidate_outside_our_subnet() {
+    let (endpoints, _tally) = planned_remote_endpoints(
+        &[addr("192.168.1.10", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("10.9.9.9", 63000)],
+        Some(&addr("198.51.100.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(!endpoints.contains(&"10.9.9.9:63000".parse().unwrap()));
+    assert!(endpoints.contains(&"198.51.100.20:63000".parse().unwrap()));
+}
+
+#[test]
+fn planned_remote_endpoints_reject_ipv4_mapped_private_candidate() {
+    let (endpoints, _tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("::ffff:10.0.0.1", 63000)],
+        Some(&addr("198.51.100.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert_eq!(
+        endpoints,
+        vec!["198.51.100.20:63000".parse::<SocketAddr>().unwrap()]
+    );
+}
+
+#[test]
+fn planned_remote_endpoints_cap_targets_from_an_oversized_candidate_list() {
+    // Public candidates throughout, so the cap and not the address filter is
+    // what bounds the result.
+    let mut remotes = Vec::new();
+    for host in 1..=150u8 {
+        remotes.push(addr(&format!("203.0.113.{host}"), 63000));
+        remotes.push(addr(&format!("198.51.100.{host}"), 63000));
+    }
+
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &remotes,
+        Some(&addr("198.51.100.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(tally.capped > 0, "the cap should have discarded targets");
+    assert!(tally.suspicious());
+    assert!(
+        endpoints.len() <= 8,
+        "expected at most 8 endpoints, got {}",
+        endpoints.len()
+    );
+}
+
+/// Guards the deployment whose STUN server sits inside the private network,
+/// so the observed reflexive address is itself private. Applying the /24 gate
+/// to a peer's reflexive address would drop it and remove the only branch
+/// that works across arbitrary NATs; this test reds if anyone does that.
+#[test]
+fn planned_remote_endpoints_keep_private_reflexive_when_stun_is_on_the_lan() {
+    let (endpoints, _tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("192.168.1.10", 62000)),
+        &[],
+        Some(&addr("192.168.1.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(endpoints.contains(&"192.168.1.20:63000".parse().unwrap()));
+}
+
+/// The four refusal classes tell four different operational stories, so a
+/// change that collapses them into one counter, or that makes the warning
+/// fire on the benign dual-homed shape, has to red here.
+#[test]
+fn refused_punch_candidates_are_counted_by_class_and_sampled() {
+    let (_planned, tally) = plan_punch_targets(
+        &[addr("192.168.1.10", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[
+            addr("127.0.0.1", 63000),
+            addr("203.0.113.5", 0),
+            addr("10.9.9.9", 63000),
+            addr("not-an-ip", 63000),
+        ],
+        Some(&addr("198.51.100.20", 63000)),
+    );
+
+    assert_eq!(tally.offered, 5);
+    assert_eq!(tally.unroutable, 1);
+    assert_eq!(tally.zeroport, 1);
+    assert_eq!(tally.offsubnet, 1);
+    assert_eq!(tally.unparsable, 1);
+    assert_eq!(tally.sample.as_deref(), Some("127.0.0.1:63000"));
+    assert_eq!(tally.reflexive, None);
+    assert!(tally.admitted > 0, "the reflexive path should still plan");
+    assert!(tally.suspicious());
+}
+
+#[test]
+fn a_clean_plan_and_an_off_subnet_only_plan_are_not_suspicious() {
+    let (_planned, clean) = plan_punch_targets(
+        &[addr("192.168.1.10", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("192.168.1.20", 63000)],
+        Some(&addr("198.51.100.20", 63000)),
+    );
+    assert_eq!(clean.offsubnet, 0);
+    assert!(!clean.suspicious());
+
+    let (_planned, off_subnet) = plan_punch_targets(
+        &[addr("192.168.1.10", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("10.9.9.9", 63000)],
+        Some(&addr("198.51.100.20", 63000)),
+    );
+    assert_eq!(off_subnet.offsubnet, 1);
+    assert!(off_subnet.admitted > 0);
+    assert!(!off_subnet.suspicious());
+}
+
+#[test]
+fn an_offer_whose_every_candidate_is_refused_is_suspicious() {
+    let (planned, tally) = plan_punch_targets(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("127.0.0.1", 63000), addr("224.0.0.1", 63000)],
+        None,
+    );
+
+    assert!(planned.is_empty());
+    assert_eq!(tally.admitted, 0);
+    assert_eq!(tally.unroutable, 2);
+    assert!(tally.suspicious());
+}
+
+/// A peer's reflexive address is refused on its own terms: losing it removes
+/// the only branch that works across arbitrary NATs, so it is recorded apart
+/// from the host-candidate counts.
+#[test]
+fn a_refused_reflexive_address_is_recorded_apart_from_the_candidates() {
+    let (_planned, tally) = plan_punch_targets(
+        &[addr("192.168.1.10", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("192.168.1.20", 63000)],
+        Some(&addr("127.0.0.1", 63000)),
+    );
+
+    assert_eq!(tally.reflexive, Some("never-routable"));
+    assert_eq!(tally.unroutable, 0);
+    assert_eq!(tally.sample.as_deref(), Some("127.0.0.1:63000"));
+    assert!(tally.suspicious());
+}
+
+#[test]
+fn split_address_predicates_match_the_old_advert_predicate() {
+    // Expected values are hand-derived from the single disjunction the advert
+    // filter used before the split, which is the spec for this refactor.
+    let cases = [
+        ("127.0.0.1", true),
+        ("::1", true),
+        ("0.0.0.0", true),
+        ("::", true),
+        ("224.0.0.1", true),
+        ("ff02::1", true),
+        ("255.255.255.255", true),
+        ("169.254.1.1", true),
+        ("fe80::1", true),
+        ("192.0.2.1", true),
+        ("198.51.100.1", true),
+        ("203.0.113.1", true),
+        ("100.64.0.1", true),
+        ("100.127.255.255", true),
+        ("100.128.0.1", false),
+        ("10.0.0.1", true),
+        ("192.168.1.1", true),
+        ("172.16.0.1", true),
+        ("fd00::1", true),
+        ("8.8.8.8", false),
+        ("2001:4860:4860::8888", false),
+    ];
+
+    for (text, expected) in cases {
+        let ip = text.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            is_unroutable_direct_advert_ip(ip),
+            expected,
+            "unexpected advert verdict for {text}"
+        );
+        assert_eq!(
+            is_never_punchable_ip(ip) || is_private_ip(ip) || is_doc_ip(ip),
+            expected,
+            "the split predicates disagree with the advert filter for {text}"
+        );
+    }
+}
+
+/// The documentation ranges are held out of the punch filter deliberately, so
+/// that the reflexive addresses these tests and lab topologies use as public
+/// stand-ins keep working. An advert must still not name one.
+#[test]
+fn documentation_addresses_are_punchable_but_not_advertisable() {
+    let ip = "198.51.100.20".parse::<IpAddr>().unwrap();
+
+    assert!(!is_never_punchable_ip(ip));
+    assert!(!is_private_ip(ip));
+    assert!(is_unroutable_direct_advert_ip(ip));
 }
 
 /// B4: strict-fresh path returns Fresh; the offer is well within TTL and
@@ -855,4 +1098,16 @@ fn signal_relays_without_an_advert_still_resolves() {
         ],
         "the responder path passes no advert and must still produce a target set"
     );
+}
+
+#[test]
+fn short_id_truncates_a_multibyte_session_id_on_a_character_boundary_without_panicking() {
+    // The session id arrives as an unvalidated string in a remote party's JSON,
+    // so a byte-index slice can land inside a multi-byte character. Byte 8 of
+    // this input is the middle of the euro sign.
+    assert_eq!(short_id("aaaaaaa\u{20AC}zzzz"), "aaaaaaa\u{20AC}");
+    // Ascii behaviour is unchanged: long truncates to eight, short passes through.
+    assert_eq!(short_id("abcdefghij"), "abcdefgh");
+    assert_eq!(short_id("abc"), "abc");
+    assert_eq!(short_id(""), "");
 }

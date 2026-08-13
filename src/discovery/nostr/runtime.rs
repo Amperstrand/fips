@@ -23,7 +23,10 @@ use super::signal::{
     validate_traversal_answer_for_offer,
 };
 use super::stun::observe_traversal_addresses;
-use super::traversal::{nonce, now_ms, planned_remote_endpoints, run_punch_attempt};
+use super::traversal::{
+    PunchTargetTally, is_doc_ip, is_never_punchable_ip, is_private_ip, nonce, now_ms,
+    planned_remote_endpoints, run_punch_attempt,
+};
 use super::types::{
     ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
     CachedOverlayAdvert, NostrFailureDecision, NostrPeerFailureView, NostrRefetchOutcome,
@@ -43,11 +46,61 @@ fn short_npub(npub: &str) -> String {
         .unwrap_or_else(|| npub.to_string())
 }
 
-fn short_id(id: &str) -> String {
-    if id.len() > 8 {
-        id[..8].to_string()
+/// Shorten a peer-supplied identifier for logging.
+///
+/// Truncates on a character boundary rather than a byte index. The input is a
+/// session id taken straight from a remote party's JSON with no charset
+/// validation, and slicing by byte offset panics when the boundary falls
+/// inside a multi-byte character.
+pub(super) fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Record, once per planning call, the punch candidates a peer named that we
+/// declined to punch.
+///
+/// One aggregated record rather than one per candidate: a peer's candidate
+/// list is unbounded, so per-candidate logging would trade the packet
+/// amplification the filter closes for a log amplification. `warn` is used for
+/// the shapes no honest peer produces, because `info` is the level a shipped
+/// node collects by default and those refusals are the ones an operator needs
+/// to see; the routine off-subnet case stays at `debug`.
+fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
+    if tally.offered <= tally.admitted && tally.capped == 0 {
+        return;
+    }
+    let sample = tally.sample.as_deref().unwrap_or("-");
+    let reflexive = tally.reflexive.unwrap_or("-");
+    if tally.suspicious() {
+        warn!(
+            peer = %peer,
+            session = %session,
+            offered = tally.offered,
+            admitted = tally.admitted,
+            unparsable = tally.unparsable,
+            zeroport = tally.zeroport,
+            unroutable = tally.unroutable,
+            offsubnet = tally.offsubnet,
+            capped = tally.capped,
+            reflexive = %reflexive,
+            sample = %sample,
+            "traversal: punch candidates refused"
+        );
     } else {
-        id.to_string()
+        debug!(
+            peer = %peer,
+            session = %session,
+            offered = tally.offered,
+            admitted = tally.admitted,
+            unparsable = tally.unparsable,
+            zeroport = tally.zeroport,
+            unroutable = tally.unroutable,
+            offsubnet = tally.offsubnet,
+            capped = tally.capped,
+            reflexive = %reflexive,
+            sample = %sample,
+            "traversal: punch candidates refused"
+        );
     }
 }
 
@@ -95,26 +148,11 @@ fn endpoint_summary(endpoints: &[OverlayEndpointAdvert]) -> String {
         .join(",")
 }
 
-fn is_unroutable_direct_advert_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
+/// Addresses an advert must not name as a directly dialable endpoint: the
+/// never-punchable ranges plus the private and documentation ones, which are
+/// useless to a peer that found the advert on a relay.
+pub(super) fn is_unroutable_direct_advert_ip(ip: std::net::IpAddr) -> bool {
+    is_never_punchable_ip(ip) || is_private_ip(ip) || is_doc_ip(ip)
 }
 
 fn endpoint_advert_is_publicly_usable(endpoint: &OverlayEndpointAdvert) -> bool {
@@ -1186,12 +1224,13 @@ impl NostrDiscovery {
             ));
         }
 
-        let remotes = planned_remote_endpoints(
+        let (remotes, tally) = planned_remote_endpoints(
             &offer.local_addresses,
             offer.reflexive_address.as_ref(),
             &answer.payload.local_addresses,
             answer.payload.reflexive_address.as_ref(),
         )?;
+        log_refusals(&tally, &peer_short, &short_id(&session_id));
 
         let remote_addr = run_punch_attempt(
             &base_socket,
@@ -1360,14 +1399,15 @@ impl NostrDiscovery {
             return Ok(());
         }
 
-        let remotes = planned_remote_endpoints(
+        let (remotes, tally) = planned_remote_endpoints(
             &answer.local_addresses,
             answer.reflexive_address.as_ref(),
             &offer.local_addresses,
             offer.reflexive_address.as_ref(),
         )?;
+        log_refusals(&tally, &peer_short, &short_id(&offer.session_id));
 
-        if let Ok(remote_addr) = run_punch_attempt(
+        let punch = run_punch_attempt(
             &base_socket,
             &offer.session_id,
             &remotes,
@@ -1377,23 +1417,33 @@ impl NostrDiscovery {
                 .expect("accepted answers always include a punch hint"),
             Duration::from_secs(self.config.attempt_timeout_secs),
         )
-        .await
-        {
-            debug!(
-                peer = %peer_short,
-                session = %short_id(&offer.session_id),
-                remote = %remote_addr,
-                "traversal: responder punch succeeded"
-            );
-            let _ = self.event_tx.send(BootstrapEvent::Established {
-                traversal: EstablishedTraversal::new(
-                    offer.session_id,
-                    offer.sender_npub,
-                    remote_addr,
-                    base_socket,
-                )
-                .with_transport_name("nostr-nat"),
-            });
+        .await;
+        match punch {
+            Ok(remote_addr) => {
+                debug!(
+                    peer = %peer_short,
+                    session = %short_id(&offer.session_id),
+                    remote = %remote_addr,
+                    "traversal: responder punch succeeded"
+                );
+                let _ = self.event_tx.send(BootstrapEvent::Established {
+                    traversal: EstablishedTraversal::new(
+                        offer.session_id,
+                        offer.sender_npub,
+                        remote_addr,
+                        base_socket,
+                    )
+                    .with_transport_name("nostr-nat"),
+                });
+            }
+            Err(err) => {
+                debug!(
+                    peer = %peer_short,
+                    session = %short_id(&offer.session_id),
+                    error = %err,
+                    "traversal: responder punch failed"
+                );
+            }
         }
 
         let _ = self.publish_delete(&relays, [answer_event.id]).await;

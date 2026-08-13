@@ -311,6 +311,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stay at DEBUG because an unauthenticated sender can drive them at line rate.
   These counters are not yet readable through the control socket.
 
+- Traversal punch targets taken from a peer's offer or answer are now
+  filtered and bounded. A rendezvous-enabled node previously punched every
+  address a signed offer named, including loopback, link-local, multicast,
+  broadcast, unspecified and CGNAT addresses, and placed no limit on how
+  many candidates one offer could carry. Any npub could
+  therefore have a node emit a burst of UDP packets at addresses of the
+  sender's choosing, carrying the node's own source address. Candidates in
+  the never-routable ranges are now rejected, IPv4-mapped IPv6 forms are
+  canonicalized before the check so they cannot slip past it, candidates
+  with port 0 are dropped, private-range candidates are punched only when
+  they share a /24 with one of our own addresses (which is what same-LAN
+  traversal already required of its own path), and the planned target list
+  is capped at eight. A peer's reflexive address is checked against the
+  never-routable ranges but not against the /24 rule, so a deployment whose
+  STUN server sits inside the private network keeps working. A malformed
+  address in a peer's signal now drops that one candidate instead of
+  failing the whole traversal. A node also records what it declined: one
+  log record per planning attempt carries how many candidates the peer
+  offered, how many were planned, the count refused in each class and one
+  sample address, at warning level for the shapes no honest peer produces
+  and at debug level for the routine off-subnet case. Same-LAN and
+  reflexive traversal are otherwise unaffected.
+
 - The FSP session address is now bound to the peer key the Noise handshake
   authenticated, on both the initial and the rekey path. The responder recorded
   a session under the source address carried in the datagram without ever
