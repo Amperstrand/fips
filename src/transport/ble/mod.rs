@@ -41,6 +41,8 @@ pub mod addr;
 /// the logic must not be behind a platform-only gate.
 #[cfg(any(target_os = "android", test))]
 pub mod android_io;
+#[cfg(bluest_available)]
+pub mod io_macos;
 pub mod io;
 pub mod neighbor;
 pub mod pool;
@@ -99,6 +101,9 @@ pub type DefaultBleTransport = BleTransport<io::BluerIo>;
 #[cfg(all(target_os = "android", not(bluer_available), not(test)))]
 pub type DefaultBleTransport = BleTransport<android_io::AndroidIo>;
 
+#[cfg(all(bluest_available, not(bluer_available), not(test)))]
+pub type DefaultBleTransport = BleTransport<io_macos::BluestIo>;
+
 #[cfg(test)]
 pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
 
@@ -107,7 +112,12 @@ pub type DefaultBleTransport = BleTransport<io::MockBleIo>;
 // backend to provide it. It cannot fire today; it exists for whoever next
 // widens `ble_available`, and it fails the build rather than shipping a
 // transport that quietly never connects.
-#[cfg(all(not(test), not(bluer_available), not(target_os = "android")))]
+#[cfg(all(
+    not(test),
+    not(bluer_available),
+    not(bluest_available),
+    not(target_os = "android")
+))]
 compile_error!(
     "this target is `ble_available` but has no concrete `BleIo` backend. \
      Add its backend and an arm to the `DefaultBleTransport` cascade in \
@@ -1395,7 +1405,8 @@ mod tests {
     /// developer will actually see it.
     #[test]
     fn a_target_that_compiles_this_module_has_a_real_backend() {
-        let has_concrete_backend = cfg!(bluer_available) || cfg!(target_os = "android");
+        let has_concrete_backend =
+            cfg!(bluer_available) || cfg!(target_os = "android") || cfg!(bluest_available);
         assert!(
             has_concrete_backend,
             "target {} is `ble_available` but has no concrete `BleIo` backend, \

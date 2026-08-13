@@ -65,6 +65,10 @@ procfs = { version = "0.18", default-features = false }
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
 
+# bluest/CoreBluetooth — see build.rs `bluest_available` cfg gate.
+[target.'cfg(target_os = "macos")'.dependencies]
+bluest = { version = "0.6", features = ["l2cap", "unstable"] }
+
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
 windows-service = "0.8.1"

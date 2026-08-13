@@ -41,11 +41,16 @@ fn main() {
     // satisfy libdbus-sys's pkg-config cross-compile requirement, and musl
     // router targets don't run BlueZ by default anyway.
     println!("cargo:rustc-check-cfg=cfg(bluer_available)");
+    println!("cargo:rustc-check-cfg=cfg(bluest_available)");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let bluer_available = target_os == "linux" && target_env != "musl";
     if bluer_available {
         println!("cargo:rustc-cfg=bluer_available");
+    }
+    let bluest_available = target_os == "macos";
+    if bluest_available {
+        println!("cargo:rustc-cfg=bluest_available");
     }
 
     // Whether the BLE transport is compiled at all.
@@ -58,7 +63,7 @@ fn main() {
     // backend; `transport::ble` carries a compile-time tripwire that refuses
     // a build where the two disagree.
     println!("cargo:rustc-check-cfg=cfg(ble_available)");
-    if bluer_available || target_os == "android" {
+    if bluer_available || bluest_available || target_os == "android" {
         println!("cargo:rustc-cfg=ble_available");
     }
 }
