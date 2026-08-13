@@ -1,0 +1,77 @@
+# cargo-deny configuration.
+#
+# Fork-local: lives on Amperstrand/fips, never PR'd upstream.
+# Run locally: `cargo deny check`
+# Run in CI: see .github/workflows/fork-ci.yml (deny job).
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+# =============================================================================
+# Advisories — security/maintenance advisories from RustSec + GitHub Advisory
+# Database
+# =============================================================================
+[advisories]
+yanked = "warn"
+ignore = [
+    # nostr-relay-pool 0.44.x is marked unmaintained (RUSTSEC-2026-0243).
+    # Resolved when fips upgrades to nostr-sdk 0.45+ (the standalone pool
+    # crate was merged into nostr-sdk then). Tracked in fork history; no
+    # action needed until upstream fips bumps nostr-sdk.
+    "RUSTSEC-2026-0243",
+
+    # paste 1.0.15 is marked unmaintained (RUSTSEC-2024-0436). Pulled in
+    # transitively via rtnetlink (Linux netlink bindings). No safe upgrade;
+    # rtnetlink would need to swap to `pastey` upstream. Accept the risk for
+    # the Linux-only netlink path.
+    "RUSTSEC-2024-0436",
+
+    # instant 0.1.13 is marked unmaintained (RUSTSEC-2024-0384). Pulled in
+    # transitively via nostr 0.44.x. Author recommends `web-time`. Resolved
+    # when fips upgrades to nostr-sdk 0.45+ (which uses web-time).
+    "RUSTSEC-2024-0384",
+]
+
+# =============================================================================
+# Licenses — deny licenses not on the allowlist
+# =============================================================================
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "WTFPL",
+    "GPL-3.0-or-later",
+]
+confidence-threshold = 0.8
+
+# =============================================================================
+# Bans — detect duplicate deps, banned crates, etc.
+# =============================================================================
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+allow = []
+deny = []
+
+# =============================================================================
+# Sources — restrict which crate registries/git sources are allowed
+# =============================================================================
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+]
+allow-git = [
+    # Our own fork of nostr-relay-pool, used by feature/mipsel
+    "https://github.com/Amperstrand/nostr",
+]
