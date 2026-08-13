@@ -459,6 +459,21 @@ pub struct ErrorMetrics {
     pub coords_required: Counter,
     pub path_broken: Counter,
     pub mtu_exceeded: Counter,
+    /// `PathMtuNotification`s ignored for carrying a path MTU below the
+    /// actionable floor. This signal arrives inside an established session
+    /// on the decrypted path, so a rising count means an authenticated peer
+    /// is misconfigured or misbehaving.
+    pub path_mtu_notif_below_floor: Counter,
+    /// `MtuExceeded` signals whose bottleneck was ignored for falling below
+    /// the actionable floor. The signal is unencrypted, unauthenticated and
+    /// unmetered, so a rising count on its own is the forged-signal
+    /// signature; `mtu_exceeded` counts the whole population.
+    pub mtu_exceeded_below_floor: Counter,
+    /// `LookupResponse` path MTU annotations ignored for falling below the
+    /// actionable floor. The response carried a verified proof, so a rising
+    /// count means a forwarder on the reverse path is mangling the unsigned
+    /// annotation.
+    pub lookup_resp_mtu_below_floor: Counter,
 }
 
 impl ErrorMetrics {
@@ -468,6 +483,9 @@ impl ErrorMetrics {
             coords_required: self.coords_required.get(),
             path_broken: self.path_broken.get(),
             mtu_exceeded: self.mtu_exceeded.get(),
+            path_mtu_notif_below_floor: self.path_mtu_notif_below_floor.get(),
+            mtu_exceeded_below_floor: self.mtu_exceeded_below_floor.get(),
+            lookup_resp_mtu_below_floor: self.lookup_resp_mtu_below_floor.get(),
         }
     }
 }

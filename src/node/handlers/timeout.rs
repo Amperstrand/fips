@@ -208,6 +208,7 @@ impl Node {
             info!(dest = %name, "Session handshake timed out, removing");
             self.sessions.remove(addr);
             self.pending_tun_packets.remove(addr);
+            self.path_mtu_lookup_release(addr);
         }
 
         // Second pass: collect resend candidates
@@ -285,6 +286,7 @@ impl Node {
             }
             self.sessions.remove(&addr);
             self.pending_tun_packets.remove(&addr);
+            self.path_mtu_lookup_release(&addr);
             debug!(
                 dest = %name,
                 idle_secs = timeout_ms / 1000,

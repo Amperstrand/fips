@@ -33,8 +33,11 @@
     },
     "error_signals": {
       "coords_required": 0,
+      "lookup_resp_mtu_below_floor": 0,
       "mtu_exceeded": 0,
-      "path_broken": 0
+      "mtu_exceeded_below_floor": 0,
+      "path_broken": 0,
+      "path_mtu_notif_below_floor": 0
     },
     "forwarding": {
       "decode_error_bytes": 0,

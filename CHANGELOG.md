@@ -228,6 +228,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The influence a remote party has over path MTU is now bounded, and the
+  per-destination path MTU cache has a way back. The `path_mtu` field is an
+  unsigned per-hop transit annotation carried outside the signed proof, and the
+  `MtuExceeded` and `PathBroken` signals arrive unencrypted with no sender
+  check, so any forwarder — or anyone who can reach the node — could lower it,
+  and it was accepted with no minimum. A single `MtuExceeded` carrying a very
+  small value drove a session's path MTU to zero, after which every packet to
+  that destination was answered with an ICMPv6 Packet Too Big instead of being
+  sent: a blackhole that lasted until the daemon restarted. The same value
+  reached the SYN-time TCP MSS clamp, where anything at or below 137 saturates
+  to a segment size of zero and the band just above it yields single digits.
+  Values below an actionable minimum are now ignored rather than applied or
+  stored, at the three places a remote value is acted on: the path MTU state
+  machine, the reactive `MtuExceeded` write, and the discovery response, whose
+  coordinates are still cached so refusing the annotation cannot become a way
+  to deny discovery. The MSS clamp additionally refuses to write a zero. Each
+  of the three refusals logs a warning and increments its own counter in the
+  error-signal family, so an operator can tell them apart without scraping
+  logs: they carry different meanings, one being an authenticated peer inside
+  an established session, one an unencrypted signal anyone able to reach the
+  node can send at will, and one a verified discovery response whose unsigned
+  annotation a forwarder on the reverse path rewrote. Because those three
+  refusals are the only way a remote value reaches the per-destination store,
+  the SYN-time clamp does not apply the minimum a second time when it reads
+  that store: a small value there is one the node derived from its own outgoing
+  link, which is exact rather than suspect, and BLE in particular negotiates a
+  link MTU per connection that lands under the minimum routinely. The clamp
+  refuses only a stored value admitting no TCP payload byte at all, at 137 or
+  below, where the segment size saturates to zero and the clamp would be
+  skipped entirely; it logs that at trace rather than warn, since it sits on
+  the per-packet path, and the peer's link promotion reports it once instead.
+  A stored per-destination path MTU is released when the path is invalidated by
+  a `PathBroken` report, by session idle expiry, or by handshake timeout, and
+  the link MTU read from the local transport is reseeded in its place, so a
+  directly connected peer does not lose its own measurement along with the
+  remote claim. Locally derived MTUs are not subject to the minimum, at the
+  seed or at the clamp. Legitimate narrow paths are unaffected: adaptation to
+  hops well below the IPv6 minimum, which the mesh does use, continues to work.
+
 - The FSP session address is now bound to the peer key the Noise handshake
   authenticated, on both the initial and the rekey path. The responder recorded
   a session under the source address carried in the datagram without ever

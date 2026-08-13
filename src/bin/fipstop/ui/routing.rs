@@ -291,6 +291,9 @@ fn draw_routing_stats(
             ("Coords Required", err("coords_required")),
             ("Path Broken", err("path_broken")),
             ("MTU Exceeded", err("mtu_exceeded")),
+            ("PMTU Notif < Floor", err("path_mtu_notif_below_floor")),
+            ("MTU Exceeded < Floor", err("mtu_exceeded_below_floor")),
+            ("Lookup PMTU < Floor", err("lookup_resp_mtu_below_floor")),
         ],
     ));
     right.push(Line::from(""));

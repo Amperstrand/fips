@@ -435,7 +435,20 @@ impl PathMtuState {
     ///   value, spanning at least 2 * notification_interval.
     ///
     /// Returns `true` if the effective MTU changed.
+    ///
+    /// A reported value below [`MIN_ACTIONABLE_PATH_MTU`] is ignored entirely.
+    /// The notification carries a remote party's claim about the path, and
+    /// below that floor the claim cannot describe a usable path: acting on it
+    /// drives the send gate into answering every packet with an ICMPv6 Packet
+    /// Too Big instead of sending it. Returning `false` leaves whatever the
+    /// local seed established and correctly reports "no change".
+    ///
+    /// [`MIN_ACTIONABLE_PATH_MTU`]: crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU
     pub fn apply_notification(&mut self, reported_mtu: u16, now: Instant) -> bool {
+        if reported_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+            return false;
+        }
+
         if reported_mtu < self.current_mtu {
             // Decrease: immediate
             self.current_mtu = reported_mtu;
@@ -447,7 +460,7 @@ impl PathMtuState {
         if reported_mtu > self.current_mtu {
             // Increase: track consecutive notifications
             if reported_mtu == self.pending_increase_mtu {
-                self.consecutive_increase_count += 1;
+                self.consecutive_increase_count = self.consecutive_increase_count.saturating_add(1);
             } else {
                 // Different value: reset sequence
                 self.pending_increase_mtu = reported_mtu;
@@ -551,5 +564,66 @@ owd_window_size: 48
         assert_eq!(config.mode, MmpMode::Minimal);
         assert_eq!(config.log_interval_secs, DEFAULT_LOG_INTERVAL_SECS);
         assert_eq!(config.owd_window_size, DEFAULT_OWD_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn apply_notification_ignores_a_decrease_below_the_actionable_floor() {
+        // The reported value comes from a remote party over an unauthenticated
+        // signal. Driving current_mtu into this band turns the TUN send gate
+        // into a blackhole: every packet is answered with a Packet Too Big
+        // instead of being sent. Sub-floor values are ignored outright, not
+        // clamped, so the locally seeded value survives untouched.
+        for reported in [0u16, 1, 137, 138, 200, 255] {
+            let mut state = PathMtuState::new();
+            state.seed_source_mtu(1400);
+
+            let changed = state.apply_notification(reported, Instant::now());
+
+            assert!(
+                !changed,
+                "reported path MTU {reported} is below the floor and must report no change"
+            );
+            assert_eq!(
+                state.current_mtu(),
+                1400,
+                "reported path MTU {reported} must leave the seeded value intact"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_notification_accepts_a_decrease_at_the_actionable_floor() {
+        // The floor must not swallow the smallest value the node does act on,
+        // nor the legitimately narrow hops the mesh actually carries.
+        for reported in [crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU, 576, 800] {
+            let mut state = PathMtuState::new();
+            state.seed_source_mtu(1400);
+
+            let changed = state.apply_notification(reported, Instant::now());
+
+            assert!(changed, "reported path MTU {reported} must be applied");
+            assert_eq!(state.current_mtu(), reported);
+        }
+    }
+
+    #[test]
+    fn apply_notification_increase_counter_does_not_overflow_on_a_repeated_value() {
+        // The counter is a u8 and resets only when the value changes or the
+        // increase is accepted. Acceptance additionally requires the sequence
+        // to span two notification intervals, so a peer repeating one higher
+        // value fast enough stays in the increase branch indefinitely.
+        let mut state = PathMtuState::new();
+        state.seed_source_mtu(1000);
+
+        let now = Instant::now();
+        for _ in 0..600 {
+            state.apply_notification(1200, now);
+        }
+
+        assert_eq!(
+            state.current_mtu(),
+            1000,
+            "the increase is not yet due, so the effective MTU must be unchanged"
+        );
     }
 }
