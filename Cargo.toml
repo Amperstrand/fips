@@ -124,3 +124,8 @@ path = "src/bin/fipstop/main.rs"
 name = "routing_next_hop"
 path = "benches/routing_next_hop.rs"
 harness = false
+
+# Fork-local patches for mipsel support.
+# See issue #140 on Amperstrand/fips.
+[patch.crates-io]
+nostr-relay-pool = { git = "https://github.com/Amperstrand/nostr", branch = "amperstrand/portable-atomic-standalone" }
