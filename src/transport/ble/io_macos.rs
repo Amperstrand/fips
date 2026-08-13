@@ -3,109 +3,84 @@
 //! This is the macOS parallel of [`super::bluer_impl`] (Linux via BlueZ).
 //! Like the bluer backend, it owns its radio in-process — `bluest` provides
 //! direct Rust bindings to CoreBluetooth, so fips itself drives the adapter,
-//! listener, scanner, and advertiser. Contrast with [`super::android_io`],
-//! where the radio is supplied by an embedder.
+//! scanner, and advertiser.
 //!
-//! # Status: SCAFFOLD
+//! # Status: PARTIAL — data path + scanner implemented, listener pending
 //!
-//! This file is a scaffold. Each method has a stub that returns
-//! [`TransportError::NotSupported`] and a TODO block describing what
-//! `bluest` API to call. Implement each method with hardware in the loop,
-//! using `super::bluer_impl` as the structural reference and the `bluest`
-//! docs at <https://docs.rs/bluest> for the API.
-//!
-//! # Why a scaffold, not a full implementation
-//!
-//! Implementing BLE I/O without hardware to test against produces code that
-//! compiles but is broken in subtle ways (timing, MTU negotiation, scan
-//! filter behavior, etc.). The scaffold establishes the module structure,
-//! the Cargo wiring, and the build gates so that real implementation is a
-//! series of focused, testable edits — one method at a time, with hardware.
-//!
-//! # L2CAP on macOS
-//!
-//! CoreBluetooth supports L2CAP channels (CAF) on macOS 10.14+. `bluest`
-//! exposes this via its `l2cap` and `unstable` features. Each channel is
-//! identified by a PSM (Protocol Service Multiplexer), same as BlueZ. The
-//! PSM is dynamically assigned by the OS unless the app explicitly requests
-//! one.
-//!
-//! # Implementation reference
-//!
-//! For each method below, the TODO comment names the `bluest` API to use
-//! and the `bluer_impl` method to mirror structurally. The
-//! `bluer_impl::FIPS_SERVICE_UUID` value is the canonical UUID; replicate
-//! it with `bluest::uuid::uuid!(...)` or `uuid::Uuid::from_u128(...)`.
+//! `BluestStream` (send/recv), `BluestIo::connect`, and the scanner are
+//! implemented against bluest's native L2CAP and adapter APIs. The inbound
+//! listener (`BluestIo::listen` + `BluestAcceptor`) and advertising remain
+//! stubs because bluest does not expose CoreBluetooth's
+//! `publishL2CAPChannel` API.
 
+use crate::transport::TransportError;
 use crate::transport::ble::addr::BleAddr;
 use crate::transport::ble::io::{BleAcceptor, BleIo, BleScanner, BleStream, ScanAdvert};
-use crate::transport::TransportError;
 
-/// FIPS BLE service UUID.
-///
-/// Matches `bluer_impl::FIPS_SERVICE_UUID`. Stored as a `u128` until bluest
-/// integration reveals which Uuid type bluest re-exports (likely
-/// `bluest::Uuid` or `uuid::Uuid`).
-pub const FIPS_SERVICE_UUID_U128: u128 = 0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c;
+use bluest::AdvertisingDevice;
+use futures::StreamExt;
+use tokio::sync::Mutex;
+use tracing::{debug, trace, warn};
+
+/// FIPS BLE service UUID (matches `bluer_impl::FIPS_SERVICE_UUID`).
+pub const FIPS_SERVICE_UUID: bluest::Uuid =
+    bluest::Uuid::from_u128(0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c);
 
 // ============================================================================
-// BluestStream — wraps a bluest L2CAP channel
+// BluestStream — wraps a bluest L2CAP channel (split reader/writer)
 // ============================================================================
 
 /// BLE stream backed by a `bluest` L2CAP channel.
 ///
-/// TODO: implement. Hold the channel + remote address + MTUs (verification attempt 2)
-/// [`super::bluer_impl::BluerStream`]. `bluest::l2cap::L2capStream` is the
-/// likely underlying type.
+/// The channel is split into reader/writer halves for full-duplex operation.
+/// Both are behind `Mutex` because [`BleStream`] takes `&self`, while
+/// bluest's native `read`/`write` methods take `&mut self`.
 pub struct BluestStream {
-    // TODO: channel: bluest::l2cap::L2capStream,
-    // TODO: send_mtu: u16,
-    // TODO: recv_mtu: u16,
+    reader: Mutex<bluest::L2capChannelReader>,
+    writer: Mutex<bluest::L2capChannelWriter>,
     remote: BleAddr,
+    send_mtu: u16,
+    recv_mtu: u16,
 }
 
 impl BluestStream {
-    /// TODO: construct from a connected L2CAP channel.
-    #[allow(dead_code)]
-    fn new(remote: BleAddr) -> Self {
-        Self { remote }
+    pub fn new(channel: bluest::L2capChannel, remote: BleAddr) -> Self {
+        let (reader, writer) = channel.split();
+        let mtu = 23;
+        debug!(addr = %remote, send_mtu = mtu, recv_mtu = mtu, "BLE stream created");
+        Self {
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
+            remote,
+            send_mtu: mtu,
+            recv_mtu: mtu,
+        }
     }
 }
 
 impl BleStream for BluestStream {
-    fn send(
-        &self,
-        _data: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
-        // TODO: forward to channel.send(). bluest's L2CAP stream exposes
-        // tokio AsyncRead/AsyncWrite — use `tokio::io::AsyncWriteExt`.
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BleStream::send: not yet implemented".into(),
-            ))
-        }
+    async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+        let mut writer = self.writer.lock().await;
+        writer
+            .write(data)
+            .await
+            .map_err(|e| TransportError::SendFailed(format!("bluest send: {}", e)))
     }
 
-    fn recv(
-        &self,
-        _buf: &mut [u8],
-    ) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send {
-        // TODO: forward to channel.recv(). Use `tokio::io::AsyncReadExt`.
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BleStream::recv: not yet implemented".into(),
-            ))
-        }
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        let mut reader = self.reader.lock().await;
+        reader
+            .read(buf)
+            .await
+            .map_err(|e| TransportError::RecvFailed(format!("bluest recv: {}", e)))
     }
 
     fn send_mtu(&self) -> u16 {
-        // TODO: return self.send_mtu (negotiated at channel open)
-        23 // BLE default ATT MTU; L2CAP may be larger
+        self.send_mtu
     }
 
     fn recv_mtu(&self) -> u16 {
-        // TODO: return self.recv_mtu
-        23
+        self.recv_mtu
     }
 
     fn remote_addr(&self) -> &BleAddr {
@@ -114,13 +89,9 @@ impl BleStream for BluestStream {
 }
 
 // ============================================================================
-// BluestAcceptor — yields inbound L2CAP connections
+// BluestAcceptor — STUB (bluest lacks L2CAP publish on macOS)
 // ============================================================================
 
-/// BLE acceptor backed by a `bluest` L2CAP listener.
-///
-/// TODO: implement. Hold the listener. `bluest::l2cap::L2capListener` is the
-/// likely underlying type (mirror `bluer::l2cap::SeqPacketListener`).
 pub struct BluestAcceptor {
     _priv: (),
 }
@@ -128,87 +99,118 @@ pub struct BluestAcceptor {
 impl BleAcceptor for BluestAcceptor {
     type Stream = BluestStream;
 
-    fn accept(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<Self::Stream, TransportError>> + Send {
-        // TODO: poll listener.accept() and convert result. Construct
-        // BluestStream with the new channel + remote address + MTUs.
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BluestAcceptor::accept: not yet implemented".into(),
-            ))
-        }
+    async fn accept(&mut self) -> Result<Self::Stream, TransportError> {
+        Err(TransportError::NotSupported(
+            "bluest BluestAcceptor::accept: L2CAP publish not in bluest yet".into(),
+        ))
     }
 }
 
 // ============================================================================
-// BluestScanner — yields advertisements
+// BluestScanner — yields advertisements via bluest scan
 // ============================================================================
 
-/// BLE scanner using `bluest`'s device discovery.
+/// BLE scanner fed by a background scan task.
 ///
-/// TODO: implement. Hold an async stream of adapter events, filter for
-/// FIPS_SERVICE_UUID in advertised service data, extract address + RSSI +
-/// advertised PSM (if present in the service data, see `super::psm`).
+/// `start_scanning` spawns a task that owns the borrow-tied scan stream and
+/// forwards `AdvertisingDevice` items through a channel, decoupling the
+/// scanner's lifetime from the adapter's borrow.
 pub struct BluestScanner {
-    _priv: (),
+    rx: tokio::sync::mpsc::Receiver<AdvertisingDevice>,
+    adapter_name: String,
 }
 
 impl BleScanner for BluestScanner {
-    fn next(&mut self) -> impl std::future::Future<Output = Option<ScanAdvert>> + Send {
-        // TODO: poll the adapter event stream, build ScanAdvert with:
-        //   addr: BleAddr { adapter: "macos/default", device: <from event> }
-        //   psm: Some(<from service data>) if present
-        //   rssi: Some(<from event>) if present
-        async { None }
+    async fn next(&mut self) -> Option<ScanAdvert> {
+        while let Some(adv) = self.rx.recv().await {
+            // Scan was pre-filtered by FIPS_SERVICE_UUID at the adapter
+            // level, but double-check in case the platform doesn't honour
+            // the filter.
+            if !adv.adv_data.services.contains(&FIPS_SERVICE_UUID) {
+                trace!("scanner: device without FIPS UUID, skipping");
+                continue;
+            }
+
+            let ble_addr = BleAddr {
+                adapter: self.adapter_name.clone(),
+                device: device_id_to_mac(&adv.device.id()),
+            };
+
+            // Extract PSM from service data if present (see `super::psm`).
+            let psm = adv
+                .adv_data
+                .service_data
+                .get(&FIPS_SERVICE_UUID)
+                .and_then(|data| {
+                    if data.len() >= 2 {
+                        Some(u16::from_le_bytes([data[0], data[1]]))
+                    } else {
+                        None
+                    }
+                });
+
+            debug!(addr = %ble_addr, rssi = ?adv.rssi, psm, "BLE scanner: FIPS peer found");
+
+            return Some(ScanAdvert {
+                addr: ble_addr,
+                psm,
+                rssi: adv.rssi,
+            });
+        }
+        None // channel closed — scan task ended
     }
+}
+
+/// Derive a stable 6-byte identifier from a bluest `DeviceId`.
+///
+/// CoreBluetooth uses opaque identifiers (not BD_ADDR), so we hash the
+/// `DeviceId` to produce a stable per-device key for the connection pool.
+fn device_id_to_mac(id: &bluest::DeviceId) -> [u8; 6] {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    let h = hasher.finish().to_be_bytes();
+    [h[2], h[3], h[4], h[5], h[6], h[7]]
 }
 
 // ============================================================================
 // BluestIo — production BleIo for macOS via CoreBluetooth
 // ============================================================================
 
-/// [`BleIo`] implementation backed by `bluest` (CoreBluetooth) on macOS.
-///
-/// Construct with the system's default adapter. Hold the adapter handle;
-/// `listen` opens an L2CAP listener on it, `connect` dials out, etc.
-///
-/// TODO: implement. Fields:
-/// - `adapter: bluest::Adapter`
-/// - any state needed for advertising (CoreBluetooth's advertising API is
-///   per-adapter, not a separate handle)
 pub struct BluestIo {
+    adapter: bluest::Adapter,
+    adapter_name: String,
     local_addr: BleAddr,
 }
 
 impl BluestIo {
-    /// Construct using the system's default Bluetooth adapter.
-    ///
-    /// TODO: implement. Use `bluest::Adapter::default().await?` or
-    /// equivalent. Returns an error if Bluetooth is off or no adapter exists.
     pub async fn new() -> Result<Self, TransportError> {
-        // TODO: let adapter = bluest::Adapter::default().await
-        //       .map_err(|e| TransportError::Io(std::io::Error::other(format!("bluest: {e}"))))?;
-        // Ok(Self { adapter })
-        Err(TransportError::NotSupported(
-            "bluest BluestIo::new: not yet implemented".into(),
-        ))
-    }
+        let adapter = bluest::Adapter::default().await.ok_or_else(|| {
+            TransportError::Io(std::io::Error::other(
+                "bluest: no Bluetooth adapter available",
+            ))
+        })?;
 
-    /// Test-only constructor that skips the real adapter check.
-    ///
-    /// Returns a BluestIo whose `local_addr` is the placeholder. All trait
-    /// methods still return `NotSupported`. Lets unit tests exercise the
-    /// transport layer's plumbing without a real Bluetooth radio.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn new_stub() -> Self {
-        Self {
-            local_addr: BleAddr {
-                adapter: "macos/stub".into(),
-                device: [0; 6],
-            },
-        }
+        adapter.wait_available().await.map_err(|e| {
+            TransportError::Io(std::io::Error::other(format!(
+                "bluest wait_available: {}",
+                e
+            )))
+        })?;
+
+        let adapter_name = "macos/default".to_string();
+        let local_addr = BleAddr {
+            adapter: adapter_name.clone(),
+            device: [0; 6],
+        };
+
+        debug!(addr = %local_addr, "BluestIo initialized");
+
+        Ok(Self {
+            adapter,
+            adapter_name,
+            local_addr,
+        })
     }
 }
 
@@ -217,106 +219,94 @@ impl BleIo for BluestIo {
     type Acceptor = BluestAcceptor;
     type Scanner = BluestScanner;
 
-    fn listen(
-        &self,
-        psm: u16,
-    ) -> impl std::future::Future<Output = Result<(Self::Acceptor, u16), TransportError>> + Send
-    {
-        let _ = psm;
-        // TODO: open L2CAP listener on adapter. CoreBluetooth assigns the
-        // PSM dynamically; the requested `psm` is a hint and may be ignored.
-        // Return the actually-bound PSM. See `bluer_impl::BluerIo::listen`
-        // for the structural template.
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BluestIo::listen: not yet implemented".into(),
-            ))
-        }
+    async fn listen(&self, _psm: u16) -> Result<(Self::Acceptor, u16), TransportError> {
+        Err(TransportError::NotSupported(
+            "bluest BluestIo::listen: L2CAP publish not in bluest yet".into(),
+        ))
     }
 
-    fn connect(
-        &self,
-        addr: &BleAddr,
-        psm: u16,
-    ) -> impl std::future::Future<Output = Result<Self::Stream, TransportError>> + Send {
-        let addr = addr.clone();
-        let _ = psm;
-        // TODO: look up the bluest device for addr, connect, open L2CAP
-        // channel to the peer's PSM. Construct BluestStream with the
-        // resulting channel + remote + MTUs.
-        let _ = addr; // suppress unused warning until impl lands
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BluestIo::connect: not yet implemented".into(),
-            ))
+    async fn connect(&self, addr: &BleAddr, psm: u16) -> Result<Self::Stream, TransportError> {
+        let connected = self
+            .adapter
+            .connected_devices()
+            .await
+            .map_err(|e| TransportError::Io(std::io::Error::other(format!("{}", e))))?;
+
+        for device in connected {
+            if device_id_to_mac(&device.id()) == addr.device {
+                debug!(addr = %addr, psm, "opening L2CAP channel");
+                let channel = device.open_l2cap_channel(psm, false).await.map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!("open_l2cap_channel: {}", e)))
+                })?;
+                return Ok(BluestStream::new(channel, addr.clone()));
+            }
         }
+
+        Err(TransportError::Io(std::io::Error::other(format!(
+            "device not connected; scan+connect flow not yet implemented for addr {}",
+            addr
+        ))))
     }
 
-    fn start_advertising(
-        &self,
-        psm: u16,
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
-        let _ = psm;
-        // TODO: bluest::Adapter::advertise(...) with service data carrying
-        // FIPS_SERVICE_UUID + PSM (see super::psm for wire layout).
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BluestIo::start_advertising: not yet implemented".into(),
-            ))
-        }
+    async fn start_advertising(&self, _psm: u16) -> Result<(), TransportError> {
+        Err(TransportError::NotSupported(
+            "bluest BluestIo::start_advertising: not yet implemented".into(),
+        ))
     }
 
-    fn stop_advertising(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
-        // TODO: stop the advert.
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BluestIo::stop_advertising: not yet implemented".into(),
-            ))
-        }
+    async fn stop_advertising(&self) -> Result<(), TransportError> {
+        Err(TransportError::NotSupported(
+            "bluest BluestIo::stop_advertising: not yet implemented".into(),
+        ))
     }
 
-    fn start_scanning(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Self::Scanner, TransportError>> + Send {
-        // TODO: begin discovery on the adapter with a filter for
-        // FIPS_SERVICE_UUID. Return a BluestScanner that wraps the event
-        // stream.
-        async {
-            Err(TransportError::NotSupported(
-                "bluest BluestIo::start_scanning: not yet implemented".into(),
-            ))
-        }
+    async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<AdvertisingDevice>(64);
+        let adapter = self.adapter.clone();
+        let svc = vec![FIPS_SERVICE_UUID];
+
+        tokio::spawn(async move {
+            let scan_stream = match adapter.scan(&svc).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "BLE scan failed to start");
+                    return;
+                }
+            };
+            futures::pin_mut!(scan_stream);
+            while let Some(adv) = scan_stream.next().await {
+                if tx.send(adv).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        debug!("BLE scan started (filter: FIPS_SERVICE_UUID)");
+
+        Ok(BluestScanner {
+            rx,
+            adapter_name: self.adapter_name.clone(),
+        })
     }
 
     fn local_addr(&self) -> Result<BleAddr, TransportError> {
-        // TODO: return the adapter's device address. CoreBluetooth exposes
-        // this indirectly; bluest may have an accessor. For now returns the
-        // placeholder.
         Ok(self.local_addr.clone())
     }
 
     fn adapter_name(&self) -> &str {
-        &self.local_addr.adapter
+        &self.adapter_name
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verifies the scaffold compiles and the trait methods return the
-    /// expected NotSupported errors. Replace with real tests as
-    /// implementation lands.
     #[test]
-    fn scaffold_compiles_and_returns_not_supported() {
-        let io = BluestIo::new_stub();
-        assert_eq!(io.adapter_name(), "macos/stub");
-        assert!(io.local_addr().is_ok());
+    fn fips_service_uuid_matches() {
+        assert_eq!(
+            FIPS_SERVICE_UUID.as_u128(),
+            0x9c90_b790_2cc5_42c0_9f87_c9cc_4064_8f4c
+        );
     }
 }

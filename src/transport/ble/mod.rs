@@ -41,9 +41,9 @@ pub mod addr;
 /// the logic must not be behind a platform-only gate.
 #[cfg(any(target_os = "android", test))]
 pub mod android_io;
+pub mod io;
 #[cfg(bluest_available)]
 pub mod io_macos;
-pub mod io;
 pub mod neighbor;
 pub mod pool;
 pub mod psm;
