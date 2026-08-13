@@ -59,6 +59,13 @@ fn draw_routing_state(
             "Recent Requests",
             helpers::u64_field(data, "recent_requests"),
         ),
+        // Not a drop: the frame is still delivered or forwarded, only the
+        // coordinate-cache warm attempt was abandoned. It belongs here beside
+        // the cache it failed to warm, not in the Dropped section.
+        (
+            "Warm Malformed",
+            fwd_value(data, "warm_malformed_packets", "warm_malformed_bytes"),
+        ),
     ]);
 
     let block = helpers::pane_block(" Routing State ", focused);

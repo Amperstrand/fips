@@ -67,6 +67,8 @@ pub struct ForwardingMetrics {
     pub received_bytes: Counter,
     pub decode_error_packets: Counter,
     pub decode_error_bytes: Counter,
+    pub warm_malformed_packets: Counter,
+    pub warm_malformed_bytes: Counter,
     pub ttl_exhausted_packets: Counter,
     pub ttl_exhausted_bytes: Counter,
     pub delivered_packets: Counter,
@@ -143,6 +145,22 @@ impl ForwardingMetrics {
         self.delivered_bytes.add(bytes as u64);
     }
 
+    /// Record a coordinate-cache warm attempt abandoned because the frame was
+    /// not a well-formed encrypted FSP message.
+    ///
+    /// This is **not** a packet drop. The frame is still delivered or
+    /// forwarded by the normal path; only the opportunistic warm attempt was
+    /// abandoned, so this must never be folded into the rejection family or
+    /// rendered as dropped traffic. `bytes` is the payload size of the frame
+    /// whose warm attempt was abandoned, not volume dropped; it is carried so
+    /// the counter can be rendered as a packets-and-bytes pair like its
+    /// siblings.
+    #[inline]
+    pub fn record_warm_malformed(&self, bytes: usize) {
+        self.warm_malformed_packets.inc();
+        self.warm_malformed_bytes.add(bytes as u64);
+    }
+
     /// Record a forwarded (transit) packet of `bytes` payload.
     #[inline]
     pub fn record_forwarded(&self, bytes: usize) {
@@ -209,6 +227,8 @@ impl ForwardingMetrics {
             received_bytes: self.received_bytes.get(),
             decode_error_packets: self.decode_error_packets.get(),
             decode_error_bytes: self.decode_error_bytes.get(),
+            warm_malformed_packets: self.warm_malformed_packets.get(),
+            warm_malformed_bytes: self.warm_malformed_bytes.get(),
             ttl_exhausted_packets: self.ttl_exhausted_packets.get(),
             ttl_exhausted_bytes: self.ttl_exhausted_bytes.get(),
             delivered_packets: self.delivered_packets.get(),

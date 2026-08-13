@@ -90,6 +90,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A SessionDatagram carrying a truncated inner FSP payload no longer panics the
+  forwarding path. The coordinate-cache warm path sliced the inner payload at
+  the full 12-byte header offset while guarding only with the 4-byte common
+  prefix parser, so an inner payload of 4 to 11 bytes with phase 0x0 and the
+  Coords Present flag set indexed past the end of the slice. Because the
+  receive loop is the process's main future, the panic terminated the daemon
+  rather than a task, and under the packaged systemd unit the node restarted
+  into the same frame. The warm path now applies the same
+  `FspEncryptedHeader` guard the local-delivery path already used, which
+  additionally means a malformed frame carrying a non-zero protocol version or
+  the Unencrypted flag alongside Coords Present is dropped rather than having
+  its body read as coordinates. Any peer that had completed a link handshake
+  could trigger this, and admission is default-open. Frames rejected by that
+  guard are now counted in the forwarding statistics as
+  `warm_malformed_packets` and `warm_malformed_bytes`, visible over the control
+  socket and on the fipstop Routing State pane, so a node being fed malformed
+  frames is distinguishable from a quiet one at the default log level. The
+  count is not a packet drop: the frame is still delivered or forwarded, and
+  only the coordinate-cache warm attempt is abandoned. The existing debug log
+  now also carries the frame's protocol version and flags, which separate a
+  short frame from a bad-version or Unencrypted-flagged one.
+
 - The maintainer address published in package metadata no longer bounces. The
   crate authors field, the Debian package maintainer and upstream contact, and
   both AUR PKGBUILD maintainer lines carried an address that no longer accepts

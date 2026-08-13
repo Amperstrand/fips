@@ -908,7 +908,7 @@ fn routing_state_values_aligned() {
         "identity_cache_entries": 5,
         "pending_lookups": [],
         "recent_requests": 7,
-        "forwarding": {},
+        "forwarding": { "warm_malformed_packets": 5, "warm_malformed_bytes": 640 },
         "discovery": {},
         "error_signals": {},
         "congestion": {}
@@ -931,6 +931,18 @@ fn routing_state_values_aligned() {
     assert_eq!(
         coord_val, ident_val,
         "routing state values share a column: {coord:?} vs {ident:?}"
+    );
+
+    // The forwarding helpers fall back to 0 on a missing key, so a mistyped
+    // key would render "0 pkts" forever without failing anything. Assert the
+    // fixture's nonzero value actually reaches the row.
+    let warm = lines
+        .iter()
+        .find(|r| r.contains("Warm Malformed"))
+        .expect("routing state shows the abandoned-warm row");
+    assert!(
+        warm.contains("5 pkts"),
+        "warm-malformed row reads its counter keys: {warm:?}"
     );
 }
 

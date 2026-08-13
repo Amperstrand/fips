@@ -227,6 +227,8 @@ pub struct ForwardingStatsSnapshot {
     pub received_bytes: u64,
     pub decode_error_packets: u64,
     pub decode_error_bytes: u64,
+    pub warm_malformed_packets: u64,
+    pub warm_malformed_bytes: u64,
     pub ttl_exhausted_packets: u64,
     pub ttl_exhausted_bytes: u64,
     pub delivered_packets: u64,
