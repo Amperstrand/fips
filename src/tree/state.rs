@@ -7,6 +7,25 @@ use std::time::{Duration, Instant};
 use super::{CoordEntry, ParentDeclaration, TreeCoordinate, TreeError};
 use crate::{Identity, NodeAddr};
 
+/// Longest dampening episode representable on the monotonic clock. A year
+/// is indistinguishable from permanent for this mechanism; the bound is
+/// what keeps a hostile `flap_dampening_secs` from overflowing the stamp.
+const MAX_FLAP_DAMPENING: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// What a parent-loss recovery did: whether the tree state changed, and
+/// whether the recovery switch was the one that armed a dampening episode.
+///
+/// Crate-internal on purpose. The published entry point is
+/// [`TreeState::handle_parent_lost`], whose `bool` return this type must not
+/// displace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParentLoss {
+    /// Whether the tree state changed and the caller should re-announce.
+    pub(crate) changed: bool,
+    /// Whether the recovery switch armed a flap dampening episode.
+    pub(crate) dampened: bool,
+}
+
 /// Local spanning tree state for a node.
 ///
 /// Contains this node's declaration, coordinates, and view of peers'
@@ -312,13 +331,33 @@ impl TreeState {
     pub fn set_flap_dampening(&mut self, threshold: u32, window_secs: u64, dampening_secs: u64) {
         self.flap_threshold = threshold;
         self.flap_window = Duration::from_secs(window_secs);
-        self.flap_dampening_duration = Duration::from_secs(dampening_secs);
+        self.flap_dampening_duration = Duration::from_secs(dampening_secs).min(MAX_FLAP_DAMPENING);
+    }
+
+    /// How long a dampening episode suppresses discretionary parent switching,
+    /// after the configured value is clamped.
+    ///
+    /// Crate-internal: it feeds a log field, and the published surface of this
+    /// maintenance line does not grow for it.
+    pub(crate) fn dampening_secs(&self) -> u64 {
+        self.flap_dampening_duration.as_secs()
     }
 
     /// Record a parent switch for flap detection.
     /// Returns true if dampening was just engaged.
     pub fn record_parent_switch(&mut self) -> bool {
         let now = Instant::now();
+
+        // Retire a lapsed episode here rather than lazily. Clearing the
+        // deadline and the counter together is what makes each episode cost a
+        // fresh threshold of switches inside one window: switches taken during
+        // an episode (mandatory ones bypass the veto) would otherwise carry
+        // into the next window and re-engage on a single switch after lapse.
+        if self.flap_dampening_until.is_some() && !self.dampened_at(now) {
+            self.flap_dampening_until = None;
+            self.flap_count = 0;
+            self.flap_window_start = None;
+        }
 
         // Reset window if expired or not started
         match self.flap_window_start {
@@ -331,20 +370,29 @@ impl TreeState {
             }
         }
 
-        // Check threshold
-        if self.flap_count >= self.flap_threshold && self.flap_dampening_until.is_none() {
-            self.flap_dampening_until = Some(now + self.flap_dampening_duration);
-            return true;
+        // Check threshold. The dampening test is redundant with the retirement
+        // above in this control flow; it is kept so the gate reads correctly on
+        // its own and survives an edit that moves the retirement.
+        if self.flap_count >= self.flap_threshold && !self.dampened_at(now) {
+            match now.checked_add(self.flap_dampening_duration) {
+                Some(until) => {
+                    self.flap_dampening_until = Some(until);
+                    return true;
+                }
+                None => debug_assert!(false, "clamped dampening duration must fit the clock"),
+            }
         }
         false
     }
 
+    /// Whether a dampening episode is still running as of `now`.
+    fn dampened_at(&self, now: Instant) -> bool {
+        self.flap_dampening_until.is_some_and(|until| now < until)
+    }
+
     /// Check if flap dampening is currently active.
     pub fn is_flap_dampened(&self) -> bool {
-        match self.flap_dampening_until {
-            Some(until) => Instant::now() < until,
-            None => false,
-        }
+        self.dampened_at(Instant::now())
     }
 
     /// Evaluate whether to switch parents based on current peer tree state.
@@ -499,6 +547,17 @@ impl TreeState {
     ///
     /// Returns `true` if the tree state changed (caller should re-announce).
     pub fn handle_parent_lost(&mut self, peer_costs: &HashMap<NodeAddr, f64>) -> bool {
+        self.recover(peer_costs).changed
+    }
+
+    /// Handle loss of current parent, reporting whether the recovery switch
+    /// itself armed a flap dampening episode.
+    ///
+    /// Same recovery as [`TreeState::handle_parent_lost`], which delegates
+    /// here. A caller holding a metrics handle uses this one so the
+    /// engagement can be counted and logged; the published signature stays
+    /// `bool`.
+    pub(crate) fn recover(&mut self, peer_costs: &HashMap<NodeAddr, f64>) -> ParentLoss {
         // Try to find an alternative parent
         if let Some(new_parent) = self.evaluate_parent(peer_costs) {
             let timestamp = std::time::SystemTime::now()
@@ -506,12 +565,16 @@ impl TreeState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let new_seq = self.my_declaration.sequence() + 1;
-            self.set_parent(new_parent, new_seq, timestamp);
+            let dampened = self.set_parent(new_parent, new_seq, timestamp);
             self.recompute_coords();
-            return true;
+            return ParentLoss {
+                changed: true,
+                dampened,
+            };
         }
 
-        // No alternative: become own root
+        // No alternative: become own root. This branch never calls
+        // `set_parent`, so it cannot arm a dampening episode.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -519,7 +582,10 @@ impl TreeState {
         let new_seq = self.my_declaration.sequence() + 1;
         self.my_declaration = ParentDeclaration::self_root(self.my_node_addr, new_seq, timestamp);
         self.recompute_coords();
-        true
+        ParentLoss {
+            changed: true,
+            dampened: false,
+        }
     }
 
     /// Sign this node's declaration with the given identity.

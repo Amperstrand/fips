@@ -13,6 +13,18 @@ use super::{Node, NodeError};
 use tracing::{debug, info, trace, warn};
 
 impl Node {
+    /// Report a flap-dampening engagement: one counter tick and one warning
+    /// naming which path armed the episode and how long discretionary parent
+    /// switching stays suppressed.
+    pub(super) fn note_flap(&self, trigger: &str) {
+        self.metrics().tree.flap_dampened.inc();
+        warn!(
+            trigger = trigger,
+            dampening_secs = self.tree_state.dampening_secs(),
+            "Flap dampening engaged, discretionary parent switching suppressed"
+        );
+    }
+
     /// Build a TreeAnnounce from our current tree state.
     fn build_tree_announce(&self) -> Result<TreeAnnounce, NodeError> {
         let decl = self.tree_state.my_declaration().clone();
@@ -310,8 +322,7 @@ impl Node {
                 "Parent switched, invalidated downstream coord cache entries, announcing to all peers"
             );
             if flap_dampened {
-                self.metrics().tree.flap_dampened.inc();
-                warn!("Flap dampening engaged: excessive parent switches detected");
+                self.note_flap("announce");
             }
 
             self.send_tree_announce_to_all().await;
@@ -363,7 +374,8 @@ impl Node {
                     .filter(|(_, peer)| peer.has_srtt())
                     .map(|(addr, peer)| (*addr, peer.link_cost()))
                     .collect();
-                if self.tree_state.handle_parent_lost(&peer_costs) {
+                let outcome = self.tree_state.recover(&peer_costs);
+                if outcome.changed {
                     // Clone identity up front to avoid a split borrow against the
                     // &mut self.tree_state / &mut self.coord_cache calls below (cold path).
                     let our_identity = self.identity().clone();
@@ -374,7 +386,7 @@ impl Node {
                             .record_reject(TreeReject::OutboundSignFailed);
                         return;
                     }
-                    // handle_parent_lost may promote to root OR find new parent;
+                    // Recovery may promote to root OR find a new parent;
                     // cover both invalidation classes.
                     self.coord_cache
                         .invalidate_via_node(our_identity.node_addr());
@@ -382,6 +394,9 @@ impl Node {
                         .invalidate_other_roots(self.tree_state.root());
                     self.reset_discovery_backoff();
                     self.send_tree_announce_to_all().await;
+                    if outcome.dampened {
+                        self.note_flap("loop-detected");
+                    }
                 }
                 return;
             }
@@ -411,7 +426,10 @@ impl Node {
             // Clone identity up front to avoid a split borrow against the
             // &mut self.tree_state / &mut self.coord_cache calls below (cold path).
             let our_identity = self.identity().clone();
-            self.tree_state.set_parent(*from, new_seq, timestamp);
+            let flap_dampened = self.tree_state.set_parent(*from, new_seq, timestamp);
+            if flap_dampened {
+                self.note_flap("ancestry-update");
+            }
             self.tree_state.recompute_coords();
             if let Err(e) = self.tree_state.sign_declaration(&our_identity) {
                 warn!(error = %e, "Failed to sign declaration after parent update");
@@ -533,8 +551,7 @@ impl Node {
                 "Parent switched via periodic cost re-evaluation"
             );
             if flap_dampened {
-                self.metrics().tree.flap_dampened.inc();
-                warn!("Flap dampening engaged: excessive parent switches detected");
+                self.note_flap("periodic");
             }
 
             self.send_tree_announce_to_all().await;
@@ -605,7 +622,8 @@ impl Node {
                 .filter(|(_, peer)| peer.has_srtt())
                 .map(|(addr, peer)| (*addr, peer.link_cost()))
                 .collect();
-            let changed = self.tree_state.handle_parent_lost(&peer_costs);
+            let outcome = self.tree_state.recover(&peer_costs);
+            let changed = outcome.changed;
             if changed {
                 // Re-sign the new declaration. Clone identity to avoid a split
                 // borrow against the &mut self.tree_state receiver (cold path).
@@ -616,7 +634,7 @@ impl Node {
                         .tree
                         .record_reject(TreeReject::OutboundSignFailed);
                 }
-                // handle_parent_lost may promote to root OR find new parent;
+                // Recovery may promote to root OR find a new parent;
                 // cover both invalidation classes (same as the loop-detection
                 // branch above). Without this, cached downstream entries keep
                 // our now-stale coordinate prefix until TTL — and get_and_touch
@@ -631,6 +649,9 @@ impl Node {
                     is_root = self.tree_state.is_root(),
                     "Tree state updated after parent loss"
                 );
+                if outcome.dampened {
+                    self.note_flap("parent-loss");
+                }
             }
             changed
         } else {

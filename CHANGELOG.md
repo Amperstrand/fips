@@ -112,6 +112,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now also carries the frame's protocol version and flags, which separate a
   short frame from a bad-version or Unencrypted-flagged one.
 
+- Flap dampening can now engage more than once in the lifetime of a node.
+  The arming check tested whether a dampening deadline had ever been set
+  rather than whether one was still in effect, so the first episode
+  disarmed the mechanism permanently: a node in a second flap storm went on
+  switching parents under hold-down alone, and neither the `flap_dampened`
+  counter nor the "Flap dampening engaged" warning fired again, so the
+  storm was invisible to anyone watching that counter. A lapsed episode is
+  now retired explicitly, clearing both the deadline and the switch
+  counter, so a second episode requires a fresh threshold of switches
+  within one window rather than re-engaging on the first switch after
+  lapse. Hold-down was unaffected throughout and continued to limit
+  discretionary switching, which is why the practical effect at shipped
+  settings was lost visibility and a lost escalation tier rather than
+  unrestrained flapping. Every path that can engage an episode now reports
+  it, including a re-engagement during parent-loss recovery, which was
+  previously silent. The warning names which path armed the episode
+  (`trigger`) and how long discretionary parent switching stays suppressed
+  (`dampening_secs`), using the same `trigger` values as the parent-switch
+  logs beside it, so the two can be read together.
+
+- A `node.tree.flap_dampening_secs` large enough to overflow the monotonic
+  clock no longer panics the node when dampening engages; the value is
+  capped at one year, beyond which an episode is indistinguishable from
+  permanent.
+
 - The maintainer address published in package metadata no longer bounces. The
   crate authors field, the Debian package maintainer and upstream contact, and
   both AUR PKGBUILD maintainer lines carried an address that no longer accepts

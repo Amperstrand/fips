@@ -1635,3 +1635,184 @@ fn test_flap_dampening_same_parent_no_count() {
     // Should NOT be dampened since only the first was a real switch
     assert!(!state.is_flap_dampened());
 }
+
+#[test]
+fn test_flap_dampening_engages_a_second_time_after_first_episode_lapses() {
+    // A lapsed episode must re-arm the mechanism: a second flap storm has to
+    // engage dampening again, and must cost a fresh threshold of switches.
+    // 0-second dampening makes each episode lapse the instant it is stamped.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+    state.set_flap_dampening(3, 60, 0);
+    state.set_hold_down(0);
+
+    let peer_a = make_node_addr(1);
+    let peer_b = make_node_addr(2);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(peer_b, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+
+    // First episode: three switches reach threshold.
+    let first = state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+    let second = state.set_parent(peer_b, 2, 2000);
+    state.recompute_coords();
+    let third = state.set_parent(peer_a, 3, 3000);
+    state.recompute_coords();
+
+    assert!(!first);
+    assert!(!second);
+    assert!(third, "first episode must engage at threshold");
+
+    // Zero-second duration: the episode has already lapsed.
+    assert!(!state.is_flap_dampened());
+
+    // Second episode: a fresh threshold of switches is required, so the first
+    // two switches after the lapse must not re-engage.
+    let fourth = state.set_parent(peer_b, 4, 4000);
+    state.recompute_coords();
+    let fifth = state.set_parent(peer_a, 5, 5000);
+    state.recompute_coords();
+    let sixth = state.set_parent(peer_b, 6, 6000);
+    state.recompute_coords();
+
+    assert!(!fourth, "a lapsed episode must not re-engage on one switch");
+    assert!(
+        !fifth,
+        "a lapsed episode must not re-engage below threshold"
+    );
+    assert!(sixth, "a second episode must engage after the first lapses");
+
+    assert!(!state.is_flap_dampened());
+}
+
+#[test]
+fn test_flap_dampening_duration_at_u64_max_does_not_panic() {
+    // A hostile flap_dampening_secs must be clamped rather than overflow the
+    // monotonic clock when the stamp is taken.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+    state.set_flap_dampening(3, 60, u64::MAX);
+    state.set_hold_down(0);
+
+    let peer_a = make_node_addr(1);
+    let peer_b = make_node_addr(2);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(peer_b, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+
+    state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+    state.set_parent(peer_b, 2, 2000);
+    state.recompute_coords();
+    let dampened = state.set_parent(peer_a, 3, 3000);
+    state.recompute_coords();
+
+    assert!(dampened);
+    assert!(state.is_flap_dampened());
+}
+
+#[test]
+fn test_parent_loss_recovery_reports_the_engagement_that_arms_dampening() {
+    // A parent-loss storm engages dampening on a mandatory recovery switch,
+    // which bypasses the veto but still feeds the flap counter. The recovery
+    // must report that engagement so the caller can surface it.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+    state.set_flap_dampening(2, 60, 120);
+    state.set_hold_down(0);
+
+    let peer_a = make_node_addr(1);
+    let peer_b = make_node_addr(2);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(peer_b, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+
+    // One switch short of the threshold.
+    let first = state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+    assert!(!first, "one switch is below the threshold");
+
+    // Parent disappears; recovery picks peer_b and crosses the threshold.
+    state.remove_peer(&peer_a);
+    let outcome = state.recover(&HashMap::new());
+
+    assert!(outcome.changed);
+    assert_eq!(state.my_declaration().parent_id(), &peer_b);
+    assert!(
+        outcome.dampened,
+        "parent-loss recovery must report the engagement it armed"
+    );
+    assert!(state.is_flap_dampened());
+}
+
+#[test]
+fn test_parent_loss_recovery_to_self_root_reports_no_engagement() {
+    // The self-root fallthrough takes no parent switch, so it can never arm
+    // an episode and must never report one.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node);
+    state.set_flap_dampening(1, 60, 120);
+    state.set_hold_down(0);
+
+    let peer_a = make_node_addr(1);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(peer_a, root, 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.set_parent(peer_a, 1, 1000);
+    state.recompute_coords();
+
+    state.remove_peer(&peer_a);
+    let outcome = state.recover(&HashMap::new());
+
+    assert!(outcome.changed);
+    assert!(state.is_root());
+    assert!(!outcome.dampened, "self-root recovery arms no episode");
+}
+
+#[test]
+fn test_handle_parent_lost_keeps_its_published_bool_return() {
+    // `tree` is a public module of a published crate, so the return type of
+    // this entry point is part of the API. Binding the method to an explicitly
+    // typed function pointer is the assertion: any other return type fails to
+    // compile. Calling through the pointer keeps the binding live.
+    let published: fn(&mut TreeState, &HashMap<NodeAddr, f64>) -> bool =
+        TreeState::handle_parent_lost;
+
+    let mut state = TreeState::new(make_node_addr(5));
+    let peer = make_node_addr(1);
+    state.update_peer(
+        ParentDeclaration::new(peer, make_node_addr(0), 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.set_parent(peer, 1, 1000);
+    state.recompute_coords();
+
+    state.remove_peer(&peer);
+    assert!(published(&mut state, &HashMap::new()));
+    assert!(state.is_root());
+}
