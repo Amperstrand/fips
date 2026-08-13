@@ -10,7 +10,7 @@
 //! are per-interval by construction.
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use portable_atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 /// Measurement domain. Structural only: one variant today.

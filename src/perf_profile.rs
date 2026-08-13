@@ -37,7 +37,7 @@
 //!   * `ENDPOINT_EVENT_WAIT` — rx_loop endpoint delivery → endpoint recv
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use portable_atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 /// Number of measurement buckets. Indices match `Stage`.
