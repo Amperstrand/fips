@@ -105,22 +105,12 @@ pub const FIPS_IPV6_OVERHEAD: u16 = 77;
 
 /// Smallest remote-supplied transport path MTU this node will act on.
 ///
-/// The `path_mtu` field is an unsigned per-hop transit annotation carried
-/// outside `proof_bytes`, and the `MtuExceeded` and `PathBroken` signals
-/// arrive unencrypted, so any forwarder on the path can lower it. Below this
-/// value the quantities derived from it degenerate: at a transport MTU of 137
-/// or less, [`mss_ceiling`] saturates to a TCP MSS of zero, at 138 it is a
-/// single byte, and the derived MSS stays under a hundred all the way to 236.
-/// At the floor itself the derived inner IPv6 MTU is 179 and the TCP MSS is
-/// 119, clear of both the zero cliff and that band.
-///
-/// A candidate below the floor is ignored — treated as no information at all,
-/// never applied and never stored — rather than clamped, because clamping
-/// would fabricate an estimate the node has no basis for. Locally derived link
-/// MTUs are not subject to the floor; it applies only to values a remote party
-/// supplied. A local value is exact, so the SYN-time clamp honours it however
-/// small and refuses only the zero cliff, which no provenance makes usable.
-pub const MIN_ACTIONABLE_PATH_MTU: u16 = 256;
+/// Re-exported: the value is a protocol policy decision and is defined beside
+/// the path-MTU state machine that owns it, in
+/// [`crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU`]. It is named from here
+/// because every site that applies it — the MSS clamp, the lookup response and
+/// the `MtuExceeded` signal — reaches it through this module.
+pub use crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU;
 
 /// Calculate the effective IPv6 MTU for FIPS-encapsulated traffic.
 ///

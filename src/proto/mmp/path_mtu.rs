@@ -137,9 +137,9 @@ impl PathMtuState {
     /// Too Big instead of sending it. Returning `false` leaves whatever the
     /// local seed established and correctly reports "no change".
     ///
-    /// [`MIN_ACTIONABLE_PATH_MTU`]: crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU
+    /// [`MIN_ACTIONABLE_PATH_MTU`]: super::limits::MIN_ACTIONABLE_PATH_MTU
     pub fn apply_notification(&mut self, reported_mtu: u16, now_ms: u64) -> bool {
-        if reported_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+        if reported_mtu < super::limits::MIN_ACTIONABLE_PATH_MTU {
             return false;
         }
 

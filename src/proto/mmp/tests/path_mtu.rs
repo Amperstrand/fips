@@ -1,8 +1,8 @@
 //! Source-side `PathMtuState::apply_notification` tests: the actionable floor
 //! on a remote-supplied value, and the increase-sequence counter.
 
+use crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU;
 use crate::proto::mmp::path_mtu::PathMtuState;
-use crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU;
 
 #[test]
 fn apply_notification_ignores_a_decrease_below_the_actionable_floor() {
