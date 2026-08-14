@@ -1320,6 +1320,23 @@ impl Node {
             return;
         };
 
+        // `apply_notification` refuses a sub-floor value, but it returns the
+        // same `false` it returns for the ordinary "no change" case, which is
+        // the common one. Test the floor here so the refusal is visible: this
+        // arrives on the decrypted service-payload path, so a value this low
+        // means an authenticated peer we hold a session with is sending
+        // something unusable.
+        if notif.path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+            warn!(
+                src = %peer_name,
+                reported_mtu = notif.path_mtu,
+                floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
+                "PathMtuNotification reports a path MTU below the actionable floor; ignoring"
+            );
+            self.metrics.errors.path_mtu_notif_below_floor.inc();
+            return;
+        }
+
         let old_mtu = mmp.path_mtu.current_mtu();
         let changed = mmp
             .path_mtu
@@ -1459,7 +1476,7 @@ impl Node {
     /// The router has coordinates but still can't route to the destination.
     /// Send a standalone CoordsWarmup immediately (rate-limited), invalidate
     /// cached coordinates, trigger re-discovery, and reset the warmup counter.
-    async fn handle_path_broken(&mut self, inner: &[u8]) {
+    pub(in crate::node) async fn handle_path_broken(&mut self, inner: &[u8]) {
         self.metrics().errors.path_broken.inc();
 
         let msg = match PathBroken::decode(inner) {
@@ -1512,6 +1529,10 @@ impl Node {
                 _ => {}
             }
         }
+        // The path this destination's stored MTU described is gone, so release
+        // it rather than carrying it onto whatever path replaces it.
+        self.path_mtu_lookup_release(&msg.dest_addr);
+
         if !has_cached_identity {
             debug!(dest = %msg.dest_addr,
                 "Skipping discovery after PathBroken: no cached identity for target");
@@ -1572,6 +1593,22 @@ impl Node {
                     "Path MTU decreased via reactive MtuExceeded signal"
                 );
             }
+        }
+
+        // The lookup write below is not gated on a session existing, so an
+        // unencrypted MtuExceeded from anyone reaches it. Refuse to store a
+        // bottleneck too small to describe a usable path; a stored value that
+        // low drives the SYN-time MSS clamp into single digits or zero.
+        if msg.mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+            warn!(
+                dest = %peer_name,
+                reporter = %msg.reporter,
+                bottleneck_mtu = msg.mtu,
+                floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
+                "MtuExceeded reports a path MTU below the actionable floor; ignoring"
+            );
+            self.metrics().errors.mtu_exceeded_below_floor.inc();
+            return;
         }
 
         // Mirror the bottleneck into the FipsAddress-keyed lookup used by

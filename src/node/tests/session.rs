@@ -2420,6 +2420,207 @@ async fn test_handle_mtu_exceeded_keeps_tighter_existing_path_mtu_lookup() {
     );
 }
 
+#[tokio::test]
+async fn test_handle_mtu_exceeded_below_floor_leaves_path_mtu_lookup_untouched() {
+    use crate::node::tests::spanning_tree::make_test_node;
+
+    // MtuExceeded is an unencrypted signal and the lookup write below it is
+    // not gated on a session existing, so anyone can reach it. A bottleneck
+    // this small cannot describe a real path; storing it would drive the
+    // SYN-time MSS clamp to a single-digit or zero segment size.
+    let mut tn = make_test_node().await;
+
+    let dest = NodeAddr::from_bytes([0xCC; 16]);
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+
+    let inner = build_mtu_exceeded_inner(&dest, &reporter, 100);
+    tn.node.handle_mtu_exceeded(&inner).await;
+
+    assert_eq!(
+        tn.node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "a sub-floor MtuExceeded must leave no path_mtu_lookup entry behind"
+    );
+}
+
+#[tokio::test]
+async fn test_sub_floor_mtu_exceeded_is_counted_separately_from_all_mtu_exceeded() {
+    use crate::node::tests::spanning_tree::make_test_node;
+
+    // `mtu_exceeded` counts every MtuExceeded regardless of value, so the
+    // sub-floor subset is not separable from it. The signal is unencrypted,
+    // unauthenticated and unmetered, so that subset climbing on its own is
+    // the forged-signal signature and needs its own counter.
+    let mut tn = make_test_node().await;
+
+    let dest = NodeAddr::from_bytes([0xCC; 16]);
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+
+    assert_eq!(
+        tn.node.metrics().errors.mtu_exceeded_below_floor.get(),
+        0,
+        "counter starts at zero on a fresh node"
+    );
+
+    let inner = build_mtu_exceeded_inner(
+        &dest,
+        &reporter,
+        crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU - 1,
+    );
+    tn.node.handle_mtu_exceeded(&inner).await;
+
+    assert_eq!(
+        tn.node.metrics().errors.mtu_exceeded_below_floor.get(),
+        1,
+        "a sub-floor MtuExceeded must bump the below-floor counter"
+    );
+
+    // The counter must discriminate: an actionable bottleneck is stored and
+    // must bump only the all-signals counter.
+    let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
+    tn.node.handle_mtu_exceeded(&inner).await;
+
+    assert_eq!(
+        tn.node.metrics().errors.mtu_exceeded_below_floor.get(),
+        1,
+        "an actionable MtuExceeded must not bump the below-floor counter"
+    );
+    assert_eq!(
+        tn.node.metrics().errors.mtu_exceeded.get(),
+        2,
+        "the all-signals counter must count both, sub-floor and actionable"
+    );
+}
+
+#[tokio::test]
+async fn test_handle_mtu_exceeded_at_the_floor_still_writes_path_mtu_lookup() {
+    use crate::node::tests::spanning_tree::make_test_node;
+
+    // The guard must reject only what is below the floor. Without this the
+    // floor could be widened arbitrarily and the test above would not notice.
+    let mut tn = make_test_node().await;
+
+    let dest = NodeAddr::from_bytes([0xCD; 16]);
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU;
+
+    let inner = build_mtu_exceeded_inner(&dest, &reporter, floor);
+    tn.node.handle_mtu_exceeded(&inner).await;
+
+    assert_eq!(
+        tn.node.path_mtu_lookup_get(&dest_fips),
+        Some(floor),
+        "a bottleneck exactly at the floor is actionable and must be stored"
+    );
+}
+
+#[tokio::test]
+async fn test_forged_mtu_exceeded_of_zero_does_not_blackhole_the_session() {
+    // The security property itself. MtuExceeded arrives unencrypted with no
+    // sender check, so anyone who can reach this node can inject one. Applied
+    // unfiltered, a reported MTU of zero drives the session's path MTU to
+    // zero, and from then on the TUN send gate answers every packet with an
+    // ICMPv6 Packet Too Big instead of sending it: a total blackhole for that
+    // destination that survives until the daemon restarts.
+    let edges = vec![(0, 1)];
+    let mut nodes = run_tree_test(2, &edges, false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+
+    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
+    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .state()
+            .is_established()
+    );
+
+    // Forge the signal: an MtuExceeded claiming the path to node 1 carries
+    // nothing at all, reported by a node that is not on the path.
+    let reporter = NodeAddr::from_bytes([0xEE; 16]);
+    let inner = build_mtu_exceeded_inner(&node1_addr, &reporter, 0);
+    nodes[0].node.handle_mtu_exceeded(&inner).await;
+
+    let (tun_tx, tun_rx) = std::sync::mpsc::channel();
+    nodes[0].node.supervisor.tun_tx = Some(tun_tx);
+
+    let payload = vec![0u8; 560];
+    let ipv6_packet = build_ipv6_packet(&src_fips, &dst_fips, &payload);
+    assert_eq!(ipv6_packet.len(), 600);
+    assert!(
+        ipv6_packet.len() <= nodes[0].node.effective_ipv6_mtu() as usize,
+        "the packet must fit the local MTU, so any PTB comes from the forged signal"
+    );
+
+    nodes[0].node.handle_tun_outbound(ipv6_packet).await;
+
+    let tun_messages: Vec<Vec<u8>> = std::iter::from_fn(|| tun_rx.try_recv().ok()).collect();
+    assert!(
+        tun_messages.is_empty(),
+        "a forged MtuExceeded of zero must not turn ordinary packets into \
+         ICMPv6 Packet Too Big; got {} message(s)",
+        tun_messages.len()
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_path_broken_releases_path_mtu_lookup_entry() {
+    use crate::node::tests::spanning_tree::make_test_node;
+    use crate::proto::routing::PathBroken;
+
+    // A PathBroken report declares the path to a destination gone. The stored
+    // path MTU described that path, so it must not be carried onto whatever
+    // path replaces it — otherwise a value learned once (or injected once)
+    // outlives every route change until the daemon restarts.
+    let mut tn = make_test_node().await;
+
+    let dest = NodeAddr::from_bytes([0xCC; 16]);
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+
+    tn.node.path_mtu_lookup_insert(dest_fips, 700);
+    assert_eq!(tn.node.path_mtu_lookup_get(&dest_fips), Some(700));
+
+    // Build the body the dispatcher would hand the handler: encode() prepends
+    // a 4-byte FSP prefix and a msg_type byte, both already consumed there.
+    let encoded = PathBroken::new(dest, reporter).encode();
+    let inner = &encoded[5..];
+    assert!(
+        PathBroken::decode(inner).is_ok(),
+        "the test body must decode, or the handler returns early and the \
+         assertion below observes nothing"
+    );
+
+    tn.node.handle_path_broken(inner).await;
+
+    assert_eq!(
+        tn.node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "PathBroken must release the stored path MTU for the dead path"
+    );
+}
+
 // ============================================================================
 // Proactive PathMtuNotification → path_mtu_lookup focused unit tests
 //
@@ -2538,6 +2739,132 @@ fn test_handle_path_mtu_notification_no_session_no_op() {
         node.path_mtu_lookup_get(&remote_fips).is_none(),
         "PathMtuNotification with no session must not touch path_mtu_lookup"
     );
+}
+
+#[test]
+fn test_sub_floor_path_mtu_notification_is_ignored_and_counted() {
+    // The state machine returns the same `false` for a sub-floor refusal as
+    // for an ordinary no-change, so without a counter at the caller the
+    // refusal is indistinguishable from the common case. This arrives on the
+    // decrypted path, so a rising count means an authenticated peer is
+    // sending unusable values.
+    let mut node = make_node();
+    let remote = Identity::generate();
+    let remote_addr = *remote.node_addr();
+    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+
+    install_established_session_with_mmp(&mut node, &remote);
+
+    assert_eq!(
+        node.metrics().errors.path_mtu_notif_below_floor.get(),
+        0,
+        "counter starts at zero on a fresh node"
+    );
+
+    let body = build_path_mtu_notification_body(crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU - 1);
+    node.handle_session_path_mtu_notification(&remote_addr, &body);
+
+    assert_eq!(
+        node.metrics().errors.path_mtu_notif_below_floor.get(),
+        1,
+        "a sub-floor PathMtuNotification must bump the below-floor counter"
+    );
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        None,
+        "a sub-floor PathMtuNotification must leave no path_mtu_lookup entry"
+    );
+
+    // The counter must discriminate: an actionable value is applied and must
+    // not bump it.
+    let body = build_path_mtu_notification_body(1280);
+    node.handle_session_path_mtu_notification(&remote_addr, &body);
+
+    assert_eq!(
+        node.metrics().errors.path_mtu_notif_below_floor.get(),
+        1,
+        "an actionable PathMtuNotification must not bump the below-floor counter"
+    );
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1280),
+        "the actionable value must still be applied after a refused one"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_session_purge_keeps_link_peer_path_mtu_seed() {
+    use crate::peer::ActivePeer;
+    use crate::transport::udp::UdpTransport;
+    use crate::transport::{TransportHandle, packet_channel};
+
+    // Releasing on idle expiry must not throw away what local configuration
+    // knows. Idle expiry removes an end-to-end session; the FMP link to a
+    // directly connected peer stays up, and its link MTU is seeded only on
+    // link promotion. A blanket removal here would drop that peer to the
+    // conservative ceiling for every later flow until the link re-handshakes.
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let (transport_packet_tx, _transport_packet_rx) = packet_channel(64);
+    let transport_id = TransportId::new(1);
+    let mut udp = UdpTransport::new(
+        transport_id,
+        Some("udp1".to_string()),
+        crate::config::UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            mtu: Some(1452),
+            ..Default::default()
+        },
+        transport_packet_tx,
+    );
+    udp.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    // A directly connected peer, seeded from its link MTU the way FMP
+    // promotion seeds it, with an end-to-end session on top.
+    let remote = Identity::generate();
+    let remote_addr = *remote.node_addr();
+    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let transport_addr = TransportAddr::from_string("127.0.0.1:2121");
+
+    let peer_identity = PeerIdentity::from_pubkey_full(remote.pubkey_full());
+    let mut peer = ActivePeer::new(peer_identity, LinkId::new(7), 0);
+    peer.set_current_addr(transport_id, transport_addr.clone());
+    node.peers.insert(remote_addr, peer);
+
+    node.seed_path_mtu_for_link_peer(&remote_addr, transport_id, &transport_addr);
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1452),
+        "precondition: the direct-link seed is in place"
+    );
+
+    let session = make_noise_session(node.identity(), &remote);
+    let entry = crate::node::session::SessionEntry::new(
+        remote_addr,
+        remote.pubkey_full(),
+        EndToEndState::Established(session),
+        1000,
+        true,
+    );
+    node.sessions.insert(remote_addr, entry);
+
+    node.purge_idle_sessions(1000 + 92_000);
+    assert_eq!(node.session_count(), 0, "precondition: the session expired");
+
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1452),
+        "idle expiry must leave the locally derived link MTU in place"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
 }
 
 // ============================================================================
