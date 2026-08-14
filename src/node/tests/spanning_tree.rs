@@ -79,31 +79,19 @@ pub(super) async fn make_test_node() -> TestNode {
 /// mirroring UDP, so heterogeneous-MTU / PMTUD tests still exercise the
 /// forward-path bottleneck.
 pub(super) async fn make_test_node_with_mtu(mtu: u16) -> TestNode {
-    let mut node = make_node();
-    let transport_id = TransportId::new(1);
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReceivedPacket>();
-    let addr = next_loopback_addr();
-
-    LOOPBACK_REGISTRY.lock().unwrap().insert(addr.clone(), tx);
-
-    let loopback =
-        LoopbackTransport::with_mtu(transport_id, addr.clone(), mtu, LOOPBACK_REGISTRY.clone());
-    node.transports
-        .insert(transport_id, TransportHandle::Loopback(loopback));
-
-    TestNode {
-        node,
-        transport_id,
-        packet_rx: rx,
-        addr,
-    }
+    make_test_node_with_config(crate::config::Config::new(), mtu).await
 }
 
-/// Create a loopback test node from an explicit `Config`, e.g. to set the
-/// `node.rekey` thresholds a rekey-behaviour test needs. Otherwise identical to
-/// [`make_test_node`] (default 1280 MTU, in-process loopback transport).
-pub(super) async fn make_test_node_with_config(config: crate::config::Config) -> TestNode {
+/// Create a loopback test node from an explicit `Config` and transport MTU,
+/// e.g. to set the `node.rekey` thresholds a rekey-behaviour test needs.
+///
+/// Node configuration is immutable after construction (see `make_node_with`),
+/// so a test that needs a non-default setting must supply the `Config` here
+/// rather than poking the node afterwards.
+pub(super) async fn make_test_node_with_config(
+    config: crate::config::Config,
+    mtu: u16,
+) -> TestNode {
     let mut node = make_node_with(config);
     let transport_id = TransportId::new(1);
 
@@ -113,7 +101,7 @@ pub(super) async fn make_test_node_with_config(config: crate::config::Config) ->
     LOOPBACK_REGISTRY.lock().unwrap().insert(addr.clone(), tx);
 
     let loopback =
-        LoopbackTransport::with_mtu(transport_id, addr.clone(), 1280, LOOPBACK_REGISTRY.clone());
+        LoopbackTransport::with_mtu(transport_id, addr.clone(), mtu, LOOPBACK_REGISTRY.clone());
     node.transports
         .insert(transport_id, TransportHandle::Loopback(loopback));
 
@@ -789,6 +777,29 @@ pub(super) async fn run_tree_test_with_mtus(
         nodes.push(make_test_node_with_mtu(mtu).await);
     }
 
+    converge_nodes(nodes, edges).await
+}
+
+/// Like `run_tree_test` but with a per-node `Config`.
+///
+/// `configs` must have one entry per node. Used by tests that need a
+/// non-default setting on a node in a routable mesh, which cannot be produced
+/// any other way because node config is immutable after construction.
+pub(super) async fn run_tree_test_with_configs(
+    configs: Vec<crate::config::Config>,
+    edges: &[(usize, usize)],
+) -> Vec<TestNode> {
+    let mut nodes = Vec::new();
+    for config in configs {
+        nodes.push(make_test_node_with_config(config, 1280).await);
+    }
+
+    converge_nodes(nodes, edges).await
+}
+
+/// Drive the given nodes to convergence over `edges` and assert every edge
+/// established a bidirectional peer.
+async fn converge_nodes(mut nodes: Vec<TestNode>, edges: &[(usize, usize)]) -> Vec<TestNode> {
     for &(i, j) in edges {
         initiate_handshake(&mut nodes, i, j).await;
     }
