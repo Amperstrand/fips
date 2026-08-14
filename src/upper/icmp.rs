@@ -103,6 +103,25 @@ pub const FIPS_OVERHEAD: u16 = 16 + 16 + 5 + 35 + 12 + 6 + 16; // 106 bytes
 /// ```
 pub const FIPS_IPV6_OVERHEAD: u16 = 77;
 
+/// Smallest remote-supplied transport path MTU this node will act on.
+///
+/// The `path_mtu` field is an unsigned per-hop transit annotation carried
+/// outside `proof_bytes`, and the `MtuExceeded` and `PathBroken` signals
+/// arrive unencrypted, so any forwarder on the path can lower it. Below this
+/// value the quantities derived from it degenerate: at a transport MTU of 137
+/// or less, [`mss_ceiling`] saturates to a TCP MSS of zero, at 138 it is a
+/// single byte, and the derived MSS stays under a hundred all the way to 236.
+/// At the floor itself the derived inner IPv6 MTU is 179 and the TCP MSS is
+/// 119, clear of both the zero cliff and that band.
+///
+/// A candidate below the floor is ignored — treated as no information at all,
+/// never applied and never stored — rather than clamped, because clamping
+/// would fabricate an estimate the node has no basis for. Locally derived link
+/// MTUs are not subject to the floor; it applies only to values a remote party
+/// supplied. A local value is exact, so the SYN-time clamp honours it however
+/// small and refuses only the zero cliff, which no provenance makes usable.
+pub const MIN_ACTIONABLE_PATH_MTU: u16 = 256;
+
 /// Calculate the effective IPv6 MTU for FIPS-encapsulated traffic.
 ///
 /// Given a transport MTU (e.g., UDP payload size), returns the maximum
@@ -110,6 +129,21 @@ pub const FIPS_IPV6_OVERHEAD: u16 = 77;
 /// through the FIPS mesh after IPv6 header compression.
 pub fn effective_ipv6_mtu(transport_mtu: u16) -> u16 {
     transport_mtu.saturating_sub(FIPS_IPV6_OVERHEAD)
+}
+
+/// Largest TCP segment size a FIPS-encapsulated path of `transport_mtu`
+/// bytes on the wire admits: the effective inner IPv6 MTU less the 40-byte
+/// IPv6 header and the 20-byte TCP header.
+///
+/// Zero means the path has no room for even one payload byte, so no TCP
+/// segment fits and no clamp derived from it carries information. That is
+/// the one condition the SYN-time clamp treats as unusable regardless of
+/// where the MTU came from, and it is why the seed site warns; both read it
+/// from here so they cannot disagree about where the cliff is.
+pub fn mss_ceiling(transport_mtu: u16) -> u16 {
+    effective_ipv6_mtu(transport_mtu)
+        .saturating_sub(40)
+        .saturating_sub(20)
 }
 
 /// Check if we should send an ICMPv6 error for this packet.
