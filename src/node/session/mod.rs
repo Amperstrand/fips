@@ -319,7 +319,6 @@ impl SessionEntry {
     }
 
     /// Whether this node initiated the Noise handshake.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_initiator(&self) -> bool {
         self.is_initiator
     }
