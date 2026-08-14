@@ -69,6 +69,7 @@ pub(crate) enum Step {
     CheckRekey,
     CheckSessionRekey,
     CheckPendingLookups,
+    PollProbes,
     PollTransportDiscovery,
     SampleTransportCongestion,
     ActivateConnectedUdpSessions,
@@ -107,6 +108,7 @@ pub(crate) const STEPS: [Step; N_STEPS] = [
     Step::CheckRekey,
     Step::CheckSessionRekey,
     Step::CheckPendingLookups,
+    Step::PollProbes,
     Step::PollTransportDiscovery,
     Step::SampleTransportCongestion,
     Step::ActivateConnectedUdpSessions,
@@ -140,6 +142,7 @@ impl Step {
             Step::CheckRekey => "check_rekey",
             Step::CheckSessionRekey => "check_session_rekey",
             Step::CheckPendingLookups => "check_pending_lookups",
+            Step::PollProbes => "poll_probes",
             Step::PollTransportDiscovery => "poll_transport_discovery",
             Step::SampleTransportCongestion => "sample_transport_congestion",
             Step::ActivateConnectedUdpSessions => "activate_connected_udp_sessions",
@@ -378,9 +381,9 @@ mod tests {
     #[test]
     fn emitted_row_count_matches_build() {
         let emitted = STEPS.iter().filter(|s| s.emitted()).count();
-        // 25 unconditional subsystem steps + the whole-tick span, plus the two
+        // 26 unconditional subsystem steps + the whole-tick span, plus the two
         // conditionally-compiled steps where this build has them.
-        let mut expected = 26;
+        let mut expected = 27;
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             expected += 1;
         }

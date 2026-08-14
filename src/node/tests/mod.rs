@@ -20,6 +20,7 @@ mod forwarding;
 mod handshake;
 mod heartbeat;
 mod mmp_chartests;
+mod probe;
 mod routing;
 mod session;
 mod spanning_tree;
