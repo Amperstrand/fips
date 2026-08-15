@@ -378,9 +378,9 @@ mod tests {
     #[test]
     fn emitted_row_count_matches_build() {
         let emitted = STEPS.iter().filter(|s| s.emitted()).count();
-        // 24 unconditional subsystem steps + the whole-tick span, plus the two
+        // 25 unconditional subsystem steps + the whole-tick span, plus the two
         // conditionally-compiled steps where this build has them.
-        let mut expected = 25;
+        let mut expected = 26;
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             expected += 1;
         }
