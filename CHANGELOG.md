@@ -102,6 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting channel at all, so someone with a finding had to guess at an
   address or open a public issue.
 
+- `node.rate_limit.session_setup_burst` (64) and
+  `node.rate_limit.session_setup_rate` (16.0), the parameters of the new
+  per-link-peer session-setup limiter. Setup messages naming a peer this node
+  is already established with are metered on a second per-link bucket derived
+  from `node.limits.max_peers`, `node.rekey.after_secs` and
+  `node.rate_limit.handshake_max_resends`, so raising the peer limit sizes it
+  automatically. A zero burst or a non-positive rate is rejected at config
+  validation rather than silently refusing every session.
+
 - `node.rate_limit.established_handshake_burst` and
   `node.rate_limit.established_handshake_rate`, the parameters of the new
   established-link msg1 token bucket. Both are optional; omitting them (the
@@ -122,6 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a downgrade — revert with `dpkg -i` rather than `apt install`. `--features` is
   refused together with `--no-build`, which would stamp the marker onto binaries
   the features never reached.
+
+- `node.rendezvous.nostr.max_concurrent_offers_per_npub`, defaulting to 4, which
+  bounds how many inbound traversal offers one sender npub may have in flight
+  at once. It sits inside `max_concurrent_incoming_offers`, which remains the
+  outer bound, so a value above that is inert; zero is rejected at config
+  validation, since it refuses every inbound offer rather than disabling the
+  limit. Existing configurations parse unchanged, the key being optional.
 
 ### Changed
 
@@ -174,6 +190,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nostr.*`, `lan.*`). A deployed `node.discovery:` block still loads and is
   folded into the new tables with a one-time deprecation warning; migrate your
   `fips.yaml` to the new keys.
+
+
+- Inbound traversal offers are now admitted against a per-sender allowance as
+  well as the global pool. The intake path previously took a permit from a
+  single semaphore before any identity check, with the sender's npub used only
+  as a log field, so one sender could hold every slot and deny traversal
+  onboarding to every other peer for as long as it kept offering. Admission now
+  takes a per-npub permit and a global permit together. A sender over its own
+  allowance is refused at debug rather than warn, because the party tripping it
+  is by definition sending faster than the node wants and a record per
+  rejection would turn the spam into log volume; the global bound being reached
+  keeps its warn, which is the operator's signal that the node is genuinely
+  saturated. **This does not make the pool inexhaustible.** Nostr identities
+  cost nothing to generate and the signal subscription carries no author
+  restriction, so an attacker running four throwaway npubs still saturates the
+  shipped 16-slot pool at an unchanged total offer rate. What the change buys
+  is that one identity can no longer do it alone, and that the two refusals are
+  distinguishable in the log. The permit is still held across the whole
+  attempt; that duration remains inferred from the attempt timeout rather than
+  measured.
+
+- Config validation now rejects a `node.rendezvous.nostr.signal_ttl_secs` that
+  is too large for the configured `replay_window_secs`. A traversal signal is
+  acceptable over its TTL plus 60s of clock-skew grace on each side, and that
+  span has to stay strictly inside the replay window, or a session id evicted
+  from the replay cache on expiry is still fresh enough to be accepted a second
+  time. The relation was documented but unenforced, so raising the TTL past
+  180s silently voided it. The bound is derived from the skew constant rather
+  than restated, and is checked whether or not nostr discovery is enabled, for
+  the same reason the rekey rules are. The shipped defaults (120s against 300s)
+  are unaffected, but a configuration that had widened the TTL or narrowed the
+  replay window now fails to load, with an error naming the concrete floor for
+  `replay_window_secs`. The NAT lab's config generator was one such
+  configuration and its generated `replay_window_secs` moves from 60 to 180.
+  Note that this covers eviction on expiry only: `seen_sessions_max_entries`
+  remains a separate capacity-eviction route that no config relation bounds.
 
 - Config validation now rejects two `node.rekey` settings that appear to
   disable the trigger and in fact fire it continuously. `after_messages` of
@@ -251,6 +303,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alias and will be removed at the v2 cutover; migrate to `listen`.
 
 ### Fixed
+
+- Inbound session-setup messages are now rate limited, keyed on the
+  authenticated link peer the datagram arrived over. The setup path allocated
+  a session entry and sent a routed SessionAck for every well-formed message
+  naming an address it had no entry for, and that address is an envelope field
+  the sender picks, so one neighbour could grow the session table at whatever
+  rate it could transmit and buy an ack per entry to a destination of its
+  choosing. The limiter sits ahead of every send and both handshake
+  constructions in the handler, so a refused message emits nothing and costs
+  no cryptography. The key is the link peer rather than the claimed source
+  address, which is what makes it a limit at all: keying on the source would
+  hand a single sender a fresh full bucket per forged message.
+
+  Two consequences worth stating rather than discovering. The limiter bounds
+  each neighbour's contribution and makes a flood attributable; it does not
+  give the node an absolute ceiling, which stays at roughly
+  `peers * rate * handshake_timeout_secs`. And a legitimate peer reaching this
+  node over the *same* link as an attacker shares that attacker's bucket, so
+  establishment behind a flooded neighbour is refused until it refills. Rekey
+  and restart traffic is deliberately not subject to that: setup messages
+  naming an already-established peer draw on a separate per-link bucket,
+  because suppressed key rotation is silent — nothing errors and no session
+  drops — and would have shown up only as a flat `rekey_armed`.
+
+- A forged SessionAck no longer destroys an in-flight session initiation. The
+  handler removed the session entry to take ownership of the handshake state
+  and, when the XK msg2 read failed, returned without putting it back. Nothing
+  in that message is authenticated — the only thing tying it to the initiation
+  is the datagram's source address, which the sender chooses — so any node able
+  to reach the victim could cancel any initiation with 57 bytes of the right
+  length, and hold establishment down by repeating it. The entry is now kept.
+  Keeping it is not enough on its own, and the second half is the part worth
+  naming: the msg2 read mixes the sender's ephemeral into the symmetric state
+  before it authenticates anything, so an entry put back as the failed read
+  left it holds a handshake that can never read the genuine msg2, which trades
+  a one-round-trip denial for one lasting the full handshake timeout. The read
+  is therefore rolled back to its pre-read state before the entry goes back.
+  The three later failure paths in the same handler still drop the entry: each
+  is downstream of a msg2 that authenticated, so it is a local failure rather
+  than a possible forgery. The entry's activity stamp is deliberately not
+  refreshed on the failure path, so a spray cannot hold a dead initiation past
+  its original sweep deadline, and a new `ack_handshake_failed` counter makes
+  the refusals visible at the default log level. Only the XK handshake on this
+  branch is covered; the additional drop sites in the XX handshake on the
+  development branch are not.
+
+- An unauthenticated session msg3 no longer discards a completed key epoch.
+  The four failure paths in the responder-side rekey arm of the msg3 handler
+  abandoned the whole rekey, which nulls a `pending` session sitting beside the
+  handshake, when only the handshake had failed. That `pending` session is the
+  epoch the real peer may already have cut over to, so discarding it kills the
+  reverse direction until the session idles out. Two unauthenticated messages
+  reached it: a forged setup message arms a handshake beside a completed rekey
+  once that rekey has waited a full idle timeout for a peer that never appeared
+  on the new epoch, and any garbage msg3 of the right length then finishes the
+  job. All four paths now abandon only the handshake. The neighbouring comment
+  in the setup handler, which claimed no path in that handler discards the
+  pending keys, has been corrected rather than left to be trusted: the
+  dual-initiation arm still calls the destructive form on an unauthenticated
+  msg1, and that is now named at the site as the one path that does.
 
 - The packaged macOS daemon now recreates and binds its control socket at
   `/var/run/fips/control.sock` instead of falling through to the shared

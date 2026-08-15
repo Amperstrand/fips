@@ -70,6 +70,15 @@ pub struct SessionStats {
     /// already have adopted, so a sustained rate means one side keeps
     /// rekeying while the other never appears on the new epoch.
     pub pending_replaced: u64,
+    /// An inbound SessionAck failed the XK msg2 read against a session we
+    /// are initiating. The entry is kept and the handshake rolled back,
+    /// since the message authenticates nothing; a sustained rate is either
+    /// a broken path to the responder or forged acks holding establishment
+    /// down.
+    pub ack_handshake_failed: u64,
+    /// A setup message was refused by the per-link-peer setup limiter,
+    /// before any handshake state was created or any ack sent.
+    pub setup_rate_limited: u64,
 }
 
 impl SessionStats {
@@ -85,6 +94,8 @@ impl SessionStats {
             rekey_pending: self.rekey_pending,
             rekey_expired: self.rekey_expired,
             pending_replaced: self.pending_replaced,
+            ack_handshake_failed: self.ack_handshake_failed,
+            setup_rate_limited: self.setup_rate_limited,
         }
     }
 
@@ -97,6 +108,8 @@ impl SessionStats {
             SessionReject::RekeyTiebreak => self.rekey_tiebreak += 1,
             SessionReject::RekeyYielded => self.rekey_yielded += 1,
             SessionReject::RekeyPending => self.rekey_pending += 1,
+            SessionReject::AckHandshakeFailed => self.ack_handshake_failed += 1,
+            SessionReject::SetupRateLimited => self.setup_rate_limited += 1,
         }
     }
 }
@@ -364,6 +377,8 @@ pub struct SessionStatsSnapshot {
     pub rekey_pending: u64,
     pub rekey_expired: u64,
     pub pending_replaced: u64,
+    pub ack_handshake_failed: u64,
+    pub setup_rate_limited: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

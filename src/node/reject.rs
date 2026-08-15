@@ -226,6 +226,18 @@ pub enum SessionReject {
     /// rather than arming a second handshake. Tracked via
     /// [`SessionStats::rekey_pending`](crate::node::stats::SessionStats).
     RekeyPending,
+    /// An inbound SessionAck naming a session we are initiating failed the
+    /// XK msg2 read. The message carries no authenticator tying it to the
+    /// initiation, so the entry is kept and the handshake rolled back
+    /// rather than discarded; a sustained rate here is either a broken path
+    /// to the responder or somebody spraying forged acks to hold
+    /// establishment down. Tracked via
+    /// [`SessionStats::ack_handshake_failed`](crate::node::stats::SessionStats).
+    AckHandshakeFailed,
+    /// A setup message was refused by the per-link-peer setup limiter
+    /// before any handshake state was created or any ack sent. Tracked via
+    /// [`SessionStats::setup_rate_limited`](crate::node::stats::SessionStats).
+    SetupRateLimited,
 }
 
 /// MMP rejection reasons.

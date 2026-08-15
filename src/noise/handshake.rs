@@ -13,6 +13,11 @@ use std::fmt;
 /// Symmetric state during handshake.
 ///
 /// Maintains the chaining key (ck), handshake hash (h), and current cipher.
+///
+/// `Clone` exists for [`HandshakeState::try_read_xk_message_2`], which has to
+/// put the pre-read state back after a message that mixed material in before
+/// failing to authenticate.
+#[derive(Clone)]
 struct SymmetricState {
     /// Chaining key for key derivation.
     ck: [u8; 32],
@@ -741,6 +746,39 @@ impl HandshakeState {
         self.progress = HandshakeProgress::Message2Done;
 
         Ok(())
+    }
+
+    /// Read XK message 2, leaving the handshake untouched when the message
+    /// does not authenticate.
+    ///
+    /// `read_xk_message_2` mixes the sender's ephemeral into the symmetric
+    /// state before it authenticates the encrypted epoch, so a message that
+    /// fails partway leaves a handshake that can never read the genuine msg2
+    /// afterwards. A caller that keeps its session entry across a failed read
+    /// — because the message may be a forgery rather than a real peer's
+    /// corrupt reply — needs the pre-read state back.
+    ///
+    /// The saved set is exactly what `read_xk_message_2` writes:
+    /// `symmetric`, `remote_ephemeral`, `remote_epoch` and `progress`. **That
+    /// mirror is manual.** A later edit that adds a write to
+    /// `read_xk_message_2` without adding it here silently reintroduces the
+    /// poisoning, and no caller can detect it.
+    pub fn try_read_xk_message_2(&mut self, message: &[u8]) -> Result<(), NoiseError> {
+        let symmetric = self.symmetric.clone();
+        let remote_ephemeral = self.remote_ephemeral;
+        let remote_epoch = self.remote_epoch;
+        let progress = self.progress;
+
+        match self.read_xk_message_2(message) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.symmetric = symmetric;
+                self.remote_ephemeral = remote_ephemeral;
+                self.remote_epoch = remote_epoch;
+                self.progress = progress;
+                Err(e)
+            }
+        }
     }
 
     /// Write XK message 3 (initiator only).
