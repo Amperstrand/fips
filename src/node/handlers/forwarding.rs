@@ -27,7 +27,7 @@ impl Node {
     /// has already had its msg_type byte stripped by dispatch.
     pub(in crate::node) async fn handle_session_datagram(
         &mut self,
-        _from: &NodeAddr,
+        from: &NodeAddr,
         payload: &[u8],
         incoming_ce: bool,
     ) {
@@ -58,6 +58,7 @@ impl Node {
             self.metrics().forwarding.record_delivered(payload.len());
             self.handle_session_payload(
                 &datagram_ref.src_addr,
+                from,
                 datagram_ref.payload,
                 datagram_ref.path_mtu,
                 incoming_ce,

@@ -91,6 +91,27 @@ pub struct RateLimitConfig {
     /// `node.rekey.after_secs` and `handshake_max_resends`.
     #[serde(default)]
     pub established_handshake_rate: Option<f64>,
+    /// Per-link-peer burst capacity for inbound FSP SessionSetup messages
+    /// that would open a new session (`node.rate_limit.session_setup_burst`).
+    ///
+    /// 64 absorbs a legitimate reconnect burst arriving behind one
+    /// neighbour. It bounds nothing on its own; `session_setup_rate` is what
+    /// bounds the sustained cost.
+    #[serde(default = "RateLimitConfig::default_session_setup_burst")]
+    pub session_setup_burst: u32,
+    /// Per-link-peer refill rate for those messages, in tokens per second
+    /// (`node.rate_limit.session_setup_rate`).
+    ///
+    /// 16/s caps one neighbour's forced half-open occupancy at
+    /// `rate * handshake_timeout_secs` (480 entries at defaults) and its ack
+    /// amplification at `rate * (1 + handshake_max_resends)` (96 acks/s).
+    ///
+    /// Setup messages naming a peer this node is already established with
+    /// are metered on a separate per-link bucket, derived from
+    /// `node.limits.max_peers` exactly as `established_handshake_*` is, so a
+    /// stranger flood cannot suppress rekey traffic sharing the link.
+    #[serde(default = "RateLimitConfig::default_session_setup_rate")]
+    pub session_setup_rate: f64,
 }
 
 impl Default for RateLimitConfig {
@@ -104,6 +125,8 @@ impl Default for RateLimitConfig {
             handshake_max_resends: 5,
             established_handshake_burst: None,
             established_handshake_rate: None,
+            session_setup_burst: 64,
+            session_setup_rate: 16.0,
         }
     }
 }
@@ -126,6 +149,12 @@ impl RateLimitConfig {
     }
     fn default_handshake_max_resends() -> u32 {
         5
+    }
+    fn default_session_setup_burst() -> u32 {
+        64
+    }
+    fn default_session_setup_rate() -> f64 {
+        16.0
     }
 }
 

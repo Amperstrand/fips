@@ -973,6 +973,25 @@ impl Config {
             )));
         }
 
+        // The per-link session-setup bucket. The same trap as above in a
+        // non-optional field: zero does not disable the limiter, it refuses
+        // every inbound setup message and so refuses every session.
+        if rl.session_setup_burst == 0 {
+            return Err(ConfigError::Validation(
+                "`node.rate_limit.session_setup_burst` is 0, which refuses every inbound SessionSetup rather than disabling the limit. \
+                 Set a positive burst; a very large value effectively disables it."
+                    .to_string(),
+            ));
+        }
+
+        let setup_rate = rl.session_setup_rate;
+        if !(setup_rate.is_finite() && setup_rate > 0.0) {
+            return Err(ConfigError::Validation(format!(
+                "`node.rate_limit.session_setup_rate` is {setup_rate}, but must be a finite value greater than 0; \
+                 a non-positive or non-finite refill rate never replenishes a link's setup bucket, so that link stops establishing sessions once its initial burst is spent."
+            )));
+        }
+
         // The freshness window backstops session-id replay protection: an
         // offer evicted from the replay cache must already be too old to pass
         // the freshness check, or it can be accepted a second time. A signal

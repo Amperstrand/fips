@@ -32,7 +32,7 @@ mod tree;
 pub(crate) mod wire;
 
 use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
-use self::rate_limit::HandshakeRateLimiter;
+use self::rate_limit::{HandshakeRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
 use self::routing_error_rate_limit::RoutingErrorRateLimiter;
 
@@ -492,6 +492,8 @@ pub struct Node {
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
     msg1_rate_limiter: HandshakeRateLimiter,
+    /// Rate limiter for inbound FSP SessionSetup, keyed on the link peer.
+    setup_rate_limiter: SessionSetupRateLimiter,
     /// Rate limiter for ICMP Packet Too Big messages.
     icmp_rate_limiter: IcmpRateLimiter,
     /// Rate limiter for routing error signals (CoordsRequired / PathBroken).
@@ -639,6 +641,28 @@ fn build_msg1_rate_limiter(config: &Config) -> HandshakeRateLimiter {
     )
 }
 
+/// Build the per-link session-setup limiter's two bucket sizes.
+///
+/// The stranger bucket is configured directly. The established bucket is
+/// derived exactly as the FMP limiter's is, from `max_peers`, the rekey
+/// period and the resend budget: a hub neighbour can legitimately carry the
+/// rekey traffic of every session this node holds, so that is the population
+/// the per-link bucket has to cover.
+fn build_setup_rate_limiter(config: &Config) -> SessionSetupRateLimiter {
+    let rl = &config.node.rate_limit;
+    let established = rate_limit::derive_established_bucket(
+        config.node.limits.max_peers,
+        config.node.rekey.after_secs,
+        rl.handshake_max_resends,
+        rl.session_setup_burst,
+        rl.session_setup_rate,
+    );
+    SessionSetupRateLimiter::with_params(
+        (rl.session_setup_burst, rl.session_setup_rate),
+        established,
+    )
+}
+
 impl Node {
     /// Create a new node from configuration.
     pub fn new(config: Config) -> Result<Self, NodeError> {
@@ -681,6 +705,7 @@ impl Node {
             config.node.cache.coord_ttl_secs * 1000,
         );
         let msg1_rate_limiter = build_msg1_rate_limiter(&config);
+        let setup_rate_limiter = build_setup_rate_limiter(&config);
 
         let max_connections = config.node.limits.max_connections;
         let max_peers = config.node.limits.max_peers;
@@ -764,6 +789,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
@@ -841,6 +867,7 @@ impl Node {
             config.node.cache.coord_ttl_secs * 1000,
         );
         let msg1_rate_limiter = build_msg1_rate_limiter(&config);
+        let setup_rate_limiter = build_setup_rate_limiter(&config);
 
         let max_connections = config.node.limits.max_connections;
         let max_peers = config.node.limits.max_peers;
@@ -921,6 +948,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             msg1_rate_limiter,
+            setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
