@@ -24,7 +24,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   burst or a non-positive rate is rejected at config validation rather than
   silently refusing all rekey traffic.
 
+- `node.discovery.nostr.max_concurrent_offers_per_npub`, defaulting to 4, which
+  bounds how many inbound traversal offers one sender npub may have in flight
+  at once. It sits inside `max_concurrent_incoming_offers`, which remains the
+  outer bound, so a value above that is inert; zero is rejected at config
+  validation, since it refuses every inbound offer rather than disabling the
+  limit. Existing configurations parse unchanged, the key being optional.
+
 ### Changed
+
+- Inbound traversal offers are now admitted against a per-sender allowance as
+  well as the global pool. The intake path previously took a permit from a
+  single semaphore before any identity check, with the sender's npub used only
+  as a log field, so one sender could hold every slot and deny traversal
+  onboarding to every other peer for as long as it kept offering. Admission now
+  takes a per-npub permit and a global permit together. A sender over its own
+  allowance is refused at debug rather than warn, because the party tripping it
+  is by definition sending faster than the node wants and a record per
+  rejection would turn the spam into log volume; the global bound being reached
+  keeps its warn, which is the operator's signal that the node is genuinely
+  saturated. **This does not make the pool inexhaustible.** Nostr identities
+  cost nothing to generate and the signal subscription carries no author
+  restriction, so an attacker running four throwaway npubs still saturates the
+  shipped 16-slot pool at an unchanged total offer rate. What the change buys
+  is that one identity can no longer do it alone, and that the two refusals are
+  distinguishable in the log. The permit is still held across the whole
+  attempt; that duration remains inferred from the attempt timeout rather than
+  measured.
+
+- Config validation now rejects a `node.discovery.nostr.signal_ttl_secs` that
+  is too large for the configured `replay_window_secs`. A traversal signal is
+  acceptable over its TTL plus 60s of clock-skew grace on each side, and that
+  span has to stay strictly inside the replay window, or a session id evicted
+  from the replay cache on expiry is still fresh enough to be accepted a second
+  time. The relation was documented but unenforced, so raising the TTL past
+  180s silently voided it. The bound is derived from the skew constant rather
+  than restated, and is checked whether or not nostr discovery is enabled, for
+  the same reason the rekey rules are. The shipped defaults (120s against 300s)
+  are unaffected, but a configuration that had widened the TTL or narrowed the
+  replay window now fails to load, with an error naming the concrete floor for
+  `replay_window_secs`. The NAT lab's config generator was one such
+  configuration and its generated `replay_window_secs` moves from 60 to 180.
+  Note that this covers eviction on expiry only: `seen_sessions_max_entries`
+  remains a separate capacity-eviction route that no config relation bounds.
 
 - Config validation now rejects two `node.rekey` settings that appear to
   disable the trigger and in fact fire it continuously. `after_messages` of

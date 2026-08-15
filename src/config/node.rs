@@ -349,6 +349,11 @@ pub struct NostrDiscoveryConfig {
     /// Acts as a rate limit against offer spam from relays.
     #[serde(default = "NostrDiscoveryConfig::default_max_concurrent_incoming_offers")]
     pub max_concurrent_incoming_offers: usize,
+    /// Max concurrent inbound traversal offers accepted from any one sender
+    /// npub. Sits inside `max_concurrent_incoming_offers`, which remains the
+    /// outer bound.
+    #[serde(default = "NostrDiscoveryConfig::default_max_concurrent_offers_per_npub")]
+    pub max_concurrent_offers_per_npub: usize,
     /// Max cached overlay adverts retained from relay traffic.
     /// Bounds memory under ambient advert volume.
     #[serde(default = "NostrDiscoveryConfig::default_advert_cache_max_entries")]
@@ -437,6 +442,7 @@ impl Default for NostrDiscoveryConfig {
             policy: NostrDiscoveryPolicy::default(),
             open_discovery_max_pending: Self::default_open_discovery_max_pending(),
             max_concurrent_incoming_offers: Self::default_max_concurrent_incoming_offers(),
+            max_concurrent_offers_per_npub: Self::default_max_concurrent_offers_per_npub(),
             advert_cache_max_entries: Self::default_advert_cache_max_entries(),
             seen_sessions_max_entries: Self::default_seen_sessions_max_entries(),
             attempt_timeout_secs: Self::default_attempt_timeout_secs(),
@@ -500,6 +506,20 @@ impl NostrDiscoveryConfig {
 
     fn default_max_concurrent_incoming_offers() -> usize {
         16
+    }
+
+    /// Four, derived rather than picked. The initiator side already admits at
+    /// most one in-flight traversal per peer npub, so one concurrent offer per
+    /// peer is the honest steady state. An offer is published to and consumed
+    /// from the whole DM relay set, three URLs by default, and whether the
+    /// notification stream deduplicates one event delivered by three relays is
+    /// not established here — if it does not, one honest offer can present as
+    /// three near-simultaneous admissions before the replay check rejects the
+    /// duplicates. Four is that worst-case fan-out plus one, so a retry
+    /// overlapping a still-timing-out attempt is still admitted, and it is a
+    /// quarter of the default global bound.
+    fn default_max_concurrent_offers_per_npub() -> usize {
+        4
     }
 
     fn default_advert_cache_max_entries() -> usize {
