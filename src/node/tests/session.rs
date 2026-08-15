@@ -2865,9 +2865,11 @@ async fn test_coords_required_naming_a_dest_with_no_session_is_counted_as_an_unk
     node.handle_coords_required(&reporter, &encoded[5..]).await;
     assert_eq!(node.stats().session.unknown_session, 1);
 
-    // The gate runs ahead of the response rate limiter, so a second
-    // identical signal is rejected the same way rather than being
-    // absorbed by rate-limiter state keyed on an attacker-chosen address.
+    // A second identical signal is refused the same way. This does not pin
+    // the gate's position relative to the response rate limiter: should_send
+    // returning false would not short-circuit the handler, so this counter
+    // reaches 2 either way. The ordering is pinned by
+    // test_coords_required_for_an_unbound_dest_never_reaches_the_response_rate_limiter.
     node.handle_coords_required(&reporter, &encoded[5..]).await;
     assert_eq!(node.stats().session.unknown_session, 2);
 
@@ -2896,6 +2898,51 @@ async fn test_coords_required_naming_a_dest_with_no_session_is_counted_as_an_unk
         errors.coords_required.get(),
         2,
         "the arrival counter is the denominator and counts refused arrivals too"
+    );
+}
+
+#[tokio::test]
+async fn test_coords_required_for_an_unbound_dest_never_reaches_the_response_rate_limiter() {
+    let mut node = make_node();
+
+    let dest = NodeAddr::from_bytes([0xCC; 16]);
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+
+    assert_eq!(
+        node.coords_response_rate_limiter.len(),
+        0,
+        "precondition: the response rate limiter holds nothing before the signal"
+    );
+
+    let encoded = CoordsRequired::new(dest, reporter).encode();
+    node.handle_coords_required(&reporter, &encoded[5..]).await;
+
+    assert_eq!(node.stats().session.unknown_session, 1);
+    assert_eq!(
+        node.coords_response_rate_limiter.len(),
+        0,
+        "an inadmissible signal must be refused before should_send can insert \
+         the attacker-chosen address into last_sent"
+    );
+}
+
+#[tokio::test]
+async fn test_coords_required_for_a_bound_dest_does_reach_the_response_rate_limiter() {
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_initiating(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+
+    let encoded = CoordsRequired::new(dest, reporter).encode();
+    node.handle_coords_required(&reporter, &encoded[5..]).await;
+
+    assert_eq!(node.stats().session.unknown_session, 0);
+    assert_eq!(
+        node.coords_response_rate_limiter.len(),
+        1,
+        "an admitted signal must still consult the response rate limiter"
     );
 }
 
