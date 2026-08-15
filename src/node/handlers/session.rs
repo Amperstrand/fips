@@ -1280,7 +1280,7 @@ impl Node {
     /// warmup counter for subsequent data packets.
     ///
     /// `src_addr` is the datagram's claimed source and is not
-    /// end-to-end authenticated; see `signal_admissible`.
+    /// end-to-end authenticated; see `signal_verdict`.
     pub(in crate::node) async fn handle_coords_required(
         &mut self,
         src_addr: &NodeAddr,
@@ -1362,7 +1362,7 @@ impl Node {
     /// cached coordinates, trigger re-discovery, and reset the warmup counter.
     ///
     /// `src_addr` is the datagram's claimed source and is not
-    /// end-to-end authenticated; see `signal_admissible`.
+    /// end-to-end authenticated; see `signal_verdict`.
     pub(in crate::node) async fn handle_path_broken(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
         self.metrics().errors.path_broken.inc();
 
@@ -1449,7 +1449,7 @@ impl Node {
     /// PathMtuState for the affected session, causing an immediate decrease.
     ///
     /// `src_addr` is the datagram's claimed source and is not
-    /// end-to-end authenticated; see `signal_admissible`.
+    /// end-to-end authenticated; see `signal_verdict`.
     pub(in crate::node) async fn handle_mtu_exceeded(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
         self.metrics().errors.mtu_exceeded.inc();
 
