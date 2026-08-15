@@ -253,6 +253,7 @@ impl Node {
                 // cross-subsystem effects for us to drive.
                 let actions = crate::proto::lookup::on_response_accepted(
                     &mut self.lookup,
+                    response.request_id,
                     &target,
                     response.target_coords,
                     now_ms,
@@ -270,6 +271,7 @@ impl Node {
         for action in actions {
             match action {
                 LookupAction::CacheCoords {
+                    request_id,
                     target,
                     coords,
                     now_ms,
@@ -283,6 +285,7 @@ impl Node {
                     // response at all.
                     if path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
                         warn!(
+                            request_id = request_id,
                             target = %self.peer_display_name(&target),
                             path_mtu = path_mtu,
                             floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
