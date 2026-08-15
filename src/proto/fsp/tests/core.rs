@@ -277,6 +277,25 @@ fn poll_rekey_does_not_abandon_a_fresh_or_locally_initiated_handshake() {
 }
 
 #[test]
+fn poll_rekey_expiry_reads_the_handshake_flag_and_never_the_pending_flag() {
+    let fsp = Fsp::new();
+    // A completed rekey waiting for its cutover, with an expired peer stamp
+    // and no handshake beside it. `has_pending` must not stand in for
+    // `rekey_in_progress` here: widening the condition to either flag would
+    // discard the epoch the peer has already moved to. The other two arms of
+    // this snapshot are quiet, so an empty result can only mean the abandon
+    // arm declined.
+    let mut s = session_snapshot(11);
+    s.has_pending = true;
+    s.rekey_in_progress = false;
+    s.armed_handshake_expired = true;
+    assert!(
+        fsp.poll_rekey(vec![s], &cfg(100, 1000)).is_empty(),
+        "a pending session with no armed handshake is not an expiring handshake"
+    );
+}
+
+#[test]
 fn poll_rekey_groups_abandons_between_the_drains_and_the_rekeys() {
     let fsp = Fsp::new();
     let mut a = session_snapshot(1);
