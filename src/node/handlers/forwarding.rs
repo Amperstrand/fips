@@ -47,7 +47,7 @@ impl Node {
         // Coordinate cache warming from plaintext session-layer headers.
         // Runs ahead of both the delivery and the TTL decisions: the coords
         // a peer put on the wire are equally valid whichever way those go.
-        self.try_warm_coord_cache_ref(&datagram_ref);
+        self.try_warm_coord_cache_ref(&datagram_ref, payload.len());
 
         // Local delivery: dispatch to session layer handlers without
         // materializing an owned SessionDatagram payload Vec. Delivery to
@@ -181,7 +181,13 @@ impl Node {
     ///
     /// Decode failures are logged and silently ignored — they don't block
     /// forwarding.
-    fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>) {
+    ///
+    /// `outer_len` is the length of the msg_type-stripped `SessionDatagram`
+    /// buffer this view was decoded from. It is carried in rather than
+    /// reconstructed from the header size so the malformed-frame byte counter
+    /// measures the same population as its siblings — which are charged the
+    /// outer slice — instead of the inner FSP payload.
+    fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>, outer_len: usize) {
         let prefix = match FspCommonPrefix::parse(datagram.payload) {
             Some(p) => p,
             None => return,
@@ -238,11 +244,10 @@ impl Node {
                     // drill-down that separates a short frame from a bad version
                     // or a U-flagged one. The level stays at debug: any peer past
                     // the handshake can drive this at line rate.
-                    self.metrics()
-                        .forwarding
-                        .record_warm_malformed(datagram.payload.len());
+                    self.metrics().forwarding.record_warm_malformed(outer_len);
                     debug!(
                         len = datagram.payload.len(),
+                        outer_len,
                         version = prefix.version,
                         flags = prefix.flags,
                         "Not a well-formed encrypted FSP message; not warming coords"

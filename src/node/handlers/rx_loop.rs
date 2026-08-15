@@ -259,7 +259,10 @@ impl Node {
                     // distinct resources; the `path_mtu_lookup` cache and the
                     // `nostr_discovery` subsystem are deliberately excluded
                     // from `Reloadable` since neither reloads from a backing
-                    // file (see `node::reloadable`).
+                    // file (see `node::reloadable`). The `path_mtu_lookup`
+                    // cache is nevertheless swept on this tick, by
+                    // `purge_expired_path_mtu` below: that is expiry, not
+                    // reload.
                     self.reload_host_map().await;
                     self.poll_pending_connects().await;
                     self.poll_nostr_discovery().await;
@@ -269,6 +272,7 @@ impl Node {
                     self.resend_pending_session_handshakes(now_ms).await;
                     self.resend_pending_session_msg3(now_ms).await;
                     self.purge_idle_sessions(now_ms);
+                    self.purge_expired_path_mtu(now_ms);
                     self.process_pending_retries(now_ms).await;
                     self.check_tree_state().await;
                     self.check_bloom_state().await;

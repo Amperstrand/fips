@@ -370,7 +370,7 @@ pub struct Node {
     /// the TUN reader/writer threads at TCP MSS clamp time so the
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
     /// and the learned per-destination path MTU.
-    path_mtu_lookup: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, u16>>>,
+    path_mtu_lookup: crate::upper::tun::PathMtuLookup,
 
     // === Transports & Links ===
     /// Active transports (owned by Node).
@@ -2528,9 +2528,21 @@ impl Node {
         self.sessions.remove(remote)
     }
 
-    /// Read the path_mtu_lookup entry for a destination FipsAddress.
+    /// Read the path MTU stored for a destination FipsAddress.
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_get(&self, fips_addr: &crate::FipsAddress) -> Option<u16> {
+        self.path_mtu_lookup
+            .read()
+            .ok()
+            .and_then(|map| map.get(fips_addr).map(|e| e.mtu))
+    }
+
+    /// Read the whole path_mtu_lookup entry, including how it is released.
+    #[cfg(test)]
+    pub(crate) fn path_mtu_lookup_entry(
+        &self,
+        fips_addr: &crate::FipsAddress,
+    ) -> Option<crate::upper::tun::PathMtuEntry> {
         self.path_mtu_lookup
             .read()
             .ok()
@@ -2538,10 +2550,32 @@ impl Node {
     }
 
     /// Write a path_mtu_lookup entry directly (for tests that pre-seed the map).
+    ///
+    /// Writes a held entry, which is what a locally derived seed or a
+    /// session-carried value stores, so pre-seeding does not put a test at
+    /// the mercy of the expiry pass. Use `path_mtu_lookup_learn` for the
+    /// discovery-carrier shape.
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_insert(&self, fips_addr: crate::FipsAddress, mtu: u16) {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
-            map.insert(fips_addr, mtu);
+            map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
+        }
+    }
+
+    /// Write an expiring path_mtu_lookup entry directly, as the discovery
+    /// `LookupResponse` carrier does (for tests that drive the expiry pass).
+    #[cfg(test)]
+    pub(crate) fn path_mtu_lookup_learn(
+        &self,
+        fips_addr: crate::FipsAddress,
+        mtu: u16,
+        at_ms: u64,
+    ) {
+        if let Ok(mut map) = self.path_mtu_lookup.write() {
+            map.insert(
+                fips_addr,
+                crate::upper::tun::PathMtuEntry::learned(mtu, at_ms),
+            );
         }
     }
 
@@ -2558,7 +2592,26 @@ impl Node {
     /// link-peer seed keeps the second while discarding the first; a plain
     /// removal would silently drop a direct peer back to the conservative
     /// ceiling until its link re-handshakes.
-    fn path_mtu_lookup_release(&self, addr: &NodeAddr) {
+    ///
+    /// Two stores describe the same dead path, so this releases both: the
+    /// `FipsAddress`-keyed map the TCP MSS clamp reads, and the session's own
+    /// source-side path MTU estimate.
+    fn path_mtu_lookup_release(&mut self, addr: &NodeAddr) {
+        // The session's own source-side estimate described the same dead path,
+        // and the increase ladder is the only thing that would ever raise it
+        // again. Reset it here so the two halves of "this path is gone" stay
+        // together. The two timeout callers remove the session before calling
+        // this, so this arm is reached only from the PathBroken route, where
+        // the session survives the event.
+        //
+        // It runs first so the `&mut self.sessions` borrow ends before the
+        // shared `self.peers` borrow the reseed below takes.
+        if let Some(entry) = self.sessions.get_mut(addr)
+            && let Some(mmp) = entry.mmp_mut()
+        {
+            mmp.path_mtu.reset_source_mtu();
+        }
+
         let fips_addr = crate::FipsAddress::from_node_addr(addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => {

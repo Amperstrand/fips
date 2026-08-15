@@ -2535,6 +2535,65 @@ async fn test_path_broken_releases_path_mtu_lookup_entry() {
 }
 
 #[tokio::test]
+async fn test_path_broken_resets_the_session_source_path_mtu() {
+    use crate::node::tests::spanning_tree::make_test_node;
+    use crate::protocol::PathBroken;
+
+    // The other half of the same release. The map the SYN clamp reads is not
+    // the only store describing the dead path: the session's own source-side
+    // estimate gates every outbound packet, and the increase ladder is the
+    // only thing that would ever raise it again — three matching higher
+    // notifications spanning two notification intervals, which arrive only
+    // while the peer is still receiving our datagrams.
+    let mut tn = make_test_node().await;
+
+    // An Established session, not an Initiating one: an Initiating entry
+    // carries no MMP state at all, which would make the assertion vacuous.
+    let remote = Identity::generate();
+    install_established_session_with_mmp(&mut tn.node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+
+    tn.node
+        .get_session_mut(&dest)
+        .expect("the session was just installed")
+        .mmp_mut()
+        .expect("install_established_session_with_mmp initialises MMP state")
+        .path_mtu
+        .apply_notification(800, std::time::Instant::now());
+    assert_eq!(
+        tn.node
+            .get_session(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        Some(800),
+        "precondition: the source-side estimate is tightened before the path dies"
+    );
+
+    // Same construction as the sibling test: encode() prepends a 4-byte FSP
+    // prefix and a msg_type byte, both already consumed by the dispatcher.
+    let encoded = PathBroken::new(dest, reporter).encode();
+    let inner = &encoded[5..];
+    assert!(
+        PathBroken::decode(inner).is_ok(),
+        "the test body must decode, or the handler returns early and the \
+         assertion below observes nothing"
+    );
+
+    tn.node.handle_path_broken(&reporter, inner).await;
+
+    assert_eq!(
+        tn.node
+            .get_session(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        Some(u16::MAX),
+        "PathBroken must return the source-side estimate to the no-measurement \
+         state, so the next send re-seeds it from the outbound transport"
+    );
+}
+
+#[tokio::test]
 async fn test_idle_session_purge_keeps_link_peer_path_mtu_seed() {
     use crate::peer::ActivePeer;
     use crate::transport::udp::UdpTransport;
@@ -2607,6 +2666,169 @@ async fn test_idle_session_purge_keeps_link_peer_path_mtu_seed() {
     for transport in node.transports.values_mut() {
         transport.stop().await.ok();
     }
+}
+
+/// A node with one UDP transport at `mtu`, and `path_mtu_lookup` seeded from
+/// that transport's link MTU for a remote address. The remote is deliberately
+/// *not* registered in `node.peers`: a test that wants the expiry pass to
+/// reseed it must add the `ActivePeer` itself, so that the two tests below
+/// can tell "restored by the reseed" apart from "never a candidate".
+async fn node_with_link_seed(
+    mtu: u16,
+) -> (
+    Node,
+    crate::NodeAddr,
+    crate::FipsAddress,
+    TransportId,
+    TransportAddr,
+) {
+    use crate::transport::udp::UdpTransport;
+    use crate::transport::{TransportHandle, packet_channel};
+
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let (transport_packet_tx, _transport_packet_rx) = packet_channel(64);
+    let transport_id = TransportId::new(1);
+    let mut udp = UdpTransport::new(
+        transport_id,
+        Some("udp1".to_string()),
+        crate::config::UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            mtu: Some(mtu),
+            ..Default::default()
+        },
+        transport_packet_tx,
+    );
+    udp.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    let remote = Identity::generate();
+    let remote_addr = *remote.node_addr();
+    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let transport_addr = TransportAddr::from_string("127.0.0.1:2121");
+
+    node.seed_path_mtu_for_link_peer(&remote_addr, transport_id, &transport_addr);
+
+    (node, remote_addr, remote_fips, transport_id, transport_addr)
+}
+
+#[tokio::test]
+async fn test_expired_path_mtu_keeps_the_link_peer_seed() {
+    use crate::peer::ActivePeer;
+
+    // The same regression the release helper's reseed half exists to
+    // prevent, reproduced on the expiry path. A tighter discovery value
+    // overwrites a direct peer's link MTU under keep-tighter, so expiring it
+    // with a bare removal would silently drop that peer to the conservative
+    // ceiling until its link re-handshakes.
+    let (mut node, remote_addr, remote_fips, transport_id, transport_addr) =
+        node_with_link_seed(1452).await;
+
+    let remote = Identity::generate();
+    let peer_identity = PeerIdentity::from_pubkey_full(remote.pubkey_full());
+    let mut peer = ActivePeer::new(peer_identity, LinkId::new(7), 0);
+    peer.set_current_addr(transport_id, transport_addr);
+    node.peers.insert(remote_addr, peer);
+
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1452),
+        "precondition: the direct-link seed is in place"
+    );
+
+    let t0 = 5_000_000u64;
+    node.path_mtu_lookup_learn(remote_fips, 800, t0);
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(800),
+        "precondition: a tighter remote-learned value is sitting on the seed"
+    );
+
+    let ttl_ms = node.config().node.cache.coord_ttl_secs * 1000;
+    node.purge_expired_path_mtu(t0 + ttl_ms + 1);
+
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1452),
+        "expiring a remote value must restore the local link seed, not leave the \
+         destination with no entry at all"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn test_local_path_mtu_seed_never_expires() {
+    // Discriminating half of the test above, which on its own cannot tell
+    // "the seed was restored by the reseed sweep" from "the seed was never a
+    // candidate for expiry". Here the remote is not in `node.peers`, so there
+    // is no reseed to mask the difference: a seed that carried a deadline
+    // would be removed and stay removed.
+    let (mut node, _remote_addr, remote_fips, _tid, _taddr) = node_with_link_seed(1452).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1452),
+        "precondition: the direct-link seed is in place"
+    );
+    assert_eq!(
+        node.path_mtu_lookup_entry(&remote_fips)
+            .and_then(|e| e.learned_ms),
+        None,
+        "precondition: a locally derived seed carries no deadline"
+    );
+
+    let ttl_ms = node.config().node.cache.coord_ttl_secs * 1000;
+    node.purge_expired_path_mtu(10 * ttl_ms);
+
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1452),
+        "a locally derived link MTU describes a link this node can still see, \
+         so no amount of elapsed time may expire it"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn test_mirrored_notification_path_mtu_survives_a_purge() {
+    // The proactive mirror exists because a peer repeating an identical value
+    // on a stable path never rewrites the entry: the handler returns early
+    // when the session-side MTU is unchanged. An entry from that carrier must
+    // therefore carry no deadline, or expiring it would permanently reopen
+    // the gap the mirror closed, for every long-lived multi-hop destination.
+    let mut node = make_node();
+    let remote = Identity::generate();
+    let remote_addr = *remote.node_addr();
+    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+
+    install_established_session_with_mmp(&mut node, &remote);
+
+    let body = build_path_mtu_notification_body(1280);
+    node.handle_session_path_mtu_notification(&remote_addr, &body);
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1280),
+        "precondition: the mirror wrote the notified value"
+    );
+
+    let ttl_ms = node.config().node.cache.coord_ttl_secs * 1000;
+    node.purge_expired_path_mtu(10 * ttl_ms);
+
+    assert_eq!(
+        node.path_mtu_lookup_get(&remote_fips),
+        Some(1280),
+        "a value learned inside a session is released by the session, not by a \
+         timer, and must survive any number of expiry passes"
+    );
 }
 
 // ============================================================================

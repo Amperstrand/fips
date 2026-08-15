@@ -1201,17 +1201,24 @@ impl Node {
         let fips_addr = crate::FipsAddress::from_node_addr(src_addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => match map.get(&fips_addr).copied() {
-                Some(existing) if existing <= new_mtu => {
+                Some(existing) if existing.mtu <= new_mtu => {
                     debug!(
                         dest = %peer_name,
                         fips_addr = %fips_addr,
                         new_mtu,
-                        existing,
+                        existing = existing.mtu,
                         "PathMtuNotification: keeping tighter existing path_mtu_lookup value"
                     );
                 }
                 other => {
-                    map.insert(fips_addr, new_mtu);
+                    // Held, not expiring. This value arrives inside a session,
+                    // and a session's teardown or a PathBroken naming it
+                    // already releases the entry. A deadline here would
+                    // instead recreate the gap this mirror exists to close: a
+                    // peer repeating an identical value on a stable path takes
+                    // the unchanged early-return above and never rewrites the
+                    // entry, so an expiring one would vanish and stay gone.
+                    map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(new_mtu));
                     debug!(
                         dest = %peer_name,
                         fips_addr = %fips_addr,
@@ -1534,17 +1541,23 @@ impl Node {
         let fips_addr = crate::FipsAddress::from_node_addr(&msg.dest_addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => match map.get(&fips_addr).copied() {
-                Some(existing) if existing <= msg.mtu => {
+                Some(existing) if existing.mtu <= msg.mtu => {
                     debug!(
                         dest = %peer_name,
                         fips_addr = %fips_addr,
                         bottleneck_mtu = msg.mtu,
-                        existing,
+                        existing = existing.mtu,
                         "Reactive MtuExceeded: keeping tighter existing path_mtu_lookup value"
                     );
                 }
                 other => {
-                    map.insert(fips_addr, msg.mtu);
+                    // Held, not expiring. The admission gate above requires a
+                    // session for the named destination, and that session's
+                    // teardown releases this entry. Nothing re-sends the signal
+                    // once traffic is sized to fit, so a deadline would drop a
+                    // genuine persistent bottleneck and start the next flow at
+                    // the conservative ceiling.
+                    map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(msg.mtu));
                     debug!(
                         dest = %peer_name,
                         fips_addr = %fips_addr,
