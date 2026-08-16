@@ -202,6 +202,10 @@ impl MmpStats {
 /// typed-rejection enum stays the canonical entry point and so a
 /// future transport-to-node bridge (event or sampling) has a
 /// well-known destination.
+///
+/// `payload_len_mismatch` is different in kind: it counts a framing
+/// drop the node itself performs at the receive dispatch point, so it
+/// has a live writer and can be non-zero on a running node.
 #[derive(Default)]
 pub struct TransportStats {
     /// Reserved for node-side inbound-cap-exceeded admission rejection
@@ -209,18 +213,24 @@ pub struct TransportStats {
     /// on the transport-level stats (`TcpStats::connections_rejected`,
     /// `TorStats::connections_rejected`) directly.
     pub inbound_cap_exceeded: u64,
+    /// Inbound FMP frames dropped because the payload length declared
+    /// in the common prefix did not match the frame the transport
+    /// delivered.
+    pub payload_len_mismatch: u64,
 }
 
 impl TransportStats {
     pub fn snapshot(&self) -> TransportStatsSnapshot {
         TransportStatsSnapshot {
             inbound_cap_exceeded: self.inbound_cap_exceeded,
+            payload_len_mismatch: self.payload_len_mismatch,
         }
     }
 
     pub(super) fn record_reject(&mut self, reason: TransportReject) {
         match reason {
             TransportReject::InboundCapExceeded => self.inbound_cap_exceeded += 1,
+            TransportReject::PayloadLenMismatch => self.payload_len_mismatch += 1,
         }
     }
 }
@@ -396,6 +406,7 @@ pub struct MmpStatsSnapshot {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TransportStatsSnapshot {
     pub inbound_cap_exceeded: u64,
+    pub payload_len_mismatch: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -576,5 +587,26 @@ mod tests {
         let mut stats = NodeStats::new();
         stats.record_reject(RejectReason::Transport(TransportReject::InboundCapExceeded));
         assert_eq!(stats.transport.inbound_cap_exceeded, 1);
+    }
+
+    /// Records both transport reasons so a swapped or shared arm shows up
+    /// as a mis-attributed counter rather than as a plausible total.
+    #[test]
+    fn transport_stats_record_reject_keeps_the_two_reasons_on_separate_counters() {
+        let mut s = TransportStats::default();
+        s.record_reject(TransportReject::PayloadLenMismatch);
+        s.record_reject(TransportReject::PayloadLenMismatch);
+        s.record_reject(TransportReject::InboundCapExceeded);
+        assert_eq!(s.payload_len_mismatch, 2);
+        assert_eq!(s.inbound_cap_exceeded, 1);
+    }
+
+    #[test]
+    fn node_stats_record_reject_dispatches_payload_len_mismatch_to_transport() {
+        let mut stats = NodeStats::new();
+        stats.record_reject(RejectReason::Transport(TransportReject::PayloadLenMismatch));
+        assert_eq!(stats.transport.payload_len_mismatch, 1);
+        assert_eq!(stats.transport.inbound_cap_exceeded, 0);
+        assert_eq!(stats.handshake.bad_state, 0);
     }
 }

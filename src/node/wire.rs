@@ -87,11 +87,6 @@ pub const FLAG_SP: u8 = 0x04;
 /// A `None` from the established arm means "no fixed relationship", so a caller
 /// skips such a frame rather than rejecting it. That is the safe direction: a
 /// truncating cast here would produce a false rejection instead.
-// Nothing calls this yet. The dispatch point that calls it arrives in the
-// following commit, which removes this annotation with it. `CommonPrefix::flags`
-// and `EncryptedHeader::payload_len` below carry the annotation for the same
-// reason.
-#[allow(dead_code)]
 pub fn expected_payload_len(phase: u8, total: usize) -> Option<u16> {
     match phase {
         PHASE_MSG1 => Some((MSG1_WIRE_SIZE - COMMON_PREFIX_SIZE) as u16),

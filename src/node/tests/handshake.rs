@@ -1151,3 +1151,137 @@ async fn test_should_admit_msg1_admits_rekey_when_addr_form_differs() {
     assert!(node.is_established_link_msg1(transport_id, &numeric_addr));
     assert!(!node.is_established_link_msg1(transport_id, &stranger_addr));
 }
+
+// ============================================================================
+// Frame-length validation at the dispatch point
+// ============================================================================
+
+/// Build a promoted peer and return the node, the peer's address, and the
+/// session index inbound frames must name to reach it.
+///
+/// `handle_encrypted_frame` looks a frame up by `(transport_id, receiver_idx)`
+/// in `peers_by_index`, so a frame carrying this index reaches the decrypt and
+/// bumps the peer's failure counter. That counter is how the tests below tell
+/// "the frame reached its handler" apart from "the frame was dropped before
+/// the dispatch": an unknown session is dropped silently and counts nothing.
+fn node_with_promoted_peer(transport_id: TransportId) -> (Node, NodeAddr, SessionIndex) {
+    let mut node = make_node();
+    let link_id = LinkId::new(1);
+    let (conn, identity) = make_completed_connection(&mut node, link_id, transport_id, 1_000);
+    let node_addr = *identity.node_addr();
+    node.add_connection(conn).unwrap();
+    node.promote_connection(link_id, identity, 2_000).unwrap();
+    let our_index = node
+        .get_peer(&node_addr)
+        .and_then(|p| p.our_index())
+        .expect("promoted peer must have our_index");
+    (node, node_addr, our_index)
+}
+
+/// A well-formed established frame carrying 40 bytes of inner plaintext.
+///
+/// 16-byte header + 40 + 16-byte tag = 72 bytes on the wire, declaring 40.
+/// The ciphertext is filler: these tests are about the length check, and
+/// every one of them stops before or at the AEAD.
+fn established_frame_declaring_40(receiver_idx: SessionIndex) -> Vec<u8> {
+    use crate::node::wire::{build_encrypted, build_established_header};
+    use crate::noise::TAG_SIZE;
+
+    let header = build_established_header(receiver_idx, 0, 0, 40);
+    build_encrypted(&header, &[0u8; 40 + TAG_SIZE])
+}
+
+#[tokio::test]
+async fn an_established_frame_whose_declared_payload_len_disagrees_with_its_length_is_dropped() {
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, our_index) = node_with_promoted_peer(transport_id);
+
+    let mut frame = established_frame_declaring_40(our_index);
+    // Bytes 2-3 are the little-endian payload_len. 68 is what a validator
+    // written to the field's looser description would compute for this frame
+    // (72 on the wire minus the 4-byte common prefix), so it is both a wrong
+    // value and the specific wrong value worth naming.
+    frame[2..4].copy_from_slice(&68u16.to_le_bytes());
+
+    node.process_packet(ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string("127.0.0.1:2121"),
+        frame,
+    ))
+    .await;
+
+    assert_eq!(
+        node.stats().transport.payload_len_mismatch,
+        1,
+        "the frame must be counted as a framing drop"
+    );
+    assert_eq!(
+        node.get_peer(&node_addr)
+            .expect("peer must survive a dropped frame")
+            .consecutive_decrypt_failures(),
+        0,
+        "the frame must be dropped before the phase dispatch, so the \
+         encrypted-frame handler never sees it"
+    );
+}
+
+#[tokio::test]
+async fn an_established_frame_with_a_correct_payload_len_is_not_dropped() {
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, our_index) = node_with_promoted_peer(transport_id);
+
+    let frame = established_frame_declaring_40(our_index);
+
+    node.process_packet(ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string("127.0.0.1:2121"),
+        frame,
+    ))
+    .await;
+
+    assert_eq!(
+        node.stats().transport.payload_len_mismatch,
+        0,
+        "a frame whose header agrees with its length must not be dropped"
+    );
+    assert_eq!(
+        node.get_peer(&node_addr)
+            .expect("peer must survive a failed decrypt below the threshold")
+            .consecutive_decrypt_failures(),
+        1,
+        "the frame must reach the encrypted-frame handler, where the filler \
+         ciphertext fails the AEAD tag"
+    );
+}
+
+#[tokio::test]
+async fn a_msg1_with_a_correct_payload_len_is_not_dropped() {
+    use crate::node::wire::build_msg1;
+
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    // A real-shaped msg1 with filler Noise bytes: `build_msg1` writes the
+    // only payload_len the msg1 arm accepts, and the handshake fails one
+    // step later at the DH, which is the observable that it got there.
+    let frame = build_msg1(SessionIndex::new(1), &[0u8; 106]);
+
+    node.process_packet(ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string("127.0.0.1:2121"),
+        frame,
+    ))
+    .await;
+
+    assert_eq!(
+        node.stats().transport.payload_len_mismatch,
+        0,
+        "a msg1 built by the encoder must not be dropped by the length check"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        1,
+        "the msg1 must reach handle_msg1, which rejects the filler Noise \
+         payload at the DH"
+    );
+}
