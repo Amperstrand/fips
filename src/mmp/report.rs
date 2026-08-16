@@ -74,8 +74,6 @@ pub struct ReceiverReport {
     pub interval_bytes_recv: u32,
 }
 
-// Encode/decode will be implemented in Step 2.
-
 impl SenderReport {
     /// Encode to wire format (48 bytes: msg_type + 3 reserved + 44 payload).
     pub fn encode(&self) -> Vec<u8> {

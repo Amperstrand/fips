@@ -2,27 +2,33 @@
 //! queries can render off the rx_loop hot path instead of round-tripping the
 //! mpsc → rx_loop oneshot.
 //!
-//! This is the stable seam of the control read-isolation milestone
-//! (TASK-2026-0152, phase R0). The handle bundles the state that is already
-//! independently shareable, and grows one `ArcSwap` snapshot cell per phase as
-//! each subsystem's read state is published from its natural mutator:
+//! The handle bundles the node state that is independently shareable, plus one
+//! `ArcSwap` snapshot cell per read subsystem:
 //!
-//! - `context` / `metrics` — already `Arc`-shared (refactor steps B/C).
-//! - `stats` (R2) — `ArcSwap<StatsSnapshot>`: stats_history dual-ring + the
-//!   scalar gauges `show_status` needs, published from the tick.
-//! - `routing` (R3) — `ArcSwap<RoutingSnapshot>`: tree / bloom / coord /
-//!   identity, published from their announce / discovery mutators.
-//! - `entities` (R4) — `ArcSwap<EntitySnapshot>`: peers / sessions / links /
-//!   connections / transports, published per-entity with `Vec<Arc<Row>>`
+//! - `context` / `metrics` — already `Arc`-shared.
+//! - `stats` — `ArcSwap<StatsSnapshot>`: stats_history dual-ring + the scalar
+//!   gauges `show_status` needs, published from the tick.
+//! - `routing` — `ArcSwap<RoutingSnapshot>`: tree / bloom / coord / identity,
+//!   published from the tick.
+//! - `entities` — `ArcSwap<EntitySnapshot>`: peers / sessions / links /
+//!   connections / transports, published from the tick with `Vec<Arc<Row>>`
 //!   structural sharing.
 //!
-//! Publisher placement follows the Q1 rules in
-//! `design/fast-path-refactoring-r0-read-handle.md`: every snapshot is
-//! published at its state's natural mutation site (on-change), never by the
-//! contended rx_loop task it is meant to bypass.
+//! Publisher placement: all three snapshot cells are published from the
+//! periodic tick, which runs as one arm of the rx_loop's `select!`. Publishing
+//! therefore costs the rx_loop; what the handle removes is the read-side round
+//! trip out to the rx_loop and back, not the cost of publishing. The
+//! `publish_routing_snapshot` and `publish_entities_snapshot` doc comments on
+//! `Node` carry the reasoning for the two projections that need coherent
+//! `&Node` access across subsystems.
 //!
-//! R0 ships only the type and the dispatch seam ([`snapshot_dispatch`]); no
-//! query reads the handle yet. Cutover begins in R1.
+//! A projection is a point-in-time copy, not a live view. The entity tables in
+//! particular are mutated on the packet path between ticks, so a reader sees
+//! the state as of the last publish.
+//!
+//! [`snapshot_dispatch`] is the seam: it serves the commands in its match arms
+//! directly from the handle and returns `None` for everything else, so the
+//! caller falls back to the mpsc → rx_loop path.
 
 use std::sync::Arc;
 
@@ -37,9 +43,9 @@ use super::snapshot::{EntitySnapshot, RoutingSnapshot, StatsSnapshot};
 /// Cloneable read-only view of node state for off-loop control serving.
 ///
 /// All fields are `Arc` / `ArcSwap` handles, so cloning is cheap and a clone
-/// can be held by every accepted control connection. Fields are consumed
-/// starting R1 as `show_*` queries cut over to off-loop rendering; until then
-/// they are wired but unread.
+/// can be held by every accepted control connection. The snapshot cells are
+/// read by the `*_from_handle` query functions that [`snapshot_dispatch`]
+/// routes to.
 #[derive(Clone)]
 pub(crate) struct ControlReadHandle {
     /// Effectively-immutable node context (config, identity, limits).
