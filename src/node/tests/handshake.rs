@@ -1129,7 +1129,7 @@ async fn test_should_admit_msg1_rejects_fresh_when_accept_off() {
     assert!(!node.should_admit_msg1(transport_id, &addr));
 }
 
-/// ISSUE-2026-0004 regression test: `should_admit_msg1` admits rekey/restart
+/// Regression test: `should_admit_msg1` admits rekey/restart
 /// msg1 from a peer with an existing link even when the transport has
 /// accept_connections=false. Without this, the dual-init tie-breaker
 /// deadlocks (the larger-NodeAddr side drops the winner's rekey msg1).
@@ -1201,7 +1201,8 @@ async fn test_should_admit_msg1_admits_rekey_when_udp_accept_off() {
 }
 
 /// Regression test for the udp.outbound_only rekey loop observed in
-/// production 2026-04-30 (parallel to ISSUE-2026-0004).
+/// production 2026-04-30 (parallel to the rekey/restart admission case
+/// above).
 ///
 /// Production scenario: nomad runs `udp.outbound_only=true` with peer
 /// core-vm configured by hostname (`core-vm.tail65015.ts.net:2121`).
@@ -1281,4 +1282,661 @@ async fn test_should_admit_msg1_admits_rekey_when_addr_form_differs() {
     assert!(node.is_established_link_msg1(transport_id, &hostname_addr));
     assert!(node.is_established_link_msg1(transport_id, &numeric_addr));
     assert!(!node.is_established_link_msg1(transport_id, &stranger_addr));
+}
+
+// ============================================================================
+// Frame-length validation at the dispatch point
+// ============================================================================
+
+/// Build a promoted peer and return the node, the peer's address, and the
+/// session index inbound frames must name to reach it.
+///
+/// `handle_encrypted_frame` looks a frame up by `(transport_id, receiver_idx)`
+/// in `peers_by_index`, so a frame carrying this index reaches the decrypt and
+/// bumps the peer's failure counter. That counter is how the tests below tell
+/// "the frame reached its handler" apart from "the frame was dropped before
+/// the dispatch": an unknown session is dropped silently and counts nothing.
+fn node_with_promoted_peer(transport_id: TransportId) -> (Node, NodeAddr, SessionIndex) {
+    let mut node = make_node();
+    let link_id = LinkId::new(1);
+    let identity = seed_completed_connection(&mut node, link_id, transport_id, 1_000);
+    let node_addr = *identity.node_addr();
+    node.promote_connection(link_id, identity, 2_000).unwrap();
+    let our_index = node
+        .get_peer(&node_addr)
+        .and_then(|p| p.our_index())
+        .expect("promoted peer must have our_index");
+    (node, node_addr, our_index)
+}
+
+/// A well-formed established frame carrying 40 bytes of inner plaintext.
+///
+/// 16-byte header + 40 + 16-byte tag = 72 bytes on the wire, declaring 40.
+/// The ciphertext is filler: these tests are about the length check, and
+/// every one of them stops before or at the AEAD.
+fn established_frame_declaring_40(receiver_idx: SessionIndex) -> Vec<u8> {
+    use crate::noise::TAG_SIZE;
+    use crate::proto::fmp::wire::{build_encrypted, build_established_header};
+
+    let header = build_established_header(receiver_idx, 0, 0, 40);
+    build_encrypted(&header, &[0u8; 40 + TAG_SIZE])
+}
+
+#[tokio::test]
+async fn an_established_frame_whose_declared_payload_len_disagrees_with_its_length_is_dropped() {
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, our_index) = node_with_promoted_peer(transport_id);
+
+    let mut frame = established_frame_declaring_40(our_index);
+    // Bytes 2-3 are the little-endian payload_len. 68 is what a validator
+    // written to the field's looser description would compute for this frame
+    // (72 on the wire minus the 4-byte common prefix), so it is both a wrong
+    // value and the specific wrong value worth naming.
+    frame[2..4].copy_from_slice(&68u16.to_le_bytes());
+
+    node.process_packet(ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string("127.0.0.1:2121"),
+        frame,
+    ))
+    .await;
+
+    assert_eq!(
+        node.stats().transport.payload_len_mismatch,
+        1,
+        "the frame must be counted as a framing drop"
+    );
+    assert_eq!(
+        node.get_peer(&node_addr)
+            .expect("peer must survive a dropped frame")
+            .consecutive_decrypt_failures(),
+        0,
+        "the frame must be dropped before the phase dispatch, so the \
+         encrypted-frame handler never sees it"
+    );
+}
+
+#[tokio::test]
+async fn an_established_frame_with_a_correct_payload_len_is_not_dropped() {
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, our_index) = node_with_promoted_peer(transport_id);
+
+    let frame = established_frame_declaring_40(our_index);
+
+    node.process_packet(ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string("127.0.0.1:2121"),
+        frame,
+    ))
+    .await;
+
+    assert_eq!(
+        node.stats().transport.payload_len_mismatch,
+        0,
+        "a frame whose header agrees with its length must not be dropped"
+    );
+    assert_eq!(
+        node.get_peer(&node_addr)
+            .expect("peer must survive a failed decrypt below the threshold")
+            .consecutive_decrypt_failures(),
+        1,
+        "the frame must reach the encrypted-frame handler, where the filler \
+         ciphertext fails the AEAD tag"
+    );
+}
+
+#[tokio::test]
+async fn a_msg1_with_a_correct_payload_len_is_not_dropped() {
+    use crate::proto::fmp::wire::build_msg1;
+
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    // A real-shaped msg1 with filler Noise bytes: `build_msg1` writes the
+    // only payload_len the msg1 arm accepts, and the handshake fails one
+    // step later at the DH, which is the observable that it got there.
+    let frame = build_msg1(SessionIndex::new(1), &[0u8; 106]);
+
+    node.process_packet(ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string("127.0.0.1:2121"),
+        frame,
+    ))
+    .await;
+
+    assert_eq!(
+        node.stats().transport.payload_len_mismatch,
+        0,
+        "a msg1 built by the encoder must not be dropped by the length check"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        1,
+        "the msg1 must reach handle_msg1, which rejects the filler Noise \
+         payload at the DH"
+    );
+}
+
+// ============================================================================
+// Identity confirmation after the DH (the address-keyed msg1 carve-out)
+// ============================================================================
+
+/// A node whose only transport refuses fresh inbound handshakes, paired with
+/// a second started UDP socket standing in for the far end.
+///
+/// Returns the node, the far end's address, the far end's receive channel,
+/// and the far end's transport, which the caller must keep alive for its
+/// receive loop to go on running.
+///
+/// Both transports are started on purpose. A msg2 the node decides to send
+/// then really leaves it and really arrives on the returned channel, which is
+/// what makes "no msg2 was sent" an observation about the confirmation rather
+/// than a property of the fixture: on an unstarted transport every send
+/// fails, and the send-failure arm records the same reject the confirmation
+/// records, so the two worlds would be indistinguishable.
+async fn node_refusing_inbound(
+    transport_id: TransportId,
+) -> (
+    Node,
+    TransportAddr,
+    crate::transport::PacketRx,
+    crate::transport::udp::UdpTransport,
+) {
+    use crate::config::UdpConfig;
+    use crate::transport::udp::UdpTransport;
+
+    let mut node = make_node();
+
+    let refusing = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        accept_connections: Some(false),
+        ..Default::default()
+    };
+    let (tx, _rx) = packet_channel(64);
+    let mut udp = UdpTransport::new(transport_id, None, refusing, tx);
+    udp.start_async().await.expect("node transport must bind");
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    let far_end_config = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    };
+    let (far_tx, far_rx) = packet_channel(64);
+    let mut far_end = UdpTransport::new(TransportId::new(200), None, far_end_config, far_tx);
+    far_end.start_async().await.expect("far end must bind");
+    let far_addr = TransportAddr::from_string(
+        &far_end
+            .local_addr()
+            .expect("a started transport has a local address")
+            .to_string(),
+    );
+
+    (node, far_addr, far_rx, far_end)
+}
+
+/// A real, cryptographically valid msg1 from `initiator` addressed to
+/// `responder`'s static key.
+///
+/// It has to be valid under our static, or `receive_handshake_init` refuses
+/// it for the wrong reason and the test passes without ever reaching the
+/// confirmation.
+fn genuine_msg1(initiator: &Node, responder: &Node) -> Vec<u8> {
+    use crate::proto::fmp::wire::build_msg1;
+
+    let responder_identity = PeerIdentity::from_pubkey_full(responder.identity().pubkey_full());
+    let mut machine = outbound_leg(LinkId::new(9_999), responder_identity, 1_000);
+    let noise_msg1 = machine
+        .start_handshake(
+            initiator.identity().keypair(),
+            initiator.startup_epoch(),
+            1_000,
+        )
+        .expect("the initiator side of a real msg1 must build");
+    build_msg1(SessionIndex::new(7), &noise_msg1)
+}
+
+/// The node address a `Node`'s own identity presents to its peers.
+fn node_addr_of(node: &Node) -> NodeAddr {
+    *PeerIdentity::from_pubkey_full(node.identity().pubkey_full()).node_addr()
+}
+
+/// The FMP phase byte of a packet, for telling a msg1 from a msg2 on the wire.
+fn wire_phase(data: &[u8]) -> Option<u8> {
+    crate::proto::fmp::wire::CommonPrefix::parse(data).map(|p| p.phase)
+}
+
+/// Assert that nothing arrives on `rx` within a window long enough for a
+/// localhost datagram to have been delivered had one been sent.
+async fn assert_nothing_sent(rx: &mut crate::transport::PacketRx, why: &str) {
+    let arrival = tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await;
+    assert!(arrival.is_err(), "{}", why);
+}
+
+#[tokio::test]
+async fn a_msg1_spoofed_from_an_established_peers_address_is_dropped_after_the_dh_reveals_a_different_identity()
+ {
+    use crate::peer::ActivePeer;
+
+    let transport_id = TransportId::new(1);
+    let (mut node, victim_addr, mut far_rx, _far_end) = node_refusing_inbound(transport_id).await;
+
+    // The victim: a promoted peer at the address the spoofed msg1 will be
+    // sourced from, so the carve-out admits the msg1 past the refusing gate.
+    let victim = make_node();
+    let victim_identity = PeerIdentity::from_pubkey_full(victim.identity().pubkey_full());
+    let victim_node_addr = *victim_identity.node_addr();
+    let victim_link = node.allocate_link_id();
+    let mut victim_peer = ActivePeer::new(victim_identity, victim_link, 1_000);
+    victim_peer.set_current_addr(transport_id, victim_addr.clone());
+    node.peers.insert(victim_node_addr, victim_peer);
+    node.addr_to_link
+        .insert((transport_id, victim_addr.clone()), victim_link);
+
+    // The off-path party: a genuine msg1 under our static, built with a
+    // different identity's keypair, sourced from the victim's address.
+    let attacker = make_node();
+    let attacker_node_addr = node_addr_of(&attacker);
+    let wire_msg1 = genuine_msg1(&attacker, &node);
+
+    let bad_state_before = node.stats().handshake.bad_state;
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        victim_addr.clone(),
+        wire_msg1,
+        2_000,
+    ))
+    .await;
+
+    assert!(
+        node.get_peer(&attacker_node_addr).is_none(),
+        "the identity the DH revealed does not own the address the waiver \
+         matched, so it must not become a peer"
+    );
+    assert_eq!(
+        node.peer_count(),
+        1,
+        "only the victim may remain a peer after the spoofed msg1"
+    );
+    assert_eq!(
+        node.connection_count(),
+        0,
+        "the rejected msg1 must leave no connection behind"
+    );
+    assert_eq!(
+        node.link_count(),
+        0,
+        "the rejected msg1 must leave no link behind"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state_before,
+        1,
+        "the drop must be counted"
+    );
+    assert_nothing_sent(
+        &mut far_rx,
+        "no msg2 may reach the victim's address: the responder answers only \
+         after the confirmation, and this msg1 must not get that far",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_msg1_admitted_by_a_link_no_identity_owns_is_dropped_after_the_dh() {
+    let transport_id = TransportId::new(1);
+    let (mut node, source_addr, mut far_rx, _far_end) = node_refusing_inbound(transport_id).await;
+
+    // The fixture `test_should_admit_msg1_admits_rekey_when_accept_off` uses:
+    // a reverse-address entry with no peer and no connection behind it. It is
+    // enough to waive the refusing gate, and it attributes the address to
+    // nobody.
+    let link_id = node.allocate_link_id();
+    node.addr_to_link
+        .insert((transport_id, source_addr.clone()), link_id);
+
+    assert!(
+        node.should_admit_msg1(transport_id, &source_addr),
+        "the fixture must exercise the carve-out, not the gate"
+    );
+
+    let initiator = make_node();
+    let initiator_node_addr = node_addr_of(&initiator);
+    let wire_msg1 = genuine_msg1(&initiator, &node);
+
+    let bad_state_before = node.stats().handshake.bad_state;
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        source_addr.clone(),
+        wire_msg1,
+        2_000,
+    ))
+    .await;
+
+    assert!(
+        node.get_peer(&initiator_node_addr).is_none(),
+        "a msg1 the waiver could attribute to no identity must not promote \
+         the identity the DH revealed"
+    );
+    assert_eq!(node.peer_count(), 0, "no peer may be created");
+    assert_eq!(
+        node.connection_count(),
+        0,
+        "the rejected msg1 must leave no connection behind"
+    );
+    assert_eq!(
+        node.link_count(),
+        0,
+        "the rejected msg1 must leave no link behind"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state_before,
+        1,
+        "the drop must be counted"
+    );
+    assert_nothing_sent(
+        &mut far_rx,
+        "no msg2 may leave the node for an address no identity owns",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_msg1_from_a_link_whose_dial_expects_this_identity_is_admitted() {
+    let transport_id = TransportId::new(1);
+    let (mut node, peer_addr, mut far_rx, _far_end) = node_refusing_inbound(transport_id).await;
+
+    // UDP is connectionless, so `initiate_connection` runs `start_handshake`
+    // in the same synchronous stretch: the reverse-address entry and the
+    // connection carrying the dialled identity land together, and the
+    // classifier can attribute the address. Do not substitute a
+    // connection-oriented transport here; that arm defers `start_handshake`
+    // and is the window the next test is about.
+    let peer = make_node();
+    let peer_identity = PeerIdentity::from_pubkey_full(peer.identity().pubkey_full());
+    node.initiate_connection(transport_id, peer_addr.clone(), peer_identity)
+        .await
+        .expect("the dial must register the link and the connection");
+
+    // Our own dial's msg1 went out first; drain it so the assertion below is
+    // about the answer to the crossing msg1.
+    let ours = tokio::time::timeout(std::time::Duration::from_secs(1), far_rx.recv())
+        .await
+        .expect("our dial's msg1 must arrive")
+        .expect("the far end's channel must be open");
+    assert_eq!(
+        wire_phase(&ours.data),
+        Some(crate::proto::fmp::wire::PHASE_MSG1),
+        "the dial's own packet is a msg1"
+    );
+
+    let bad_state_before = node.stats().handshake.bad_state;
+    let wire_msg1 = genuine_msg1(&peer, &node);
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        peer_addr.clone(),
+        wire_msg1,
+        2_000,
+    ))
+    .await;
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(1), far_rx.recv())
+        .await
+        .expect("the crossing msg1 must be answered")
+        .expect("the far end's channel must be open");
+    assert_eq!(
+        wire_phase(&answer.data),
+        Some(crate::proto::fmp::wire::PHASE_MSG2),
+        "a simultaneous open with the peer we dialled must still be answered"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state_before,
+        0,
+        "a crossing msg1 from the identity the dial expects must not be \
+         rejected"
+    );
+}
+
+#[tokio::test]
+async fn a_crossing_msg1_in_the_connection_oriented_dial_window_is_rejected() {
+    use crate::config::TcpConfig;
+    use crate::transport::tcp::TcpTransport;
+
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    // bind_addr=None makes accept_connections() false, the idiom
+    // `test_should_admit_msg1_rejects_fresh_when_accept_off` uses.
+    let cfg = TcpConfig {
+        bind_addr: None,
+        ..Default::default()
+    };
+    let (tx, _rx) = packet_channel(64);
+    let tcp = TcpTransport::new(transport_id, None, cfg, tx);
+    node.transports
+        .insert(transport_id, TransportHandle::Tcp(tcp));
+
+    let peer = make_node();
+    let peer_identity = PeerIdentity::from_pubkey_full(peer.identity().pubkey_full());
+    let addr = TransportAddr::from_string("10.0.0.2:2121");
+
+    // The state `initiate_connection`'s connection-oriented arm leaves behind
+    // while the transport connect is outstanding: a link, a reverse-address
+    // entry, a pending connect, and no connection yet. Built directly rather
+    // than by driving a connect, which would need a reachable peer.
+    let link_id = node.allocate_link_id();
+    let link = Link::new(
+        link_id,
+        transport_id,
+        addr.clone(),
+        LinkDirection::Outbound,
+        Duration::from_millis(100),
+    );
+    node.links.insert(link_id, link);
+    node.addr_to_link
+        .insert((transport_id, addr.clone()), link_id);
+    node.peering.pending_connects.push(PendingConnect {
+        link_id,
+        transport_id,
+        remote_addr: addr.clone(),
+        peer_identity,
+    });
+
+    let bad_state_before = node.stats().handshake.bad_state;
+    let wire_msg1 = genuine_msg1(&peer, &node);
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        addr.clone(),
+        wire_msg1,
+        2_000,
+    ))
+    .await;
+
+    // This is the assertion that separates the two worlds, and it is the one
+    // to read first when the test reds. After the change the reject returns
+    // above every registry mutation, so the dial's own entry is untouched.
+    // Without it, `handle_msg1` allocates a fresh link id, writes it over
+    // this entry, and then removes the entry outright when the msg2 send
+    // fails on the unstarted transport.
+    assert_eq!(
+        node.addr_to_link.get(&(transport_id, addr.clone())),
+        Some(&link_id),
+        "the dial's reverse-address entry must still name the dial's own link"
+    );
+    // The remaining three state the shape of the outcome. They hold either
+    // way for this fixture, whose unstarted TCP transport cannot send, so
+    // they are not what makes this test able to fail.
+    assert_eq!(node.peer_count(), 0, "no peer may be created");
+    assert_eq!(node.connection_count(), 0, "no connection may be created");
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state_before,
+        1,
+        "the drop must be counted"
+    );
+}
+
+#[tokio::test]
+async fn msg1_waiver_classifies_all_three_outcomes() {
+    use crate::config::UdpConfig;
+    use crate::node::handlers::handshake::Msg1Waiver;
+    use crate::peer::ActivePeer;
+    use crate::transport::udp::UdpTransport;
+
+    let mut node = make_node();
+
+    // A registered accepting transport, not an unregistered id, so the
+    // NotNeeded assertion exercises the `accept_connections()` limb of the
+    // guard rather than its absent-transport fallback.
+    let accepting_id = TransportId::new(1);
+    let (accept_tx, _accept_rx) = packet_channel(64);
+    let accepting = UdpTransport::new(
+        accepting_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            accept_connections: Some(true),
+            ..Default::default()
+        },
+        accept_tx,
+    );
+    node.transports
+        .insert(accepting_id, TransportHandle::Udp(accepting));
+
+    let refusing_id = TransportId::new(2);
+    let (refuse_tx, _refuse_rx) = packet_channel(64);
+    let refusing = UdpTransport::new(
+        refusing_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            accept_connections: Some(false),
+            ..Default::default()
+        },
+        refuse_tx,
+    );
+    node.transports
+        .insert(refusing_id, TransportHandle::Udp(refusing));
+
+    let classify = |node: &Node, transport_id: TransportId, addr: &TransportAddr| {
+        node.msg1_waiver(
+            node.is_established_link_msg1(transport_id, addr),
+            transport_id,
+            addr,
+        )
+    };
+
+    // NotNeeded: the gate would have admitted this msg1 anyway, so nothing
+    // was waived and there is nothing to confirm.
+    let fresh = TransportAddr::from_string("10.0.0.2:2121");
+    assert_eq!(
+        classify(&node, accepting_id, &fresh),
+        Msg1Waiver::NotNeeded,
+        "an accepting transport waives nothing"
+    );
+
+    // Unattributed: the carve-out admits on a bare reverse-address entry
+    // that names neither a promoted peer nor a carrier.
+    let bare = TransportAddr::from_string("10.0.0.3:2121");
+    let bare_link = node.allocate_link_id();
+    node.addr_to_link
+        .insert((refusing_id, bare.clone()), bare_link);
+    assert_eq!(
+        classify(&node, refusing_id, &bare),
+        Msg1Waiver::Unattributed,
+        "a link no identity owns must fail closed"
+    );
+
+    // Expect, by promoted peer. `ActivePeer::new` sets neither transport_id
+    // nor current_addr, so this peer is reached through the reverse-address
+    // entry that names its link.
+    let promoted_addr = TransportAddr::from_string("10.0.0.4:2121");
+    let promoted_link = node.allocate_link_id();
+    let promoted = make_peer_identity();
+    let promoted_node_addr = *promoted.node_addr();
+    node.peers.insert(
+        promoted_node_addr,
+        ActivePeer::new(promoted, promoted_link, 1_000),
+    );
+    node.addr_to_link
+        .insert((refusing_id, promoted_addr.clone()), promoted_link);
+    assert_eq!(
+        classify(&node, refusing_id, &promoted_addr),
+        Msg1Waiver::Expect(promoted_node_addr),
+        "an address whose link a promoted peer owns is attributed to that peer"
+    );
+
+    // Expect, by carrier: a link with no promoted peer yet, whose connection
+    // carries the identity the dial expects.
+    let carrier_addr = TransportAddr::from_string("10.0.0.5:2121");
+    let carrier_link = node.allocate_link_id();
+    let dialled = make_peer_identity();
+    let dialled_node_addr = *dialled.node_addr();
+    node.seed_handshake_machine(HandshakeSeed::outbound(carrier_link, dialled, 1_000))
+        .unwrap();
+    node.addr_to_link
+        .insert((refusing_id, carrier_addr.clone()), carrier_link);
+    assert_eq!(
+        classify(&node, refusing_id, &carrier_addr),
+        Msg1Waiver::Expect(dialled_node_addr),
+        "an address whose link carries a dialled identity is attributed to it"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_reverse_address_entry_does_not_hide_a_peer_reachable_by_address() {
+    use crate::config::UdpConfig;
+    use crate::node::handlers::handshake::Msg1Waiver;
+    use crate::peer::ActivePeer;
+    use crate::transport::udp::UdpTransport;
+
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+    let (tx, _rx) = packet_channel(64);
+    let udp = UdpTransport::new(
+        transport_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            accept_connections: Some(false),
+            ..Default::default()
+        },
+        tx,
+    );
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    // A live peer whose current_addr is the numeric form inbound packets
+    // carry, which is the second predicate's whole reason for existing.
+    let numeric = TransportAddr::from_string("100.64.0.5:2121");
+    let peer_link = node.allocate_link_id();
+    let peer_identity = make_peer_identity();
+    let peer_node_addr = *peer_identity.node_addr();
+    let mut peer = ActivePeer::new(peer_identity, peer_link, 1_000);
+    peer.set_current_addr(transport_id, numeric.clone());
+    node.peers.insert(peer_node_addr, peer);
+
+    // A reverse-address entry at that same numeric address naming a link
+    // that no longer exists. `remove_link` clears the reverse lookup only
+    // under the key it rebuilds from the removed link's own remote address,
+    // so an entry inserted for that link under a second address form outlives
+    // it, and link ids are never reused.
+    let dead_link = node.allocate_link_id();
+    assert_ne!(
+        dead_link, peer_link,
+        "the stale entry names a different link"
+    );
+    node.addr_to_link
+        .insert((transport_id, numeric.clone()), dead_link);
+
+    assert_eq!(
+        node.msg1_waiver(
+            node.is_established_link_msg1(transport_id, &numeric),
+            transport_id,
+            &numeric
+        ),
+        Msg1Waiver::Expect(peer_node_addr),
+        "the stale entry must not hide the peer the address scan finds: \
+         classifying this Unattributed would reject the peer's rekey msg1 \
+         after the DH, and would go on rejecting it, because the reject \
+         returns above the insert that would overwrite the stale entry"
+    );
 }

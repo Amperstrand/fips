@@ -1,9 +1,11 @@
 //! RX event loop and packet dispatch.
 
 use crate::control::{ControlSocket, commands};
+use crate::node::reject::{RejectReason, TransportReject};
 use crate::node::{Node, NodeError};
 use crate::proto::fmp::wire::{
     COMMON_PREFIX_SIZE, CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2,
+    expected_payload_len,
 };
 use crate::transport::ReceivedPacket;
 use std::time::Duration;
@@ -448,7 +450,11 @@ impl Node {
     /// Process a single received packet.
     ///
     /// Dispatches based on the phase field in the 4-byte common prefix.
-    async fn process_packet(&mut self, packet: ReceivedPacket) {
+    ///
+    /// Visible to the rest of `crate::node` so tests can drive a single
+    /// packet through the dispatch, the same reach `handle_msg1` and
+    /// `handle_msg2` already have.
+    pub(in crate::node) async fn process_packet(&mut self, packet: ReceivedPacket) {
         if packet.data.len() < COMMON_PREFIX_SIZE {
             return; // Drop packets too short for common prefix
         }
@@ -496,6 +502,39 @@ impl Node {
                     );
                 }
             }
+            return;
+        }
+
+        // Drop a frame whose declared payload length disagrees with the
+        // frame that arrived, before that field can be used as a parsing
+        // input.
+        //
+        // Every transport's packets converge here, but the two families
+        // reach this line differently. TCP, Tor and Nym read their frame
+        // boundary out of this same field, so for them the comparison holds
+        // by construction and never fires. UDP, Ethernet and BLE deliver one
+        // whole frame per packet, where the arrived length is known exactly
+        // and nothing compares the two today. A short read on those
+        // transports is a truncated frame, which fails the AEAD tag or the
+        // exact-size handshake parse already; this changes which reason it
+        // is dropped for, not whether it is dropped.
+        //
+        // A `None` means the phase carries no fixed relationship and the
+        // frame is left alone rather than rejected, so an unrecognised phase
+        // still reaches the dispatch below and is handled there.
+        if let Some(expected) = expected_payload_len(prefix.phase, packet.data.len())
+            && prefix.payload_len != expected
+        {
+            debug!(
+                phase = prefix.phase,
+                declared = prefix.payload_len,
+                expected,
+                len = packet.data.len(),
+                transport_id = %packet.transport_id,
+                "FMP payload_len disagrees with frame length, dropping"
+            );
+            self.stats_mut()
+                .record_reject(RejectReason::Transport(TransportReject::PayloadLenMismatch));
             return;
         }
 

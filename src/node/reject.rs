@@ -298,10 +298,10 @@ pub enum ForwardingReject {
 
 /// Transport-layer rejection reasons.
 ///
-/// Currently covers the admission cap-hit path at the TCP and Tor
-/// accept loops. Additional transport-side rejection variants
-/// (framing errors, connection failures wired through to the node
-/// stats path) can be added incrementally.
+/// Covers the admission cap-hit path at the TCP and Tor accept loops
+/// and the frame-length check at the receive dispatch point. Additional
+/// transport-side rejection variants (connection failures wired through
+/// to the node stats path) can be added incrementally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TransportReject {
@@ -310,6 +310,13 @@ pub enum TransportReject {
     /// (`max_inbound_connections`) was already reached. Tracked via
     /// [`TransportStats::inbound_cap_exceeded`](crate::node::stats::TransportStats).
     InboundCapExceeded,
+    /// Inbound FMP frame dropped because the payload length its header
+    /// declares does not match the frame the transport delivered. This
+    /// is a framing rejection, not an admission one: it applies to
+    /// established data frames as well as to handshake frames, and it
+    /// is decided before the phase dispatch. Tracked via
+    /// [`TransportStats::payload_len_mismatch`](crate::node::stats::TransportStats).
+    PayloadLenMismatch,
 }
 
 #[cfg(test)]
@@ -402,5 +409,19 @@ mod tests {
             r,
             RejectReason::Transport(TransportReject::InboundCapExceeded)
         ));
+    }
+
+    #[test]
+    fn transport_reject_payload_len_mismatch_round_trips() {
+        let r = RejectReason::Transport(TransportReject::PayloadLenMismatch);
+        assert!(matches!(
+            r,
+            RejectReason::Transport(TransportReject::PayloadLenMismatch)
+        ));
+        assert_ne!(
+            r,
+            RejectReason::Transport(TransportReject::InboundCapExceeded),
+            "a framing drop must not compare equal to an admission rejection"
+        );
     }
 }

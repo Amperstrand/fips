@@ -1,6 +1,6 @@
 //! Message handlers: per-message-type behavior on `impl Node`.
 
-mod handshake;
+pub(in crate::node) mod handshake;
 pub(crate) mod lookup;
 mod mmp;
 mod rekey;
