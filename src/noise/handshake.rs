@@ -21,7 +21,13 @@ use std::fmt;
 struct SymmetricState {
     /// Chaining key for key derivation.
     ck: [u8; 32],
-    /// Handshake hash for transcript binding.
+    /// Running SHA-256 accumulator over the handshake transcript.
+    ///
+    /// Maintained by `mix_hash` at every step, but never fed to the AEAD:
+    /// `encrypt_and_hash` passes an empty associated-data field. Nothing in
+    /// production reads it, so it provides no transcript binding today, and
+    /// anything built on `handshake_hash()` (channel binding, an exporter,
+    /// cookie binding) will silently not work until the AAD carries `h`.
     h: [u8; 32],
     /// Current cipher state for encrypting handshake payloads.
     cipher: CipherState,
@@ -101,7 +107,7 @@ impl SymmetricState {
         (CipherState::new(k1), CipherState::new(k2))
     }
 
-    /// Get the handshake hash (for channel binding).
+    /// Get the handshake hash.
     fn handshake_hash(&self) -> [u8; 32] {
         self.h
     }
@@ -916,7 +922,7 @@ impl HandshakeState {
         ))
     }
 
-    /// Get the handshake hash (for channel binding, available after complete).
+    /// Get the handshake hash (available after complete).
     pub fn handshake_hash(&self) -> [u8; 32] {
         self.symmetric.handshake_hash()
     }
