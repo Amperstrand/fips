@@ -229,6 +229,27 @@ mod tests {
         frame
     }
 
+    /// The wire sizes above are written as literals, independently of the FMP
+    /// wire module, which derives the same values from the Noise message sizes.
+    /// Keeping them independent is deliberate: this module takes no dependency
+    /// on `crate::node`, and the import below exists only under `cfg(test)`.
+    /// The cost is that the two can drift. A wrong literal on this side also
+    /// breaks the TCP integration tests, since they move real frames through
+    /// this reader; a wrong value on the wire-module side does not reach here
+    /// at all, and this test is what catches that direction.
+    #[test]
+    fn stream_reader_constants_agree_with_the_fmp_wire_module() {
+        use crate::node::wire;
+
+        assert_eq!(MSG1_WIRE_SIZE, wire::MSG1_WIRE_SIZE);
+        assert_eq!(MSG2_WIRE_SIZE, wire::MSG2_WIRE_SIZE);
+        assert_eq!(PREFIX_SIZE, wire::COMMON_PREFIX_SIZE);
+        assert_eq!(
+            ESTABLISHED_REMAINING_HEADER + PREFIX_SIZE,
+            wire::ESTABLISHED_HEADER_SIZE
+        );
+    }
+
     #[tokio::test]
     async fn test_read_established_frame() {
         let payload_len = 64u16;

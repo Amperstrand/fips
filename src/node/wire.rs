@@ -67,6 +67,43 @@ pub const FLAG_CE: u8 = 0x02;
 pub const FLAG_SP: u8 = 0x04;
 
 // ============================================================================
+// Wire Length Validation
+// ============================================================================
+
+/// Expected `payload_len` for a packet of `phase` and total wire length
+/// `total`, or `None` if the phase carries no fixed relationship.
+///
+/// Each frame kind states its own relationship; there is no single shared
+/// convention. The handshake frames count everything after the 4-byte common
+/// prefix. The established frame counts only the inner plaintext, excluding
+/// both the 16-byte header and the AEAD tag, which is what
+/// [`CommonPrefix::payload_len`] documents.
+///
+/// The handshake arms are built from the same constants the encoders use; the
+/// established arm is not, since no encoder reads `ENCRYPTED_MIN_SIZE`. Neither
+/// shape stops a one-sided edit from making the two disagree, which is what the
+/// tests below exist to catch.
+///
+/// A `None` from the established arm means "no fixed relationship", so a caller
+/// skips such a frame rather than rejecting it. That is the safe direction: a
+/// truncating cast here would produce a false rejection instead.
+// Nothing calls this yet. The dispatch point that calls it arrives in the
+// following commit, which removes this annotation with it. `CommonPrefix::flags`
+// and `EncryptedHeader::payload_len` below carry the annotation for the same
+// reason.
+#[allow(dead_code)]
+pub fn expected_payload_len(phase: u8, total: usize) -> Option<u16> {
+    match phase {
+        PHASE_MSG1 => Some((MSG1_WIRE_SIZE - COMMON_PREFIX_SIZE) as u16),
+        PHASE_MSG2 => Some((MSG2_WIRE_SIZE - COMMON_PREFIX_SIZE) as u16),
+        PHASE_ESTABLISHED => total
+            .checked_sub(ENCRYPTED_MIN_SIZE)
+            .and_then(|n| u16::try_from(n).ok()),
+        _ => None,
+    }
+}
+
+// ============================================================================
 // Common Prefix
 // ============================================================================
 
@@ -622,5 +659,41 @@ mod tests {
         let prefix = CommonPrefix::parse(&packet).unwrap();
         // payload_len = sender_idx(4) + receiver_idx(4) + noise_msg2(57) = 65
         assert_eq!(prefix.payload_len, 65);
+    }
+
+    #[test]
+    fn expected_payload_len_for_an_established_frame_excludes_header_and_tag() {
+        let header = build_established_header(SessionIndex::new(7), 0, 0, 40);
+        let frame = build_encrypted(&header, &[0u8; 40 + TAG_SIZE]);
+
+        // 16 header + 40 plaintext + 16 tag = 72 on the wire, declaring 40.
+        assert_eq!(frame.len(), ESTABLISHED_HEADER_SIZE + 40 + TAG_SIZE);
+        assert_eq!(
+            expected_payload_len(PHASE_ESTABLISHED, frame.len()),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn expected_payload_len_matches_what_build_msg1_and_build_msg2_actually_emit() {
+        // The Noise buffers are sized with literals rather than
+        // HANDSHAKE_MSG1_SIZE / HANDSHAKE_MSG2_SIZE, unlike the two tests
+        // above. With the constant on both sides, changing it would move the
+        // encoder's payload_len and the validator's expectation together and
+        // leave this test green. Pinning the input keeps the two sides
+        // independent so a one-sided change is caught.
+        let msg1 = build_msg1(SessionIndex::new(1), &[0u8; 106]);
+        let prefix = CommonPrefix::parse(&msg1).unwrap();
+        assert_eq!(
+            expected_payload_len(PHASE_MSG1, msg1.len()),
+            Some(prefix.payload_len)
+        );
+
+        let msg2 = build_msg2(SessionIndex::new(1), SessionIndex::new(2), &[0u8; 57]);
+        let prefix = CommonPrefix::parse(&msg2).unwrap();
+        assert_eq!(
+            expected_payload_len(PHASE_MSG2, msg2.len()),
+            Some(prefix.payload_len)
+        );
     }
 }
