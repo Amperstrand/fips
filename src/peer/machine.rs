@@ -88,10 +88,19 @@ const RESEND_BACKOFF: f64 = 2.0;
 const REKEY_CADENCE_INTERVAL_MS: u64 = 60_000;
 const REKEY_RESEND_INTERVAL_MS: u64 = 1_000;
 const REKEY_MAX_RESENDS: u32 = 5;
-const REKEY_AFTER_SECS: u64 = 3_600;
-const REKEY_AFTER_MESSAGES: u64 = 1_000_000;
+// `REKEY_AFTER_SECS`, `REKEY_AFTER_MESSAGES` and `LIVENESS_INTERVAL_MS` below
+// are placeholders pinned to today's `RekeyConfig` and `NodeConfig` defaults.
+// They are not a wiring to the config: nothing here reads a config value, so
+// an operator override is not tracked. They are what the machine falls back to
+// until it is wired to config. The tie to the defaults is asserted by
+// `rekey_constants_match_the_rekey_config_defaults` and
+// `liveness_interval_matches_the_heartbeat_config_default` rather than stated
+// in these declarations, because `Default for NodeConfig` is an ordinary impl
+// and cannot be called from a `const` initializer.
+const REKEY_AFTER_SECS: u64 = 120;
+const REKEY_AFTER_MESSAGES: u64 = 65_536;
 const DRAIN_WINDOW_MS: u64 = 5_000;
-const LIVENESS_INTERVAL_MS: u64 = 15_000;
+const LIVENESS_INTERVAL_MS: u64 = 10_000;
 const REKEY_DAMPEN_MS: u64 = 30_000;
 const CLOSED_BACKOFF_MS: u64 = 5_000;
 
@@ -3385,6 +3394,28 @@ mod tests {
                 .start_handshake(keypair, make_epoch(), 1100)
                 .is_err()
         );
+    }
+
+    /// `LIVENESS_INTERVAL_MS` stays pinned to `NodeConfig`'s heartbeat default.
+    ///
+    /// The expectation is read from the default rather than repeated as a
+    /// literal, so raising or lowering `heartbeat_interval_secs` without
+    /// re-pinning the constant reds here instead of drifting unnoticed.
+    #[test]
+    fn liveness_interval_matches_the_heartbeat_config_default() {
+        assert_eq!(
+            LIVENESS_INTERVAL_MS,
+            crate::config::NodeConfig::default().heartbeat_interval_secs * 1_000
+        );
+    }
+
+    /// `REKEY_AFTER_SECS` and `REKEY_AFTER_MESSAGES` stay pinned to
+    /// `RekeyConfig`'s defaults, read from the impl for the same reason.
+    #[test]
+    fn rekey_constants_match_the_rekey_config_defaults() {
+        let defaults = crate::config::RekeyConfig::default();
+        assert_eq!(REKEY_AFTER_SECS, defaults.after_secs);
+        assert_eq!(REKEY_AFTER_MESSAGES, defaults.after_messages);
     }
 }
 
