@@ -12,10 +12,10 @@
 //!   peer / session / link / connection / transport counts), plus
 //!   `peer_aliases` (effectively immutable after construction).
 //!
-//! The snapshot holds *data*, not rendered `Response` envelopes (Q1-d):
+//! The snapshot holds *data*, not rendered `Response` envelopes:
 //! rendering happens in the control task off the rx_loop. Staleness is bounded
 //! by the tick interval and is never staler than the underlying data, which
-//! also advances only on the tick (Q1-b).
+//! also advances only on the tick.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use crate::node::stats_history::StatsHistory;
 use crate::upper::tun::TunState;
 
 /// Read-only snapshot of the stats-history rings plus the scalar gauges and
-/// counts `show_status` reports. Published from the tick (Q1-b).
+/// counts `show_status` reports. Published from the tick.
 #[derive(Clone)]
 pub(crate) struct StatsSnapshot {
     /// Cloned read copy of the history rings (the dual-ring read side).
@@ -65,14 +65,14 @@ pub(crate) struct StatsSnapshot {
     pub peer_aliases: Arc<HashMap<NodeAddr, String>>,
     /// Loaded peer-ACL status (`show_acl`). The ACL itself is an
     /// `arc_swap::ArcSwap<PeerAcl>` mutated only by the tick's `reload_peer_acl`;
-    /// the human-readable status is a cheap projection of it (R5).
+    /// the human-readable status is a cheap projection of it.
     pub acl_status: PeerAclStatus,
     /// Per-stats-history-peer metadata resolved against the live peer/session
     /// tables and host map at publish time (`show_stats_peers` /
     /// `show_stats_history_all_peers`), keyed by `NodeAddr`. The lifecycle
     /// timestamps and per-peer metric rings stay in `history`; this map carries
     /// only the cross-subsystem fields a renderer can't derive from the rings
-    /// alone (`is_active`, resolved `npub`, resolved `display_name`) (R5).
+    /// alone (`is_active`, resolved `npub`, resolved `display_name`).
     pub peer_meta: Arc<HashMap<NodeAddr, StatsPeerMeta>>,
 }
 
@@ -137,10 +137,10 @@ fn empty_acl_status() -> PeerAclStatus {
 }
 
 // =====================================================================
-// RoutingSnapshot (R3 — Category-D derived/routing/cache read view)
+// RoutingSnapshot (derived/routing/cache read view)
 // =====================================================================
 
-/// Read-only snapshot of the Category-D derived/routing/cache subsystems that
+/// Read-only snapshot of the derived/routing/cache subsystems that
 /// the pure-snapshot `show_tree` / `show_bloom` / `show_cache` / `show_routing`
 /// / `show_identity_cache` queries render. Published via `ArcSwap`.
 ///
@@ -149,22 +149,22 @@ fn empty_acl_status() -> PeerAclStatus {
 /// cohesive routing view holding the four subsystems (tree / bloom / coord
 /// cache / identity cache) plus the F-queue summary scalars.
 ///
-/// **Publisher placement (Q1).** The four subsystems mutate at many scattered
+/// **Publisher placement.** The four subsystems mutate at many scattered
 /// handler sites (28 `coord_cache_mut` call sites, 16 `tree_state_mut`, ~32
 /// identity-cache touches), and every projected row needs a *display name*
-/// resolved against the live peer/session tables and host map — Category-E
+/// resolved against the live peer/session tables and host map — per-entity
 /// state reachable only with `&Node`. Wiring an on-change `publish_*` at each
 /// mutation site would be large, error-prone surgery, and each call would still
 /// need `&Node` to resolve names across subsystem boundaries. So this snapshot
-/// is published from the **tick** (Q1-b acceptable-at-mutator / the documented
-/// interim the spec permits, mirroring R2's stats publish): the tick is the one
-/// site with coherent `&Node` access to resolve all display names together. A
+/// is published from the **tick**, the same placement the stats snapshot
+/// above uses: the tick is the one site with coherent `&Node` access to
+/// resolve all display names together. A
 /// single combined cell is the natural shape because there is exactly one
 /// publisher — the multi-mutator "rebuild the whole snapshot N times" hazard
-/// that Q1-c warns against does not arise.
+/// does not arise.
 ///
 /// The snapshot holds *data* (typed rows + scalars), not rendered `Response`
-/// envelopes (Q1-d); rendering happens off the rx_loop in the control task. The
+/// envelopes; rendering happens off the rx_loop in the control task. The
 /// counter-family `stats` blocks the queries also emit come from the
 /// `MetricsRegistry` (already `Arc`-shared in the handle) at render time, not
 /// from this snapshot.
@@ -173,9 +173,9 @@ fn empty_acl_status() -> PeerAclStatus {
 /// the captured absolute timestamps, so the rendered age stays fresh relative
 /// to the read, exactly as the on-loop queries computed it.
 ///
-/// Forward-compat: when step 5 structurally extracts the Category-D subsystems
-/// into typed types, these projections become thin views over them without
-/// changing the read-handle interface or this publisher placement.
+/// Forward-compat: if the derived/routing/cache subsystems are later
+/// extracted into typed types, these projections become thin views over them
+/// without changing the read-handle interface or this publisher placement.
 #[derive(Clone)]
 pub(crate) struct RoutingSnapshot {
     /// Spanning-tree read view (`show_tree`).
@@ -396,10 +396,10 @@ pub(crate) struct IdentityRow {
 }
 
 // =====================================================================
-// EntitySnapshot (R4 — Category-E per-entity table read views)
+// EntitySnapshot (per-entity table read views)
 // =====================================================================
 
-/// Read-only snapshot of the Category-E per-entity tables that the
+/// Read-only snapshot of the per-entity tables that the
 /// pure-snapshot `show_peers` / `show_sessions` / `show_links` /
 /// `show_connections` / `show_transports` / `show_mmp` queries render.
 /// Published via `ArcSwap`.
@@ -407,7 +407,7 @@ pub(crate) struct IdentityRow {
 /// This is the `entities` cell: peers / sessions / links / connections /
 /// transports, published per-entity with `Vec<Arc<Row>>` structural sharing.
 ///
-/// **Structural sharing (the umbrella mandate).** Every entity table is a
+/// **Structural sharing.** Every entity table is a
 /// `Vec<Arc<Row>>`, so a republish in which only one row changed re-allocates
 /// only that one `Arc<Row>` — the unchanged rows are reused by pointer from the
 /// previous snapshot (`Arc::ptr_eq`-stable). The publisher diffs each freshly
@@ -415,10 +415,11 @@ pub(crate) struct IdentityRow {
 /// keeps the old `Arc` when they are equal. A clone of the snapshot for each
 /// accepted control connection is then a vector of cheap pointer clones, not a
 /// deep table copy. This is what keeps the per-tick publish cost off the hot
-/// path at scale, as the umbrella requires for R4.
+/// path at scale.
 ///
-/// **Publisher placement (Q1).** Like R3, this is published from the **tick**,
-/// not per-mutator. Two reasons, both stronger than for R3:
+/// **Publisher placement.** Like the routing snapshot, this is published from
+/// the **tick**, not per-mutator. Two reasons, both stronger here than for the
+/// routing snapshot:
 ///
 /// 1. Every projected row needs a *display name* resolved against the live
 ///    peer/session tables and host map (`&Node`), and `show_peers` additionally
@@ -429,23 +430,22 @@ pub(crate) struct IdentityRow {
 ///    metrics, `last_seen`, noise counters, replay/decrypt counters) are
 ///    mutated continuously on the **data plane / rx_loop**, not at the discrete
 ///    peer/session/link lifecycle mutators. Per-lifecycle-mutator publication
-///    (Q1-a) would therefore not even capture freshness for those fields; the
+///    would therefore not even capture freshness for those fields; the
 ///    tick is the natural cadence at which this read view advances.
 ///
-/// The diff-and-reuse therefore satisfies the structural-sharing goal the
-/// umbrella mandates (only changed rows re-allocate) while keeping a single
-/// coherent `&Node` publisher — the "no monolithic per-tick *re-allocation* of
-/// every row" warning is honored because unchanged rows are reused, not rebuilt.
-/// This is the documented acceptable interim (the spec's tick-publish-with-
-/// Arc-reuse fallback), consistent with R3.
+/// The diff-and-reuse therefore satisfies the structural-sharing goal (only
+/// changed rows re-allocate) while keeping a single coherent `&Node`
+/// publisher: there is no monolithic per-tick *re-allocation* of every row,
+/// because unchanged rows are reused rather than rebuilt. This is the same
+/// tick publish placement the routing snapshot uses, for the same reason.
 ///
-/// The snapshot holds typed rows (Q1-d data, not rendered `Response`
+/// The snapshot holds typed rows (data, not rendered `Response`
 /// envelopes). Time-relative fields (`idle_ms`) are derived at render time from
 /// captured absolute timestamps, so the rendered age stays fresh relative to
 /// the read, exactly as the on-loop queries computed it.
 ///
-/// Forward-compat: step 10 later extracts the session table into a typed
-/// `(transport_id, our_index)`-indexed type; these projections then become thin
+/// Forward-compat: if the session table is later extracted into a typed
+/// `(transport_id, our_index)`-indexed type, these projections become thin
 /// views over it without changing the read-handle interface or this publisher
 /// placement.
 #[derive(Clone)]
@@ -733,7 +733,7 @@ pub(crate) struct MmpSessionRow {
 /// one, preserving structural sharing: an `Arc<Row>` from `prev` is reused
 /// (kept by pointer) whenever a new row matches an old row by identity `key`
 /// **and** compares equal by value, so only changed/new rows allocate a fresh
-/// `Arc`. This is the `Vec<Arc<Row>>` discipline the R4 umbrella mandates — a
+/// `Arc`. This is the `Vec<Arc<Row>>` structural-sharing discipline — a
 /// single-row change re-allocates one row, not the whole table, keeping the
 /// per-tick publish cost off the hot path at scale.
 ///

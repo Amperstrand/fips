@@ -53,14 +53,14 @@ pub(crate) struct ControlReadHandle {
     /// Metrics registry (counters / gauges) for `show_stats_*`.
     metrics: Arc<MetricsRegistry>,
     /// stats_history dual-ring read copy + the scalar gauges/counts
-    /// `show_status` needs, published from the tick (R2, Q1-b).
+    /// `show_status` needs, published from the tick.
     stats: Arc<ArcSwap<StatsSnapshot>>,
-    /// Category-D derived/routing/cache read view (tree / bloom / coord /
-    /// identity + F-queue scalars), published from the tick (R3).
+    /// Derived/routing/cache read view (tree / bloom / coord /
+    /// identity + F-queue scalars), published from the tick.
     routing: Arc<ArcSwap<RoutingSnapshot>>,
-    /// Category-E per-entity table read view (peers / sessions / links /
+    /// Per-entity table read view (peers / sessions / links /
     /// connections / transports + mmp), published from the tick with
-    /// `Vec<Arc<Row>>` structural sharing (R4).
+    /// `Vec<Arc<Row>>` structural sharing.
     entities: Arc<ArcSwap<EntitySnapshot>>,
 }
 
@@ -96,19 +96,19 @@ impl ControlReadHandle {
     }
 
     /// Load the latest published stats snapshot (the freshest available by
-    /// construction; no IO_TIMEOUT staleness gate, per Q1-e).
+    /// construction; no IO_TIMEOUT staleness gate).
     pub(crate) fn stats(&self) -> arc_swap::Guard<Arc<StatsSnapshot>> {
         self.stats.load()
     }
 
-    /// Load the latest published Category-D routing snapshot (freshest
-    /// available by construction; no staleness gate, per Q1-e).
+    /// Load the latest published routing snapshot (freshest
+    /// available by construction; no staleness gate).
     pub(crate) fn routing(&self) -> arc_swap::Guard<Arc<RoutingSnapshot>> {
         self.routing.load()
     }
 
-    /// Load the latest published Category-E entity snapshot (freshest available
-    /// by construction; no staleness gate, per Q1-e).
+    /// Load the latest published entity snapshot (freshest available
+    /// by construction; no staleness gate).
     pub(crate) fn entities(&self) -> arc_swap::Guard<Arc<EntitySnapshot>> {
         self.entities.load()
     }
@@ -133,18 +133,18 @@ pub(crate) fn snapshot_dispatch(request: &Request, handle: &ControlReadHandle) -
         )),
         "show_stats_list" => Some(Response::ok(queries::show_stats_list())),
         "show_metrics" => Some(Response::ok(queries::show_metrics_from_handle(handle))),
-        // R5: peer-ACL status, served from the tick-published `StatsSnapshot`.
+        // Peer-ACL status, served from the tick-published `StatsSnapshot`.
         // The ACL is an `arc_swap::ArcSwap<PeerAcl>` reloaded only on the tick;
         // its status projection is captured at the same tick.
         "show_acl" => Some(Response::ok(queries::show_acl_from_handle(handle))),
-        // R2: served from the tick-published `StatsSnapshot` (rings + scalar
+        // Served from the tick-published `StatsSnapshot` (rings + scalar
         // gauges/counts). `show_status` and the two node-level/per-peer series
         // queries carry enough data in the snapshot to render faithfully
         // off-loop, including the parameterized series selectors (the snapshot
         // holds the full rings, so any metric / window / granularity is
         // satisfiable).
         //
-        // R5 closes out the per-peer stats queries: `show_stats_peers` and
+        // The per-peer stats queries: `show_stats_peers` and
         // `show_stats_history_all_peers` now read the snapshot's per-peer
         // `peer_meta` (live `is_active`, resolved npub / display name, captured
         // at publish time) joined against the `history` rings, so they no longer
@@ -163,7 +163,7 @@ pub(crate) fn snapshot_dispatch(request: &Request, handle: &ControlReadHandle) -
             handle,
             request.params.as_ref(),
         )),
-        // R3: served from the tick-published `RoutingSnapshot` (tree / bloom /
+        // Served from the tick-published `RoutingSnapshot` (tree / bloom /
         // coord cache / identity cache + F-queue scalars). Display names are
         // resolved at publish time, so these render entirely off-loop. The
         // counter-family `stats` blocks come from the `MetricsRegistry` (also
@@ -175,7 +175,7 @@ pub(crate) fn snapshot_dispatch(request: &Request, handle: &ControlReadHandle) -
         "show_identity_cache" => Some(Response::ok(queries::show_identity_cache_from_handle(
             handle,
         ))),
-        // R4: served from the tick-published `EntitySnapshot` (per-entity
+        // Served from the tick-published `EntitySnapshot` (per-entity
         // `Vec<Arc<Row>>` tables with structural sharing). Display names,
         // tree-relationship flags, and Nostr-traversal state are resolved at
         // publish time, so these render entirely off-loop. All six are
