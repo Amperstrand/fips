@@ -99,7 +99,12 @@ const REKEY_MAX_RESENDS: u32 = 5;
 // and cannot be called from a `const` initializer.
 const REKEY_AFTER_SECS: u64 = 120;
 const REKEY_AFTER_MESSAGES: u64 = 65_536;
-const DRAIN_WINDOW_MS: u64 = 5_000;
+/// Drain-window deadline armed at rekey cutover. Sourced from the value that
+/// actually governs the live drain so the two cannot drift; the armed timer
+/// is currently stored and never fired (`drive_peer_timers` has no
+/// `DrainExpiry` arm), so this is a stored-value correction, not a live
+/// timing change.
+const DRAIN_WINDOW_MS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 1_000;
 const LIVENESS_INTERVAL_MS: u64 = 10_000;
 const REKEY_DAMPEN_MS: u64 = 30_000;
 const CLOSED_BACKOFF_MS: u64 = 5_000;
@@ -3416,6 +3421,64 @@ mod tests {
         let defaults = crate::config::RekeyConfig::default();
         assert_eq!(REKEY_AFTER_SECS, defaults.after_secs);
         assert_eq!(REKEY_AFTER_MESSAGES, defaults.after_messages);
+    }
+
+    /// A rekey cutover arms the drain timer for the drain window FSP uses.
+    ///
+    /// The expected offset is the literal `10_000`: `DRAIN_WINDOW_SECS` in
+    /// `src/proto/fsp/limits.rs` is 10 seconds, and that is the value this
+    /// deadline is meant to carry. Writing it out rather than reusing
+    /// `DRAIN_WINDOW_MS` is what keeps the assertion able to fail; expressed
+    /// in terms of the constant under test it would move with any re-pointing
+    /// of that constant and assert nothing.
+    #[test]
+    fn drain_expiry_deadline_is_the_configured_drain_window() {
+        let mut alloc = IndexAllocator::new();
+        let id = peer_identity();
+        let addr = *id.node_addr();
+        let mut m = PeerMachine::new_outbound(LinkId::new(1), id, 0);
+        m.state = PeerState::Maintaining {
+            addr,
+            kind: MaintainKind::Rekey(RekeyPhase::PendingCutover),
+        };
+        m.rekey_our_index = Some(SessionIndex::new(0x2222));
+        m.conn.set_our_index(SessionIndex::new(0x1111));
+        m.remote_epoch = Some([9u8; 8]);
+        m.session_established_at_ms = 0;
+
+        let actions = m.step(
+            PeerEvent::Timeout {
+                kind: TimerKind::RekeyCadence,
+            },
+            7_000,
+            &mut alloc,
+        );
+
+        let deadline = actions
+            .iter()
+            .find_map(|a| match a {
+                PeerAction::SetTimer {
+                    kind: TimerKind::DrainExpiry,
+                    at_ms,
+                } => Some(*at_ms),
+                _ => None,
+            })
+            .expect("the cutover must arm a DrainExpiry timer");
+        assert_eq!(deadline, 7_000 + 10_000);
+    }
+
+    /// `DRAIN_WINDOW_MS` is the FSP drain limit in milliseconds.
+    ///
+    /// This is a tautology as the constant is now declared, and is not
+    /// coverage: it is an executable statement of where the value comes from.
+    /// It reds only if a later edit replaces the const expression with a
+    /// literal that disagrees with the limit.
+    #[test]
+    fn drain_window_ms_is_sourced_from_the_fsp_limit() {
+        assert_eq!(
+            DRAIN_WINDOW_MS,
+            crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 1_000
+        );
     }
 }
 
