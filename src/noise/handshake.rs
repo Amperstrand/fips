@@ -9,6 +9,7 @@ use rand::Rng;
 use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, ecdh::shared_secret_point};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Symmetric state during handshake.
 ///
@@ -17,7 +18,11 @@ use std::fmt;
 /// `Clone` exists for [`HandshakeState::try_read_xk_message_2`], which has to
 /// put the pre-read state back after a message that mixed material in before
 /// failing to authenticate.
-#[derive(Clone)]
+///
+/// `ck` and `h` are cleared on drop, including on the clone above once it
+/// goes out of scope. `cipher` is skipped because [`CipherState`] clears its
+/// own retained key.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct SymmetricState {
     /// Chaining key for key derivation.
     ck: [u8; 32],
@@ -30,6 +35,7 @@ struct SymmetricState {
     /// cookie binding) will silently not work until the AAD carries `h`.
     h: [u8; 32],
     /// Current cipher state for encrypting handshake payloads.
+    #[zeroize(skip)]
     cipher: CipherState,
 }
 
@@ -76,6 +82,9 @@ impl SymmetricState {
         let mut key = [0u8; 32];
         key.copy_from_slice(&output[32..64]);
         self.cipher.initialize_key(key);
+        key.zeroize();
+
+        output.zeroize();
     }
 
     /// Encrypt and mix into hash.
@@ -104,7 +113,13 @@ impl SymmetricState {
         k1.copy_from_slice(&output[..32]);
         k2.copy_from_slice(&output[32..64]);
 
-        (CipherState::new(k1), CipherState::new(k2))
+        let ciphers = (CipherState::new(k1), CipherState::new(k2));
+
+        output.zeroize();
+        k1.zeroize();
+        k2.zeroize();
+
+        ciphers
     }
 
     /// Get the handshake hash.
