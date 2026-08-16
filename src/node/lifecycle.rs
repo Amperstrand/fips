@@ -489,18 +489,22 @@ impl Node {
         };
 
         // Start the Noise handshake and get message 1
-        let our_keypair = self.identity().keypair();
-        let noise_msg1 =
-            match connection.start_handshake(our_keypair, self.startup_epoch(), current_time_ms) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    // Clean up the index and link
-                    let _ = self.index_allocator.free(our_index);
-                    self.links.remove(&link_id);
-                    self.addr_to_link.remove(&(transport_id, remote_addr));
-                    return Err(NodeError::HandshakeFailed(e.to_string()));
-                }
-            };
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
+        let start_result =
+            connection.start_handshake(our_keypair, self.startup_epoch(), current_time_ms);
+        our_keypair.non_secure_erase();
+        let noise_msg1 = match start_result {
+            Ok(msg) => msg,
+            Err(e) => {
+                // Clean up the index and link
+                let _ = self.index_allocator.free(our_index);
+                self.links.remove(&link_id);
+                self.addr_to_link.remove(&(transport_id, remote_addr));
+                return Err(NodeError::HandshakeFailed(e.to_string()));
+            }
+        };
 
         // Set index and transport info on the connection
         connection.set_our_index(our_index);

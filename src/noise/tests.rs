@@ -212,7 +212,11 @@ fn cipher_state_drop_impl_clears_the_retained_key() {
     assert_zeroize_on_drop::<CipherState>();
 
     let mut cipher = CipherState::new([7u8; 32]);
-    assert_eq!(cipher.key_bytes(), [7u8; 32]);
+    // `key_bytes` hands back a copy of live key material, so the observation
+    // is bound and cleared rather than left in an unnamed temporary.
+    let mut observed = cipher.key_bytes();
+    assert_eq!(observed, [7u8; 32]);
+    observed.zeroize();
     assert!(cipher.has_key());
 
     cipher.zeroize();

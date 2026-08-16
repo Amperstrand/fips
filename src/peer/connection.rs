@@ -5,6 +5,7 @@
 //! ActivePeer upon successful authentication.
 
 use crate::PeerIdentity;
+use crate::identity::ErasingKeypair;
 use crate::noise::{self, NoiseError, NoiseSession};
 use crate::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
@@ -402,10 +403,15 @@ impl PeerConnection {
     /// The epoch is our startup epoch, encrypted into msg1 for restart detection.
     pub fn start_handshake(
         &mut self,
-        our_keypair: Keypair,
+        mut our_keypair: Keypair,
         epoch: [u8; 8],
         current_time_ms: u64,
     ) -> Result<Vec<u8>, NoiseError> {
+        // The parameter is this frame's own copy of the node's long-term
+        // private key, and the state checks below return before it is used.
+        // The guard clears it on every exit path.
+        let our_keypair = ErasingKeypair::take(&mut our_keypair);
+
         if self.direction != LinkDirection::Outbound {
             return Err(NoiseError::WrongState {
                 expected: "outbound connection".to_string(),
@@ -426,7 +432,9 @@ impl PeerConnection {
             .expect("outbound must have expected identity")
             .pubkey_full();
 
-        let mut hs = noise::HandshakeState::new_initiator(our_keypair, remote_static);
+        let mut kp = *our_keypair.get();
+        let mut hs = noise::HandshakeState::new_initiator(kp, remote_static);
+        kp.non_secure_erase();
         hs.set_local_epoch(epoch);
         let msg1 = hs.write_message_1()?;
 
@@ -443,11 +451,15 @@ impl PeerConnection {
     /// The epoch is our startup epoch, encrypted into msg2 for restart detection.
     pub fn receive_handshake_init(
         &mut self,
-        our_keypair: Keypair,
+        mut our_keypair: Keypair,
         epoch: [u8; 8],
         message: &[u8],
         current_time_ms: u64,
     ) -> Result<Vec<u8>, NoiseError> {
+        // Same as `start_handshake`: the parameter copy outlives two early
+        // returns, so the guard owns it rather than an erase per exit path.
+        let our_keypair = ErasingKeypair::take(&mut our_keypair);
+
         if self.direction != LinkDirection::Inbound {
             return Err(NoiseError::WrongState {
                 expected: "inbound connection".to_string(),
@@ -462,7 +474,9 @@ impl PeerConnection {
             });
         }
 
-        let mut hs = noise::HandshakeState::new_responder(our_keypair);
+        let mut kp = *our_keypair.get();
+        let mut hs = noise::HandshakeState::new_responder(kp);
+        kp.non_secure_erase();
         hs.set_local_epoch(epoch);
 
         // Process message 1 (this reveals the initiator's identity and epoch)

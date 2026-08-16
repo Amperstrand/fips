@@ -226,14 +226,18 @@ impl Node {
             packet.timestamp_ms,
         );
 
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let noise_msg1 = &packet.data[header.noise_msg1_offset..];
-        let msg2_response = match conn.receive_handshake_init(
+        let init_result = conn.receive_handshake_init(
             our_keypair,
             self.startup_epoch(),
             noise_msg1,
             packet.timestamp_ms,
-        ) {
+        );
+        our_keypair.non_secure_erase();
+        let msg2_response = match init_result {
             Ok(m) => m,
             Err(e) => {
                 debug!(

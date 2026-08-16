@@ -194,8 +194,11 @@ impl Node {
         };
 
         // Create IK initiator handshake directly (no PeerConnection)
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let mut hs = HandshakeState::new_initiator(our_keypair, peer_pubkey);
+        our_keypair.non_secure_erase();
         hs.set_local_epoch(self.startup_epoch());
 
         let noise_msg1 = match hs.write_message_1() {
@@ -605,8 +608,11 @@ impl Node {
         let dest_pubkey = *entry.remote_pubkey();
 
         // Create Noise XK initiator handshake
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
+        our_keypair.non_secure_erase();
         handshake.set_local_epoch(self.startup_epoch());
 
         let msg1 = match handshake.write_xk_message_1() {

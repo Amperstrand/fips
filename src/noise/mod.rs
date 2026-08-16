@@ -229,14 +229,19 @@ impl Clone for CipherState {
 
 impl CipherState {
     /// Create a new cipher state with the given key.
-    pub(crate) fn new(key: [u8; 32]) -> Self {
+    ///
+    /// The parameter is this frame's own copy of live key material, so it is
+    /// cleared before returning. The caller's copy stays the caller's to clear.
+    pub(crate) fn new(mut key: [u8; 32]) -> Self {
         let cipher = Self::build_cipher(&key);
-        Self {
+        let state = Self {
             key,
             cipher,
             nonce: 0,
             has_key: true,
-        }
+        };
+        key.zeroize();
+        state
     }
 
     /// Create an empty cipher state (no key yet).
@@ -250,11 +255,15 @@ impl CipherState {
     }
 
     /// Initialize with a key.
-    pub(super) fn initialize_key(&mut self, key: [u8; 32]) {
+    ///
+    /// The parameter is this frame's own copy of live key material, so it is
+    /// cleared before returning. The caller's copy stays the caller's to clear.
+    pub(super) fn initialize_key(&mut self, mut key: [u8; 32]) {
         self.key = key;
         self.cipher = Self::build_cipher(&key);
         self.nonce = 0;
         self.has_key = true;
+        key.zeroize();
     }
 
     /// Build a ring `LessSafeKey` from raw key bytes. Centralized so the

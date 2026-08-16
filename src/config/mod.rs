@@ -32,6 +32,7 @@ use crate::{Identity, IdentityError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "linux")]
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
@@ -217,11 +218,16 @@ pub fn default_gateway_path() -> PathBuf {
 }
 
 /// Read a bare bech32 nsec from a key file.
+///
+/// The file contents are the private key, and trimming copies it into a
+/// second string, so the read buffer is cleared on every exit path rather
+/// than dropped as it stands. The returned nsec is the caller's.
 pub fn read_key_file(path: &Path) -> Result<String, ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
         path: path.to_path_buf(),
         source: e,
     })?;
+    let contents = Zeroizing::new(contents);
     let nsec = contents.trim().to_string();
     if nsec.is_empty() {
         return Err(ConfigError::EmptyKeyFile {
@@ -442,7 +448,9 @@ pub fn resolve_identity(
     if config.node.identity.persistent {
         // Persistent mode: load existing key file or generate-and-persist
         if key_path.exists() {
-            let nsec = read_key_file(&key_path)?;
+            // Held in a guard, not a bare `String`: if the parse below fails,
+            // the `?` returns and a bare local would be freed uncleared.
+            let nsec = Zeroizing::new(read_key_file(&key_path)?);
             let identity = Identity::from_secret_str(&nsec)?;
             warn_unmanaged_key_file(&key_path);
             if let Err(e) = write_pub_file(&pub_path, &identity.npub()) {
@@ -453,7 +461,7 @@ pub fn resolve_identity(
                 );
             }
             return Ok(ResolvedIdentity {
-                nsec,
+                nsec: nsec.to_string(),
                 source: IdentitySource::KeyFile(key_path),
             });
         }
@@ -467,7 +475,8 @@ pub fn resolve_identity(
             Path::new(SYSTEM_CONFIG_DIR),
             Path::new(LEGACY_SYSTEM_CONFIG_DIR),
         ) {
-            let nsec = read_key_file(&legacy)?;
+            // Guarded for the same reason as the current-path read above.
+            let nsec = Zeroizing::new(read_key_file(&legacy)?);
             let identity = Identity::from_secret_str(&nsec)?;
             tracing::warn!(
                 legacy = %legacy.display(),
@@ -484,14 +493,20 @@ pub fn resolve_identity(
                 );
             }
             return Ok(ResolvedIdentity {
-                nsec,
+                nsec: nsec.to_string(),
                 source: IdentitySource::KeyFile(legacy),
             });
         }
 
         // No key file anywhere — generate and persist
         let identity = Identity::generate();
-        let nsec = encode_nsec(&identity.keypair().secret_key());
+        // `keypair()` and `secret_key()` each hand back a whole private key
+        // rather than a handle, so both temporaries are bound and erased.
+        let mut our_keypair = identity.keypair();
+        let mut secret_key = our_keypair.secret_key();
+        let nsec = encode_nsec(&secret_key);
+        secret_key.non_secure_erase();
+        our_keypair.non_secure_erase();
         let npub = identity.npub();
 
         if let Some(parent) = key_path.parent() {
@@ -529,7 +544,13 @@ pub fn resolve_identity(
         // Ephemeral mode (default): fresh keypair every start, write key files
         // for operator visibility
         let identity = Identity::generate();
-        let nsec = encode_nsec(&identity.keypair().secret_key());
+        // `keypair()` and `secret_key()` each hand back a whole private key
+        // rather than a handle, so both temporaries are bound and erased.
+        let mut our_keypair = identity.keypair();
+        let mut secret_key = our_keypair.secret_key();
+        let nsec = encode_nsec(&secret_key);
+        secret_key.non_secure_erase();
+        our_keypair.non_secure_erase();
         let npub = identity.npub();
 
         if let Some(parent) = key_path.parent() {
@@ -571,11 +592,27 @@ pub fn resolve_identity(
 }
 
 /// Result of identity resolution.
+///
+/// `nsec` is the node's private key in plaintext. Every local that carries it
+/// through [`resolve_identity`] either moves into this struct or is held in a
+/// guard that clears it, so this is where the surviving string lives and where
+/// clearing it belongs.
+/// A caller that wants the value out should take it with [`Option::take`] or
+/// `std::mem::take` rather than moving the field, which the `Drop` below
+/// forbids.
 pub struct ResolvedIdentity {
     /// The nsec string (bech32 or hex) for creating an Identity.
     pub nsec: String,
     /// Where the identity came from.
     pub source: IdentitySource,
+}
+
+impl Drop for ResolvedIdentity {
+    /// Clear the plaintext private key rather than dropping the allocation
+    /// with the key still in it.
+    fn drop(&mut self) {
+        self.nsec.zeroize();
+    }
 }
 
 /// Where a resolved identity originated.
@@ -637,6 +674,20 @@ pub struct IdentityConfig {
     /// When true, the key file is reused across restarts.
     #[serde(default)]
     pub persistent: bool,
+}
+
+impl Drop for IdentityConfig {
+    /// Clear the plaintext private key.
+    ///
+    /// This field holds the node's private key for the whole process
+    /// lifetime, which is the longest any secret lives in this crate, so
+    /// leaving the allocation to be freed with the key still in it is the
+    /// largest residue the crate can reach. A caller that needs the value out
+    /// should take it with [`Option::take`]; moving the field is what the
+    /// `Drop` forbids.
+    fn drop(&mut self) {
+        self.nsec.zeroize();
+    }
 }
 
 /// Root configuration structure.
@@ -709,10 +760,16 @@ impl Config {
 
     /// Load configuration from a single file.
     pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        // The config file is the highest-priority home of a plaintext key:
+        // `node.identity.nsec` is read straight out of it, so the whole file
+        // text is treated as secret for as long as it is held.
+        let contents =
+            Zeroizing::new(
+                std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?,
+            );
 
         serde_yaml::from_str(&contents).map_err(|e| ConfigError::ParseYaml {
             path: path.to_path_buf(),
@@ -755,10 +812,19 @@ impl Config {
     /// Merge another configuration into this one.
     ///
     /// Values from `other` override values in `self` when present.
-    pub fn merge(&mut self, other: Config) {
-        // Merge node.identity section
+    pub fn merge(&mut self, mut other: Config) {
+        // Merge node.identity section. The nsec is taken rather than moved
+        // out of `other.node.identity`, which clears its private key on drop
+        // and so cannot be left partially moved.
         if other.node.identity.nsec.is_some() {
-            self.node.identity.nsec = other.node.identity.nsec;
+            // Clear whatever this field already held before overwriting it.
+            // Assigning over the field drops the old `String` in place, which
+            // does not run `Drop for IdentityConfig` and would free a
+            // plaintext key uncleared when two config files both carry one.
+            if let Some(mut old) = self.node.identity.nsec.take() {
+                old.zeroize();
+            }
+            self.node.identity.nsec = other.node.identity.nsec.take();
         }
         if other.node.identity.persistent {
             self.node.identity.persistent = true;
