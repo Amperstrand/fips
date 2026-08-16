@@ -6,22 +6,22 @@
 //! This module is deliberately separate from any single transport so it can
 //! be shared by the stream-oriented transports (TCP, Tor, Nym).
 
+use crate::noise::TAG_SIZE;
+use crate::proto::fmp::wire;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// FMP phase values (low nibble of byte 0).
-const PHASE_ESTABLISHED: u8 = 0x0;
-const PHASE_MSG1: u8 = 0x1;
-const PHASE_MSG2: u8 = 0x2;
+const PHASE_ESTABLISHED: u8 = wire::PHASE_ESTABLISHED;
+const PHASE_MSG1: u8 = wire::PHASE_MSG1;
+const PHASE_MSG2: u8 = wire::PHASE_MSG2;
 
 /// Size of the FMP common prefix.
-const PREFIX_SIZE: usize = 4;
+const PREFIX_SIZE: usize = wire::COMMON_PREFIX_SIZE;
 
-/// Overhead for established frames: 12 bytes remaining header + 16 bytes AEAD tag.
-/// The full established header is 16 bytes (PREFIX_SIZE + 12), so after reading
-/// the 4-byte prefix, 12 more header bytes remain. Then payload_len bytes of
-/// ciphertext, then 16 bytes of AEAD tag.
-const ESTABLISHED_REMAINING_HEADER: usize = 12;
-const AEAD_TAG_SIZE: usize = 16;
+/// Overhead for established frames: the header bytes left after the prefix,
+/// then payload_len bytes of ciphertext, then the AEAD tag.
+const ESTABLISHED_REMAINING_HEADER: usize = wire::ESTABLISHED_HEADER_SIZE - PREFIX_SIZE;
+const AEAD_TAG_SIZE: usize = TAG_SIZE;
 
 /// Errors from the FMP stream reader.
 #[derive(Debug)]
@@ -83,8 +83,8 @@ impl From<std::io::Error> for StreamError {
 /// Known wire sizes for handshake messages.
 /// msg1: 4 (prefix) + 4 (sender_idx) + 106 (noise_msg1) = 114 bytes
 /// msg2: 4 (prefix) + 4 (sender_idx) + 4 (receiver_idx) + 57 (noise_msg2) = 69 bytes
-const MSG1_WIRE_SIZE: usize = 114;
-const MSG2_WIRE_SIZE: usize = 69;
+const MSG1_WIRE_SIZE: usize = wire::MSG1_WIRE_SIZE;
+const MSG2_WIRE_SIZE: usize = wire::MSG2_WIRE_SIZE;
 
 /// Expected payload_len for msg1: sender_idx(4) + noise_msg1(106) = 110.
 const MSG1_PAYLOAD_LEN: u16 = (MSG1_WIRE_SIZE - PREFIX_SIZE) as u16;
@@ -120,7 +120,7 @@ pub async fn read_fmp_packet<R: AsyncRead + Unpin>(
     let version = prefix[0] >> 4;
     let phase = prefix[0] & 0x0F;
 
-    if version != 0 {
+    if version != wire::FMP_VERSION {
         return Err(StreamError::UnknownVersion(version));
     }
 
@@ -229,19 +229,18 @@ mod tests {
         frame
     }
 
-    /// The wire sizes above are written as literals, independently of the FMP
-    /// wire module, which derives the same values from the Noise message sizes.
-    /// Keeping them independent is deliberate: this module takes no dependency
-    /// on `crate::proto::fmp`, and the import below exists only under
-    /// `cfg(test)`.
-    /// The cost is that the two can drift. A wrong literal on this side also
-    /// breaks the TCP integration tests, since they move real frames through
-    /// this reader; a wrong value on the wire-module side does not reach here
-    /// at all, and this test is what catches that direction.
+    /// States in executable form that the constants above are sourced from the
+    /// FMP wire module rather than restated here.
+    ///
+    /// These assertions no longer discriminate: each side of every one is now
+    /// the same constant, so this test cannot fail while the sourcing holds,
+    /// and it is here to fail loudly if someone re-inlines a literal. It
+    /// replaces a genuine drift check that was meaningful only while the two
+    /// sets of values were written independently. What still catches a wrong
+    /// value is the TCP suite in `super::tcp`, which moves real frames through
+    /// this reader against separately written literals.
     #[test]
-    fn stream_reader_constants_agree_with_the_fmp_wire_module() {
-        use crate::proto::fmp::wire;
-
+    fn stream_reader_constants_are_sourced_from_the_fmp_wire_module() {
         assert_eq!(MSG1_WIRE_SIZE, wire::MSG1_WIRE_SIZE);
         assert_eq!(MSG2_WIRE_SIZE, wire::MSG2_WIRE_SIZE);
         assert_eq!(PREFIX_SIZE, wire::COMMON_PREFIX_SIZE);
