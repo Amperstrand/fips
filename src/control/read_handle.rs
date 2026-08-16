@@ -116,14 +116,16 @@ impl ControlReadHandle {
 
 /// Attempt to serve a request entirely from the read handle, off the rx_loop.
 ///
-/// Returns `Some(response)` when the command is a pure-snapshot query that has
-/// been cut over to off-loop rendering, or `None` when it must take the
-/// mpsc → rx_loop path (parameterized queries, mutations, and any query not
-/// yet cut over).
+/// Returns `Some(response)` when the command can be rendered from the bundled
+/// snapshot cells, or `None` when it must take the mpsc → rx_loop path.
 ///
-/// Cutover queries (R1) read only `NodeContext` / `MetricsRegistry` (the state
-/// the read handle already bundles) plus host-OS facts (`/proc`, nftables), so
-/// they render entirely in the control task without touching `Node`.
+/// The queries served here read any of the cells the handle bundles —
+/// `context`, `metrics`, `stats`, `routing`, `entities` — plus host-OS facts
+/// gathered in [`super::listening`] and [`super::firewall_state`], so they
+/// render in the control task without touching `Node`. Taking a parameter is
+/// not what decides it: `show_stats_history` is parameterized and is served
+/// here. What falls back is a query needing live `Node` state the snapshot does
+/// not carry, and every mutation.
 pub(crate) fn snapshot_dispatch(request: &Request, handle: &ControlReadHandle) -> Option<Response> {
     use crate::control::queries;
 
