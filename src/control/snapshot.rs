@@ -1,8 +1,7 @@
 //! Read-side state snapshots published from the node's natural mutators so
 //! pure-snapshot `show_*` queries render off the rx_loop hot path.
 //!
-//! [`StatsSnapshot`] is the R2 reference implementation of the canonical
-//! snapshot pattern (see `design/fast-path-refactoring-r0-read-handle.md`): a
+//! [`StatsSnapshot`] is the reference implementation of the canonical snapshot pattern: a
 //! read-only data bundle published via `ArcSwap` from the tick after
 //! `StatsHistory::tick()`. It carries
 //!
@@ -145,8 +144,8 @@ fn empty_acl_status() -> PeerAclStatus {
 /// the pure-snapshot `show_tree` / `show_bloom` / `show_cache` / `show_routing`
 /// / `show_identity_cache` queries render. Published via `ArcSwap`.
 ///
-/// The R0 stub (`design/fast-path-refactoring-r0-read-handle.md`) names a
-/// single combined `ArcSwap<RoutingSnapshot>` for R3. This is that cell: one
+/// This is the single combined `ArcSwap<RoutingSnapshot>` cell for the routing
+/// subsystems: one
 /// cohesive routing view holding the four subsystems (tree / bloom / coord
 /// cache / identity cache) plus the F-queue summary scalars.
 ///
@@ -405,10 +404,8 @@ pub(crate) struct IdentityRow {
 /// `show_connections` / `show_transports` / `show_mmp` queries render.
 /// Published via `ArcSwap`.
 ///
-/// The R0 stub (`design/fast-path-refactoring-r0-read-handle.md`) pre-scopes
-/// R4 as `entities — ArcSwap<EntitySnapshot>: peers / sessions / links /
-/// connections / transports, published per-entity with `Vec<Arc<Row>>`
-/// structural sharing`. This is that cell.
+/// This is the `entities` cell: peers / sessions / links / connections /
+/// transports, published per-entity with `Vec<Arc<Row>>` structural sharing.
 ///
 /// **Structural sharing (the umbrella mandate).** Every entity table is a
 /// `Vec<Arc<Row>>`, so a republish in which only one row changed re-allocates
