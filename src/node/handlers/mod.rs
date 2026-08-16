@@ -6,7 +6,7 @@ pub(crate) mod discovery;
 mod dispatch;
 mod encrypted;
 mod forwarding;
-mod handshake;
+pub(in crate::node) mod handshake;
 mod mmp;
 mod rekey;
 mod rx_loop;

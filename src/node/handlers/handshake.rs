@@ -1,5 +1,6 @@
 //! Handshake handlers and connection promotion.
 
+use crate::NodeAddr;
 use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
 use crate::node::rate_limit::Msg1Class;
@@ -10,6 +11,28 @@ use crate::peer::{ActivePeer, PeerConnection, PromotionResult, cross_connection_
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Why an inbound msg1 got past the `accept_connections` gate, and against
+/// what identity the post-DH confirmation must check it.
+///
+/// Three outcomes, not two: an `Option` would conflate "no waiver was needed"
+/// with "the waiver was used and nobody owns the matched address", and the
+/// second of those is the case that must reject.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::node) enum Msg1Waiver {
+    /// The transport accepts fresh inbound handshakes (or no transport is
+    /// registered), so the address carve-out did not admit this msg1 and
+    /// there is nothing to confirm.
+    NotNeeded,
+    /// The carve-out is what admitted this msg1, and the matched address
+    /// belongs to this identity: either a promoted peer, or a handshake
+    /// already in flight on the matched link whose identity is expected
+    /// (outbound dial) or already learned (inbound msg1).
+    Expect(NodeAddr),
+    /// The carve-out is what admitted this msg1, and no identity can be
+    /// attributed to the matched address. Fail closed: reject after the DH.
+    Unattributed,
+}
 
 impl Node {
     /// Returns true if an inbound msg1's source matches an established
@@ -61,6 +84,80 @@ impl Node {
             return true;
         }
         false
+    }
+
+    /// Classify the msg1 waiver for a source that `should_admit_msg1`
+    /// admitted, so the post-DH confirmation knows whether it has an
+    /// identity to check against and what to do when it has none.
+    ///
+    /// `established` is the caller's already-computed
+    /// `is_established_link_msg1(...)`, so the O(peers) scan is not repeated
+    /// on the refusal path.
+    ///
+    /// The two attribution limbs are composed the same way
+    /// `is_established_link_msg1` composes its own: as an OR, not as an
+    /// if/else. An `addr_to_link` entry that yields no identity must not
+    /// short-circuit the address scan, because the two keys can be different
+    /// forms of the same peer's address (the hostname-vs-numeric case that
+    /// predicate 2 exists for) and the entry can outlive the link it named.
+    pub(in crate::node) fn msg1_waiver(
+        &self,
+        established: bool,
+        transport_id: crate::transport::TransportId,
+        remote_addr: &crate::transport::TransportAddr,
+    ) -> Msg1Waiver {
+        // The carve-out only admits anything when the gate would otherwise
+        // refuse, so an accepting transport has nothing to confirm.
+        if self
+            .transports
+            .get(&transport_id)
+            .is_none_or(|t| t.accept_connections())
+        {
+            return Msg1Waiver::NotNeeded;
+        }
+        if !established {
+            // `should_admit_msg1` refused this msg1 and the caller returned,
+            // so this arm is unreachable from the one call site. Fail closed
+            // rather than skipping the check, so a second caller cannot
+            // reintroduce the hole this classifier exists to close.
+            return Msg1Waiver::Unattributed;
+        }
+
+        // Predicate 1: the reverse-address lookup.
+        if let Some(&link_id) = self.addr_to_link.get(&(transport_id, remote_addr.clone())) {
+            if let Some(peer) = self.peers.values().find(|p| p.link_id() == link_id) {
+                return Msg1Waiver::Expect(*peer.node_addr());
+            }
+            // A link with no promoted peer: a dial in progress or an inbound
+            // handshake in flight. Both register a connection carrying the
+            // expected (outbound) or learned (inbound) identity.
+            if let Some(id) = self
+                .connections
+                .get(&link_id)
+                .and_then(|c| c.expected_identity())
+            {
+                return Msg1Waiver::Expect(*id.node_addr());
+            }
+            // Deliberately fall through instead of returning. The entry can
+            // name a link that no longer exists — `remove_link` clears the
+            // reverse lookup only under the key it rebuilds from the link's
+            // own remote address, so an entry inserted under a second
+            // address form for that link survives its removal. Rejecting
+            // here would refuse a peer predicate 2 can still attribute, and
+            // would refuse it permanently: this classifier's caller returns
+            // above the insert that overwrites the stale entry, so nothing
+            // downstream would ever repair the map.
+        }
+
+        // Predicate 2: the address scan over promoted peers, which always
+        // yields an identity when it matches.
+        self.peers
+            .values()
+            .find(|p| {
+                p.transport_id() == Some(transport_id) && p.current_addr() == Some(remote_addr)
+            })
+            .map(|p| Msg1Waiver::Expect(*p.node_addr()))
+            .unwrap_or(Msg1Waiver::Unattributed)
     }
 
     /// Returns true if an inbound msg1 should be admitted past the
@@ -134,6 +231,12 @@ impl Node {
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;
         }
+
+        // Snapshot which identity, if any, the address carve-out attributed
+        // this source to. Taken here rather than after the DH so the answer
+        // is the one the gate acted on. On an accepting transport this is one
+        // map lookup and a return.
+        let waiver = self.msg1_waiver(established, packet.transport_id, &packet.remote_addr);
 
         // Parse header
         let header = match Msg1Header::parse(&packet.data) {
@@ -262,6 +365,39 @@ impl Node {
         };
 
         let peer_node_addr = *peer_identity.node_addr();
+
+        // The address carve-out admitted this msg1 past a refusing gate on
+        // the strength of the source address alone. Now that the DH has
+        // revealed the initiator's static, confirm it belongs to the party
+        // that address is attributed to; an off-path party sourcing from an
+        // established peer's address gets no further than here. Cheap
+        // rejection is unchanged: a stranger under accept_connections=false
+        // is still refused above, having paid nothing.
+        match waiver {
+            Msg1Waiver::NotNeeded => {}
+            Msg1Waiver::Expect(expected) if expected == peer_node_addr => {}
+            Msg1Waiver::Expect(expected) => {
+                warn!(
+                    expected = %self.peer_display_name(&expected),
+                    actual = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %packet.transport_id,
+                    "Msg1 admitted by the established-address waiver carries a different identity, dropping"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                return;
+            }
+            Msg1Waiver::Unattributed => {
+                warn!(
+                    actual = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %packet.transport_id,
+                    "Msg1 admitted by the established-address waiver, but no identity owns that address, dropping"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                return;
+            }
+        }
 
         // Identity-based restart/rekey detection: if the peer is already
         // active but addr_to_link didn't match (different source address, e.g.,
