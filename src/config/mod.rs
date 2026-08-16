@@ -68,8 +68,7 @@ const PUB_FILENAME: &str = "fips.pub";
 /// Recognizes IPv4 `127.x.x.x`, IPv6 `::1` (with or without brackets), and
 /// the literal string `localhost`. Hostnames are conservatively assumed to
 /// be non-loopback. Used by `Config::validate()` to reject misconfigured
-/// loopback UDP binds combined with non-loopback peer addresses (see
-/// ISSUE-2026-0005).
+/// loopback UDP binds combined with non-loopback peer addresses.
 fn is_loopback_addr_str(addr: &str) -> bool {
     // Bracketed IPv6: `[::1]:port`
     if let Some(rest) = addr.strip_prefix('[')
@@ -896,9 +895,9 @@ impl Config {
         // Reject loopback UDP bind combined with non-loopback peer addresses.
         // Linux pins the source IP to a loopback-bound socket, so packets
         // sent from such a socket to external peers are dropped at the
-        // routing layer with no clear error in the daemon log. See
-        // ISSUE-2026-0005. Outbound-only mode is exempt because it
-        // overrides bind_addr to 0.0.0.0:0 (kernel-picked source).
+        // routing layer with no clear error in the daemon log.
+        // Outbound-only mode is exempt because it overrides bind_addr to
+        // 0.0.0.0:0 (kernel-picked source).
         for (name, cfg) in self.transports.udp.iter() {
             if cfg.outbound_only() {
                 continue;

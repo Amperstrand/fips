@@ -128,8 +128,7 @@ fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
 /// `BootstrapEvent::Established` events and `adopt_established_traversal` keeps
 /// only the first on a non-deterministic race; when the two nodes' independent
 /// races resolve to mismatched sessions, each side's Noise msg1 lands on a peer
-/// port the peer already stopped draining and both handshakes stall (root cause
-/// of ISSUE-2026-0031).
+/// port the peer already stopped draining and both handshakes stall.
 ///
 /// To collapse the four-socket dance to a single, guaranteed-matching socket
 /// pair, both nodes deterministically keep the session **initiated by the

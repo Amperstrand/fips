@@ -1322,8 +1322,6 @@ impl Node {
     /// Returning the smallest (rather than the first-iterated, which used
     /// to vary across HashMap iteration order + async-startup race) makes
     /// the clamp deterministic across daemon restarts.
-    ///
-    /// See `ISSUE-2026-0011` for the empirical investigation.
     pub fn transport_mtu(&self) -> u16 {
         let min_operational = self
             .transports
