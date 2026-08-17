@@ -308,6 +308,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour of the shipped binaries changes; this affects only callers using
   `fips` as a library.
 
+- The warning raised when a lookup response carries a path MTU below the
+  actionable floor now names the request it refused, as a `request_id` field on
+  the log line. Every other warning that handler emits already carried the
+  correlator, and this one could not: it is raised while the cached-coordinates
+  effect is applied, after the response itself has gone out of scope. An
+  operator reading the refusal therefore had a counter and a peer name but no
+  way to tie the line to a particular exchange, or to the sibling lines logged
+  for it. **Only the log line changes** — the response is still accepted, the
+  coordinates are still cached, the sub-floor path MTU is still discarded, and
+  the same counter is still charged.
+
 ### Deprecated
 
 - The `discovery` metric-family key (control-socket JSON). It is dual-emitted
