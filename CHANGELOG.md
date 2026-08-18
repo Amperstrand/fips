@@ -139,6 +139,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation, since it refuses every inbound offer rather than disabling the
   limit. Existing configurations parse unchanged, the key being optional.
 
+- The UDP transport's listen socket descriptor can now be handed to an
+  embedder, for hosts that associate a socket with one interface or network
+  and steer inbound traffic by that association rather than routing by
+  destination address. On such a host a peer reachable only over a secondary
+  network fails in a way FIPS can neither see nor fix: the address is
+  well-formed, the send succeeds, the peer replies, and the host discards the
+  reply before it reaches our socket, so the link retries msg1 forever with no
+  error surfaced anywhere. The correction is a socket option chosen against
+  host state FIPS has no basis to reason about, so the descriptor goes to
+  whoever does. Call `Node::enable_app_owned_udp_fd()` after `Node::new` and
+  before `start()`, and read `AppOwnedUdpSocket { instance, fd }` off the
+  returned channel once the transport is up, following the existing
+  `enable_app_owned_tun` contract. One message is sent per UDP transport that
+  binds, so a multi-listener configuration yields all of them; nothing is sent
+  when no UDP transport is configured or one fails to bind, so an embedder
+  tells "no socket" from "here is the socket" by the receive timing out. The
+  `instance` field is the name the listener was configured under, `None` for a
+  single unnamed instance, and it is what makes more than one listener usable:
+  transports are created by iterating a map, so arrival order is luck, and an
+  embedder whose whole purpose is to bind one socket to one network would
+  otherwise have to guess which socket it just received. Guessing wrong pins
+  one lane's socket to the other lane's network, which is the failure the seam
+  exists to correct. FIPS keeps owning the socket, and
+  the descriptor carries no promise beyond "this is the transport's socket,
+  and it is open now". Two limits: the per-peer connected-UDP sockets that
+  Linux and macOS open after `start()` returns are not covered, and a
+  transport that adopts a socket handed in by the traversal bootstrap does not
+  fire the seam. Unix only, since the Windows UDP backend has no descriptor.
+
 ### Changed
 
 - Node health is determined at start completion instead of unconditionally
