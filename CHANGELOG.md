@@ -168,6 +168,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport that adopts a socket handed in by the traversal bootstrap does not
   fire the seam. Unix only, since the Windows UDP backend has no descriptor.
 
+- A peer address may name which *instance* of a transport it belongs to, as
+  `transport: "udp/aware"` rather than `"udp"`, where the part after the slash
+  is the key the transport was configured under. A node running several
+  instances of one type could not be told them apart by a dialer: both bind
+  wildcard sockets, so the address-family test matches either, and selection
+  fell through to the lowest transport id. One socket carried every dial and
+  the other never carried traffic. A bare type is unqualified and matches any
+  instance, which is what every existing configuration and caller produces, so
+  nothing changes for a node that does not use the syntax. A qualified name is
+  never substituted with a different instance: that is the wrong-lane dial the
+  syntax exists to prevent, so an unmatched name fails the address instead, and
+  the same name is what an embedder binds by and what the dialer routes on. The
+  slash is already how FIPS qualifies an instance inside an address
+  (`eth0/aa:bb:...`) and cannot occur in a type name. Only UDP resolves an
+  instance name today; an address that qualifies any other transport type is
+  refused rather than matched loosely. **Because a qualified name never falls
+  back, the configuration validator rejects one that no configured transport
+  answers to**, naming the peer, the instance asked for and the instances that
+  exist. Otherwise the address would simply be skipped at every dial, which is
+  invisible for a peer that has a second address that works: the lane would
+  never carry traffic and nothing above debug logging would say so.
+
 ### Changed
 
 - Node health is determined at start completion instead of unconditionally
