@@ -49,7 +49,23 @@ pub use secp256k1::XOnlyPublicKey;
 /// The path-taking constructors exist for a program that is told where its
 /// daemon is; everything else uses this, the way a Berkeley call needs no
 /// argument to find the kernel.
+///
+/// **Platform-conditional, because the daemon's own default is.** The daemon
+/// resolves its path at startup by looking for a directory rather than by
+/// compiling a string, and macOS has no `/run` at all, so a client that
+/// compiled the Linux path there would look somewhere that cannot exist. The
+/// value here is the first branch of that resolver which applies to the
+/// platform: `/run/fips` on Linux, `/var/run/fips` on macOS and FreeBSD, whose
+/// packaged services create it.
+///
+/// A daemon that fell through to `$XDG_RUNTIME_DIR` or `/tmp`, which a
+/// development run usually does, is not at this path on any platform. That is
+/// what `connect_at` and `bind_at` are for, and it is why the resolver is
+/// documented rather than hidden.
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 pub const SOCKET: &str = "/run/fips/api.sock";
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub const SOCKET: &str = "/var/run/fips/api.sock";
 
 /// Bytes taken from the RPC connection per `recvmsg`.
 ///
@@ -442,7 +458,7 @@ impl FipsStream {
                 )
             };
             if sent < 0 {
-                let error = io::Error::last_os_error();
+                let error = seqpacket::peer_gone_as_epipe(io::Error::last_os_error());
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -458,8 +474,11 @@ impl FipsStream {
     /// is not end of file, and this is the one place where mimicking Berkeley
     /// exactly would be wrong: reading a zero-byte datagram as a close would let
     /// a peer tear down a live flow by sending nothing. A closed daemon half is
-    /// `EPIPE`, discriminated by `POLLHUP`, measured for this socket pair in
-    /// [`seqpacket`](super::seqpacket).
+    /// `EPIPE` on every platform, but the platforms disagree on how the kernel
+    /// says so: Linux discriminates a zero-byte read with `POLLHUP`, and Darwin
+    /// returns `ECONNRESET` outright. Both are measured for this socket pair in
+    /// [`seqpacket`](super::seqpacket), and both are translated to `EPIPE` here
+    /// so a caller never sees the difference.
     ///
     /// A datagram longer than `buf` is truncated and the remainder discarded,
     /// which is `SOCK_SEQPACKET` behaviour. Size `buf` at
@@ -471,7 +490,7 @@ impl FipsStream {
             let received =
                 unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
             if received < 0 {
-                let error = io::Error::last_os_error();
+                let error = seqpacket::peer_gone_as_epipe(io::Error::last_os_error());
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -985,22 +1004,36 @@ mod tests {
         let (passed, held) = seqpacket::pair().unwrap();
         let held = UnixStream::from(held);
 
-        // Both written before the client reads, so one recvmsg carries the
-        // plain line, the descriptor-bearing line and the descriptor. This is
-        // the measured rule: the ancillary data belongs to the sendmsg the read
-        // ended on, not to the first line the reader completes.
+        // Both are written before the client reads, so everything below is
+        // already queued and no read here waits on anything.
         (&daemon).write_all(REFUSAL).unwrap();
         fdpass::send_once(daemon.as_raw_fd(), CONNECT_REPLY, Some(passed.as_fd())).unwrap();
         drop(passed);
 
+        // **How many reads this takes is the platform's business, and asserting
+        // it was wrong.** Linux coalesces the plain write with the sendmsg that
+        // follows, so one recvmsg returns both lines and the descriptor. Darwin
+        // stops a stream read at the ancillary boundary, so the plain line
+        // arrives by itself and the descriptor-bearing line comes on the next
+        // read. Measured on macos-latest, where the earlier form of this test
+        // failed on exactly that difference.
+        //
+        // The rule under test is the same on both and is what the assertions
+        // below check: a descriptor belongs to the last complete line of the
+        // read that carried it. Darwin satisfies it more easily than Linux
+        // does, since the read it arrives on holds nothing later.
         let mut wire = Wire::new(client);
-        wire.fill().unwrap();
+        for _ in 0..4 {
+            if wire.lines.len() >= 2 {
+                break;
+            }
+            wire.fill().unwrap();
+        }
         assert_eq!(
             wire.lines.len(),
             2,
-            "the plain line and the descriptor-bearing one should arrive as one \
-             recvmsg; if they did not, the measured association rule this \
-             module rests on does not hold on this platform"
+            "both lines should have arrived within four reads of a socket that \
+             already held them"
         );
 
         let (first, first_fd) = wire.line().unwrap();

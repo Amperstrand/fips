@@ -23,11 +23,25 @@ use tokio::net::UnixStream;
 
 /// Space for the control message, sized at runtime and checked against this.
 ///
-/// `CMSG_SPACE(4)` is 24 bytes on the platforms this builds for. The array is
-/// `u64` so it carries the alignment `cmsghdr` requires, and is larger than
-/// needed so a platform with a wider header is caught by the assertion rather
-/// than by memory corruption.
+/// `CMSG_SPACE(4)` is 24 bytes on Linux and 16 on Darwin, whose `cmsghdr` is
+/// 12 bytes and whose alignment is 4 rather than 8. The array is `u64` so it
+/// carries the alignment `cmsghdr` requires, and at 64 bytes is larger than
+/// either, so a platform with a wider header is caught by the assertion rather
+/// than by memory corruption. Nothing computes from the number: the send path
+/// checks the runtime `CMSG_SPACE` against this buffer's size and the receive
+/// path offers the whole buffer.
 type CmsgBuf = [u64; 8];
+
+/// `recvmsg` flags that make a received descriptor close-on-exec.
+///
+/// Linux and FreeBSD do it atomically with `MSG_CMSG_CLOEXEC`, which is the
+/// only way to be certain no `fork` in another thread wins the race. macOS has
+/// no equivalent flag, so there is nothing to pass and [`recv`] sets
+/// `FD_CLOEXEC` on each descriptor afterwards instead.
+#[cfg(not(target_os = "macos"))]
+const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(target_os = "macos")]
+const RECV_FLAGS: libc::c_int = 0;
 
 /// Send `line` on `stream`, with `fd` in the ancillary data when given.
 ///
@@ -154,9 +168,10 @@ pub(super) struct Chunk {
 /// the kernel closes the descriptor rather than queueing it, so the reply looks
 /// right and the flow is silently gone.
 ///
-/// `MSG_CMSG_CLOEXEC` keeps a received descriptor out of a child the client
-/// forks later. `EINTR` is retried, because a signal delivered during the wait
-/// says nothing about the connection.
+/// A received descriptor is kept out of a child the client forks later, by
+/// [`RECV_FLAGS`] where the platform has a flag for it and by an `fcntl` on
+/// each descriptor where it does not. `EINTR` is retried, because a signal
+/// delivered during the wait says nothing about the connection.
 pub(super) fn recv(sock: RawFd, buf: &mut [u8]) -> io::Result<Chunk> {
     loop {
         let mut iov = libc::iovec {
@@ -173,11 +188,20 @@ pub(super) fn recv(sock: RawFd, buf: &mut [u8]) -> io::Result<Chunk> {
 
         // SAFETY: `sock` is the caller's open socket, and `msg` describes
         // buffers that outlive the call.
-        let received = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        let received = unsafe { libc::recvmsg(sock, &mut msg, RECV_FLAGS) };
         if received < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
+            }
+            // A listener's descriptor is a socket pair half, and Darwin reports
+            // its closed peer as ECONNRESET where Linux returns a zero-byte
+            // message. They are the same event, so it is reported as the empty
+            // chunk every caller here already reads as the far end going away.
+            // Doing it here rather than in each caller keeps `accept`'s
+            // documented EPIPE true on both platforms.
+            if error.raw_os_error() == Some(libc::ECONNRESET) {
+                return Ok(Chunk { len: 0, fd: None });
             }
             return Err(error);
         }
@@ -185,6 +209,17 @@ pub(super) fn recv(sock: RawFd, buf: &mut [u8]) -> io::Result<Chunk> {
         // SAFETY: recvmsg succeeded, so it filled `msg_control` within
         // `msg_controllen`, and `control` is still alive.
         let mut fds = unsafe { take_fds(&msg) };
+
+        // Darwin has no `MSG_CMSG_CLOEXEC`, so the flag is set here instead.
+        // Later than the atomic form and with the same window `seqpacket::pair`
+        // documents: a concurrent `fork` and `exec` in these few instructions
+        // would inherit the descriptor. A failure to set it is reported rather
+        // than ignored, because the descriptor is live either way and the
+        // caller must not be told the receive was clean.
+        #[cfg(target_os = "macos")]
+        for fd in &fds {
+            super::seqpacket::set_cloexec(fd.as_raw_fd())?;
+        }
 
         // Whatever did arrive is taken before the truncation check, so nothing
         // leaks on that path: dropping an `OwnedFd` closes it. The connection

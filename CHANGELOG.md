@@ -245,8 +245,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counterpart in Berkeley sockets and a client author must know it: the v1
   wire carries no half-close, so nothing peer-driven ever closes a flow, and a
   server written to read until the flow ends waits for a signal that cannot
-  arrive. The listener is built on `SOCK_SEQPACKET`, so it is available on
-  Linux and FreeBSD.
+  arrive. The listener uses `SOCK_SEQPACKET` on Linux and FreeBSD and
+  `SOCK_DGRAM` on macOS, which does not implement `SOCK_SEQPACKET` for
+  `AF_UNIX`; both keep the message boundaries the API's contract with its
+  clients rests on. The two kernels signal a closed peer differently and were
+  measured rather than reasoned about, so the receive path treats a Darwin
+  `ECONNRESET` as end of file alongside the `POLLHUP` and zero-byte read that
+  Linux gives. `EAGAIN` is deliberately not in that company: it means the
+  socket is empty and the peer alive, so it stays an error and the caller
+  waits again.
 
 ### Changed
 

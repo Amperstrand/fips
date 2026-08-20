@@ -25,13 +25,15 @@
 //! real limit: the transport MTU less the FIPS encapsulation and the four-byte
 //! port header.
 //!
-//! **Platform support.** The listener is built on Linux and FreeBSD only, and
-//! two separate things bound that. Windows has no `SCM_RIGHTS` and so no way to
-//! hand a descriptor to another process at all. macOS has `SCM_RIGHTS` but does
-//! not implement `SOCK_SEQPACKET` for `AF_UNIX`, so only the descriptor's
-//! socket type is missing there; see [`seqpacket`] for what a macOS port would
-//! have to settle. The gate is explicit rather than `cfg(unix)` so macOS fails
-//! to build here instead of failing at `socketpair` on a running node.
+//! **Platform support.** The listener is built on Linux, FreeBSD and macOS.
+//! Windows is excluded and cannot be included: it has no `SCM_RIGHTS`, so there
+//! is no way to hand a descriptor to another process at all, which is the whole
+//! mechanism. macOS needed only the descriptor's socket type, since it has
+//! `SCM_RIGHTS` but does not implement `SOCK_SEQPACKET` for `AF_UNIX`; see
+//! [`seqpacket`] for the type it uses instead and for the measured difference
+//! in how the two report a close. The gate is an explicit platform list rather
+//! than `cfg(unix)` so a platform nobody has measured fails to build here
+//! instead of failing at `socketpair` on a running node.
 //!
 //! - `protocol.rs` — the command types and the pure decisions over them. No
 //!   I/O, no node state.
@@ -53,23 +55,29 @@ pub mod link;
 pub mod protocol;
 pub mod registry;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+// Tests only, and compiled on every unix rather than only where the listener
+// is, because its whole purpose is to compare one kernel's answer with
+// another's. See the module header.
+#[cfg(all(test, unix))]
+mod dgram_probe;
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 pub mod client;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 pub mod fdpass;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 pub mod seqpacket;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 pub use unix_impl::NativeApi;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 mod unix_impl {
     use super::fdpass;
     use super::link::{Accepted, DropReason, NativeMessage, Outbound, Outcome};
     use super::protocol::{self, Command, Connect, Inject, Listen};
     use super::registry::{Arrival, Datagram, FlowKey, Limits, RegistryError};
-    use super::seqpacket::{Received, Seqpacket, pair, set_sndbuf};
+    use super::seqpacket::{Received, Seqpacket, pair, set_rcvbuf, set_sndbuf};
     use crate::config::NativeApiConfig;
     use crate::control::protocol::{Request, Response};
     use crate::identity::{NodeAddr, decode_npub, encode_npub};
@@ -726,6 +734,29 @@ mod unix_impl {
     /// it too, and a listener has no connection to reach it through.
     fn wire_flow(per_flow: usize) -> std::io::Result<(Wiring, OwnedFd, mpsc::Sender<Datagram>)> {
         let (ours, theirs) = pair()?;
+
+        // `hand_over` writes a flow's whole held batch onto this pair before the
+        // client has the descriptor, so nothing is reading while it is written
+        // and the batch has to fit in the kernel's buffer.
+        //
+        // **Both halves are sized because the two kernels charge different
+        // ones.** Linux accounts an `AF_UNIX` message against the sender's
+        // `SO_SNDBUF`, which is generous by default; BSD queues it in the
+        // receiver's `so_rcv`, whose `SOCK_DGRAM` default on Darwin is small
+        // enough that a two or three datagram batch fills it. Sizing only the
+        // sender, as the listener pair does, leaves the flow pair unbounded by
+        // anything this code sets on Darwin, and the first batch past the
+        // ceiling destroys the whole arriving flow before its client ever sees
+        // it. Neither call is fatal: a flow with a default-sized buffer works,
+        // it just holds less.
+        let budget = per_flow.max(1) * ARRIVAL_ALLOWANCE;
+        if let Err(error) = set_sndbuf(&ours, budget) {
+            warn!(error = %error, "Could not size a native API flow's send buffer");
+        }
+        if let Err(error) = set_rcvbuf(&theirs, budget) {
+            warn!(error = %error, "Could not size a native API flow's receive buffer");
+        }
+
         let sock = Arc::new(Seqpacket::new(ours)?);
         let (sink, inbound) = mpsc::channel::<Datagram>(per_flow.max(1));
         Ok((Wiring { sock, inbound }, theirs, sink))
@@ -936,13 +967,25 @@ mod unix_impl {
     /// What a failed hand-off write says about the client, for the counter.
     ///
     /// Both take the same three-part cleanup, so this decides only what an
-    /// operator is told: `EPIPE` is a client that closed its listener between
-    /// the arrival being taken off the queue and this write, which a healthy
-    /// client can lose, and anything else is a full send buffer, which is a
-    /// client that stopped reading. Reporting the two alike would leave a
-    /// normal close looking like a fault.
+    /// operator is told: a gone listener is a client that closed between the
+    /// arrival being taken off the queue and this write, which a healthy client
+    /// can lose, and anything else is a full send buffer, which is a client that
+    /// stopped reading. Reporting the two alike would leave a normal close
+    /// looking like a fault.
+    ///
+    /// **Three errnos mean "gone", because the platforms do not agree.** Linux
+    /// `SOCK_SEQPACKET` reports a closed peer as `EPIPE`. Darwin disconnects the
+    /// survivor of a `SOCK_DGRAM` pair instead, so its first send gives
+    /// `ECONNRESET` and later ones `EDESTADDRREQ`, and neither is `BrokenPipe`.
+    /// Matching on the kind alone would file every ordinary macOS listener close
+    /// under the counter an operator reads to find a wedged client.
     pub(super) fn why(error: &std::io::Error) -> DropReason {
-        if error.kind() == std::io::ErrorKind::BrokenPipe {
+        let gone = error.kind() == std::io::ErrorKind::BrokenPipe
+            || matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNRESET) | Some(libc::EDESTADDRREQ)
+            );
+        if gone {
             DropReason::ListenerGone
         } else {
             DropReason::ListenerNotReading
@@ -1114,9 +1157,24 @@ mod unix_impl {
     }
 
     /// Write datagrams the node delivered onto the client's descriptor.
+    ///
+    /// **A full client buffer drops the datagram and keeps the flow.** On Linux
+    /// this never arrives here: the send reports `EAGAIN` and `Seqpacket::send`
+    /// waits for the client to drain. Darwin's `SOCK_DGRAM` has no sender-side
+    /// queue to wait on, so an unread client surfaces as `ENOBUFS` on the send
+    /// itself. Returning on it would end this flow's only writer while the
+    /// registration, the port and the reader all stayed alive, so every later
+    /// inbound datagram would be counted as a full queue for the rest of the
+    /// flow's life, and a client that resumed reading would never recover.
+    /// Dropping the datagram is what a datagram API does when the far end
+    /// cannot take it.
     async fn feed(sock: Arc<Seqpacket>, mut inbound: mpsc::Receiver<Datagram>) {
         while let Some(datagram) = inbound.recv().await {
             if let Err(error) = sock.send(&datagram).await {
+                if error.raw_os_error() == Some(libc::ENOBUFS) {
+                    debug!(error = %error, "Native API flow write dropped a datagram");
+                    continue;
+                }
                 debug!(error = %error, "Native API flow write failed");
                 return;
             }
@@ -1204,7 +1262,10 @@ mod unix_impl {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "freebsd", target_os = "macos")
+))]
 mod tests {
     use super::link::{self, NativeMessage, Outbound};
     use super::registry::{Limits, Registry};
@@ -1733,6 +1794,41 @@ mod tests {
         .expect_err("the arrival write failed");
 
         assert_eq!(reason, link::DropReason::ListenerGone);
+    }
+
+    #[test]
+    fn a_gone_listener_is_recognised_by_every_errno_a_platform_uses_for_it() {
+        // The same event, spelled three ways. Linux SOCK_SEQPACKET reports a
+        // closed peer as EPIPE; Darwin disconnects the survivor of a SOCK_DGRAM
+        // pair, so its first send gives ECONNRESET and later ones EDESTADDRREQ.
+        // Matching on ErrorKind::BrokenPipe alone recognises only the first, and
+        // would file every ordinary macOS listener close under the counter an
+        // operator reads to find a client that has stopped reading.
+        //
+        // Built from raw errnos rather than ErrorKind, because that is the only
+        // form that distinguishes them: ECONNRESET maps to ConnectionReset and
+        // EDESTADDRREQ to Uncategorized, and neither is BrokenPipe.
+        use super::unix_impl::why;
+        use std::io::Error;
+
+        for errno in [libc::EPIPE, libc::ECONNRESET, libc::EDESTADDRREQ] {
+            assert_eq!(
+                why(&Error::from_raw_os_error(errno)),
+                link::DropReason::ListenerGone,
+                "errno {errno} should count as a listener that went away"
+            );
+        }
+
+        // The discrimination has to survive: a full buffer is still a client
+        // that stopped reading, and folding everything into ListenerGone would
+        // pass the loop above while destroying what the counter is for.
+        for errno in [libc::ENOBUFS, libc::EAGAIN] {
+            assert_eq!(
+                why(&Error::from_raw_os_error(errno)),
+                link::DropReason::ListenerNotReading,
+                "errno {errno} should still count as a client not reading"
+            );
+        }
     }
 
     #[test]

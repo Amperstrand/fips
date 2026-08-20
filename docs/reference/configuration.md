@@ -404,7 +404,7 @@ tuning under high load or on memory-constrained devices.
 
 ### Native Datagram API (`node.native_api.*`)
 
-**Experimental, off by default, and built on Linux and FreeBSD only.** A
+**Experimental, off by default, and built on Linux, FreeBSD and macOS only.** A
 client process connects to a Unix socket and asks either to open a flow to a
 remote pubkey or to hold a local port. Both answers carry a file descriptor:
 a flow's, which the client sends and receives datagrams on, or a listener's,
@@ -1072,7 +1072,7 @@ node:
     enabled: true
     socket_path: null                # null = auto (platform runtime dir → XDG → /tmp)
   # native_api:                      # uncomment to enable the experimental native datagram API
-  #   enabled: true                  # opt-in, default false; Linux and FreeBSD only
+  #   enabled: true                  # opt-in, default false; not on Windows
   #   socket_path: /run/fips/api.sock  # omit the key for the resolution above
   #   pending_per_flow: 16           # datagrams held for one flow; 1..=64
   #   backlog: 16                    # flows announced on one listener, awaiting its task; at least 1

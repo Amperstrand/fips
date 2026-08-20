@@ -200,7 +200,7 @@ that is enabled.
 ## Native Datagram API
 
 **Experimental. Disabled by default** (`node.native_api.enabled`, default
-`false`), and built on Linux and FreeBSD only. It is not a stable API
+`false`), and built on Linux, FreeBSD and macOS only. It is not a stable API
 surface, not a reliability layer, and not the v2 external process API. No
 compatibility promise is made about it.
 

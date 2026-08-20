@@ -135,8 +135,8 @@ impl Node {
         drop(control_tx);
 
         // Native datagram API socket. Experimental, off by default, and built
-        // on Linux and FreeBSD only: Windows has no way to pass a descriptor
-        // between processes, and macOS has no AF_UNIX SOCK_SEQPACKET. Bound
+        // on Linux, FreeBSD and macOS: Windows has no way to pass a descriptor
+        // between processes at all, which is the mechanism itself. Bound
         // synchronously so a bad path or a socket already in use is reported
         // here, before the node starts serving, rather than at whatever later
         // moment a spawned bind happened to run.
@@ -154,7 +154,7 @@ impl Node {
             // there is no listener the channel exists and nothing ever sends,
             // and the guard keeps it open so the arm never sees a closed
             // receiver.
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
             let guard = {
                 let mut guard = Some(tx.clone());
                 if self.config().node.native_api.enabled {
@@ -174,7 +174,7 @@ impl Node {
                 }
                 guard
             };
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
             let guard = Some(tx.clone());
             (rx, guard)
         };

@@ -936,7 +936,7 @@ impl ControlConfig {
 
 /// Native datagram API socket (`node.native_api.*`).
 ///
-/// **Experimental, and built on Linux and FreeBSD only.** The API hands a
+/// **Experimental, and built on Linux, FreeBSD and macOS only.** The API hands a
 /// client a file descriptor over `SCM_RIGHTS`, which Windows has no equivalent
 /// of, and does it over an `AF_UNIX` `SOCK_SEQPACKET` socket, which macOS does
 /// not implement. No listener is built on either, and this section is ignored
@@ -1294,7 +1294,7 @@ pub struct NodeConfig {
     pub control: ControlConfig,
 
     /// Native datagram API (`node.native_api.*`). Experimental; the listener
-    /// is built on Linux and FreeBSD only.
+    /// is built on Linux, FreeBSD and macOS only.
     #[serde(default, skip_serializing_if = "NativeApiConfig::is_default")]
     pub native_api: NativeApiConfig,
 

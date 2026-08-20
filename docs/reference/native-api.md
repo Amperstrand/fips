@@ -41,10 +41,12 @@ fixed string. The resolver takes the first of these that applies and appends
 `api.sock`:
 
 1. `/run/fips/api.sock`, when `/run/fips` exists as a directory. This is the
-   packaged Linux convention and the constant the shipped Rust client compiles
-   in.
-2. `/var/run/fips/api.sock` on FreeBSD, whose service scripts create that
-   directory. Linux skips this step.
+   packaged Linux convention, and the constant the shipped Rust client compiles
+   in on Linux.
+2. `/var/run/fips/api.sock` on FreeBSD and macOS, whose service scripts and
+   LaunchDaemons create that directory. Linux skips this step, and macOS has no
+   `/run` for step 1 to find, so this is where a packaged macOS daemon lands and
+   is the constant the client compiles in there.
 3. `$XDG_RUNTIME_DIR/fips/api.sock`, when that variable names an existing
    directory. A development run usually gets this one.
 4. `/tmp/fips-api.sock`, the last resort.
@@ -374,7 +376,7 @@ oversize datagram from anything else.
 
 Compare against the `libc` constant, never against a literal. The client maps
 each name onto `libc::<NAME>` for the platform it was built for, so the number
-differs between Linux and FreeBSD.
+differs between Linux, FreeBSD and macOS.
 
 | errno | `kind()` | What causes it |
 | ----- | -------- | -------------- |

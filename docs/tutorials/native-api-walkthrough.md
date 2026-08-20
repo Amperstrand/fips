@@ -14,7 +14,7 @@ you can build the daemon from source and can read Rust; it does not assume you
 have worked through the tutorials.
 
 **The API is experimental.** Names, fields and the command set may change
-without a deprecation cycle. It is Linux and FreeBSD only.
+without a deprecation cycle. It is Linux, FreeBSD and macOS only.
 
 ## What you will end up with
 

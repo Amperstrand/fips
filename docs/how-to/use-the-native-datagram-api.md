@@ -9,7 +9,23 @@ descriptor it reads and writes datagrams on.
 It is not a stable API surface, not a reliability layer, and not the
 v2 external process API. No compatibility promise is made: the socket
 protocol, the Rust client, and the configuration keys may change or be
-withdrawn in any release. It is built on Linux and FreeBSD only.
+withdrawn in any release. It is built on Linux, FreeBSD and macOS only.
+
+**The macOS build is exercised less than the others, and you should know
+by how much.** The socket type differs there: macOS has no
+`SOCK_SEQPACKET` for `AF_UNIX`, so a flow descriptor is a `SOCK_DGRAM`
+socket, which keeps message boundaries just the same but reports a
+closed peer differently. The unit tests run on macOS in the project's
+own automation and pass in full. The end-to-end suite does not: it
+drives a client container against a node container over a shared
+volume, and that arrangement is Linux only. So on macOS the socket
+lifecycle, the descriptor hand-off across a process boundary, and the
+reclaiming of a port when a client exits are covered by unit tests
+rather than by anything that runs the daemon and a client as two real
+processes.
+
+That is a gap in testing, not a known defect. It is written here
+because you are the one who would meet it first.
 
 Before enabling it, read the security posture below. It is short and
 it is the whole of the access control.
