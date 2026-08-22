@@ -206,6 +206,7 @@ fn draw_routing_stats(
             ("Timed Out", disc("resp_timed_out")),
             ("Identity Miss", disc("resp_identity_miss")),
             ("Proof Failed", disc("resp_proof_failed")),
+            ("Unsolicited", disc("resp_unsolicited")),
             ("Decode Error", disc("resp_decode_error")),
         ],
     ));

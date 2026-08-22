@@ -334,6 +334,7 @@ pub struct DiscoveryStatsSnapshot {
     pub resp_forwarded: u64,
     pub resp_identity_miss: u64,
     pub resp_proof_failed: u64,
+    pub resp_unsolicited: u64,
     pub resp_no_route: u64,
     pub resp_accepted: u64,
     pub resp_timed_out: u64,

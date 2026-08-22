@@ -185,6 +185,32 @@ impl Node {
             let target = response.target;
             let path_mtu = response.path_mtu;
 
+            // Correlate against our own outstanding lookups first. The
+            // request_id is fresh 64-bit randomness we drew per attempt and
+            // the target signs over it, so requiring the response to carry
+            // one we issued for this target is what makes this path
+            // solicited: an unsolicited or replayed response is dropped
+            // here, before the identity resolve and before the signature
+            // verify, and so cannot clear pending state, record a backoff
+            // success, refresh the coordinate cache, or flush queued
+            // packets. A duplicate of a response already accepted lands
+            // here too, which is ordinary and is why this is debug level.
+            let solicited = self
+                .pending_lookups
+                .get(&target)
+                .is_some_and(|pending| pending.matches(response.request_id));
+            if !solicited {
+                self.metrics()
+                    .discovery
+                    .record_reject(DiscoveryReject::RespUnsolicited);
+                debug!(
+                    request_id = response.request_id,
+                    target = %self.peer_display_name(&target),
+                    "LookupResponse does not match an outstanding request, dropping"
+                );
+                return;
+            }
+
             // Look up the target's public key from identity_cache
             let mut prefix = [0u8; 15];
             prefix.copy_from_slice(&target.as_bytes()[0..15]);
@@ -487,12 +513,22 @@ impl Node {
     /// filters contain the target. Returns the number of peers sent to.
     /// The originator does NOT record the request_id in recent_requests,
     /// so when the response arrives, it's recognized as "our request".
+    /// It records the id on the target's pending entry instead, which is
+    /// what the response path correlates against; recording it here rather
+    /// than in the callers keeps "if a request went out, its id is
+    /// recorded" true for every caller.
     pub(in crate::node) async fn initiate_lookup(&mut self, target: &NodeAddr, ttl: u8) -> usize {
         self.metrics().discovery.req_initiated.inc();
 
         let origin = *self.node_addr();
         let origin_coords = self.tree_state().my_coords().clone();
         let request = LookupRequest::generate(*target, origin, origin_coords, ttl, 0);
+
+        let now_ms = Self::now_ms();
+        self.pending_lookups
+            .entry(*target)
+            .or_insert_with(|| PendingLookup::new(now_ms))
+            .record(request.request_id);
 
         // Send only to tree peers whose bloom filter contains the target
         let peer_addrs: Vec<NodeAddr> = self
@@ -790,6 +826,18 @@ impl Node {
     }
 }
 
+/// How many outstanding `request_id`s one pending lookup remembers.
+///
+/// Bounds the per-target correlator at eight u64s. The retry ladder
+/// (`node.discovery.attempt_timeouts_secs`) is operator configuration and
+/// can be longer than this, so the recorder evicts the oldest id rather
+/// than refusing the newest: dropping the newest would discard the id most
+/// likely to be answered and fail a healthy lookup. Raising this costs
+/// eight bytes per extra attempt on every pending target and widens the
+/// set of ids a late response may still match; lowering it means a reply
+/// to an early attempt on a long ladder is dropped as unsolicited.
+const MAX_RECORDED_IDS: usize = 8;
+
 /// Tracks a pending discovery lookup with retry state.
 pub struct PendingLookup {
     /// When the lookup was first initiated.
@@ -798,6 +846,12 @@ pub struct PendingLookup {
     pub last_sent_ms: u64,
     /// Current attempt number (1 = initial, 2 = first retry, ...).
     pub attempt: u8,
+    /// `request_id`s issued for this target, oldest first, capped at
+    /// [`MAX_RECORDED_IDS`]. A response is only acted on when it carries
+    /// one of these, which is what makes the accept path solicited. The
+    /// entry itself is dropped at ladder timeout, so this set needs no
+    /// expiry of its own.
+    pub ids: Vec<u64>,
 }
 
 impl PendingLookup {
@@ -806,6 +860,23 @@ impl PendingLookup {
             initiated_ms: now_ms,
             last_sent_ms: now_ms,
             attempt: 1,
+            ids: Vec::new(),
         }
+    }
+
+    /// Remember a `request_id` we just put on the wire for this target.
+    pub fn record(&mut self, request_id: u64) {
+        if self.ids.contains(&request_id) {
+            return;
+        }
+        if self.ids.len() >= MAX_RECORDED_IDS {
+            self.ids.remove(0);
+        }
+        self.ids.push(request_id);
+    }
+
+    /// Whether `request_id` is one this node issued for this target.
+    pub fn matches(&self, request_id: u64) -> bool {
+        self.ids.contains(&request_id)
     }
 }

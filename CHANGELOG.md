@@ -1052,6 +1052,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claimed source and destination pairing no honest forwarder could produce.
   The drop log line now carries the signal type and the refusal class.
 
+- A discovery lookup response is now acted on only when it answers a lookup
+  this node actually has outstanding. The originator path took any response
+  whose `request_id` was not in the transit dedup map, so an admitted peer
+  could harvest one genuine signed response for a target and re-inject it at
+  will: each injection cleared the victim's in-flight lookup, recorded a
+  reachability success for a target that might be unreachable, refreshed the
+  cached coordinates for a further full TTL, and flushed the victim's queued
+  packets onto a route at a moment the sender chose. It also reached the
+  signature verify before any check that the response was wanted, so the
+  verify was the first cost gate on the path. The node now records the
+  `request_id` of every lookup request it sends on that target's pending
+  entry, and a response is dropped unless it names a target with a lookup
+  outstanding and carries one of the ids issued for it. Because the id is
+  fresh 64-bit randomness drawn per attempt and the target signs over it, a
+  harvested response is bound to the request it answered and cannot be
+  redirected or replayed. The check runs before the identity-cache resolve
+  and before the signature verify, so a response nobody asked for costs
+  nothing. Replies to earlier attempts of a still-outstanding lookup are
+  still accepted, which is the common case on a link whose round trip
+  exceeds the first rung of the retry ladder. Drops are counted as
+  `resp_unsolicited`, visible through `show routing`, `show metrics` and the
+  fipstop routing pane; the counter has a nonzero floor in healthy operation,
+  because a request is flooded to every qualifying tree peer and the
+  duplicate replies land there once the first has been accepted.
+
 #### Admission / peer caps
 
 - The Ethernet transport's discovery buffer is now bounded and no longer costs

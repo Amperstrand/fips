@@ -29,7 +29,8 @@
       "resp_no_route": 0,
       "resp_proof_failed": 0,
       "resp_received": 0,
-      "resp_timed_out": 0
+      "resp_timed_out": 0,
+      "resp_unsolicited": 0
     },
     "error_signals": {
       "coords_required": 0,

@@ -84,6 +84,18 @@ async fn test_request_ttl_zero_not_forwarded() {
 // Unit Tests — LookupResponse Handler
 // ============================================================================
 
+/// Record `request_id` as outstanding for `target`, exactly as
+/// `initiate_lookup` does when it puts a request on the wire. The response
+/// handler correlates against this, so a unit test that hands the handler a
+/// response without it is testing the correlation gate rather than whatever
+/// it names.
+fn seed_pending_lookup(node: &mut Node, target: crate::NodeAddr, request_id: u64) {
+    node.pending_lookups
+        .entry(target)
+        .or_insert_with(|| handlers::discovery::PendingLookup::new(Node::now_ms()))
+        .record(request_id);
+}
+
 #[tokio::test]
 async fn test_response_decode_error() {
     let mut node = make_node();
@@ -106,6 +118,8 @@ async fn test_response_originator_caches_route() {
 
     // Register target identity in cache so verification can find it
     node.register_identity(target, target_identity.pubkey_full());
+
+    seed_pending_lookup(&mut node, target, 555);
 
     // Create a valid response with a real proof signature (includes coords)
     let proof_data = LookupResponse::proof_bytes(555, &target, &coords);
@@ -183,6 +197,8 @@ async fn test_response_proof_verification_success() {
     // Register target in identity_cache
     node.register_identity(target, target_identity.pubkey_full());
 
+    seed_pending_lookup(&mut node, target, 700);
+
     // Sign with correct proof_bytes (including coords)
     let proof_data = LookupResponse::proof_bytes(700, &target, &coords);
     let proof = target_identity.sign(&proof_data);
@@ -218,6 +234,8 @@ async fn test_response_proof_verification_failure() {
     node.register_identity(target, target_identity.pubkey_full());
 
     // Sign with a DIFFERENT identity (wrong key)
+    seed_pending_lookup(&mut node, target, 701);
+
     let wrong_identity = Identity::generate();
     let proof_data = LookupResponse::proof_bytes(701, &target, &coords);
     let proof = wrong_identity.sign(&proof_data);
@@ -250,6 +268,8 @@ async fn test_response_identity_cache_miss() {
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
 
     // Do NOT register target in identity_cache
+
+    seed_pending_lookup(&mut node, target, 702);
 
     let proof_data = LookupResponse::proof_bytes(702, &target, &coords);
     let proof = target_identity.sign(&proof_data);
@@ -285,6 +305,8 @@ async fn test_response_coord_substitution_detected() {
     // Register target in identity_cache
     node.register_identity(target, target_identity.pubkey_full());
 
+    seed_pending_lookup(&mut node, target, 703);
+
     // Sign proof with real coords
     let proof_data = LookupResponse::proof_bytes(703, &target, &real_coords);
     let proof = target_identity.sign(&proof_data);
@@ -303,6 +325,255 @@ async fn test_response_coord_substitution_detected() {
         !node.coord_cache().contains(&target, now_ms),
         "Substituted coords should be detected and response discarded"
     );
+}
+
+/// Build a signed LookupResponse body for `target_identity` over
+/// `request_id`, ready to hand to `handle_lookup_response`.
+fn signed_response_body(
+    target_identity: &Identity,
+    request_id: u64,
+    coords: &TreeCoordinate,
+) -> Vec<u8> {
+    let target = *target_identity.node_addr();
+    let proof_data = LookupResponse::proof_bytes(request_id, &target, coords);
+    let proof = target_identity.sign(&proof_data);
+    LookupResponse::new(request_id, target, coords.clone(), proof).encode()[1..].to_vec()
+}
+
+/// Register `target_identity` and return its address and a plausible
+/// coordinate for it, the shared preamble of the correlation tests.
+fn register_lookup_target(node: &mut Node, target_identity: &Identity) -> TreeCoordinate {
+    let target = *target_identity.node_addr();
+    node.register_identity(target, target_identity.pubkey_full());
+    TreeCoordinate::from_addrs(vec![target, make_node_addr(0xF0)]).unwrap()
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn test_unsolicited_lookup_response_is_dropped_before_proof_verification() {
+    // Any admitted peer can hand us a correctly signed response for a target
+    // we never asked about. Accepting it lets that peer clear our pending
+    // state, refresh a cache entry's TTL and flush our queued packets at a
+    // moment it picks, so the response must not be acted on at all.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let coords = register_lookup_target(&mut node, &target_identity);
+    let body = signed_response_body(&target_identity, 900, &coords);
+
+    assert!(
+        node.pending_lookups.is_empty(),
+        "precondition: this node has no lookup outstanding for anything"
+    );
+
+    node.handle_lookup_response(&from, &body).await;
+
+    assert!(
+        !node.coord_cache().contains(&target, wall_clock_ms()),
+        "a response answering no request of ours must not reach the coordinate cache"
+    );
+    assert_eq!(
+        node.metrics().discovery.resp_accepted.get(),
+        0,
+        "an unsolicited response must not count as accepted"
+    );
+    assert_eq!(
+        node.metrics().discovery.resp_unsolicited.get(),
+        1,
+        "the drop must be visible on a counter, not only in a log"
+    );
+    assert_eq!(
+        node.metrics().discovery.resp_proof_failed.get(),
+        0,
+        "the drop must happen before the signature verify, so the verify is not a cost gate"
+    );
+}
+
+#[tokio::test]
+async fn test_lookup_response_with_a_request_id_we_never_issued_is_dropped() {
+    // Correlating on the target alone would leave the attack open: there is
+    // no inbound limiter on responses, so a peer can spray a harvested one
+    // and land inside any window in which we happen to be looking that
+    // target up. The id must match too.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let coords = register_lookup_target(&mut node, &target_identity);
+
+    node.initiate_lookup(&target, 5).await;
+    let issued = node.pending_lookups.get(&target).unwrap().ids.clone();
+    assert_eq!(issued.len(), 1, "precondition: one attempt went out");
+
+    let body = signed_response_body(&target_identity, issued[0] ^ 1, &coords);
+    node.handle_lookup_response(&from, &body).await;
+
+    assert!(
+        !node.coord_cache().contains(&target, wall_clock_ms()),
+        "a response bearing an id we never issued must not reach the coordinate cache"
+    );
+    assert!(
+        node.pending_lookups.contains_key(&target),
+        "it must not cancel the lookup that is genuinely outstanding"
+    );
+    assert_eq!(node.metrics().discovery.resp_unsolicited.get(), 1);
+}
+
+#[tokio::test]
+async fn test_a_response_matching_a_pending_attempt_is_accepted_and_clears_the_pending_lookup() {
+    // The healthy path. A fix that reds a legitimate lookup is no use, and
+    // this is the test that catches it.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let coords = register_lookup_target(&mut node, &target_identity);
+
+    node.initiate_lookup(&target, 5).await;
+    let issued = node.pending_lookups.get(&target).unwrap().ids[0];
+
+    let body = signed_response_body(&target_identity, issued, &coords);
+    node.handle_lookup_response(&from, &body).await;
+
+    assert_eq!(
+        node.coord_cache().get(&target, wall_clock_ms()),
+        Some(&coords),
+        "a response to our own outstanding request must be cached"
+    );
+    assert!(
+        !node.pending_lookups.contains_key(&target),
+        "accepting it must clear the pending lookup"
+    );
+    assert_eq!(node.metrics().discovery.resp_accepted.get(), 1);
+    assert_eq!(node.metrics().discovery.resp_unsolicited.get(), 0);
+}
+
+#[tokio::test]
+async fn test_a_late_response_for_an_earlier_retry_attempt_is_still_accepted() {
+    // Each retry draws a fresh id, and on any link with more than a second
+    // of round trip the reply to an earlier attempt is the common case. A
+    // correlator that remembered only the newest id would drop it.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let coords = register_lookup_target(&mut node, &target_identity);
+
+    node.initiate_lookup(&target, 5).await;
+    node.initiate_lookup(&target, 5).await;
+    let issued = node.pending_lookups.get(&target).unwrap().ids.clone();
+    assert_eq!(issued.len(), 2, "precondition: two attempts, two ids");
+
+    let body = signed_response_body(&target_identity, issued[0], &coords);
+    node.handle_lookup_response(&from, &body).await;
+
+    assert_eq!(
+        node.coord_cache().get(&target, wall_clock_ms()),
+        Some(&coords),
+        "the first attempt's id is still ours and its answer must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn test_a_second_genuine_response_after_the_first_is_accepted_is_dropped() {
+    // The request is flooded to every qualifying tree peer, so duplicate
+    // replies are routine. They are dropped at the correlation gate, which
+    // gives the unsolicited counter a nonzero floor in healthy operation:
+    // it is not by itself a sign of attack traffic.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let coords = register_lookup_target(&mut node, &target_identity);
+
+    node.initiate_lookup(&target, 5).await;
+    let issued = node.pending_lookups.get(&target).unwrap().ids[0];
+    let body = signed_response_body(&target_identity, issued, &coords);
+
+    node.handle_lookup_response(&from, &body).await;
+    node.handle_lookup_response(&from, &body).await;
+
+    assert_eq!(
+        node.coord_cache().get(&target, wall_clock_ms()),
+        Some(&coords),
+        "the value written by the first response must still be there"
+    );
+    assert_eq!(
+        node.metrics().discovery.resp_accepted.get(),
+        1,
+        "only the first of the two answers our request"
+    );
+    assert_eq!(
+        node.metrics().discovery.resp_unsolicited.get(),
+        1,
+        "the duplicate is counted, which is why the counter has a healthy floor"
+    );
+}
+
+#[tokio::test]
+async fn test_a_validly_signed_response_for_a_retired_lookup_is_dropped() {
+    // The pending entry's lifetime is what bounds how stale an accepted
+    // coordinate can be. Once the retry ladder is exhausted and the entry
+    // goes, a transit node holding the genuine reply can no longer deliver
+    // it late.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let coords = register_lookup_target(&mut node, &target_identity);
+
+    node.initiate_lookup(&target, 5).await;
+    let issued = node.pending_lookups.get(&target).unwrap().ids[0];
+
+    // Drive the whole ladder: three retries, then the final timeout.
+    let mut now_ms = Node::now_ms();
+    for _ in 0..4 {
+        now_ms += 100_000;
+        node.check_pending_lookups(now_ms).await;
+    }
+    assert!(
+        !node.pending_lookups.contains_key(&target),
+        "precondition: the ladder retired the lookup"
+    );
+
+    let body = signed_response_body(&target_identity, issued, &coords);
+    node.handle_lookup_response(&from, &body).await;
+
+    assert!(
+        !node.coord_cache().contains(&target, wall_clock_ms()),
+        "a reply to a retired lookup must not install a coordinate"
+    );
+    assert_eq!(node.metrics().discovery.resp_unsolicited.get(), 1);
+}
+
+#[test]
+fn pending_lookup_id_set_evicts_the_oldest_id_rather_than_refusing_the_newest() {
+    // The retry ladder is operator configuration and can be longer than the
+    // recorded-id cap. Refusing the newest id would discard the attempt most
+    // likely to be answered and fail a healthy lookup.
+    let mut pending = handlers::discovery::PendingLookup::new(0);
+    for id in 0..12u64 {
+        pending.record(id);
+    }
+    assert!(
+        pending.matches(11),
+        "the newest attempt's id must always be remembered"
+    );
+    assert!(!pending.matches(0), "the oldest id is the one evicted");
+    assert_eq!(pending.ids.len(), 8, "the set stays bounded");
 }
 
 // ============================================================================
@@ -886,6 +1157,8 @@ async fn test_originator_stores_path_mtu_in_cache() {
 
     node.register_identity(target, target_identity.pubkey_full());
 
+    seed_pending_lookup(&mut node, target, 800);
+
     let proof_data = LookupResponse::proof_bytes(800, &target, &coords);
     let proof = target_identity.sign(&proof_data);
 
@@ -929,6 +1202,8 @@ async fn test_originator_ignores_sub_floor_path_mtu_but_still_caches_coords() {
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
 
     node.register_identity(target, target_identity.pubkey_full());
+
+    seed_pending_lookup(&mut node, target, 801);
 
     let proof_data = LookupResponse::proof_bytes(801, &target, &coords);
     let proof = target_identity.sign(&proof_data);
@@ -980,6 +1255,8 @@ async fn test_actionable_lookup_response_path_mtu_does_not_bump_below_floor_coun
 
     node.register_identity(target, target_identity.pubkey_full());
 
+    seed_pending_lookup(&mut node, target, 802);
+
     let proof_data = LookupResponse::proof_bytes(802, &target, &coords);
     let proof = target_identity.sign(&proof_data);
 
@@ -1021,6 +1298,8 @@ async fn test_originator_lookup_response_keeps_tighter_path_mtu_lookup() {
     let target_fips = crate::FipsAddress::from_node_addr(&target);
     node.path_mtu_lookup_insert(target_fips, 1280);
 
+    seed_pending_lookup(&mut node, target, 800);
+
     let proof_data = LookupResponse::proof_bytes(800, &target, &coords);
     let proof = target_identity.sign(&proof_data);
 
@@ -1055,6 +1334,7 @@ fn make_verified_lookup_response(
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
 
     node.register_identity(target, target_identity.pubkey_full());
+    seed_pending_lookup(node, target, request_id);
 
     let proof_data = LookupResponse::proof_bytes(request_id, &target, &coords);
     let proof = target_identity.sign(&proof_data);

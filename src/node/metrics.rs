@@ -281,6 +281,7 @@ pub struct DiscoveryMetrics {
     pub resp_forwarded: Counter,
     pub resp_identity_miss: Counter,
     pub resp_proof_failed: Counter,
+    pub resp_unsolicited: Counter,
     pub resp_no_route: Counter,
     pub resp_accepted: Counter,
     pub resp_timed_out: Counter,
@@ -299,6 +300,7 @@ impl DiscoveryMetrics {
             DiscoveryReject::RespDecodeError => self.resp_decode_error.inc(),
             DiscoveryReject::RespIdentityMiss => self.resp_identity_miss.inc(),
             DiscoveryReject::RespProofFailed => self.resp_proof_failed.inc(),
+            DiscoveryReject::RespUnsolicited => self.resp_unsolicited.inc(),
             DiscoveryReject::RespNoRoute => self.resp_no_route.inc(),
         }
     }
@@ -325,6 +327,7 @@ impl DiscoveryMetrics {
             resp_forwarded: self.resp_forwarded.get(),
             resp_identity_miss: self.resp_identity_miss.get(),
             resp_proof_failed: self.resp_proof_failed.get(),
+            resp_unsolicited: self.resp_unsolicited.get(),
             resp_no_route: self.resp_no_route.get(),
             resp_accepted: self.resp_accepted.get(),
             resp_timed_out: self.resp_timed_out.get(),

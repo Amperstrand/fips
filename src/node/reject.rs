@@ -136,6 +136,14 @@ pub enum DiscoveryReject {
     /// Response proof signature failed verification. Tracked via
     /// [`DiscoveryStats::resp_proof_failed`](crate::node::stats::DiscoveryStats).
     RespProofFailed,
+    /// Response arrived on the originator path but carries no
+    /// `request_id` this node has outstanding for the named target, so
+    /// it answers no lookup of ours. Expected to be nonzero in healthy
+    /// operation: the request is flooded to every qualifying tree peer,
+    /// so duplicate replies land here after the first is accepted.
+    /// Tracked via
+    /// [`DiscoveryStats::resp_unsolicited`](crate::node::stats::DiscoveryStats).
+    RespUnsolicited,
     /// Response could not be routed toward the origin: no reverse-path
     /// entry for the `request_id` and no greedy tree route to the
     /// origin. Tracked via
@@ -371,6 +379,7 @@ mod tests {
             DiscoveryReject::RespDecodeError,
             DiscoveryReject::RespIdentityMiss,
             DiscoveryReject::RespProofFailed,
+            DiscoveryReject::RespUnsolicited,
         ];
         for v in variants {
             let r = RejectReason::Discovery(v);
