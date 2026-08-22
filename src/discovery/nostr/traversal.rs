@@ -32,6 +32,19 @@ pub(super) enum PunchStrategy {
 /// 400 packets, about 21 KB on the wire at 52 bytes each for IPv4.
 const MAX_PUNCH_TARGETS: usize = 8;
 
+/// Upper bound on how many candidates one peer's signal may have vetted.
+///
+/// Vetting is linear in this number and the `push_unique` scan that follows
+/// is quadratic in the plan it feeds, so an unbounded candidate list lets one
+/// signal buy an unbounded amount of our planning work regardless of the
+/// eight-target cap, which only applies after both loops have run. Thirty-two
+/// is four times `MAX_PUNCH_TARGETS` and four times what the candidate
+/// generator produces on the widest host we have seen, so an honest peer
+/// never reaches it. Raising it costs planning work per admitted signal;
+/// lowering it costs an honest many-homed peer the tail of its candidate
+/// list, which the tally records either way.
+const MAX_OFFERED_CANDIDATES: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlannedPunchTarget {
     pub(super) strategy: PunchStrategy,
@@ -42,6 +55,12 @@ pub(super) struct PlannedPunchTarget {
     /// The remote address already parsed and canonicalized by `admit_remote`,
     /// so the endpoint list never has to re-parse peer-supplied text.
     pub(super) remote_ip: IpAddr,
+}
+
+/// Whether a candidate's address text parses as a private or unique-local
+/// address.
+fn is_private_address(candidate: &TraversalAddress) -> bool {
+    candidate.ip.parse::<IpAddr>().is_ok_and(is_private_ip)
 }
 
 fn same_subnet_24(left: &TraversalAddress, right: &TraversalAddress) -> bool {
@@ -151,6 +170,8 @@ pub(super) struct PunchTargetTally {
     pub(super) offsubnet: usize,
     /// Planned targets discarded by the target cap.
     pub(super) capped: usize,
+    /// Candidates past `MAX_OFFERED_CANDIDATES` that were never vetted.
+    pub(super) over_offered: usize,
     /// The class label that refused the peer's reflexive address, if it was
     /// refused. Held apart from the candidate counts because losing the
     /// reflexive branch removes every path that works across arbitrary NATs,
@@ -170,12 +191,21 @@ impl PunchTargetTally {
     /// entirely refused offer is the reflector case itself. An off-subnet-only
     /// refusal is the ordinary dual-homed shape and is not suspicious.
     ///
-    /// A refused reflexive address always counts: the /24 gate does not apply
-    /// to it, so the only ways it can be refused are the attacker-shaped ones.
+    /// A refused reflexive address counts unless the class is `OffSubnet`.
+    /// The /24 gate now applies to a peer's reflexive address whenever our own
+    /// reflexive address is public, so an off-subnet refusal of it is what an
+    /// honest peer behind a LAN STUN server produces against a node with a
+    /// public one. The other three classes still have no honest producer.
+    ///
+    /// A candidate list longer than `MAX_OFFERED_CANDIDATES` counts too: the
+    /// generator tops out near eight, so nothing honest reaches the bound.
     pub(super) fn suspicious(&self) -> bool {
         self.unroutable + self.zeroport + self.unparsable + self.capped > 0
+            || self.over_offered > 0
             || (self.offered > 0 && self.admitted == 0)
-            || self.reflexive.is_some()
+            || self
+                .reflexive
+                .is_some_and(|label| label != RejectClass::OffSubnet.label())
     }
 
     /// Record one refused candidate against its class, keeping the first
@@ -212,10 +242,13 @@ impl PunchTargetTally {
 ///
 /// Returns the parsed address, or the class of the check that refused it.
 /// `lan_refs` are our own addresses that a private candidate must share a /24
-/// with. `apply_private_gate` is false for the peer's reflexive address: a
-/// STUN server inside the private network legitimately reports a private
-/// reflexive address, and dropping it would remove the only branch that works
-/// across arbitrary NATs.
+/// with. `apply_private_gate` is conditionally false for the peer's reflexive
+/// address: a STUN server inside the private network legitimately reports a
+/// private reflexive address, and dropping it would remove the only branch
+/// that works across arbitrary NATs. That exemption applies only when our own
+/// reflexive address is itself private, or absent; a node whose own STUN
+/// result is public has no LAN in common with a private reflexive address and
+/// would only be punching an address of the peer's choosing.
 fn admit_remote(
     candidate: &TraversalAddress,
     lan_refs: &[TraversalAddress],
@@ -261,28 +294,42 @@ pub(super) fn plan_punch_targets(
         ..PunchTargetTally::default()
     };
 
+    // Whether our own vantage point is a LAN one: either STUN reported a
+    // private address for us, or it reported nothing at all. The second case
+    // is deliberately treated as a LAN vantage point rather than a public one,
+    // so a node whose STUN probe failed, or that runs without STUN, keeps
+    // admitting a same-LAN peer's private reflexive address as it always has.
+    let local_reflexive_on_lan = local_reflexive_address.is_none_or(is_private_address);
+
     // Our own addresses a peer's private candidate has to share a /24 with.
     // The local reflexive address joins the set when it is itself private,
     // which is what keeps a LAN-STUN deployment able to match while the
     // shipped `share_local_candidates=false` leaves the local list empty.
     let mut lan_refs = local_addresses.to_vec();
     if let Some(reflexive) = local_reflexive_address
-        && reflexive.ip.parse::<IpAddr>().is_ok_and(is_private_ip)
+        && is_private_address(reflexive)
     {
         lan_refs.push(reflexive.clone());
     }
 
+    // A peer names its own candidate list, so bound it before anything walks
+    // it. The excess is recorded and discarded rather than failing the whole
+    // offer, which would cost an honest many-homed peer its traversal.
+    let considered = &remote_addresses[..remote_addresses.len().min(MAX_OFFERED_CANDIDATES)];
+    tally.over_offered = remote_addresses.len() - considered.len();
+
     // Everything on the remote side is peer-supplied, so it is vetted once
     // here and the branches below only ever see admitted candidates.
-    let remote_reflexive =
-        remote_reflexive_address.and_then(|remote| match admit_remote(remote, &lan_refs, false) {
+    let remote_reflexive = remote_reflexive_address.and_then(|remote| {
+        match admit_remote(remote, &lan_refs, !local_reflexive_on_lan) {
             Ok(ip) => Some((remote, ip)),
             Err(class) => {
                 tally.refuse_reflexive(class, remote);
                 None
             }
-        });
-    let remote_candidates = remote_addresses
+        }
+    });
+    let remote_candidates = considered
         .iter()
         .filter_map(|remote| match admit_remote(remote, &lan_refs, true) {
             Ok(ip) => Some((remote, ip)),

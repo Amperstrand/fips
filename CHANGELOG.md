@@ -761,6 +761,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the one dialed, which RFC 5389 forbids, now times out and the next
   configured server is tried.
 
+- The exemption that lets a peer's reflexive address skip the private-address
+  gate is now conditional on our own vantage point. That exemption exists for
+  the deployment whose STUN server sits inside the private network, so the
+  observed reflexive address is legitimately private; it was applied
+  unconditionally, so a node whose own STUN result was public still punched
+  whatever private address a peer named as its reflexive one. Any sender whose
+  offer or answer was accepted could therefore aim a burst of UDP packets,
+  carrying this node's source address, at a host inside the node's own private
+  network, which is the one place the candidate filter was written to keep it
+  out of. The gate now applies whenever our own reflexive address is public.
+  It stays lifted when our own reflexive address is itself private, which is
+  the LAN-STUN deployment the exemption was for, and also when we have no
+  reflexive address at all, so a failed STUN probe cannot cost a node its
+  same-LAN peering. Two consequences to state rather than discover: a peer
+  behind a private STUN server talking to a node with a public one loses its
+  reflexive candidate, which was never reachable from us in any case, and
+  because the /24 comparison is IPv4-only a unique-local IPv6 reflexive
+  address is refused unless our own reflexive address is unique-local too.
+  An off-subnet refusal of a peer's reflexive address is a shape an honest
+  deployment now produces, so it no longer raises the refusal record to
+  warning level on its own; the never-routable, port-0 and unparsable classes
+  still do.
+
+- A peer's candidate list is now bounded before it is walked rather than only
+  after. The eight-target cap ran after both planning loops had finished, so
+  it bounded what a node punched but not what it spent deciding: a signal
+  naming several thousand candidates had every one of them parsed and vetted,
+  and the deduplicating scan that follows is quadratic in the plan those
+  candidates feed. At most 32 candidates are now vetted, four times the
+  target cap and four times what the candidate generator produces on the
+  widest host, and the excess is discarded rather than failing the offer, so
+  an honest many-homed peer loses the tail of its list instead of its
+  traversal. The refusal record carries the discarded count as a new
+  `over_offered` field and treats a non-zero one as an attack shape, since
+  nothing honest reaches the bound.
+
 - Traversal punch targets taken from a peer's offer or answer are now
   filtered and bounded. A rendezvous-enabled node previously punched every
   address a signed offer named, including loopback, link-local, multicast,

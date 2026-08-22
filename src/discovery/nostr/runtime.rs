@@ -83,7 +83,7 @@ pub(super) fn short_id(id: &str) -> String {
 /// node collects by default and those refusals are the ones an operator needs
 /// to see; the routine off-subnet case stays at `debug`.
 fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
-    if tally.offered <= tally.admitted && tally.capped == 0 {
+    if tally.offered <= tally.admitted && tally.capped == 0 && tally.over_offered == 0 {
         return;
     }
     let sample = tally.sample.as_deref().unwrap_or("-");
@@ -99,6 +99,7 @@ fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
             unroutable = tally.unroutable,
             offsubnet = tally.offsubnet,
             capped = tally.capped,
+            over_offered = tally.over_offered,
             reflexive = %reflexive,
             sample = %sample,
             "traversal: punch candidates refused"
@@ -114,6 +115,7 @@ fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
             unroutable = tally.unroutable,
             offsubnet = tally.offsubnet,
             capped = tally.capped,
+            over_offered = tally.over_offered,
             reflexive = %reflexive,
             sample = %sample,
             "traversal: punch candidates refused"

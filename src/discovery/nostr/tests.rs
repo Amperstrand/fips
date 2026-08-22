@@ -699,7 +699,11 @@ fn planned_remote_endpoints_bound_an_oversized_list_of_unroutable_candidates() {
         endpoints,
         vec!["198.51.100.20:63000".parse::<SocketAddr>().unwrap()]
     );
-    assert_eq!(tally.unroutable, 300);
+    // Only the first MAX_OFFERED_CANDIDATES are vetted at all now, so the
+    // unroutable count is the bound rather than the whole list; the rest are
+    // recorded as never having been looked at.
+    assert_eq!(tally.unroutable, 32);
+    assert_eq!(tally.over_offered, 268);
     assert_eq!(tally.admitted, 1);
     assert!(tally.suspicious());
 }
@@ -708,6 +712,10 @@ fn planned_remote_endpoints_bound_an_oversized_list_of_unroutable_candidates() {
 /// so the observed reflexive address is itself private. Applying the /24 gate
 /// to a peer's reflexive address would drop it and remove the only branch
 /// that works across arbitrary NATs; this test reds if anyone does that.
+///
+/// The exemption is conditional on exactly the vantage point this test sets
+/// up: our own reflexive address is private here, so it still applies. The
+/// two tests below cover the public and absent cases.
 #[test]
 fn planned_remote_endpoints_keep_private_reflexive_when_stun_is_on_the_lan() {
     let (endpoints, _tally) = planned_remote_endpoints(
@@ -719,6 +727,88 @@ fn planned_remote_endpoints_keep_private_reflexive_when_stun_is_on_the_lan() {
     .expect("endpoint planning should succeed");
 
     assert!(endpoints.contains(&"192.168.1.20:63000".parse().unwrap()));
+}
+
+/// A node whose own STUN result is public shares no LAN with a private
+/// address, so a peer's private reflexive address is only ever an address of
+/// the peer's choosing. Admitting it made the reflexive branch a way to have
+/// this node punch inside its own private network; the /24 gate now applies.
+#[test]
+fn a_peers_private_reflexive_address_is_refused_when_our_own_stun_result_is_public() {
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[],
+        Some(&addr("192.168.1.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(endpoints.is_empty());
+    assert_eq!(tally.reflexive, Some("off-subnet"));
+}
+
+/// The conditional gate keys on our own reflexive address being private, and
+/// a node with no reflexive address at all has to keep behaving as it did:
+/// a failed STUN probe must not cost same-LAN peering.
+#[test]
+fn a_peers_private_reflexive_address_is_kept_when_we_have_no_stun_result_at_all() {
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[addr("192.168.1.10", 62000)],
+        None,
+        &[],
+        Some(&addr("192.168.1.20", 63000)),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(endpoints.contains(&"192.168.1.20:63000".parse().unwrap()));
+    assert_eq!(tally.reflexive, None);
+}
+
+/// Refusing a peer's private reflexive address is now something an honest
+/// asymmetric-STUN deployment produces, so it must not warn on its own. The
+/// never-routable case above still does.
+#[test]
+fn an_off_subnet_reflexive_refusal_alone_is_not_suspicious() {
+    let (_planned, tally) = plan_punch_targets(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("203.0.113.5", 63000)],
+        Some(&addr("192.168.1.20", 63000)),
+    );
+
+    assert_eq!(tally.reflexive, Some("off-subnet"));
+    assert!(
+        tally.admitted > 0,
+        "the host-candidate path should still plan"
+    );
+    assert!(!tally.suspicious());
+}
+
+/// The eight-target cap runs after both planning loops, so it bounds the
+/// output and not the work. The discriminating assertion is `unroutable`:
+/// vetting every candidate would count all thousand, so a count of exactly
+/// `MAX_OFFERED_CANDIDATES` is what proves the excess was never walked.
+#[test]
+fn an_oversized_candidate_list_is_bounded_before_vetting() {
+    let mut remotes = Vec::new();
+    for index in 0..1000u32 {
+        remotes.push(addr(
+            &format!("127.0.0.{}", 1 + (index % 254)),
+            63000 + (index % 1000) as u16,
+        ));
+    }
+
+    let (_planned, tally) = plan_punch_targets(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &remotes,
+        Some(&addr("198.51.100.20", 63000)),
+    );
+
+    assert_eq!(tally.offered, 1001);
+    assert_eq!(tally.unroutable, 32);
+    assert_eq!(tally.over_offered, 968);
+    assert!(tally.suspicious());
 }
 
 /// The four refusal classes tell four different operational stories, so a
