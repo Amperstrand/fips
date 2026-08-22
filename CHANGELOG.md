@@ -797,6 +797,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `over_offered` field and treats a non-zero one as an attack shape, since
   nothing honest reaches the bound.
 
+- A NAT-punch packet is now accepted only from an address this node planned to
+  probe. The punch packet's discriminator is a plain digest of the session id,
+  a value both peers already know, and it travels in the clear in every probe,
+  so acceptance proved only that the sender had seen one. The receive loop
+  broke on the first packet whose digest matched, whatever its source, and
+  returned that source as the peer address, so anyone who observed a probe, or
+  who could reach the node and guess the session id, could have an arbitrary
+  address adopted as the peer: the legitimate traversal was denied, the Noise
+  handshake and its retransmissions went to an address of the attacker's
+  choosing, and the pair was charged a failure against its backoff state. The
+  npub-pinned handshake still could not authenticate to the wrong host, so this
+  was a denial and a misdirection rather than an impersonation. The source
+  address is now ranked against the planned target list before anything else:
+  an unplanned source is dropped and, deliberately, is not acked either, since
+  acking it is a reflection the node controls. A source matching a planned
+  target exactly is adopted immediately, as before. A source matching a planned
+  target's IP on a different port is what a symmetric NAT's fresh mapping looks
+  like, and it is still adopted, because that is the main class of NAT pairing
+  punching exists to rescue; it is held as a candidate for 250 ms first, so an
+  exact match arriving inside that window supersedes it. The honest path's
+  latency is unchanged. Two consequences to state rather than discover: an
+  attacker that can source packets from a planned target's IP on any port is
+  still accepted, which is the residue only an authenticated probe can close;
+  and an attempt under a flood of spoofed matching packets now runs to its full
+  timeout instead of ending on the first one, so the refused sources are
+  counted and reported once when the attempt ends rather than logged per
+  packet.
+
 - Traversal punch targets taken from a peer's offer or answer are now
   filtered and bounded. A rendezvous-enabled node previously punched every
   address a signed offer named, including loopback, link-local, multicast,

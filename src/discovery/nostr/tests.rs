@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use nostr::nips::nip17;
 use nostr::prelude::{EventBuilder, Kind, RelayUrl, Tag, Timestamp};
@@ -14,8 +15,9 @@ use super::signal::{
 };
 use super::stun::{parse_stun_binding_success, parse_stun_url};
 use super::traversal::{
-    PunchStrategy, build_punch_packet, is_doc_ip, is_never_punchable_ip, is_private_ip, now_ms,
-    parse_punch_packet, plan_punch_targets, planned_remote_endpoints, session_hash,
+    PunchStrategy, SourceRank, build_punch_packet, is_doc_ip, is_never_punchable_ip, is_private_ip,
+    now_ms, parse_punch_packet, plan_punch_targets, planned_remote_endpoints, rank_punch_source,
+    run_punch_attempt, session_hash,
 };
 use super::types::BootstrapError;
 use super::{
@@ -1371,6 +1373,219 @@ async fn signal_events_use_current_timestamps() {
 
     assert!(created_at >= before);
     assert!(created_at <= after);
+}
+
+/// A loopback socket bound on `host`, non-blocking as both production call
+/// sites leave it, since `run_punch_attempt` hands it straight to
+/// `UdpSocket::from_std`.
+fn punch_socket(host: &str) -> std::net::UdpSocket {
+    let socket = std::net::UdpSocket::bind(format!("{host}:0")).expect("bind a loopback socket");
+    socket
+        .set_nonblocking(true)
+        .expect("the punch socket must be non-blocking");
+    socket
+}
+
+/// A hint that starts punching immediately. `start_at_ms` is absolute wall
+/// clock, so anything plausible-looking in the future would sleep out the test.
+fn immediate_punch_hint(duration_ms: u64) -> PunchHint {
+    PunchHint {
+        start_at_ms: 0,
+        interval_ms: 20,
+        duration_ms,
+    }
+}
+
+/// Send one well-formed probe carrying `session_id`'s hash from `from` to
+/// `to`, which is what a replay of captured punch bytes looks like.
+fn send_probe(from: &std::net::UdpSocket, to: SocketAddr, session_id: &str) {
+    let packet = build_punch_packet(PunchPacketKind::Probe, 1, session_id);
+    from.send_to(&packet, to).expect("probe should send");
+}
+
+/// Whether anything readable on `socket` is a punch ack.
+fn received_an_ack(socket: &std::net::UdpSocket) -> bool {
+    let mut buf = [0u8; 2048];
+    while let Ok((len, _)) = socket.recv_from(&mut buf) {
+        if parse_punch_packet(&buf[..len])
+            .map(|packet| packet.kind == PunchPacketKind::Ack)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn rank_punch_source_accepts_a_planned_target() {
+    let target: SocketAddr = "198.51.100.20:63000".parse().unwrap();
+    assert_eq!(rank_punch_source(target, &[target]), SourceRank::Planned);
+}
+
+#[test]
+fn rank_punch_source_reports_a_planned_targets_other_port_as_remapped() {
+    let target: SocketAddr = "198.51.100.20:63000".parse().unwrap();
+    let remapped: SocketAddr = "198.51.100.20:41234".parse().unwrap();
+    assert_eq!(
+        rank_punch_source(remapped, &[target]),
+        SourceRank::RemappedPort
+    );
+}
+
+#[test]
+fn rank_punch_source_rejects_an_address_we_never_planned_to_probe() {
+    let target: SocketAddr = "198.51.100.20:63000".parse().unwrap();
+    let stranger: SocketAddr = "203.0.113.9:63000".parse().unwrap();
+    assert_eq!(
+        rank_punch_source(stranger, &[target]),
+        SourceRank::Unplanned
+    );
+}
+
+/// The regression test for the defect. The punch packet's discriminator is a
+/// digest of a value both peers already know and it travels in the clear in
+/// every probe, so anyone who has seen one can replay it. Acceptance is now
+/// constrained to the targets this node planned; the spoofer is neither
+/// adopted nor acked, and an ack would be a reflection we control.
+#[tokio::test]
+async fn a_matching_punch_packet_from_an_unplanned_source_is_neither_adopted_nor_acked() {
+    let victim = punch_socket("127.0.0.3");
+    let peer = punch_socket("127.0.0.1");
+    let spoofer = punch_socket("127.0.0.2");
+    let victim_addr = victim.local_addr().expect("victim address");
+    let targets = vec![peer.local_addr().expect("peer address")];
+
+    send_probe(&spoofer, victim_addr, "session-unplanned");
+    let result = run_punch_attempt(
+        &victim,
+        "session-unplanned",
+        &targets,
+        immediate_punch_hint(400),
+        Duration::from_millis(700),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(BootstrapError::PunchTimeout(_))),
+        "a spoofed source must not be adopted, got {result:?}"
+    );
+    assert!(
+        !received_an_ack(&spoofer),
+        "an unplanned source must not be acked"
+    );
+}
+
+/// The spoofer wins the race on arrival order and still loses on address.
+#[tokio::test]
+async fn a_planned_source_is_adopted_even_when_a_spoofer_replies_first() {
+    let victim = punch_socket("127.0.0.3");
+    let peer = punch_socket("127.0.0.1");
+    let spoofer = punch_socket("127.0.0.2");
+    let victim_addr = victim.local_addr().expect("victim address");
+    let peer_addr = peer.local_addr().expect("peer address");
+
+    send_probe(&spoofer, victim_addr, "session-race");
+    send_probe(&peer, victim_addr, "session-race");
+    let result = run_punch_attempt(
+        &victim,
+        "session-race",
+        &[peer_addr],
+        immediate_punch_hint(400),
+        Duration::from_millis(700),
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("the planned peer should be adopted"),
+        peer_addr
+    );
+}
+
+/// The healthy path, which is the check that the source constraint does not
+/// red a legitimately clean run: one probe from the single planned target is
+/// adopted immediately and acked.
+#[tokio::test]
+async fn the_ordinary_probe_from_a_planned_target_is_still_adopted_and_acked() {
+    let victim = punch_socket("127.0.0.3");
+    let peer = punch_socket("127.0.0.1");
+    let victim_addr = victim.local_addr().expect("victim address");
+    let peer_addr = peer.local_addr().expect("peer address");
+
+    send_probe(&peer, victim_addr, "session-healthy");
+    let result = run_punch_attempt(
+        &victim,
+        "session-healthy",
+        &[peer_addr],
+        immediate_punch_hint(400),
+        Duration::from_millis(700),
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("the planned peer should be adopted"),
+        peer_addr
+    );
+    assert!(received_an_ack(&peer), "a planned probe should be acked");
+}
+
+/// Peer-reflexive discovery: a symmetric NAT allocates a fresh port toward us,
+/// so the peer's probe arrives from an address that is not in the plan but
+/// shares a planned target's IP. Adopting it is the main class of NAT pairing
+/// punching exists to rescue, and this test reds if the rule is ever tightened
+/// to exact matching without that being reopened deliberately.
+#[tokio::test]
+async fn a_planned_targets_remapped_port_is_adopted_when_that_is_all_that_arrives() {
+    let victim = punch_socket("127.0.0.3");
+    let peer = punch_socket("127.0.0.1");
+    let victim_addr = victim.local_addr().expect("victim address");
+    let peer_addr = peer.local_addr().expect("peer address");
+    // The address the peer's own STUN observation named, before its NAT
+    // remapped the port: same host, a port nothing is bound to.
+    let stale_target = SocketAddr::new(peer_addr.ip(), peer_addr.port().wrapping_add(1).max(1));
+
+    send_probe(&peer, victim_addr, "session-remapped");
+    let result = run_punch_attempt(
+        &victim,
+        "session-remapped",
+        &[stale_target],
+        immediate_punch_hint(400),
+        Duration::from_millis(2000),
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("a remapped port on a planned target should be adopted"),
+        peer_addr
+    );
+}
+
+/// An exact match inside the settle window supersedes a remapped one that
+/// arrived first, which is what the window is for.
+#[tokio::test]
+async fn an_exact_target_supersedes_a_remapped_port_inside_the_settle_window() {
+    let victim = punch_socket("127.0.0.3");
+    let peer = punch_socket("127.0.0.1");
+    let neighbour = punch_socket("127.0.0.1");
+    let victim_addr = victim.local_addr().expect("victim address");
+    let peer_addr = peer.local_addr().expect("peer address");
+
+    send_probe(&neighbour, victim_addr, "session-settle");
+    send_probe(&peer, victim_addr, "session-settle");
+    let result = run_punch_attempt(
+        &victim,
+        "session-settle",
+        &[peer_addr],
+        immediate_punch_hint(400),
+        Duration::from_millis(2000),
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("the exact target should win"),
+        peer_addr,
+        "an exact match must supersede a source that only shares the IP"
+    );
 }
 
 fn node_addr(first_byte: u8) -> NodeAddr {

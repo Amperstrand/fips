@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
+use tracing::debug;
 
 use super::types::{
     BootstrapError, PUNCH_ACK_MAGIC, PUNCH_MAGIC, PunchHint, PunchPacket, PunchPacketKind,
@@ -44,6 +45,48 @@ const MAX_PUNCH_TARGETS: usize = 8;
 /// lowering it costs an honest many-homed peer the tail of its candidate
 /// list, which the tally records either way.
 const MAX_OFFERED_CANDIDATES: usize = 32;
+
+/// How long the punch loop keeps listening for an exact target match once it
+/// has already accepted a planned target's address on a different port.
+///
+/// A source that matches a planned target's IP but not its port is what a
+/// symmetric NAT's fresh mapping toward us looks like, and it is worth
+/// adopting; a source that matches a target exactly is worth more, so the
+/// first remapped source does not end the attempt outright. Raising this
+/// delays adoption on the remapped path only, never past the attempt timeout;
+/// lowering it toward zero makes the first remapped source win.
+const PUNCH_SETTLE_MS: u64 = 250;
+
+/// How much the source address of a punch packet is worth as a peer address.
+///
+/// The packet's own discriminator is a plain digest of a value both peers
+/// already know, so it proves only that the sender has seen a probe. What the
+/// source address is checked against is the target list this node planned,
+/// which is the difference between adopting a peer we chose to probe and
+/// adopting whoever replayed those bytes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum SourceRank {
+    /// Not an address we planned to probe, and so not adoptable.
+    Unplanned,
+    /// A planned target's address on a different port.
+    RemappedPort,
+    /// Exactly a target we planned to probe.
+    Planned,
+}
+
+/// Rank one punch packet's source address against the targets we planned.
+///
+/// `targets` holds at most `MAX_PUNCH_TARGETS` entries, so the scan is
+/// bounded by construction.
+pub(super) fn rank_punch_source(remote: SocketAddr, targets: &[SocketAddr]) -> SourceRank {
+    if targets.contains(&remote) {
+        SourceRank::Planned
+    } else if targets.iter().any(|target| target.ip() == remote.ip()) {
+        SourceRank::RemappedPort
+    } else {
+        SourceRank::Unplanned
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlannedPunchTarget {
@@ -474,10 +517,21 @@ pub(super) async fn run_punch_attempt(
 
     let expected_hash = session_hash(session_id);
     let mut buf = [0u8; 2048];
+    // Counted rather than logged per packet: an attacker sets how many of
+    // these arrive, so a record each would trade the adoption this closes for
+    // log volume. One record at the end of the attempt instead.
+    let mut unplanned = 0usize;
+    let mut superseded = 0usize;
+    let mut candidate: Option<SocketAddr> = None;
+    let mut settle_at: Option<tokio::time::Instant> = None;
     let result = loop {
-        let recv = tokio::time::timeout_at(finish_at, udp.recv_from(&mut buf)).await;
+        let deadline = settle_at.map_or(finish_at, |settle| settle.min(finish_at));
+        let recv = tokio::time::timeout_at(deadline, udp.recv_from(&mut buf)).await;
         let Ok(Ok((len, remote))) = recv else {
-            break Err(BootstrapError::PunchTimeout(session_id.to_string()));
+            break match candidate {
+                Some(remote) => Ok(remote),
+                None => Err(BootstrapError::PunchTimeout(session_id.to_string())),
+            };
         };
         let Ok(packet) = parse_punch_packet(&buf[..len]) else {
             continue;
@@ -485,13 +539,40 @@ pub(super) async fn run_punch_attempt(
         if packet.session_hash != expected_hash {
             continue;
         }
+        // Ahead of the ack, not only ahead of the adoption: acking a source we
+        // never planned to probe is a reflection this node controls, and there
+        // is no reason to emit it.
+        let rank = rank_punch_source(remote, targets);
+        if rank == SourceRank::Unplanned {
+            unplanned += 1;
+            continue;
+        }
         if packet.kind == PunchPacketKind::Probe {
             let ack = build_punch_packet(PunchPacketKind::Ack, packet.sequence, session_id);
             let _ = udp.send_to(&ack, remote).await;
         }
-        break Ok(remote);
+        if rank == SourceRank::Planned {
+            break Ok(remote);
+        }
+        // A remapped port is adoptable, and on a symmetric NAT it is the only
+        // thing that ever arrives, so it is held rather than dropped. An exact
+        // match still supersedes it if one turns up inside the settle window.
+        if candidate.replace(remote).is_some() {
+            superseded += 1;
+        }
+        settle_at.get_or_insert_with(|| {
+            tokio::time::Instant::now() + Duration::from_millis(PUNCH_SETTLE_MS)
+        });
     };
     send_handle.abort();
+    if unplanned > 0 || superseded > 0 {
+        debug!(
+            session = %super::runtime::short_id(session_id),
+            unplanned,
+            superseded,
+            "traversal: punch packets refused on their source address"
+        );
+    }
     result
 }
 
