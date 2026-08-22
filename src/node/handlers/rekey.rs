@@ -19,6 +19,48 @@ const DRAIN_WINDOW_SECS: u64 = 10;
 /// a peer's rekey msg1.
 const REKEY_DAMPENING_SECS: u64 = 30;
 
+/// Floor on the absolute ceiling for `previous`-slot retention after a
+/// cutover, in seconds.
+///
+/// The drain deadline is peer-progress-aware: it slides forward on every
+/// inbound frame that authenticates against the old epoch, so a peer that
+/// keeps sealing in that epoch holds the retired key for as long as it
+/// likes. This bounds that. It has to stay longer than the worst-case
+/// recovery of a legitimate peer that lost msg3, which at stock defaults
+/// is the msg3 resend ladder (about 31 s) plus `handshake_timeout_secs`
+/// (30 s) before the responder abandons plus `REKEY_DAMPENING_SECS`
+/// (30 s) before it may re-initiate, so about 90 s. 120 s clears that
+/// with margin and still bounds retention to roughly one
+/// `node.rekey.after_secs` period. `drain_max_retention_ms` takes the
+/// larger of this floor and the budget the running configuration
+/// actually implies, so a shortened handshake timer cannot push the
+/// ceiling under the recovery it has to clear.
+///
+/// Lowering it below that budget cuts off legitimate slow peers: their
+/// frames go silently undecryptable until their own rekey retry
+/// re-converges the epochs, because nothing tears an established session
+/// down on repeated decrypt failure. Raising it lengthens the window in
+/// which a retired key stays resident.
+const DRAIN_MAX_RETENTION_SECS: u64 = DRAIN_WINDOW_SECS * 12;
+
+/// Effective ceiling on total `previous`-slot retention, in milliseconds.
+///
+/// The larger of `DRAIN_MAX_RETENTION_SECS` and the msg3 recovery budget
+/// the configured handshake timers imply, so the ceiling always clears
+/// the recovery it is supposed to leave room for.
+pub(in crate::node) fn drain_max_retention_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
+    let mut ladder_ms: u64 = 0;
+    let mut interval = rate_limit.handshake_resend_interval_ms as f64;
+    for _ in 0..rate_limit.handshake_max_resends {
+        ladder_ms = ladder_ms.saturating_add(interval as u64);
+        interval *= rate_limit.handshake_resend_backoff;
+    }
+    let recovery_budget_ms = ladder_ms
+        .saturating_add(rate_limit.handshake_timeout_secs.saturating_mul(1000))
+        .saturating_add(REKEY_DAMPENING_SECS * 1000);
+    (DRAIN_MAX_RETENTION_SECS * 1000).max(recovery_budget_ms)
+}
+
 /// Liveness bound on how long the FSP rekey initiator holds the
 /// `current` + `pending` state before cutting over to the new epoch.
 ///
@@ -443,6 +485,7 @@ impl Node {
         let rekey_after_messages = self.config().node.rekey.after_messages;
         let now_ms = Self::now_ms();
         let drain_ms = DRAIN_WINDOW_SECS * 1000;
+        let drain_max_ms = drain_max_retention_ms(&self.config().node.rate_limit);
         let dampening_ms = REKEY_DAMPENING_SECS * 1000;
 
         let mut sessions_to_cutover: Vec<NodeAddr> = Vec::new();
@@ -492,7 +535,7 @@ impl Node {
             }
 
             // 2. Drain window expiry
-            if entry.is_draining() && entry.drain_expired(now_ms, drain_ms) {
+            if entry.is_draining() && entry.drain_expired(now_ms, drain_ms, drain_max_ms) {
                 sessions_to_drain.push(*node_addr);
             }
 

@@ -591,6 +591,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handshake window and below `link_dead_timeout_secs`, and nothing changes on
   the wire.
 
+- Retention of a superseded FSP key epoch is now capped at an absolute
+  ceiling measured from the cutover, defaulting to 120 seconds against the
+  10-second drain window. The drain deadline slides forward on every inbound
+  frame that authenticates against the `previous` slot, which is what keeps a
+  peer that lost msg3 from having the old epoch erased out from under it, but
+  it also meant the authenticated peer holding that key could keep the retired
+  key resident for as long as it kept sealing frames in the old epoch. The
+  sliding grace is unchanged; it now delays erasure by a bounded amount rather
+  than preventing it. The ceiling is set to clear the worst-case legitimate
+  recovery of a peer that lost msg3 (the msg3 resend ladder, then
+  `handshake_timeout_secs` before the responder abandons, then the rekey
+  dampening window before it may re-initiate, about 90 seconds at stock
+  settings), and it is raised automatically if the configured handshake timers
+  imply a longer budget, so shortening a timer cannot push the ceiling under
+  the recovery it has to leave room for. Nothing changes on the wire; each side
+  runs its own drain. A peer that has still not recovered when the ceiling
+  fires is left with undecryptable frames until its own rekey retry
+  re-converges the epochs, since nothing tears an established session down on
+  repeated decrypt failure.
+
 - A session setup message naming an already-established peer no longer replaces
   that peer's session. The handler did this whenever `node.rekey.enabled` was
   false: it ran a fresh responder handshake and overwrote the entry, discarding

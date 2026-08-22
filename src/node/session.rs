@@ -726,9 +726,23 @@ impl SessionEntry {
     /// permanent silent decrypt failure. A peer that never catches up
     /// is instead handled by the FSP session liveness path (fresh
     /// handshake / teardown of a genuinely dead link).
-    pub(crate) fn drain_expired(&self, now_ms: u64, drain_ms: u64) -> bool {
+    ///
+    /// `max_drain_ms` is an absolute ceiling measured from the cutover
+    /// alone, so the sliding deadline delays erasure by a bounded amount
+    /// rather than preventing it: the only party that can push the
+    /// deadline out is the authenticated peer holding the old key, and
+    /// without a ceiling it holds that key for as long as it keeps using
+    /// it. What the ceiling costs is that a peer which has still not
+    /// recovered by then is cut off deliberately, and its frames are
+    /// undecryptable until its own rekey retry re-converges the epochs.
+    /// It must therefore stay above the worst-case legitimate recovery;
+    /// see `DRAIN_MAX_RETENTION_SECS`.
+    pub(crate) fn drain_expired(&self, now_ms: u64, drain_ms: u64, max_drain_ms: u64) -> bool {
         if self.drain_started_ms == 0 {
             return false;
+        }
+        if now_ms.saturating_sub(self.drain_started_ms) >= max_drain_ms {
+            return true;
         }
         let deadline_anchor = self.drain_started_ms.max(self.previous_last_used_ms);
         now_ms.saturating_sub(deadline_anchor) >= drain_ms
@@ -1226,6 +1240,9 @@ mod overlapping_epoch_tests {
     #[test]
     fn drain_expiry_is_peer_progress_aware() {
         const DRAIN_MS: u64 = 10_000;
+        // Well clear of the shipped ceiling, so this case still exercises
+        // the sliding deadline and nothing else.
+        const MAX_MS: u64 = 120_000;
         let cutover_ms = 1_000;
 
         // Build the post-cutover state via the production cutover path:
@@ -1254,7 +1271,7 @@ mod overlapping_epoch_tests {
             // Even though `now - drain_started_ms` exceeds DRAIN_MS, the
             // window is NOT expired: the peer just used `previous`.
             assert!(
-                !entry.drain_expired(t, DRAIN_MS),
+                !entry.drain_expired(t, DRAIN_MS, MAX_MS),
                 "previous slot must not be retired while peer keeps using it (t={t})"
             );
             assert!(
@@ -1267,11 +1284,11 @@ mod overlapping_epoch_tests {
         // last `previous`-slot use was at t=25_000; the window now
         // elapses DRAIN_MS after that, NOT DRAIN_MS after the cutover.
         assert!(
-            !entry.drain_expired(34_999, DRAIN_MS),
+            !entry.drain_expired(34_999, DRAIN_MS, MAX_MS),
             "window must not expire before DRAIN_MS past the last previous use"
         );
         assert!(
-            entry.drain_expired(35_000, DRAIN_MS),
+            entry.drain_expired(35_000, DRAIN_MS, MAX_MS),
             "window must expire DRAIN_MS after the last previous-slot decrypt"
         );
 
@@ -1289,6 +1306,7 @@ mod overlapping_epoch_tests {
     #[test]
     fn drain_expiry_unaffected_when_peer_off_old_epoch() {
         const DRAIN_MS: u64 = 10_000;
+        const MAX_MS: u64 = 120_000;
         let cutover_ms = 1_000;
 
         let (_old_send, old_recv) = xk_pair(1, 2);
@@ -1300,12 +1318,99 @@ mod overlapping_epoch_tests {
         // No old-epoch frames ever arrive: `previous_last_used_ms` stays
         // 0, the deadline anchor is the cutover time.
         assert!(
-            !entry.drain_expired(cutover_ms + DRAIN_MS - 1, DRAIN_MS),
+            !entry.drain_expired(cutover_ms + DRAIN_MS - 1, DRAIN_MS, MAX_MS),
             "window must not expire early"
         );
         assert!(
-            entry.drain_expired(cutover_ms + DRAIN_MS, DRAIN_MS),
+            entry.drain_expired(cutover_ms + DRAIN_MS, DRAIN_MS, MAX_MS),
             "window must expire on the plain wall-clock timer when peer is off the old epoch"
+        );
+    }
+    // 12. A peer that keeps exercising the old epoch delays erasure by a
+    //     bounded amount rather than preventing it. The refreshes must
+    //     continue past the ceiling: a case that stops refreshing at the
+    //     boundary passes without the ceiling and proves nothing.
+    #[test]
+    fn drain_retention_is_capped_against_a_peer_pinning_the_old_epoch() {
+        const DRAIN_MS: u64 = 10_000;
+        const MAX_MS: u64 = 120_000;
+
+        let (_old_send, old_recv) = xk_pair(1, 2);
+        let (_new_send, new_recv) = xk_pair(3, 4);
+        let mut entry = entry_with_current(old_recv);
+        entry.set_pending_session(new_recv);
+        assert!(entry.cutover_to_new_session(1));
+
+        // One old-epoch frame every half window, which is what a peer
+        // pinning the drain deadline actually does.
+        let mut t = 1u64;
+        while t < MAX_MS {
+            entry.refresh_previous_use(t);
+            assert!(
+                !entry.drain_expired(t, DRAIN_MS, MAX_MS),
+                "ceiling fired before the peer's grace ran out (t={t})"
+            );
+            t += DRAIN_MS / 2;
+        }
+
+        // Still refreshing, so the sliding deadline is nowhere near due.
+        entry.refresh_previous_use(MAX_MS + 1);
+        assert!(
+            entry.drain_expired(MAX_MS + 1, DRAIN_MS, MAX_MS),
+            "a peer pinning the old epoch retained the retired key past the ceiling"
+        );
+    }
+
+    // 13. The ceiling must not shorten the grace the sliding deadline
+    //     exists to give a peer that lost msg3 and is still catching up.
+    #[test]
+    fn drain_retention_cap_does_not_shorten_the_ordinary_grace() {
+        const DRAIN_MS: u64 = 10_000;
+        const MAX_MS: u64 = 120_000;
+        const CUTOVER_MS: u64 = 1_000;
+
+        let (_old_send, old_recv) = xk_pair(1, 2);
+        let (_new_send, new_recv) = xk_pair(3, 4);
+        let mut entry = entry_with_current(old_recv);
+        entry.set_pending_session(new_recv);
+        assert!(entry.cutover_to_new_session(CUTOVER_MS));
+        assert!(entry.is_draining());
+
+        // A peer that lost msg3 and is still catching up sends one
+        // old-epoch frame part-way through the window.
+        let last_use = CUTOVER_MS + DRAIN_MS / 2;
+        entry.refresh_previous_use(last_use);
+        assert!(!entry.drain_expired(CUTOVER_MS + DRAIN_MS, DRAIN_MS, MAX_MS));
+        assert!(!entry.drain_expired(last_use + DRAIN_MS - 1, DRAIN_MS, MAX_MS));
+        assert!(entry.drain_expired(last_use + DRAIN_MS, DRAIN_MS, MAX_MS));
+    }
+
+    // 14. The shipped ceiling has to clear the worst-case legitimate
+    //     recovery of a peer that lost msg3: the msg3 resend ladder, the
+    //     responder's handshake timeout, and the rekey dampening window
+    //     before it may re-initiate. A later tightening of the ceiling
+    //     reds this rather than silently amputating that recovery.
+    #[test]
+    fn drain_retention_cap_clears_the_msg3_recovery_budget() {
+        const DRAIN_MS: u64 = 10_000;
+        // 31 s resend ladder + 30 s handshake timeout + 30 s dampening.
+        const RECOVERY_MS: u64 = 91_000;
+        const CUTOVER_MS: u64 = 1_000;
+        let max_ms = crate::node::handlers::rekey::drain_max_retention_ms(
+            &crate::config::RateLimitConfig::default(),
+        );
+
+        let (_old_send, old_recv) = xk_pair(1, 2);
+        let (_new_send, new_recv) = xk_pair(3, 4);
+        let mut entry = entry_with_current(old_recv);
+        entry.set_pending_session(new_recv);
+        assert!(entry.cutover_to_new_session(CUTOVER_MS));
+        assert!(entry.is_draining());
+
+        entry.refresh_previous_use(CUTOVER_MS + RECOVERY_MS);
+        assert!(
+            !entry.drain_expired(CUTOVER_MS + RECOVERY_MS, DRAIN_MS, max_ms),
+            "ceiling fires inside the msg3 recovery budget"
         );
     }
 }

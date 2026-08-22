@@ -8,7 +8,7 @@ mod encrypted;
 mod forwarding;
 pub(in crate::node) mod handshake;
 mod mmp;
-mod rekey;
+pub(in crate::node) mod rekey;
 mod rx_loop;
 pub(in crate::node) mod session;
 mod timeout;
