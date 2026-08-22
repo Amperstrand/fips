@@ -1077,6 +1077,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because a request is flooded to every qualifying tree peer and the
   duplicate replies land there once the first has been accepted.
 
+- A flooded discovery dedup cache no longer makes a node unresolvable. The
+  cache is both the duplicate filter and the reverse-path table for lookup
+  responses, and at its 4096-entry bound it dropped the arriving request.
+  That drop sat ahead of both the check for whether the request names this
+  node and the forwarding path, so one link peer emitting fresh request_ids
+  could stop the node answering lookups for itself and stop it carrying
+  anyone else's, for as long as it kept the cache full. The cache now makes
+  room instead of refusing: over a peer's own share it drops that peer's
+  oldest entry, and at global capacity it drops the oldest entry of whichever
+  peer holds the most, so a light peer's reverse path is never taken to admit
+  a heavy one and extra identities buy a flooder proportionally less. A
+  peer's share is the cache divided by the current link-peer count, with a
+  floor of 64. The loosening this accepts is that an evicted request_id
+  arriving again inside the window is forwarded a second time rather than
+  recognised as a duplicate, which the per-target forward limiter and TTL
+  already bound. Evictions are counted as `req_dedup_evicted`; the old
+  `req_dedup_cache_full` counter stays in place, frozen at zero, so a
+  dashboard carried across versions does not lose the series.
+
+- Answering a lookup for ourselves is now metered per link peer. The response
+  proof is signed over the requester's `request_id`, so every request
+  addressed to this node costs a fresh Schnorr signature that cannot be
+  cached or served twice, and until now the only thing bounding that rate was
+  the dedup cache filling up, which is the defect above. A token bucket per
+  link peer, 256 signatures of burst refilling at 32 per second, absorbs the
+  legitimate burst that follows a topology change, when many correspondents
+  re-look-up at once through the few links that lead here, while capping what
+  one neighbour can make the node sign. Refusals are counted as
+  `req_sign_rate_limited` and visible in `show routing`, `show metrics` and
+  the fipstop routing pane. A refused request keeps its dedup entry, and
+  retries carry fresh request_ids, so a refusal cannot suppress the retry.
+
 #### Admission / peer caps
 
 - The Ethernet transport's discovery buffer is now bounded and no longer costs

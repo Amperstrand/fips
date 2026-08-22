@@ -120,7 +120,19 @@ pub enum DiscoveryReject {
     /// Request dedup cache (`recent_requests`) is at capacity, so the
     /// `LookupRequest` is dropped without being forwarded. Tracked via
     /// [`DiscoveryStats::req_dedup_cache_full`](crate::node::stats::DiscoveryStats).
+    ///
+    /// Frozen at zero: a full cache now evicts its oldest entry and admits
+    /// the request, counted as
+    /// [`DiscoveryStats::req_dedup_evicted`](crate::node::stats::DiscoveryStats).
+    /// The variant and its counter stay so an operator reading a dashboard
+    /// across versions does not find the series missing.
     ReqDedupCacheFull,
+    /// This node is the lookup target, but the link peer the request
+    /// arrived from has spent its signing budget. Answering costs a fresh
+    /// Schnorr signature per request, so the budget bounds what one
+    /// neighbour can make this node sign. Tracked via
+    /// [`DiscoveryStats::req_sign_rate_limited`](crate::node::stats::DiscoveryStats).
+    ReqSignRateLimited,
     /// Request arrived with TTL=0 — no more forwarding hops allowed.
     /// Tracked via
     /// [`DiscoveryStats::req_ttl_exhausted`](crate::node::stats::DiscoveryStats).
@@ -376,6 +388,7 @@ mod tests {
             DiscoveryReject::ReqDuplicate,
             DiscoveryReject::ReqDedupCacheFull,
             DiscoveryReject::ReqTtlExhausted,
+            DiscoveryReject::ReqSignRateLimited,
             DiscoveryReject::RespDecodeError,
             DiscoveryReject::RespIdentityMiss,
             DiscoveryReject::RespProofFailed,

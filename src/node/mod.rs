@@ -32,7 +32,9 @@ mod tests;
 mod tree;
 pub(crate) mod wire;
 
-use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
+use self::discovery_rate_limit::{
+    DiscoveryBackoff, DiscoveryForwardRateLimiter, LookupSignRateLimiter,
+};
 use self::peer_error_budget::PeerErrorBudget;
 use self::rate_limit::{HandshakeRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
@@ -69,7 +71,7 @@ use crate::upper::tun::{TunError, TunOutboundRx, TunState, TunTx};
 use crate::utils::index::IndexAllocator;
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity};
 use rand::Rng;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -367,6 +369,13 @@ pub struct Node {
     /// Recent discovery requests (dedup + reverse-path forwarding).
     /// Maps request_id → RecentRequest.
     recent_requests: HashMap<u64, RecentRequest>,
+    /// Arrival-order index over `recent_requests`, partitioned by the link
+    /// peer each request arrived from. The cache is full-then-evict rather
+    /// than full-then-refuse, and this is what lets an eviction be charged
+    /// to the peer that filled the cache instead of to whoever happens to
+    /// be oldest. Timestamps are nondecreasing across inserts, so each
+    /// deque is in arrival order and the front is the oldest.
+    recent_by_peer: BTreeMap<NodeAddr, VecDeque<u64>>,
     /// Per-destination path MTU lookup, keyed by FipsAddress (mirrors
     /// `coord_cache.entries[*].path_mtu`). Sync read-only access from
     /// the TUN reader/writer threads at TCP MSS clamp time so the
@@ -516,6 +525,8 @@ pub struct Node {
     discovery_backoff: DiscoveryBackoff,
     /// Rate limiter for forwarded discovery requests (transit-side).
     discovery_forward_limiter: DiscoveryForwardRateLimiter,
+    /// Signing budget for lookups we answer about ourselves (target-side).
+    discovery_sign_limiter: LookupSignRateLimiter,
 
     // === Pending Transport Connects ===
     /// Links waiting for transport-level connection establishment before
@@ -761,6 +772,7 @@ impl Node {
             bloom_state,
             coord_cache,
             recent_requests: HashMap::new(),
+            recent_by_peer: BTreeMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
             links: HashMap::new(),
@@ -813,6 +825,7 @@ impl Node {
             discovery_forward_limiter: DiscoveryForwardRateLimiter::with_interval(
                 std::time::Duration::from_secs(forward_min_interval_secs),
             ),
+            discovery_sign_limiter: LookupSignRateLimiter::new(),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
             nostr_discovery: None,
@@ -922,6 +935,7 @@ impl Node {
             bloom_state,
             coord_cache,
             recent_requests: HashMap::new(),
+            recent_by_peer: BTreeMap::new(),
             transports: HashMap::new(),
             transport_drops: HashMap::new(),
             links: HashMap::new(),
@@ -972,6 +986,7 @@ impl Node {
             ),
             discovery_backoff: DiscoveryBackoff::new(),
             discovery_forward_limiter: DiscoveryForwardRateLimiter::new(),
+            discovery_sign_limiter: LookupSignRateLimiter::new(),
             pending_connects: Vec::new(),
             retry_pending: HashMap::new(),
             nostr_discovery: None,
@@ -2547,6 +2562,13 @@ impl Node {
     // === End-to-End Sessions ===
 
     /// Get a session by remote NodeAddr.
+    /// Set the per-link-peer lookup signing budget (for tests).
+    #[cfg(test)]
+    pub(crate) fn set_discovery_sign_budget(&mut self, burst: f64, rate: f64) {
+        self.discovery_sign_limiter =
+            discovery_rate_limit::LookupSignRateLimiter::with_params(burst, rate);
+    }
+
     /// Disable the discovery forward rate limiter (for tests).
     #[cfg(test)]
     pub(crate) fn disable_discovery_forward_rate_limit(&mut self) {

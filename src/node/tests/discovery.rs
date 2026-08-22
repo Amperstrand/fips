@@ -615,6 +615,206 @@ async fn test_recent_request_expiry() {
 }
 
 // ============================================================================
+// Unit Tests — dedup cache capacity policy
+// ============================================================================
+
+use crate::node::handlers::discovery::{MAX_RECENT_DISCOVERY_REQUESTS, MIN_RECENT_PER_PEER};
+
+/// Encode a LookupRequest for `target` carrying `request_id`, ready for
+/// `handle_lookup_request` (which is handed the payload without the
+/// msg_type byte).
+fn lookup_request_payload(request_id: u64, target: &crate::NodeAddr) -> Vec<u8> {
+    let origin = make_node_addr(0xCC);
+    let coords = TreeCoordinate::from_addrs(vec![origin, make_node_addr(0)]).unwrap();
+    LookupRequest::new(request_id, *target, origin, coords, 5, 0).encode()[1..].to_vec()
+}
+
+/// Deliver `count` distinct requests from `from`, ids starting at `first_id`.
+async fn flood_requests(node: &mut Node, from: &crate::NodeAddr, first_id: u64, count: u64) {
+    let target = make_node_addr(0xBB);
+    for i in 0..count {
+        let payload = lookup_request_payload(first_id + i, &target);
+        node.handle_lookup_request(from, &payload).await;
+    }
+}
+
+/// Register `count` peers so the per-peer share of the dedup cache is the
+/// floor rather than the whole cache, and return their addresses.
+fn register_peers(node: &mut Node, count: usize) -> Vec<crate::NodeAddr> {
+    (0..count)
+        .map(|i| {
+            let identity = Identity::generate();
+            let addr = *identity.node_addr();
+            let peer_identity = crate::PeerIdentity::from_pubkey(identity.pubkey());
+            node.peers.insert(
+                addr,
+                ActivePeer::new(peer_identity, LinkId::new(i as u64), 0),
+            );
+            addr
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_a_full_dedup_cache_admits_the_new_request_by_evicting_the_oldest() {
+    // A full cache used to drop the arriving request, which let one peer
+    // spend 4096 fresh request_ids and stop the node forwarding anyone
+    // else's lookups until the entries aged out.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    flood_requests(&mut node, &from, 1, MAX_RECENT_DISCOVERY_REQUESTS as u64).await;
+    assert_eq!(
+        node.recent_requests.len(),
+        MAX_RECENT_DISCOVERY_REQUESTS,
+        "precondition: the cache is full, or the rest observes nothing"
+    );
+
+    let payload = lookup_request_payload(u64::MAX, &make_node_addr(0xBB));
+    node.handle_lookup_request(&from, &payload).await;
+
+    assert!(
+        node.recent_requests.contains_key(&u64::MAX),
+        "the arriving request must be recorded, so its response can be routed back"
+    );
+    assert!(
+        !node.recent_requests.contains_key(&1),
+        "room is made by dropping the oldest entry"
+    );
+    assert_eq!(
+        node.recent_requests.len(),
+        MAX_RECENT_DISCOVERY_REQUESTS,
+        "the cache stays at its bound"
+    );
+    assert_eq!(node.metrics().discovery.req_dedup_evicted.get(), 1);
+    assert_eq!(
+        node.metrics().discovery.req_dedup_cache_full.get(),
+        0,
+        "the cache-full drop is gone, and its counter stays frozen at zero"
+    );
+}
+
+#[tokio::test]
+async fn test_a_flooding_peer_evicts_only_its_own_dedup_entries() {
+    // The whole point of partitioning the cache by link peer: one peer
+    // filling its share must not cost another peer the reverse path its own
+    // lookup depends on.
+    let mut node = make_node();
+    let peers = register_peers(&mut node, 64);
+    let flooder = peers[0];
+    let light = peers[1];
+
+    let payload = lookup_request_payload(7, &make_node_addr(0xBB));
+    node.handle_lookup_request(&light, &payload).await;
+
+    // One over the share, so the flooder pays for its own admission.
+    flood_requests(&mut node, &flooder, 1000, MIN_RECENT_PER_PEER as u64 + 1).await;
+
+    assert!(
+        node.recent_requests.contains_key(&7),
+        "a light peer's reverse-path entry must survive a neighbour's flood"
+    );
+    assert!(
+        !node.recent_requests.contains_key(&1000),
+        "the flooder's own oldest entry is what pays for its newest"
+    );
+    assert!(
+        node.recent_requests
+            .contains_key(&(1000 + MIN_RECENT_PER_PEER as u64)),
+        "and its newest is admitted rather than dropped"
+    );
+}
+
+#[tokio::test]
+async fn test_a_node_whose_dedup_cache_is_flooded_still_answers_a_lookup_for_itself() {
+    // The availability claim. Filling the cache used to make the node
+    // unresolvable, because the cache-full drop sat ahead of the check for
+    // whether the request names us.
+    let mut node = make_node();
+    let flooder = make_node_addr(0xAA);
+    let other = make_node_addr(0xAB);
+
+    flood_requests(&mut node, &flooder, 1, MAX_RECENT_DISCOVERY_REQUESTS as u64).await;
+
+    let my_addr = *node.node_addr();
+    let payload = lookup_request_payload(u64::MAX, &my_addr);
+    node.handle_lookup_request(&other, &payload).await;
+
+    assert_eq!(
+        node.metrics().discovery.req_target_is_us.get(),
+        1,
+        "a flooded cache must not stop the node answering lookups for itself"
+    );
+}
+
+#[tokio::test]
+async fn test_the_dedup_index_stays_level_with_the_cache_across_insert_duplicate_and_purge() {
+    // Two containers where there was one, so the desync is the maintenance
+    // risk. Everything the eviction policy decides reads the index, so an
+    // index that has drifted evicts the wrong entry or none at all.
+    let mut node = make_node();
+    let peers = register_peers(&mut node, 64);
+
+    flood_requests(&mut node, &peers[0], 1, 70).await;
+    flood_requests(&mut node, &peers[1], 500, 5).await;
+    // Duplicates, which must not be indexed twice.
+    flood_requests(&mut node, &peers[1], 500, 5).await;
+
+    let indexed: usize = node.recent_by_peer.values().map(|ids| ids.len()).sum();
+    assert_eq!(
+        indexed,
+        node.recent_requests.len(),
+        "every cached request is indexed exactly once"
+    );
+
+    // Age everything out and purge through the ordinary request path.
+    let expiry_ms = node.config().node.discovery.recent_expiry_secs * 1000;
+    let future = Node::now_ms() + expiry_ms + 1;
+    node.purge_expired_requests(future);
+
+    assert!(
+        node.recent_requests.is_empty(),
+        "precondition: the purge removed everything"
+    );
+    assert!(
+        node.recent_by_peer.is_empty(),
+        "the index must not keep entries the cache no longer holds"
+    );
+}
+
+#[tokio::test]
+async fn test_answering_lookups_for_ourselves_stops_at_the_per_peer_signing_budget() {
+    // Each answer costs a fresh Schnorr signature, because the proof is
+    // bound to the requester's request_id and cannot be reused. Without a
+    // budget, one neighbour sets this node's signing rate.
+    let mut node = make_node();
+    node.set_discovery_sign_budget(3.0, 0.0);
+    let from = make_node_addr(0xAA);
+    let other = make_node_addr(0xAB);
+    let my_addr = *node.node_addr();
+
+    for id in 0..4u64 {
+        let payload = lookup_request_payload(id, &my_addr);
+        node.handle_lookup_request(&from, &payload).await;
+    }
+
+    assert_eq!(
+        node.metrics().discovery.req_target_is_us.get(),
+        3,
+        "the burst is answered and the fourth request is not"
+    );
+    assert_eq!(node.metrics().discovery.req_sign_rate_limited.get(), 1);
+
+    let payload = lookup_request_payload(100, &my_addr);
+    node.handle_lookup_request(&other, &payload).await;
+    assert_eq!(
+        node.metrics().discovery.req_target_is_us.get(),
+        4,
+        "one peer spending its budget must not make the node unresolvable through another"
+    );
+}
+
+// ============================================================================
 // Integration Tests — Multi-Node Forwarding
 // ============================================================================
 

@@ -192,6 +192,8 @@ fn draw_routing_stats(
             ("Bloom Miss", disc("req_bloom_miss")),
             ("Backoff Suppressed", disc("req_backoff_suppressed")),
             ("Fwd Rate Limited", disc("req_forward_rate_limited")),
+            ("Sign Rate Limited", disc("req_sign_rate_limited")),
+            ("Dedup Evicted", disc("req_dedup_evicted")),
             ("TTL Exhausted", disc("req_ttl_exhausted")),
             ("Decode Error", disc("req_decode_error")),
         ],

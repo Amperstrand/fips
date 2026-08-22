@@ -319,6 +319,8 @@ pub struct DiscoveryStatsSnapshot {
     pub req_decode_error: u64,
     pub req_duplicate: u64,
     pub req_dedup_cache_full: u64,
+    pub req_dedup_evicted: u64,
+    pub req_sign_rate_limited: u64,
     pub req_target_is_us: u64,
     pub req_forwarded: u64,
     pub req_ttl_exhausted: u64,

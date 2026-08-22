@@ -12,7 +12,19 @@ use crate::transport::{TransportAddr, TransportId};
 use crate::{NodeAddr, PeerIdentity};
 use tracing::{debug, info, trace, warn};
 
-const MAX_RECENT_DISCOVERY_REQUESTS: usize = 4096;
+/// Cap on the discovery request dedup cache, which is also the reverse-path
+/// table for responses in flight.
+pub(in crate::node) const MAX_RECENT_DISCOVERY_REQUESTS: usize = 4096;
+
+/// Floor under one link peer's share of the dedup cache.
+///
+/// A peer's share is the cache divided by the current link-peer count, and
+/// this is what stops that share collapsing to nothing on a node with very
+/// many links. It is a cap and not a reservation: shares can sum past the
+/// cache size, in which case the peer holding the most entries pays for the
+/// next admission. Raising it lets one busy neighbour hold more of the
+/// cache; lowering it clips a genuine transit burst.
+pub(in crate::node) const MIN_RECENT_PER_PEER: usize = 64;
 
 impl Node {
     /// Handle an incoming LookupRequest from a peer.
@@ -56,26 +68,44 @@ impl Node {
             return;
         }
 
-        if self.recent_requests.len() >= MAX_RECENT_DISCOVERY_REQUESTS {
-            self.metrics()
-                .discovery
-                .record_reject(DiscoveryReject::ReqDedupCacheFull);
-            debug!(
-                request_id = request.request_id,
-                from = %self.peer_display_name(from),
-                recent_requests = self.recent_requests.len(),
-                max_recent_requests = MAX_RECENT_DISCOVERY_REQUESTS,
-                "Discovery request dedup cache full, dropping LookupRequest"
-            );
-            return;
-        }
+        // A full cache evicts rather than refuses. Refusing meant one peer
+        // could fill the cache with fresh request_ids and stop this node
+        // answering lookups for itself and forwarding anyone else's, which
+        // is a denial of the service the cache exists to protect. The
+        // eviction is charged to the peer that filled the cache: over its
+        // own share it pays for itself, and at global capacity the peer
+        // holding the most entries pays, so extra identities buy a flooder
+        // proportionally less and a light peer's reverse path survives.
+        self.make_room_for_request(from);
 
         // Record for reverse-path forwarding and dedup
         self.recent_requests
             .insert(request.request_id, RecentRequest::new(*from, now_ms));
+        self.recent_by_peer
+            .entry(*from)
+            .or_default()
+            .push_back(request.request_id);
 
         // Are we the target?
         if request.target == *self.node_addr() {
+            // Answering costs a fresh Schnorr signature every time: the
+            // proof is bound to the requester's request_id, so it cannot be
+            // cached or served twice. Meter that per link peer, or a
+            // neighbour generating request_ids sets this node's signing
+            // rate. The dedup entry above stays regardless, so a refused
+            // request still occupies its id and a retry, which carries a
+            // fresh id, is unaffected.
+            if !self.discovery_sign_limiter.should_sign(from) {
+                self.metrics()
+                    .discovery
+                    .record_reject(DiscoveryReject::ReqSignRateLimited);
+                debug!(
+                    request_id = request.request_id,
+                    from = %self.peer_display_name(from),
+                    "Lookup signing budget spent for this peer, not answering"
+                );
+                return;
+            }
             self.metrics().discovery.req_target_is_us.inc();
             debug!(
                 request_id = request.request_id,
@@ -715,10 +745,61 @@ impl Node {
     }
 
     /// Remove expired entries from the recent_requests cache.
-    fn purge_expired_requests(&mut self, current_time_ms: u64) {
+    pub(in crate::node) fn purge_expired_requests(&mut self, current_time_ms: u64) {
         let expiry_ms = self.config().node.discovery.recent_expiry_secs * 1000;
-        self.recent_requests
-            .retain(|_, entry| !entry.is_expired(current_time_ms, expiry_ms));
+        let recent = &mut self.recent_requests;
+        recent.retain(|_, entry| !entry.is_expired(current_time_ms, expiry_ms));
+        self.recent_by_peer.retain(|_, ids| {
+            ids.retain(|id| recent.contains_key(id));
+            !ids.is_empty()
+        });
+    }
+
+    /// Evict from the dedup cache if admitting one more request would put
+    /// this peer over its share, or the cache over its capacity.
+    ///
+    /// The share is the cache divided by the current link-peer count, with
+    /// [`MIN_RECENT_PER_PEER`] as a floor, so it tracks the peer count
+    /// instead of being pinned to a number that a many-peer node outgrows.
+    fn make_room_for_request(&mut self, from: &NodeAddr) {
+        let share =
+            (MAX_RECENT_DISCOVERY_REQUESTS / self.peers.len().max(1)).max(MIN_RECENT_PER_PEER);
+
+        let over_share = self
+            .recent_by_peer
+            .get(from)
+            .is_some_and(|ids| ids.len() >= share);
+        let victim = if over_share {
+            Some(*from)
+        } else if self.recent_requests.len() >= MAX_RECENT_DISCOVERY_REQUESTS {
+            // Never take from a peer under its share: charge the fattest.
+            self.recent_by_peer
+                .iter()
+                .max_by_key(|(_, ids)| ids.len())
+                .map(|(peer, _)| *peer)
+        } else {
+            return;
+        };
+
+        let Some(victim) = victim else { return };
+        let Some(ids) = self.recent_by_peer.get_mut(&victim) else {
+            return;
+        };
+        let Some(evicted) = ids.pop_front() else {
+            return;
+        };
+        if ids.is_empty() {
+            self.recent_by_peer.remove(&victim);
+        }
+        self.recent_requests.remove(&evicted);
+        self.metrics().discovery.req_dedup_evicted.inc();
+        debug!(
+            request_id = evicted,
+            evicted_from = %self.peer_display_name(&victim),
+            admitting = %self.peer_display_name(from),
+            share = share,
+            "Discovery dedup cache full, evicting the oldest entry to make room"
+        );
     }
 
     /// Min-fold our outgoing-link MTU into a LookupResponse's `path_mtu`.
