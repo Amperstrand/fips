@@ -102,6 +102,15 @@ pub(crate) struct SessionEntry {
     /// Whether this node initiated the Noise handshake.
     /// Used for spin bit role assignment in session-layer MMP.
     is_initiator: bool,
+    /// Largest on-the-wire frame this node has sent toward the remote since
+    /// the last accepted path-MTU decrease or release, in bytes.
+    ///
+    /// Corroborates a reactive `MtuExceeded`, which is unauthenticated: an
+    /// honest report exists only because a frame this node emitted did not
+    /// fit some hop, so an honest report always names a value below this.
+    /// Reset on each accepted decrease and on release so one historical
+    /// large send cannot vouch for a session's whole lifetime.
+    max_sent_wire_len: u16,
     /// Session-layer MMP state. Initialized on Established transition.
     mmp: Option<MmpSessionState>,
 
@@ -205,6 +214,7 @@ impl SessionEntry {
             session_start_ms: 0,
             coords_warmup_remaining: 0,
             is_initiator,
+            max_sent_wire_len: 0,
             mmp: None,
             packets_sent: 0,
             packets_recv: 0,
@@ -306,6 +316,27 @@ impl SessionEntry {
     /// and CoordsRequired reset).
     pub(crate) fn set_coords_warmup_remaining(&mut self, value: u8) {
         self.coords_warmup_remaining = value;
+    }
+
+    /// Largest wire frame sent toward the remote since the last accepted
+    /// path-MTU decrease or release.
+    pub(crate) fn max_sent_wire_len(&self) -> u16 {
+        self.max_sent_wire_len
+    }
+
+    /// Note a frame of `wire_len` bytes sent toward the remote, keeping the
+    /// largest. Frames beyond `u16::MAX` saturate, which only ever makes the
+    /// corroboration more permissive and cannot exceed what a path MTU can
+    /// name.
+    pub(crate) fn record_sent_wire_len(&mut self, wire_len: usize) {
+        let wire_len = u16::try_from(wire_len).unwrap_or(u16::MAX);
+        self.max_sent_wire_len = self.max_sent_wire_len.max(wire_len);
+    }
+
+    /// Forget what has been sent, so the next reactive report needs fresh
+    /// evidence of its own.
+    pub(crate) fn clear_sent_wire_len(&mut self) {
+        self.max_sent_wire_len = 0;
     }
 
     /// Mark the session as started (transition to Established).

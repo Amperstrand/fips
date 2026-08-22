@@ -521,6 +521,10 @@ pub struct Node {
     peer_error_budget: PeerErrorBudget,
     /// Rate limiter for source-side CoordsRequired/PathBroken responses.
     coords_response_rate_limiter: RoutingErrorRateLimiter,
+    /// Rate limiter for PathBroken-driven path-MTU releases, per destination.
+    /// Deliberately its own instance: a budget another signal can spend is
+    /// not a bound on this one.
+    path_mtu_release_limiter: RoutingErrorRateLimiter,
     /// Backoff for failed discovery lookups (originator-side).
     discovery_backoff: DiscoveryBackoff,
     /// Rate limiter for forwarded discovery requests (transit-side).
@@ -821,6 +825,9 @@ impl Node {
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
                 std::time::Duration::from_millis(coords_response_interval_ms),
             ),
+            path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval(
+                crate::node::handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL,
+            ),
             discovery_backoff: DiscoveryBackoff::with_params(backoff_base_secs, backoff_max_secs),
             discovery_forward_limiter: DiscoveryForwardRateLimiter::with_interval(
                 std::time::Duration::from_secs(forward_min_interval_secs),
@@ -983,6 +990,9 @@ impl Node {
             peer_error_budget: PeerErrorBudget::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
                 std::time::Duration::from_millis(coords_response_interval_ms),
+            ),
+            path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval(
+                crate::node::handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL,
             ),
             discovery_backoff: DiscoveryBackoff::new(),
             discovery_forward_limiter: DiscoveryForwardRateLimiter::new(),
@@ -2662,6 +2672,12 @@ impl Node {
     /// `FipsAddress`-keyed map the TCP MSS clamp reads, and the session's own
     /// source-side path MTU estimate.
     fn path_mtu_lookup_release(&mut self, addr: &NodeAddr) {
+        // The evidence that corroborates a reactive MtuExceeded described the
+        // path being released, so it does not vouch for whatever replaces it.
+        if let Some(entry) = self.sessions.get_mut(addr) {
+            entry.clear_sent_wire_len();
+        }
+
         // The session's own source-side estimate described the same dead path,
         // and the increase ladder is the only thing that would ever raise it
         // again. Reset it here so the two halves of "this path is gone" stay

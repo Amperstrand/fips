@@ -41,6 +41,29 @@ use crate::upper::icmp::FIPS_OVERHEAD;
 use secp256k1::PublicKey;
 use tracing::{debug, info, trace, warn};
 
+/// Minimum interval between path-MTU releases driven by `PathBroken` for one
+/// destination.
+///
+/// `PathBroken` is unauthenticated, so a release is a remote party's claim
+/// that the path a tightened MTU described is gone. Without an interval the
+/// claim can be repeated at line rate, discarding a genuinely learned
+/// bottleneck as fast as it is relearned. Raising it defers a legitimate
+/// release after a second real break, which costs throughput on the new path
+/// but never a blackhole, since the deferred value is the tighter one.
+pub(in crate::node) const PATH_MTU_RELEASE_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1000);
+
+/// Bytes the link layer adds to an encoded `SessionDatagram` on its way to the
+/// wire: the established FMP header, the 4-byte session-relative timestamp and
+/// the AEAD tag. Mirrors the buffer `send_encrypted_link_message_with_ce`
+/// builds.
+const LINK_FRAME_OVERHEAD: usize = ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
+
+/// Wire size of an encoded `SessionDatagram` of `encoded_len` bytes.
+fn link_wire_len(encoded_len: usize) -> usize {
+    encoded_len + LINK_FRAME_OVERHEAD
+}
+
 /// Inputs to `try_send_session_data_pipelined` — the FSP+FMP pipelined
 /// fast path that hands both AEAD operations to the encrypt worker
 /// in a single dispatch.
@@ -1560,8 +1583,17 @@ impl Node {
         self.coord_cache.remove(&msg.dest_addr);
 
         // The path this destination's stored MTU described is gone, so release
-        // it rather than carrying it onto whatever path replaces it.
-        self.path_mtu_lookup_release(&msg.dest_addr);
+        // it rather than carrying it onto whatever path replaces it. Rate
+        // limited per destination on its own budget: PathBroken is
+        // unauthenticated, and an unlimited release discards a genuinely
+        // learned bottleneck as fast as it is relearned. The budget is not
+        // shared with any other signal, so nothing else can spend it.
+        if self.path_mtu_release_limiter.should_send(&msg.dest_addr) {
+            self.path_mtu_lookup_release(&msg.dest_addr);
+        } else {
+            trace!(dest = %msg.dest_addr,
+                "PathBroken path MTU release rate-limited, keeping the stored value");
+        }
 
         // Trigger re-discovery to get fresh coordinates, but only if we have
         // the target's identity cached — otherwise we can't verify the
@@ -1628,6 +1660,55 @@ impl Node {
             "MtuExceeded: transit router reports oversized packet"
         );
 
+        // Both effects below — the session's own path MTU and the
+        // FipsAddress-keyed lookup the TUN MSS clamp reads — are refused from
+        // here, so one return covers both. The guards sit ahead of the apply
+        // rather than between the two effects, which is what makes the floor
+        // govern `current_mtu` and not only the lookup table.
+
+        // Refuse a bottleneck too small to describe a usable path; a stored
+        // value that low drives the SYN-time MSS clamp into single digits or
+        // zero. The reactive carrier is unauthenticated, so it has its own
+        // floor constant, currently equal to the actionable one.
+        if msg.mtu < crate::upper::icmp::MIN_REACTIVE_PATH_MTU {
+            warn!(
+                dest = %peer_name,
+                reporter = %msg.reporter,
+                bottleneck_mtu = msg.mtu,
+                floor = crate::upper::icmp::MIN_REACTIVE_PATH_MTU,
+                "MtuExceeded reports a path MTU below the actionable floor; ignoring"
+            );
+            self.metrics().errors.mtu_exceeded_below_floor.inc();
+            return;
+        }
+
+        // Corroboration. The admission gate narrows which destination may be
+        // named; it cannot authenticate the reporter, so a legal value is a
+        // legal value from anyone and the floor alone only sets the outcome of
+        // a forgery rather than preventing it. An honest report exists only
+        // because a frame this node emitted did not fit some hop, so require
+        // that this node has actually sent something larger than the value
+        // being claimed since the last accepted decrease. Honest path-MTU
+        // discovery satisfies this by construction; a forgery has to wait for
+        // us to emit a frame bigger than the value it wants to claim, which
+        // bounds every accepted claim from below by our own traffic.
+        let sent_wire_len = self
+            .sessions
+            .get(&msg.dest_addr)
+            .map(|e| e.max_sent_wire_len())
+            .unwrap_or(0);
+        if msg.mtu >= sent_wire_len {
+            debug!(
+                dest = %peer_name,
+                reporter = %msg.reporter,
+                bottleneck_mtu = msg.mtu,
+                max_sent_wire_len = sent_wire_len,
+                "MtuExceeded reports a bottleneck no smaller than anything this node has sent; ignoring"
+            );
+            self.metrics().errors.mtu_exceeded_uncorroborated.inc();
+            return;
+        }
+
         // Apply to PathMtuState: immediate decrease via apply_notification()
         if let Some(entry) = self.sessions.get_mut(&msg.dest_addr)
             && let Some(mmp) = entry.mmp_mut()
@@ -1646,20 +1727,12 @@ impl Node {
             }
         }
 
-        // The lookup write below is not gated on a session existing, so an
-        // unencrypted MtuExceeded from anyone reaches it. Refuse to store a
-        // bottleneck too small to describe a usable path; a stored value that
-        // low drives the SYN-time MSS clamp into single digits or zero.
-        if msg.mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
-            warn!(
-                dest = %peer_name,
-                reporter = %msg.reporter,
-                bottleneck_mtu = msg.mtu,
-                floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
-                "MtuExceeded reports a path MTU below the actionable floor; ignoring"
-            );
-            self.metrics().errors.mtu_exceeded_below_floor.inc();
-            return;
+        // Spent: the evidence vouched for this decrease and does not vouch for
+        // the next one. An initiating session has no `mmp` and so reaches this
+        // with the apply above skipped; the reset belongs to the acceptance,
+        // not to the apply.
+        if let Some(entry) = self.sessions.get_mut(&msg.dest_addr) {
+            entry.clear_sent_wire_len();
         }
 
         // Mirror the bottleneck into the FipsAddress-keyed lookup used by
@@ -2192,6 +2265,7 @@ impl Node {
 
         if let Some(entry) = self.sessions.get_mut(dest_addr) {
             entry.record_sent(send.payload.len());
+            entry.record_sent_wire_len(wire_capacity);
             if let Some(mmp) = entry.mmp_mut() {
                 mmp.sender.record_sent(
                     fsp_counter,
@@ -2467,6 +2541,13 @@ impl Node {
         self.send_encrypted_link_message(&next_hop_addr, &encoded)
             .await?;
         self.metrics().forwarding.record_originated(encoded.len());
+
+        // Evidence for the reactive path-MTU carrier. A transit hop
+        // re-encapsulates what it forwards, so the frame that overflows a
+        // downstream link is the size this frame is here.
+        if let Some(entry) = self.sessions.get_mut(&datagram.dest_addr) {
+            entry.record_sent_wire_len(link_wire_len(encoded.len()));
+        }
         Ok(())
     }
 

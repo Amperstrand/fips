@@ -427,6 +427,7 @@ pub struct ErrorSignalStatsSnapshot {
     pub emit_over_peer_budget: u64,
     pub emit_over_dest_interval: u64,
     pub emit_limiter_at_capacity: u64,
+    pub mtu_exceeded_uncorroborated: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

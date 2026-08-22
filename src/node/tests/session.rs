@@ -2228,6 +2228,17 @@ fn install_halfopen(node: &mut Node, claimed: NodeAddr) {
     node.sessions.insert(claimed, entry);
 }
 
+/// Record that this node put a frame of `wire_len` bytes on the wire toward
+/// `dest`, which is what corroborates a reactive `MtuExceeded` reporting a
+/// smaller bottleneck. Honest path-MTU discovery produces this by sending;
+/// a handler test that installs a session without sending has to state it.
+fn note_sent_wire_len(node: &mut Node, dest: &NodeAddr, wire_len: usize) {
+    node.sessions
+        .get_mut(dest)
+        .expect("session must exist to corroborate a report")
+        .record_sent_wire_len(wire_len);
+}
+
 /// Install the entry `initiate_session` creates: an address this node chose
 /// itself, with the handshake still in flight and MMP not yet initialized.
 fn install_initiating(node: &mut Node, remote: &Identity) {
@@ -2263,6 +2274,7 @@ async fn test_handle_mtu_exceeded_writes_path_mtu_lookup_when_empty() {
         "lookup should start empty for this destination"
     );
 
+    note_sent_wire_len(&mut tn.node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
     tn.node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -2289,6 +2301,7 @@ async fn test_handle_mtu_exceeded_tightens_existing_path_mtu_lookup() {
     // response that didn't reflect the forward-path bottleneck).
     tn.node.path_mtu_lookup_insert(dest_fips, 1500);
 
+    note_sent_wire_len(&mut tn.node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
     tn.node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -2420,8 +2433,9 @@ async fn test_handle_mtu_exceeded_at_the_floor_still_writes_path_mtu_lookup() {
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
     let dest_fips = crate::FipsAddress::from_node_addr(&dest);
-    let floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU;
+    let floor = crate::upper::icmp::MIN_REACTIVE_PATH_MTU;
 
+    note_sent_wire_len(&mut tn.node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, floor);
     tn.node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -2944,6 +2958,7 @@ async fn test_mtu_exceeded_for_a_session_we_initiated_seeds_path_mtu_lookup_befo
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
     let dest_fips = crate::FipsAddress::from_node_addr(&dest);
 
+    note_sent_wire_len(&mut node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
     node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -2970,6 +2985,7 @@ async fn test_mtu_exceeded_from_a_third_party_forwarder_still_tightens_an_active
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
     let dest_fips = crate::FipsAddress::from_node_addr(&dest);
 
+    note_sent_wire_len(&mut node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
     node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -4958,4 +4974,227 @@ async fn test_peer_restart_reestablishes_through_a_pending_session_that_waited_o
     );
 
     cleanup_nodes(&mut nodes).await;
+}
+
+// ---------------------------------------------------------------------------
+// Reactive MtuExceeded: corroboration against what this node actually sent
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_reactive_mtu_exceeded_at_the_floor_no_longer_pins_a_session_this_node_has_not_overfilled()
+ {
+    // The defect itself. A report of exactly the floor is a legal value, and
+    // the admission gate cannot tell an honest forwarder from anyone else, so
+    // one packet drove a bound session's path MTU to the floor and pinned the
+    // FipsAddress-keyed entry the SYN-time MSS clamp reads. Nothing this node
+    // sent could have overflowed a hop at that size, so no honest report of it
+    // exists.
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_established_session_with_mmp(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+
+    let before = node
+        .sessions
+        .get(&dest)
+        .and_then(|e| e.mmp())
+        .map(|m| m.path_mtu.current_mtu());
+
+    let inner =
+        build_mtu_exceeded_inner(&dest, &reporter, crate::upper::icmp::MIN_REACTIVE_PATH_MTU);
+    node.handle_mtu_exceeded(&reporter, &inner).await;
+
+    assert_eq!(
+        node.sessions
+            .get(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        before,
+        "an uncorroborated report must leave the session path MTU alone"
+    );
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "an uncorroborated report must leave no clamp entry behind"
+    );
+    assert_eq!(
+        node.metrics().errors.mtu_exceeded_uncorroborated.get(),
+        1,
+        "the refusal must be counted apart from the below-floor refusal"
+    );
+    assert_eq!(
+        node.metrics().errors.mtu_exceeded_below_floor.get(),
+        0,
+        "the floor is not what refused this; the value is exactly at it"
+    );
+}
+
+#[tokio::test]
+async fn an_initiating_session_refuses_an_uncorroborated_report_and_accepts_a_corroborated_one() {
+    // The lookup write is the effect that survives on an initiating session,
+    // which has no MMP state at all, so this branch needs its own coverage:
+    // a guard placed on the apply rather than ahead of it would miss it.
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_initiating(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+
+    let inner = build_mtu_exceeded_inner(&dest, &reporter, 800);
+    node.handle_mtu_exceeded(&reporter, &inner).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "nothing this node sent could have overflowed a hop at 800 bytes"
+    );
+
+    // A SessionSetup can itself be the datagram that overflows a hop, so an
+    // initiating session must still be able to act on a real report.
+    note_sent_wire_len(&mut node, &dest, 1400);
+    node.handle_mtu_exceeded(&reporter, &inner).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        Some(800),
+        "a report corroborated by an oversized send must still be applied"
+    );
+}
+
+#[tokio::test]
+async fn a_second_reactive_decrease_needs_its_own_corroborating_send() {
+    // The evidence is spent on the decrease it vouched for. Otherwise one
+    // large send early in a session would vouch for every forged report for
+    // the rest of that session's life.
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_established_session_with_mmp(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+
+    note_sent_wire_len(&mut node, &dest, 1400);
+    let first = build_mtu_exceeded_inner(&dest, &reporter, 1200);
+    node.handle_mtu_exceeded(&reporter, &first).await;
+    assert_eq!(
+        node.sessions
+            .get(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        Some(1200),
+        "the corroborated first decrease is accepted"
+    );
+
+    let second = build_mtu_exceeded_inner(&dest, &reporter, 600);
+    node.handle_mtu_exceeded(&reporter, &second).await;
+    assert_eq!(
+        node.sessions
+            .get(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        Some(1200),
+        "a further decrease needs evidence of its own"
+    );
+
+    // A genuine re-route onto a smaller hop is preceded by a send that hop
+    // drops, so the honest sequence still converges.
+    note_sent_wire_len(&mut node, &dest, 900);
+    node.handle_mtu_exceeded(&reporter, &second).await;
+    assert_eq!(
+        node.sessions
+            .get(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        Some(600),
+        "once this node has again sent something that does not fit, the report applies"
+    );
+}
+
+#[tokio::test]
+async fn a_corroborated_report_below_the_reactive_floor_is_still_refused() {
+    // Corroboration and the floor are independent refusals. A hop that really
+    // is tiny still cannot drive the clamp into the band where the derived
+    // MSS degenerates.
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_established_session_with_mmp(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+
+    note_sent_wire_len(&mut node, &dest, 1400);
+    let inner = build_mtu_exceeded_inner(
+        &dest,
+        &reporter,
+        crate::upper::icmp::MIN_REACTIVE_PATH_MTU - 1,
+    );
+    node.handle_mtu_exceeded(&reporter, &inner).await;
+
+    assert_eq!(node.path_mtu_lookup_get(&dest_fips), None);
+    assert_eq!(node.metrics().errors.mtu_exceeded_below_floor.get(), 1);
+    assert_eq!(node.metrics().errors.mtu_exceeded_uncorroborated.get(), 0);
+}
+
+#[tokio::test]
+async fn the_authenticated_path_mtu_notification_still_applies_at_the_actionable_floor() {
+    // The reactive guards must not leak onto the carrier that arrives inside
+    // an established session on the decrypted path, which is authenticated and
+    // needs no corroboration.
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_established_session_with_mmp(&mut node, &remote);
+    let dest = *remote.node_addr();
+
+    let floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU;
+    let body = build_path_mtu_notification_body(floor);
+    node.handle_session_path_mtu_notification(&dest, &body);
+
+    assert_eq!(
+        node.sessions
+            .get(&dest)
+            .and_then(|e| e.mmp())
+            .map(|m| m.path_mtu.current_mtu()),
+        Some(floor),
+        "the authenticated carrier still applies a value at the actionable floor"
+    );
+}
+
+#[tokio::test]
+async fn a_path_broken_flood_releases_the_stored_path_mtu_only_once_per_interval() {
+    use crate::protocol::PathBroken;
+
+    // PathBroken is unauthenticated and its release discards a bottleneck this
+    // node learned the hard way. Unlimited, the claim can be repeated as fast
+    // as it can be sent, so a genuinely learned value never survives.
+    let mut node = make_node();
+
+    let remote = Identity::generate();
+    install_initiating(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+
+    let encoded = PathBroken::new(dest, reporter).encode();
+    let inner = &encoded[5..];
+
+    node.path_mtu_lookup_insert(dest_fips, 700);
+    node.handle_path_broken(&reporter, inner).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "the first PathBroken still releases"
+    );
+
+    node.path_mtu_lookup_insert(dest_fips, 700);
+    node.handle_path_broken(&reporter, inner).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        Some(700),
+        "a second release for the same destination inside the interval is refused"
+    );
 }

@@ -42,6 +42,7 @@
       "lookup_resp_mtu_below_floor": 0,
       "mtu_exceeded": 0,
       "mtu_exceeded_below_floor": 0,
+      "mtu_exceeded_uncorroborated": 0,
       "path_broken": 0,
       "path_mtu_notif_below_floor": 0,
       "unbound_broken": 0,

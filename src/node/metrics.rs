@@ -515,6 +515,11 @@ pub struct ErrorMetrics {
     /// count means a forwarder on the reverse path is mangling the unsigned
     /// annotation.
     pub lookup_resp_mtu_below_floor: Counter,
+    /// `MtuExceeded` signals ignored because this node has not sent a frame
+    /// larger than the bottleneck they report since the last accepted
+    /// decrease. An honest report cannot arise without such a frame, so a
+    /// rising count is a forged or stale reactive signal.
+    pub mtu_exceeded_uncorroborated: Counter,
     pub unbound: UnboundSignals,
     /// Routing errors this node declined to emit because the authenticated
     /// link peer that induced them had spent its budget. A rising count is
@@ -548,6 +553,7 @@ impl ErrorMetrics {
             emit_over_peer_budget: self.emit_over_peer_budget.get(),
             emit_over_dest_interval: self.emit_over_dest_interval.get(),
             emit_limiter_at_capacity: self.emit_limiter_at_capacity.get(),
+            mtu_exceeded_uncorroborated: self.mtu_exceeded_uncorroborated.get(),
         }
     }
 }

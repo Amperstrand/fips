@@ -977,6 +977,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is an emission change only: an unmodified peer parses the frame exactly as
   before. Which of the two signals is emitted still discloses whether the entry
   exists.
+- A reactive `MtuExceeded` is now believed only when this node has actually
+  sent a frame larger than the bottleneck it reports. The signal is
+  unauthenticated: the admission gate narrows which destination may be named
+  but cannot say who named it, so a value at the floor was a legal value from
+  anyone, and one datagram drove a bound session's path MTU to 256 and pinned
+  the address-keyed entry the SYN-time MSS clamp reads, with recovery costing
+  three consecutive higher notifications across two notification intervals.
+  Each session now carries the largest frame this node has put on the wire
+  toward it since the last accepted decrease, and a report is refused unless it
+  names something smaller. Honest path-MTU discovery satisfies that by
+  construction, because the report exists only because a frame we sent did not
+  fit; a forgery has to wait for us to emit something bigger than the value it
+  wants to claim, which bounds every accepted claim from below by our own
+  traffic. The evidence is cleared on each accepted decrease and on release, so
+  one large send early in a session cannot vouch for the rest of it.
+
+  The guard sits ahead of both effects rather than between them, which is also
+  where the existing floor check moved to: the floor previously ran after the
+  session's own path MTU had already been changed and so governed only the
+  lookup table. The reactive carrier now names its own floor constant, held
+  equal to the actionable floor so no hop legitimately configured with a small
+  transport MTU loses its feedback; corroboration, not the floor's value, is
+  what stops a legal-but-forged claim. A separate counter, rendered on the
+  fipstop Routing tab, distinguishes an uncorroborated refusal from a
+  below-floor one.
+
+- The path-MTU release a `PathBroken` drives is now rate limited per
+  destination on a budget of its own. That signal is unauthenticated too, and
+  the release discards a bottleneck this node learned by having a packet
+  dropped, so repeating the claim discarded a genuine value as fast as it could
+  be relearned. The limiter is a separate instance rather than the one the
+  coordinate warmup send already uses: a budget another signal can spend is not
+  a bound. Deferring a release is the safe direction, since the value kept is
+  the tighter one.
 
 - The influence a remote party has over path MTU is now bounded, and the
   per-destination path MTU cache has a way back. The `path_mtu` field is an

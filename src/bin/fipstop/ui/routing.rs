@@ -304,6 +304,10 @@ fn draw_routing_stats(
             ("Emit Over Peer Budget", err("emit_over_peer_budget")),
             ("Emit Over Dest Interval", err("emit_over_dest_interval")),
             ("Emit Limiter At Capacity", err("emit_limiter_at_capacity")),
+            (
+                "MTU Exceeded Uncorroborated",
+                err("mtu_exceeded_uncorroborated"),
+            ),
         ],
     ));
     right.push(Line::from(""));
