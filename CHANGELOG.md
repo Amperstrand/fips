@@ -795,6 +795,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Admission / peer caps
 
+- The Ethernet transport's discovery buffer is now bounded and no longer costs
+  a linear scan per beacon. Beacons are unauthenticated broadcast frames, and
+  the buffer deduplicated by scanning a `Vec` for the source MAC and had no
+  cap, so anything on the segment could name a fresh MAC per frame and drive
+  both quadratic CPU in the receive loop and unbounded memory. It is drained
+  once per tick only while the transport is operational, so a transport that
+  is receiving but not operational was never drained at all. The buffer is now
+  a map keyed on source MAC, capped at 1024 distinct MACs between drains, with
+  the drain order still oldest sighting first so which neighbour gets dialed
+  under a connect budget does not depend on hash iteration order. A MAC already
+  buffered is always refreshed, so a flood of new MACs cannot crowd out a
+  neighbour already seen. Refused beacons are counted in the transport's stats
+  as `beacons_dropped` and reported in the log on the first drop and then on
+  each power-of-ten thereafter, so the flooder does not set the log rate.
+  **What this does not close**: a flood can still crowd out a neighbour not yet
+  seen in that tick, and anything able to flood raw frames on the segment can
+  already jam the beacon at L2 more cheaply.
+
 - An accepted inbound TCP connection no longer holds a slot indefinitely
   without sending anything. The cap was tested at accept and the pool insert
   and counter bump followed with no read in between, while the frame reader's
