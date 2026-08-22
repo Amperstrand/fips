@@ -1779,6 +1779,47 @@ fn spawn_blackhole_relay() -> String {
     format!("ws://127.0.0.1:{port}")
 }
 
+/// The author filter on advert selection must not swallow a genuine eviction.
+///
+/// Dropping foreign-authored events narrows what the selection can return, and
+/// the eviction arm is guarded on the relays having answered with nothing at
+/// all. If that guard is written too broadly it also suppresses the real case
+/// this function exists for: the peer withdrew its advert and the cached entry
+/// has to go. Discriminator: a seeded cache entry plus relays that return
+/// nothing must still come back `Evicted` with the entry gone.
+#[tokio::test]
+async fn refetch_still_evicts_a_cached_advert_when_the_relays_return_nothing() {
+    let peer_npub = Identity::generate().npub();
+    let mut bootstrap = NostrDiscovery::new_for_test();
+    bootstrap
+        .set_advert_relays_for_test(vec![spawn_blackhole_relay()])
+        .await;
+
+    let endpoint = crate::discovery::nostr::OverlayEndpointAdvert {
+        transport: crate::discovery::nostr::OverlayTransportKind::Udp,
+        addr: "203.0.113.7:2121".to_string(),
+    };
+    let advert = NostrDiscovery::cached_advert_for_test(peer_npub.clone(), endpoint, 1_000);
+    bootstrap
+        .insert_advert_for_test(peer_npub.clone(), advert)
+        .await;
+
+    let outcome = bootstrap.refetch_advert_for_stale_check(&peer_npub).await;
+
+    assert_eq!(
+        outcome,
+        crate::discovery::nostr::NostrRefetchOutcome::Evicted,
+        "an empty relay answer is still evidence the advert is gone"
+    );
+    assert!(
+        bootstrap
+            .cached_created_at_for_test(&peer_npub)
+            .await
+            .is_none(),
+        "the stale entry should have been removed from the cache"
+    );
+}
+
 /// The per-tick retry loop must not await the pre-dial advert refetch.
 ///
 /// `process_pending_retries` runs inline on the node's 1s rx-loop tick. Each

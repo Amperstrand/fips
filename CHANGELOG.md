@@ -680,6 +680,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### NAT traversal / Nostr discovery
 
+- An advert or inbox-relay list returned by a relay is now checked against
+  the peer it claims to describe before anything else looks at it. The relay
+  pool verifies every event's signature but does not check a reply against
+  the request filter, and neither of the two options that would make it do so
+  is enabled, so a relay may answer a request for one author's advert with an
+  event it signed itself. The stale-advert refetch picked the newest
+  `created_at` across everything returned, with no author test, and then wrote
+  the result into the advert cache under the requested peer's npub, so a
+  single hostile or compromised advert relay could pin an endpoint set of its
+  own choosing for that peer. The author test now runs before the timestamp
+  contest rather than after, so a future-dated foreign event cannot even
+  suppress the genuine advert by winning it. The same filter now applies to
+  the inbox-relay lookup, where the omission let an attacker-authored relay
+  list steer this node's direct-message and traversal-signal traffic. A
+  refetch that comes back with events, none of them signed by the peer, now
+  leaves the cached entry alone: that is no evidence the advert was
+  withdrawn, and evicting on it would hand the same relay a way to clear the
+  cache. A refetch that genuinely comes back empty still evicts.
+
+- An advert's `created_at` is now clamped forward to the same 60s of clock
+  skew the traversal-signal path already tolerates. An unbounded future
+  timestamp bought a cache entry a proportionally distant validity horizon
+  and an unbeatable position in every replacement comparison, so a later
+  genuine advert could never displace it and the size-cap eviction collected
+  it last. The clamp applies to the stored timestamp as well as the validity
+  window, at all three points where an advert is cached, so ordering and
+  expiry now agree. Clamping rather than refusing the event is deliberate: a
+  node whose own clock runs slow reads every peer's honest advert as
+  future-dated, and refusing would silently withdraw Nostr-mediated dialing
+  for every peer at once.
+
 - Traversal punch targets taken from a peer's offer or answer are now
   filtered and bounded. A rendezvous-enabled node previously punched every
   address a signed offer named, including loopback, link-local, multicast,

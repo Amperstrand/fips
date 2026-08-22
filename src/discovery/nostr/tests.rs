@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
+use nostr::nips::nip17;
 use nostr::prelude::{EventBuilder, Kind, RelayUrl, Tag, Timestamp};
 
 use super::runtime::{
@@ -46,14 +47,29 @@ fn can_reach(local_nat: NatType, remote_nat: NatType) -> bool {
 }
 
 fn signed_overlay_advert_event(created_at_secs: u64, expiration_secs: Option<u64>) -> nostr::Event {
-    let keys = nostr::Keys::generate();
+    signed_overlay_advert_event_from(&nostr::Keys::generate(), created_at_secs, expiration_secs)
+}
+
+fn signed_overlay_advert_event_from(
+    keys: &nostr::Keys,
+    created_at_secs: u64,
+    expiration_secs: Option<u64>,
+) -> nostr::Event {
     let content = r#"{"identifier":"fips-overlay-v1","version":1,"endpoints":[{"transport":"tcp","addr":"8.8.8.8:443"}]}"#;
     let mut builder = EventBuilder::new(Kind::Custom(ADVERT_KIND), content)
         .custom_created_at(Timestamp::from(created_at_secs));
     if let Some(expiration_secs) = expiration_secs {
         builder = builder.tags([Tag::expiration(Timestamp::from(expiration_secs))]);
     }
-    builder.sign_with_keys(&keys).unwrap()
+    builder.sign_with_keys(keys).unwrap()
+}
+
+fn signed_inbox_relay_event(keys: &nostr::Keys, created_at_secs: u64, relay: &str) -> nostr::Event {
+    EventBuilder::new(Kind::InboxRelays, "")
+        .tags([Tag::relay(RelayUrl::parse(relay).unwrap())])
+        .custom_created_at(Timestamp::from(created_at_secs))
+        .sign_with_keys(keys)
+        .unwrap()
 }
 
 #[test]
@@ -194,6 +210,102 @@ fn advert_freshness_rejects_stale_created_at_without_expiration() {
     let valid_until =
         NostrDiscovery::compute_advert_valid_until_ms(&event, 600_000, now_secs * 1000);
     assert!(valid_until.is_none());
+}
+
+/// A hostile advert relay may answer an author-filtered request with an event
+/// it signed itself. Selection has to drop those before the newest-`created_at`
+/// contest, or a future-dated foreign advert suppresses the genuine one.
+#[test]
+fn advert_selection_ignores_events_not_signed_by_the_target_peer() {
+    let now_secs = Timestamp::now().as_secs();
+    let peer_keys = nostr::Keys::generate();
+    let hostile_keys = nostr::Keys::generate();
+
+    let hostile = signed_overlay_advert_event_from(&hostile_keys, now_secs + 3_600, None);
+    let genuine = signed_overlay_advert_event_from(&peer_keys, now_secs.saturating_sub(10), None);
+    let events = [hostile, genuine];
+
+    let selected = NostrDiscovery::newest_event_by_author(events.iter(), peer_keys.public_key())
+        .expect("the peer's own advert should be selected");
+    assert_eq!(selected.pubkey, peer_keys.public_key());
+}
+
+/// Nothing signed by the peer means nothing to select, even though the relays
+/// did answer. The caller reads this as "no evidence", not "withdrawn".
+#[test]
+fn advert_selection_returns_nothing_when_every_event_is_foreign() {
+    let now_secs = Timestamp::now().as_secs();
+    let peer_keys = nostr::Keys::generate();
+    let hostile_keys = nostr::Keys::generate();
+
+    let events = [signed_overlay_advert_event_from(
+        &hostile_keys,
+        now_secs + 3_600,
+        None,
+    )];
+
+    assert!(
+        NostrDiscovery::newest_event_by_author(events.iter(), peer_keys.public_key()).is_none()
+    );
+}
+
+/// The same omission on the inbox-relay lookup steers this node's DM and
+/// signal traffic onto relays an attacker chose, so it gets the same filter.
+#[test]
+fn inbox_relay_selection_ignores_relay_lists_not_signed_by_the_target() {
+    let now_secs = Timestamp::now().as_secs();
+    let peer_keys = nostr::Keys::generate();
+    let hostile_keys = nostr::Keys::generate();
+
+    let events = [
+        signed_inbox_relay_event(&hostile_keys, now_secs + 3_600, "wss://hostile.example/"),
+        signed_inbox_relay_event(
+            &peer_keys,
+            now_secs.saturating_sub(10),
+            "wss://genuine.example/",
+        ),
+    ];
+
+    let selected = NostrDiscovery::newest_event_by_author(events.iter(), peer_keys.public_key())
+        .expect("the peer's own relay list should be selected");
+    let relays = nip17::extract_relay_list(selected)
+        .map(|relay| relay.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(relays, vec!["wss://genuine.example/".to_string()]);
+}
+
+/// A far-future `created_at` must not buy a proportionally distant validity
+/// horizon. The window is computed from the clamped timestamp instead, so the
+/// entry expires on our clock rather than the publisher's.
+#[test]
+fn advert_freshness_clamps_created_at_beyond_the_forward_skew_tolerance() {
+    let now_secs = Timestamp::now().as_secs();
+    let event = signed_overlay_advert_event(now_secs + 3_600, None);
+    let valid_until =
+        NostrDiscovery::compute_advert_valid_until_ms(&event, 600_000, now_secs * 1000)
+            .expect("a future-dated advert is still usable, just not for as long");
+    assert_eq!(valid_until, (now_secs + 60) * 1000 + 600_000);
+}
+
+/// Pins the forward bound to `FRESHNESS_SKEW_TOLERANCE_MS` exactly, mirroring
+/// the signal path: 60s ahead is taken as published, 61s ahead is clamped.
+/// This is the healthy-path half; an ordinary clock difference must not cost a
+/// legitimate peer anything.
+#[test]
+fn advert_freshness_at_the_forward_skew_limit_is_untouched_and_one_second_beyond_is_clamped() {
+    let now_secs = Timestamp::now().as_secs();
+
+    let at_limit = signed_overlay_advert_event(now_secs + 60, None);
+    let valid_until =
+        NostrDiscovery::compute_advert_valid_until_ms(&at_limit, 600_000, now_secs * 1000)
+            .expect("an advert exactly at the forward tolerance should be accepted as published");
+    assert_eq!(valid_until, (now_secs + 60) * 1000 + 600_000);
+
+    let past_limit = signed_overlay_advert_event(now_secs + 61, None);
+    let clamped =
+        NostrDiscovery::compute_advert_valid_until_ms(&past_limit, 600_000, now_secs * 1000)
+            .expect("an advert one second past the tolerance is clamped, not refused");
+    assert_eq!(clamped, (now_secs + 60) * 1000 + 600_000);
 }
 
 #[test]

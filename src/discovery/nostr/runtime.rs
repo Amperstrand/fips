@@ -20,9 +20,9 @@ use zeroize::{Zeroize, Zeroizing};
 use super::failure_state::FailureState;
 use super::offer_admission::{AdmissionReject, OfferAdmission};
 use super::signal::{
-    FreshnessOutcome, SignalEnvelope, build_signal_event, create_traversal_answer,
-    create_traversal_offer, estimate_clock_skew, unwrap_signal_event, validate_offer_freshness,
-    validate_traversal_answer_for_offer,
+    FRESHNESS_SKEW_TOLERANCE_MS, FreshnessOutcome, SignalEnvelope, build_signal_event,
+    create_traversal_answer, create_traversal_offer, estimate_clock_skew, unwrap_signal_event,
+    validate_offer_freshness, validate_traversal_answer_for_offer,
 };
 use super::stun::observe_traversal_addresses;
 use super::traversal::{
@@ -594,21 +594,18 @@ impl NostrDiscovery {
             Err(_) => return NostrRefetchOutcome::Skipped,
         };
 
-        let mut newest: Option<(u64, &Event)> = None;
-        for ev in events.iter() {
-            let ts = ev.created_at.as_secs();
-            match newest {
-                Some((cur, _)) if ts <= cur => {}
-                _ => newest = Some((ts, ev)),
+        let Some(ev) = Self::newest_event_by_author(events.iter(), target_pubkey) else {
+            if !events.is_empty() {
+                // The relays answered, but nothing they returned was signed by
+                // this peer. That is no evidence of absence, so keep the entry.
+                return NostrRefetchOutcome::Skipped;
             }
-        }
-
-        let Some((relay_created_at, ev)) = newest else {
             // Absent on relays. Evict any stale cache entry.
             self.advert_cache.write().await.remove(peer_npub);
             self.failure_state.reset_streak_after_refresh(peer_npub);
             return NostrRefetchOutcome::Evicted;
         };
+        let relay_created_at = Self::effective_created_at_secs(ev.created_at.as_secs(), now_ms());
 
         match cached_created_at {
             Some(cached) if relay_created_at <= cached => NostrRefetchOutcome::SameAdvert,
@@ -761,6 +758,8 @@ impl NostrDiscovery {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::Custom(ADVERT_KIND) {
                         let author_npub = event.pubkey.to_bech32().expect("infallible");
+                        let created_at =
+                            Self::effective_created_at_secs(event.created_at.as_secs(), now_ms());
                         if let Some(valid_until_ms) = self.event_valid_until_ms(&event)
                             && let Ok(advert) =
                                 Self::parse_overlay_advert_event(&event, &self.config.app)
@@ -768,7 +767,7 @@ impl NostrDiscovery {
                             let mut cache = self.advert_cache.write().await;
                             let should_replace = cache
                                 .get(&author_npub)
-                                .map(|existing| existing.created_at <= event.created_at.as_secs())
+                                .map(|existing| existing.created_at <= created_at)
                                 .unwrap_or(true);
                             if should_replace && author_npub != self.npub {
                                 debug!(
@@ -784,7 +783,7 @@ impl NostrDiscovery {
                                     CachedOverlayAdvert {
                                         author_npub,
                                         advert,
-                                        created_at: event.created_at.as_secs(),
+                                        created_at,
                                         valid_until_ms,
                                     },
                                 );
@@ -1559,15 +1558,16 @@ impl NostrDiscovery {
             if author_npub != peer_npub {
                 continue;
             }
+            let created_at = Self::effective_created_at_secs(event.created_at.as_secs(), now_ms());
             let replace = best
                 .as_ref()
-                .map(|current| event.created_at.as_secs() >= current.created_at)
+                .map(|current| created_at >= current.created_at)
                 .unwrap_or(true);
             if replace {
                 best = Some(CachedOverlayAdvert {
                     author_npub,
                     advert,
-                    created_at: event.created_at.as_secs(),
+                    created_at,
                     valid_until_ms,
                 });
             }
@@ -1640,7 +1640,7 @@ impl NostrDiscovery {
                 return Ok(self.config.dm_relays.clone());
             }
         };
-        let newest = events.iter().max_by_key(|event| event.created_at.as_secs());
+        let newest = Self::newest_event_by_author(events.iter(), target_pubkey);
         if let Some(event) = newest {
             let relays = nip17::extract_relay_list(event)
                 .map(|relay| relay.to_string())
@@ -1764,6 +1764,42 @@ impl NostrDiscovery {
         Self::compute_advert_valid_until_ms(event, self.advert_max_age_ms(), now_ms())
     }
 
+    /// Newest event in `events` that was actually signed by `author`.
+    ///
+    /// The relay pool verifies each event's signature but does not check a
+    /// reply against the REQ filter unless `verify_subscriptions` or
+    /// `ban_relay_on_mismatch` is set, and neither is. A relay may therefore
+    /// answer an author-filtered request with an event it signed itself, so
+    /// the author test happens here, before the timestamp contest, not after:
+    /// a future-dated foreign event must not be able to suppress the genuine
+    /// one by winning `created_at`.
+    pub(super) fn newest_event_by_author<'a>(
+        events: impl Iterator<Item = &'a Event>,
+        author: PublicKey,
+    ) -> Option<&'a Event> {
+        events
+            .filter(|event| event.pubkey == author)
+            .max_by_key(|event| event.created_at.as_secs())
+    }
+
+    /// A peer's advert `created_at`, in seconds, clamped so it can never read
+    /// more than `FRESHNESS_SKEW_TOLERANCE_MS` ahead of `now_ms`.
+    ///
+    /// An unbounded future `created_at` buys a cache entry two things it
+    /// should not have: a proportionally distant validity horizon, and an
+    /// unbeatable position in every replacement comparison, so a later genuine
+    /// advert can never displace it. Clamping rather than rejecting is
+    /// deliberate: a node whose own clock runs slow reads every peer's honest
+    /// advert as future-dated, and rejecting would take out Nostr-mediated
+    /// dialing for every peer at once with nothing but a cache miss to show
+    /// for it. Raising the tolerance widens the window in which a future-dated
+    /// advert outranks an honest one; lowering it makes an ordinary clock
+    /// difference look hostile.
+    pub(super) fn effective_created_at_secs(created_at_secs: u64, now_ms: u64) -> u64 {
+        let ceiling_secs = now_ms.saturating_add(FRESHNESS_SKEW_TOLERANCE_MS) / 1000;
+        created_at_secs.min(ceiling_secs)
+    }
+
     pub(super) fn compute_advert_valid_until_ms(
         event: &Event,
         advert_max_age_ms: u64,
@@ -1773,7 +1809,8 @@ impl NostrDiscovery {
             return None;
         }
 
-        let created_ms = event.created_at.as_secs().saturating_mul(1000);
+        let created_ms = Self::effective_created_at_secs(event.created_at.as_secs(), now_ms)
+            .saturating_mul(1000);
         let created_window_until = created_ms.saturating_add(advert_max_age_ms);
         if created_window_until <= now_ms {
             return None;
@@ -1999,6 +2036,16 @@ impl NostrDiscovery {
     pub(crate) async fn insert_advert_for_test(&self, npub: String, advert: CachedOverlayAdvert) {
         let mut cache = self.advert_cache.write().await;
         cache.insert(npub, advert);
+    }
+
+    /// The cached `created_at` for `npub`, or `None` when nothing is cached.
+    /// Lets a unit test observe whether a refetch evicted an entry.
+    pub(crate) async fn cached_created_at_for_test(&self, npub: &str) -> Option<u64> {
+        self.advert_cache
+            .read()
+            .await
+            .get(npub)
+            .map(|c| c.created_at)
     }
 
     /// Queue a bootstrap event directly for lifecycle tests without live relays
