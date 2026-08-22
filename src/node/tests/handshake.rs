@@ -1811,3 +1811,212 @@ async fn a_stale_reverse_address_entry_does_not_hide_a_peer_reachable_by_address
          returns above the insert that would overwrite the stale entry"
     );
 }
+
+// ===== Epoch-restart dampening =====
+//
+// An epoch-mismatch msg1 is authentic, because the epoch travels inside the
+// AEAD, but it is replayable: a captured one stays valid forever and
+// accepting it destroys a working peering. Two receiver-local conditions
+// gate the teardown, and each of the first two cases below breaks one of
+// them.
+
+/// Install a peering for `initiator` that carries an epoch its genuine msg1
+/// does not, and that has gone `idle_secs` without authenticated inbound
+/// traffic. Returns the link the peering is bound to.
+fn install_peering_at_a_different_epoch(
+    node: &mut Node,
+    initiator: &Node,
+    transport_id: TransportId,
+    source_addr: &TransportAddr,
+    idle_secs: u64,
+) -> LinkId {
+    use crate::peer::ActivePeer;
+
+    let identity = PeerIdentity::from_pubkey_full(initiator.identity().pubkey_full());
+    let node_addr = *identity.node_addr();
+    let link_id = node.allocate_link_id();
+    let authenticated_at = Node::now_ms().saturating_sub(idle_secs * 1000);
+    let mut peer = ActivePeer::new(identity, link_id, authenticated_at);
+    peer.set_current_addr(transport_id, source_addr.clone());
+    // Anything but the epoch the initiator's msg1 carries, so the msg1 reads
+    // as a restart.
+    peer.set_remote_epoch(Some([0xAA; 8]));
+    node.peers.insert(node_addr, peer);
+    node.addr_to_link
+        .insert((transport_id, source_addr.clone()), link_id);
+    link_id
+}
+
+/// A peering long enough past its last authenticated inbound frame that the
+/// liveness gate does not hold the restart back.
+const IDLE_SECS: u64 = 60;
+
+#[tokio::test]
+async fn an_epoch_mismatch_msg1_against_a_live_peering_leaves_it_intact() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let source_addr = TransportAddr::from_string("127.0.0.1:41001");
+
+    // The peering is carrying authenticated traffic: it decrypted a frame a
+    // moment ago. Under replay that is always the case, because the genuine
+    // peer is heartbeating.
+    let peer_link =
+        install_peering_at_a_different_epoch(&mut node, &initiator, transport_id, &source_addr, 0);
+
+    let bad_state_before = node.stats().handshake.bad_state;
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        source_addr.clone(),
+        genuine_msg1(&initiator, &node),
+        Node::now_ms(),
+    ))
+    .await;
+
+    let peer = node
+        .get_peer(&initiator_addr)
+        .expect("a live peering must survive an epoch-mismatch msg1");
+    assert_eq!(
+        peer.link_id(),
+        peer_link,
+        "the peering must be the one that was already established, not a \
+         replacement promoted from the msg1"
+    );
+    assert_eq!(
+        peer.remote_epoch(),
+        Some([0xAA; 8]),
+        "the stored epoch must not have moved to the one the msg1 carried"
+    );
+    assert_eq!(
+        node.connection_count(),
+        0,
+        "the dropped msg1 must leave no connection behind"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state_before,
+        1,
+        "the drop must be counted"
+    );
+}
+
+#[tokio::test]
+async fn a_second_epoch_change_inside_the_dampening_interval_leaves_the_peering_intact() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let source_addr = TransportAddr::from_string("127.0.0.1:41002");
+
+    // First epoch change: the peering is genuinely idle, so it is accepted
+    // and stamps the dampener.
+    let first_link = install_peering_at_a_different_epoch(
+        &mut node,
+        &initiator,
+        transport_id,
+        &source_addr,
+        IDLE_SECS,
+    );
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        source_addr.clone(),
+        genuine_msg1(&initiator, &node),
+        Node::now_ms(),
+    ))
+    .await;
+    let promoted = node
+        .get_peer(&initiator_addr)
+        .expect("the first epoch change must be accepted");
+    assert_ne!(
+        promoted.link_id(),
+        first_link,
+        "the first epoch change must have replaced the peering"
+    );
+
+    // The peer moves epoch again straight away. Nothing about the second
+    // msg1 is distinguishable from the first, which is why the interval,
+    // not the message, has to be what refuses it.
+    let second_link = install_peering_at_a_different_epoch(
+        &mut node,
+        &initiator,
+        transport_id,
+        &source_addr,
+        IDLE_SECS,
+    );
+
+    let bad_state_before = node.stats().handshake.bad_state;
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        source_addr.clone(),
+        genuine_msg1(&initiator, &node),
+        Node::now_ms(),
+    ))
+    .await;
+
+    let peer = node
+        .get_peer(&initiator_addr)
+        .expect("a second epoch change inside the interval must not tear the peering down");
+    assert_eq!(
+        peer.link_id(),
+        second_link,
+        "the peering must be the one that was already established"
+    );
+    assert_eq!(
+        peer.remote_epoch(),
+        Some([0xAA; 8]),
+        "the stored epoch must not have moved to the one the msg1 carried"
+    );
+    assert_eq!(
+        node.connection_count(),
+        0,
+        "the dropped msg1 must leave no connection behind"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state_before,
+        1,
+        "the drop must be counted"
+    );
+}
+
+/// Healthy path, and NOT discriminating: this passes with or without the
+/// gates. It is here so that tightening either one, or a bug that stamps the
+/// dampener on a refusal, reds the suite instead of silently refusing every
+/// genuine restart.
+#[tokio::test]
+async fn a_first_epoch_change_against_a_silent_peering_still_restarts_it() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let source_addr = TransportAddr::from_string("127.0.0.1:41003");
+
+    let stale_link = install_peering_at_a_different_epoch(
+        &mut node,
+        &initiator,
+        transport_id,
+        &source_addr,
+        IDLE_SECS,
+    );
+
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        source_addr.clone(),
+        genuine_msg1(&initiator, &node),
+        Node::now_ms(),
+    ))
+    .await;
+
+    let peer = node
+        .get_peer(&initiator_addr)
+        .expect("a restart with no prior epoch change must be promoted");
+    assert_ne!(
+        peer.link_id(),
+        stale_link,
+        "the stale peering must have been torn down and replaced"
+    );
+    assert_eq!(
+        peer.remote_epoch(),
+        Some(initiator.startup_epoch()),
+        "the replacement must carry the epoch the msg1 announced"
+    );
+}

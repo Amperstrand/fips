@@ -488,6 +488,12 @@ pub struct Node {
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
+    /// When each peer identity's last ACCEPTED epoch change tore down its
+    /// peering. Keyed on identity rather than address, and held here rather
+    /// than on `ActivePeer`, because the teardown being dampened destroys
+    /// the peer entry itself. Pruned on insert; see
+    /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
+    restart_dampener: HashMap<NodeAddr, std::time::Instant>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -788,6 +794,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            restart_dampener: HashMap::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -947,6 +954,7 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            restart_dampener: HashMap::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),

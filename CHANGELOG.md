@@ -574,6 +574,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build with overflow checks on, such as the test harness. Behaviour is
   unchanged for every counter an honest peer can emit.
 
+- An epoch-mismatch msg1 no longer tears down a peering that is still
+  carrying authenticated traffic, and a second epoch change for the same peer
+  identity inside 15 seconds is refused. The epoch travels inside the AEAD, so
+  such a msg1 is authentic, but it stays authentic after capture: replaying
+  one destroyed a working peering, and with it the FSP session state that
+  peering carried, from off the path. The peering's last authenticated inbound
+  frame is the evidence that it is still alive, and nothing an unauthenticated
+  sender emits can refresh it, so a peer that genuinely restarted clears the
+  gate by having stopped sending. The refusal is a silent drop: no msg2 is
+  returned, since the stored msg2 is bound to the original msg1's ephemeral
+  and answering a sender-chosen address is free amplification. The interval is
+  stamped only when an epoch change is accepted, so a sustained replay cannot
+  starve a genuinely restarting peer. Both thresholds come from one constant,
+  sized so a restarting peer's msg1 resends still land inside its own first
+  handshake window and below `link_dead_timeout_secs`, and nothing changes on
+  the wire.
+
 - A session setup message naming an already-established peer no longer replaces
   that peer's session. The handler did this whenever `node.rekey.enabled` was
   false: it ran a fresh responder handshake and overwrote the entry, discarding
