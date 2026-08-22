@@ -65,7 +65,7 @@ impl GatewayControlSocket {
         if let Some(parent) = socket_path.parent()
             && !parent.exists()
         {
-            std::fs::create_dir_all(parent)?;
+            crate::utils::sockperm::make_parent(parent)?;
             debug!(path = %parent.display(), "Created gateway control socket directory");
         }
 
@@ -74,7 +74,9 @@ impl GatewayControlSocket {
             Self::remove_stale_socket(&socket_path)?;
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
+        // Bound under a tightened umask, so the inode is never
+        // world-accessible in the window before the chmod below.
+        let listener = crate::utils::sockperm::bind(&socket_path)?;
 
         // Set permissions to 0770 and chown to fips group
         use std::os::unix::fs::PermissionsExt;
@@ -93,6 +95,15 @@ impl GatewayControlSocket {
     }
 
     /// Remove a stale socket file from a previous unclean exit.
+    ///
+    /// The gap between the connect probe and the bind that follows is
+    /// accepted rather than closed. Reaching it needs write access to the
+    /// socket's parent directory, which the packaged layouts give to root
+    /// alone (0750 and root-owned under both systemd and the FreeBSD rc
+    /// script), and an account holding it can deny the daemon its socket
+    /// more simply by squatting the path before the daemon starts. The
+    /// removal itself unlinks a symlink rather than its target, so it is
+    /// not an arbitrary delete.
     fn remove_stale_socket(path: &Path) -> Result<(), std::io::Error> {
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => Err(std::io::Error::new(

@@ -866,6 +866,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NXDOMAIN. Connecting the socket also means a dead upstream surfaces
   ECONNREFUSED immediately instead of stalling for five seconds.
 
+#### Control socket
+
+- The control socket and the directory holding it are now created with a
+  restrictive mode rather than created wide and narrowed afterwards. `bind(2)`
+  makes the socket inode `0777 & ~umask`, so under a permissive umask the
+  socket was world-accessible for the window between the bind and the `chmod`
+  to 0770 that followed it; the bind now runs under a umask that masks the
+  "other" bits, so the inode is 0770 from creation and the chmod and chown stay
+  the authority on its final mode. The parent directory was worse than a
+  window: it was created with `create_dir_all`, which is also `0777 & ~umask`,
+  and nothing ever set a mode on it, so under a permissive umask the directory
+  holding the socket stayed world-writable for the life of the host, and a
+  world-writable parent lets an unprivileged account plant an entry at the
+  socket path. Directories this code creates now come out 0750, which is what
+  the systemd unit (`RuntimeDirectoryMode=0750`) and the FreeBSD rc script
+  (`install -d -m 0750`) already apply, so no packaged deployment sees a
+  different mode and no `fipsctl` user loses access. Both the daemon and the
+  gateway control sockets are covered. **What this does not close**: the window
+  between the stale-socket probe and the bind is documented at the site rather
+  than removed. Reaching it needs write access to the socket's parent
+  directory, which the packaged layouts give to root alone, and an account
+  holding it can deny the daemon its socket more simply by squatting the path
+  first.
+
 #### Key material and identity files
 
 - Private key writes no longer follow a symlink, and the key file's mode is
