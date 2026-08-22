@@ -2,6 +2,7 @@ mod failure_state;
 mod offer_admission;
 mod runtime;
 mod signal;
+mod signal_gate;
 mod stun;
 mod traversal;
 mod types;

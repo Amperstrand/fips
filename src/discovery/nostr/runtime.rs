@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nostr::nips::nip17;
@@ -24,6 +24,7 @@ use super::signal::{
     create_traversal_answer, create_traversal_offer, estimate_clock_skew, unwrap_signal_event,
     validate_offer_freshness, validate_traversal_answer_for_offer,
 };
+use super::signal_gate::SignalGate;
 use super::stun::observe_traversal_addresses;
 use super::traversal::{
     PunchTargetTally, is_doc_ip, is_never_punchable_ip, is_private_ip, nonce, now_ms,
@@ -243,6 +244,9 @@ pub struct NostrDiscovery {
     active_initiators: Mutex<HashSet<String>>,
     seen_sessions: Mutex<HashMap<String, u64>>,
     admission: OfferAdmission,
+    signal_gate: SignalGate,
+    /// Inbound traversal signals shed before decryption, since process start.
+    shed_signals: AtomicU64,
     event_tx: mpsc::UnboundedSender<BootstrapEvent>,
     event_rx: Mutex<mpsc::UnboundedReceiver<BootstrapEvent>>,
     connect_task: Mutex<Option<JoinHandle<()>>>,
@@ -326,6 +330,8 @@ impl NostrDiscovery {
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
             admission,
+            signal_gate: SignalGate::new(Instant::now()),
+            shed_signals: AtomicU64::new(0),
             event_tx,
             event_rx: Mutex::new(event_rx),
             connect_task: Mutex::new(None),
@@ -794,6 +800,41 @@ impl NostrDiscovery {
                     }
 
                     if event.kind != Kind::Custom(SIGNAL_KIND) {
+                        continue;
+                    }
+
+                    // Ahead of the unwrap, which is two NIP-44 decrypts and a
+                    // signature verify run inline on the single task that also
+                    // routes answers and processes adverts. Nothing about the
+                    // sender is known yet — the outer event is signed by a key
+                    // generated per event — so the allowance is necessarily
+                    // shared and indiscriminate, and the reserve is what keeps
+                    // a flood from also shedding the answers to traversals
+                    // this node started.
+                    let awaiting_answers = match self.pending_answers.try_lock() {
+                        Ok(pending) => !pending.is_empty(),
+                        // Contended rather than known empty, so treat it as
+                        // outstanding: the fail-open direction here spends the
+                        // reserve, it does not shed.
+                        Err(_) => true,
+                    };
+                    if let Err(shed) = self.signal_gate.admit(awaiting_answers, Instant::now()) {
+                        let total = self.shed_signals.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Debug, not warn, per event: the party that trips this
+                        // is by definition sending faster than the node wants,
+                        // so a record per drop turns the flood into log volume.
+                        // The doubling summary below is the operator's signal.
+                        debug!(
+                            reason = ?shed,
+                            total,
+                            "shed inbound traversal signal before decrypt"
+                        );
+                        if total.is_power_of_two() {
+                            warn!(
+                                shed = total,
+                                "inbound traversal signals shed before decrypt"
+                            );
+                        }
                         continue;
                     }
 
@@ -1984,6 +2025,8 @@ impl NostrDiscovery {
             active_initiators: Mutex::new(HashSet::new()),
             seen_sessions: Mutex::new(HashMap::new()),
             admission,
+            signal_gate: SignalGate::new(Instant::now()),
+            shed_signals: AtomicU64::new(0),
             event_tx,
             event_rx: Mutex::new(event_rx),
             connect_task: Mutex::new(None),

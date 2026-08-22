@@ -711,6 +711,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   future-dated, and refusing would silently withdraw Nostr-mediated dialing
   for every peer at once.
 
+- Inbound traversal signals are now rate limited before they are decrypted. A
+  rendezvous-enabled node handed every kind-21059 event straight to the unwrap,
+  which is two NIP-44 decrypts and a signature verify, inline on the single
+  task that also routes traversal answers and maintains the advert cache.
+  Nothing bounded how fast an unauthenticated stranger could schedule that
+  work: the per-npub offer admission cannot, because it keys on the sender's
+  public key, which only exists once the first decrypt has already run, and
+  because it is a concurrency semaphore rather than a limit over time. A token
+  bucket now sits ahead of the unwrap, so a flood costs a node its inbound
+  offers instead of the whole notify loop.
+
+  What the limit can and cannot key on is worth stating, because it decides the
+  shape of the fix. Before decryption there is no sender identity at all: the
+  outer event is signed by a key generated per event, so bucketing on its
+  author would hand an attacker a fresh allowance for free, and the timestamp
+  and recipient tag are equally attacker-chosen. The arrival relay is drawn
+  from our own configured set but is not an isolation boundary either, since an
+  attacker publishes to the same relays an honest peer does. The shared
+  allowance is therefore a single global bucket and is indiscriminate by
+  construction, which on its own would shed our own traversals along with the
+  attacker's, and since the attacker sets the rate every retry would land in
+  the same shed. A second, smaller allowance is held in reserve and drawn only
+  while this node has traversals of its own outstanding, so a flood denies a
+  node its inbound offers, which nothing receiver-side can prevent without a
+  pre-decrypt identity, rather than also denying it the answers to offers it
+  sent. Shed signals are counted and reported at debug level per event with a
+  warning each time the running total doubles, so a bucket sized below a busy
+  node's real need shows up in the log rather than as apparent relay flakiness.
+
+  Two limits on what this buys. It bounds the crypto path only: the advert
+  branch runs earlier in the same loop and is not metered here, so a stranger
+  can still put JSON parsing and a cache insert on the task per event. And the
+  relay SDK verifies each event's outer signature on its own per-relay task
+  before this loop ever sees it, which no receiver-side change short of
+  dropping the subscription can avoid.
+
 - Traversal punch targets taken from a peer's offer or answer are now
   filtered and bounded. A rendezvous-enabled node previously punched every
   address a signed offer named, including loopback, link-local, multicast,
