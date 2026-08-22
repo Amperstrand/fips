@@ -529,6 +529,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### FMP/FSP session integrity
 
+- A frame whose counter is `u64::MAX` is now refused by the replay window
+  instead of being accepted as a new high-water mark. Accepting it pinned
+  `highest` at the ceiling, after which every subsequent counter from that peer
+  fell more than a replay window below it and was rejected, wedging that peer's
+  own receive path until a rekey replaced the session. The send side already
+  refuses to emit that counter (`take_send_counter` and `advance_nonce` both
+  return a nonce-overflow error), so no conforming peer can produce it and the
+  refusal is invisible on the wire; the highest counter an honest peer can send,
+  `u64::MAX - 1`, is still accepted. Reaching this required an
+  already-authenticated peer running modified code, and the damage was confined
+  to that peer's own session.
+
+- The MMP gap tracker advances its expected-counter state with a saturating add,
+  so a received counter of `u64::MAX` no longer overflows it. The wrap silently
+  reset the expectation to zero in a release build and aborted the task under a
+  build with overflow checks on, such as the test harness. Behaviour is
+  unchanged for every counter an honest peer can emit.
+
 - A session setup message naming an already-established peer no longer replaces
   that peer's session. The handler did this whenever `node.rekey.enabled` was
   false: it ran a fresh responder handshake and overwrote the entry, discarding

@@ -62,7 +62,7 @@ impl GapTracker {
     fn observe(&mut self, counter: u64) -> u64 {
         let Some(expected) = self.expected_next else {
             // First frame: initialize
-            self.expected_next = Some(counter + 1);
+            self.expected_next = Some(counter.saturating_add(1));
             return 0;
         };
 
@@ -91,7 +91,7 @@ impl GapTracker {
         // Update expected (always advance to counter+1 or keep expected if
         // this was a late/reordered frame)
         if counter >= expected {
-            self.expected_next = Some(counter + 1);
+            self.expected_next = Some(counter.saturating_add(1));
         }
 
         lost
@@ -558,6 +558,31 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(max, 0);
         assert_eq!(mean, 0);
+    }
+
+    #[test]
+    fn test_gap_tracker_saturates_on_first_frame_at_max_counter() {
+        // Pre-fix this aborts the test process at the unchecked `counter + 1`
+        // under the dev profile's overflow checks rather than failing an
+        // assertion; the abort is the red, not a harness fault.
+        let mut g = GapTracker::new();
+        assert_eq!(g.observe(u64::MAX), 0);
+        // A saturated expectation must simply stop the tracker advancing, and
+        // every later counter then takes the in-order branch.
+        assert_eq!(g.observe(u64::MAX), 0);
+        let (count, max, _mean) = g.take_interval_stats();
+        assert_eq!(count, 0);
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn test_gap_tracker_saturates_on_advance_at_max_counter() {
+        // Primes the tracker first so the advance branch, not the first-frame
+        // branch, is the site that would overflow.
+        let mut g = GapTracker::new();
+        g.observe(10);
+        g.observe(u64::MAX);
+        assert_eq!(g.observe(u64::MAX), 0);
     }
 
     #[test]
