@@ -491,6 +491,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Data-plane / transports
 
+- An inbound onion connection no longer leaks its inbound slot when the peer
+  goes away before the accept loop has pooled it. The Tor accept loop spawned
+  the per-connection receive task, then inserted the pool entry, then bumped
+  the inbound counter; a remote that reset immediately let the receive task
+  run its cleanup first, find nothing to remove, skip the teardown that
+  decrements, and leave the increment behind for the life of the process. Once
+  enough of those accumulated the `max_inbound` gate rejected every further
+  onion connection, with the pool visibly empty. The accept loop now holds the
+  receive task on a readiness barrier until both the pool entry and the
+  counter are in place, as the TCP accept loop already did, and an aborted
+  accept still falls through to the cleanup rather than stranding the entry.
+  The same accept path also releases the slot of an entry it evicts, which a
+  reused ephemeral forward port could otherwise leave orphaned. Outbound Tor
+  connections and the whole of the Nym transport are unaffected: neither holds
+  a counted inbound slot.
+
 - A path MTU measured on one link no longer clamps a peer that has moved to
   another. Every writer of the per-destination path-MTU cache keeps the
   smaller of the existing and incoming value, which is right while a peer
