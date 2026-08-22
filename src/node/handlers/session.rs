@@ -64,6 +64,20 @@ fn link_wire_len(encoded_len: usize) -> usize {
     encoded_len + LINK_FRAME_OVERHEAD
 }
 
+/// Divisor giving the share of the session table that unauthenticated
+/// half-open entries may hold, as `max_sessions / DIVISOR`.
+///
+/// Two means a reconnect storm, where every peer that had a session
+/// initiates at once after a restart or a healed partition, still fits in
+/// half the table; a tighter share bites four times sooner and is felt by
+/// a hub before it is felt by an attacker. Half-open entries are reaped
+/// after `handshake_timeout_secs` while established ones survive
+/// `idle_timeout_secs`, so they turn over faster than the share suggests.
+/// Lowering the divisor raises the share, which lets a handshake flood
+/// crowd out peers that complete; raising it refuses legitimate initiators
+/// sooner in a storm.
+const HALF_OPEN_SHARE_DIVISOR: usize = 2;
+
 /// Inputs to `try_send_session_data_pipelined` — the FSP+FMP pipelined
 /// fast path that hands both AEAD operations to the encrypt worker
 /// in a single dispatch.
@@ -517,6 +531,19 @@ impl Node {
         // no limit at all. A setup naming an established peer cannot grow the
         // table and is metered separately, so that a stranger flood over a
         // shared link cannot stop that peer's rekey from arming.
+        // Population cap, ahead of the limiter so a full table costs no
+        // token, no responder handshake and no ack. The predicate is "would
+        // admitting this grow the table", not "is this a stranger": `class`
+        // is Stranger for an existing Initiating or AwaitingMsg3 entry too,
+        // and refusing those would break in-flight legitimate handshakes and
+        // the duplicate-ack resend. Same shape as the pending-destination cap
+        // in `queue_pending_packet`. Refuse rather than evict: msg1 is
+        // unauthenticated here, so evicting would hand a stranger a teardown
+        // primitive it does not have.
+        if !self.admit_new_session(src_addr) {
+            return;
+        }
+
         let class = if self
             .sessions
             .get(src_addr)
@@ -1798,6 +1825,59 @@ impl Node {
     /// Creates a Noise XK handshake as initiator, wraps msg1 in a
     /// SessionSetup, encapsulates in a SessionDatagram, and routes
     /// toward the destination.
+    /// Whether a session for `addr` may be created, given the table cap.
+    ///
+    /// Returns true when an entry already exists, since admitting it cannot
+    /// grow the table. Counts its own refusals, so the two reasons are
+    /// distinguishable without turning on debug logging.
+    pub(in crate::node) fn admit_new_session(&mut self, addr: &NodeAddr) -> bool {
+        let max_sessions = self.config().node.limits.max_sessions;
+        if max_sessions == 0 || self.sessions.contains_key(addr) {
+            return true;
+        }
+
+        if self.sessions.len() >= max_sessions {
+            debug!(
+                src = %self.peer_display_name(addr),
+                sessions = self.sessions.len(),
+                max_sessions = max_sessions,
+                "Session table full, refusing to create a session"
+            );
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::TableFull));
+            return false;
+        }
+
+        // Half-open entries are unauthenticated and are reaped after
+        // `handshake_timeout_secs`, so they are the cheap half of the table
+        // to fill. Holding them to a share keeps room for peers that
+        // complete. The outer length test makes the scan unreachable below
+        // the share, and the table is itself bounded by the cap above.
+        // At least one, or a table capped at one would admit no inbound
+        // session at all rather than one.
+        let half_open_share = (max_sessions / HALF_OPEN_SHARE_DIVISOR).max(1);
+        if self.sessions.len() >= half_open_share {
+            let half_open = self
+                .sessions
+                .values()
+                .filter(|e| e.is_awaiting_msg3())
+                .count();
+            if half_open >= half_open_share {
+                debug!(
+                    src = %self.peer_display_name(addr),
+                    half_open = half_open,
+                    half_open_share = half_open_share,
+                    "Half-open session share exhausted, refusing to create a session"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Session(SessionReject::HalfOpenFull));
+                return false;
+            }
+        }
+
+        true
+    }
+
     pub(in crate::node) async fn initiate_session(
         &mut self,
         dest_addr: NodeAddr,
@@ -2639,6 +2719,17 @@ impl Node {
             return;
         }
 
+        // No session, so this one would grow the table. Answer the local
+        // application the way an unroutable destination is answered rather
+        // than returning an error from `initiate_session`: the caller reads
+        // an error as "no route" and responds with a discovery lookup and a
+        // queued packet, which is outbound traffic on a node already at its
+        // limit.
+        if !self.admit_new_session(&dest_addr) {
+            self.send_icmpv6_dest_unreachable(&ipv6_packet);
+            return;
+        }
+
         // No session: initiate one and queue the packet.
         // If session initiation fails (no route), trigger discovery and
         // queue the packet for retry when discovery completes.
@@ -2766,6 +2857,10 @@ impl Node {
         if let Some(existing) = self.sessions.get(&dest_addr)
             && (existing.is_established() || existing.is_initiating())
         {
+            return;
+        }
+
+        if !self.admit_new_session(&dest_addr) {
             return;
         }
 

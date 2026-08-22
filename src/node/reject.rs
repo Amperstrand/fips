@@ -258,6 +258,18 @@ pub enum SessionReject {
     /// before any handshake state was created or any ack sent. Tracked via
     /// [`SessionStats::setup_rate_limited`](crate::node::stats::SessionStats).
     SetupRateLimited,
+    /// A session would have been created but the table is at
+    /// `node.limits.max_sessions`. Refused rather than evicted: the
+    /// deciding message is unauthenticated at this point, so evicting
+    /// would hand a stranger a way to tear down established sessions.
+    /// Tracked via
+    /// [`SessionStats::table_full`](crate::node::stats::SessionStats).
+    TableFull,
+    /// A session would have been created but unauthenticated half-open
+    /// entries already hold their share of the table. Bounds what a
+    /// handshake flood can deny an established peer. Tracked via
+    /// [`SessionStats::half_open_full`](crate::node::stats::SessionStats).
+    HalfOpenFull,
 }
 
 /// MMP rejection reasons.

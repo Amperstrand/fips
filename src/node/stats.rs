@@ -79,6 +79,14 @@ pub struct SessionStats {
     /// A setup message was refused by the per-link-peer setup limiter,
     /// before any handshake state was created or any ack sent.
     pub setup_rate_limited: u64,
+    /// A session would have been created but the table is at
+    /// `node.limits.max_sessions`. A sustained rate means either the cap
+    /// is sized below what this node legitimately carries, or something is
+    /// holding the table full.
+    pub table_full: u64,
+    /// A session would have been created but unauthenticated half-open
+    /// entries already hold their share of the table.
+    pub half_open_full: u64,
 }
 
 impl SessionStats {
@@ -96,6 +104,8 @@ impl SessionStats {
             pending_replaced: self.pending_replaced,
             ack_handshake_failed: self.ack_handshake_failed,
             setup_rate_limited: self.setup_rate_limited,
+            table_full: self.table_full,
+            half_open_full: self.half_open_full,
         }
     }
 
@@ -110,6 +120,8 @@ impl SessionStats {
             SessionReject::RekeyPending => self.rekey_pending += 1,
             SessionReject::AckHandshakeFailed => self.ack_handshake_failed += 1,
             SessionReject::SetupRateLimited => self.setup_rate_limited += 1,
+            SessionReject::TableFull => self.table_full += 1,
+            SessionReject::HalfOpenFull => self.half_open_full += 1,
         }
     }
 }
@@ -392,6 +404,8 @@ pub struct SessionStatsSnapshot {
     pub pending_replaced: u64,
     pub ack_handshake_failed: u64,
     pub setup_rate_limited: u64,
+    pub table_full: u64,
+    pub half_open_full: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

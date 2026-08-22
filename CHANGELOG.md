@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-positive rate is rejected at config validation rather than silently
   refusing every session.
 
+- `node.limits.max_sessions`, defaulting to 1024, which bounds the end-to-end
+  session table. Zero means unlimited, which restores the previous behaviour
+  exactly and is the way to back the change out on a running node. The default
+  is four times the adjacent `node.session.pending_max_destinations`. A
+  session entry measures 6608 bytes of inline state plus heap, so the table
+  holds to roughly 7 MB, and a test pins that per-entry figure so the
+  arithmetic behind the default fails loudly if an entry grows. Existing
+  configurations parse unchanged, the key being optional.
+
 - `node.rate_limit.established_handshake_burst` and
   `node.rate_limit.established_handshake_rate`, the parameters of the new
   established-link msg1 token bucket, which meters link-layer msg1 rather
@@ -1188,6 +1197,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   armed to retry on the first tick. Admission is also checked only at handshake
   time, so a peer admitted during a window that has already happened keeps its
   link.
+
+- The end-to-end session table now has a bound. It was the one remotely-grown
+  map with none: an inbound SessionSetup naming an address nobody had seen
+  inserted an entry, and the two existing limits did not reach it, the setup
+  limiter governing the arrival rate rather than the population and the idle
+  purge only reaching entries a peer stops using. One neighbour sending setups
+  at the permitted rate could hold roughly 1440 half-open entries at any
+  moment and grow the table without limit by keeping them warm. Setups that
+  would grow the table past `node.limits.max_sessions` are now refused, ahead
+  of the setup limiter, so a full table costs no token, no responder handshake
+  and no ack; a refused setup emits nothing at all, which is indistinguishable
+  from loss to the sender and is already covered by its own msg1 resend
+  schedule. The test is whether admitting would grow the table, not whether
+  the sender is a stranger, so a resent setup for an entry already present is
+  still served and an in-flight handshake is not broken. Unauthenticated
+  half-open entries are additionally held to half the table, so a handshake
+  flood cannot deny the whole of it to peers that complete; that share is sized
+  to leave a reconnect storm, where every peer initiates at once after a
+  restart or a healed partition, room to land. Locally originated sessions are
+  capped at the same ceiling, answered with ICMPv6 destination unreachable so
+  the application gets an immediate error rather than a silent drop. The cap
+  refuses rather than evicts: the setup that triggers the decision is
+  unauthenticated at that point, so evicting would hand a stranger a way to
+  tear down sessions it has nothing to do with. Refusals are counted as
+  `table_full` and `half_open_full` in the session reject family. What stays
+  open is per-neighbour fairness among established sessions: one hostile
+  neighbour that completes handshakes and keeps each session warm can occupy
+  the table and hold new session establishment closed for as long as it keeps
+  doing so, which is a denial of new sessions rather than the unbounded memory
+  growth it replaces.
 
 - An accepted inbound TCP connection no longer holds a slot indefinitely
   without sending anything. The cap was tested at accept and the pool insert

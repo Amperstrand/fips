@@ -4207,6 +4207,258 @@ async fn test_a_drained_stranger_bucket_still_admits_a_setup_naming_an_establish
 }
 
 // ============================================================================
+// Integration tests: the session-table population cap
+// ============================================================================
+
+/// Build a two-node routable mesh with the session table capped for a test
+/// and the setup limiter opened wide, so the cap is the only thing refusing.
+async fn make_session_capped_pair(max_sessions: usize) -> Vec<TestNode> {
+    let configs = (0..2)
+        .map(|_| {
+            let mut config = Config::new();
+            config.node.rekey.enabled = false;
+            config.node.limits.max_sessions = max_sessions;
+            config.node.rate_limit.session_setup_burst = 10_000;
+            config.node.rate_limit.session_setup_rate = 10_000.0;
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    nodes
+}
+
+#[tokio::test]
+async fn test_forged_setups_stop_growing_the_session_table_once_the_cap_is_reached() {
+    // The table was the one remotely-grown map with no bound: each setup from
+    // an address nobody has seen inserted an entry, and neither existing limit
+    // reached it, the setup limiter governing arrival rate rather than
+    // population and the idle purge only reaching entries a peer stops using.
+    const MAX: usize = 8;
+    let share = MAX / 2;
+    let mut nodes = make_session_capped_pair(MAX).await;
+
+    for _ in 0..share {
+        deliver_forged_setup_over_link(&mut nodes).await;
+    }
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        share,
+        "the admissible entries must be admitted, or this test would pass for \
+         the wrong reason"
+    );
+    assert_eq!(nodes[1].node.stats().session.half_open_full, 0);
+
+    // Every SessionAck goes out through `send_session_datagram`, the only
+    // thing bumping this counter on a node with no transit traffic. A refused
+    // setup must not move it.
+    let originated = nodes[1].node.metrics().forwarding.originated_packets.get();
+
+    for _ in 0..4 {
+        deliver_forged_setup_over_link(&mut nodes).await;
+    }
+
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        share,
+        "a table at its bound must stop growing"
+    );
+    assert_eq!(
+        nodes[1].node.stats().session.half_open_full,
+        4,
+        "each refusal must be counted; the DEBUG line is invisible by default"
+    );
+    assert_eq!(
+        nodes[1].node.metrics().forwarding.originated_packets.get(),
+        originated,
+        "a refused setup must emit nothing at all"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_a_setup_that_would_grow_a_full_table_is_refused_and_counted() {
+    // The table-full arm specifically: one established entry against a cap of
+    // one, so the half-open share is not what refuses.
+    let mut nodes = make_session_capped_pair(1).await;
+    establish_pair_session(&mut nodes).await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        1,
+        "precondition: the table is full with the established peer"
+    );
+
+    let originated = nodes[1].node.metrics().forwarding.originated_packets.get();
+    deliver_forged_setup_over_link(&mut nodes).await;
+
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        1,
+        "a full table must not grow for a stranger"
+    );
+    assert_eq!(nodes[1].node.stats().session.table_full, 1);
+    assert_eq!(
+        nodes[1].node.metrics().forwarding.originated_packets.get(),
+        originated,
+        "a refused setup must cost no ack"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_a_full_session_table_still_serves_a_setup_naming_an_existing_entry() {
+    // The guard against writing the cap as "refuse strangers". A setup for an
+    // entry already present cannot grow the table, and refusing it would break
+    // the duplicate-ack resend an initiator depends on.
+    let mut nodes = make_session_capped_pair(1).await;
+    establish_pair_session(&mut nodes).await;
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let refused_before = nodes[1].node.stats().session.table_full;
+    let originated = nodes[1].node.metrics().forwarding.originated_packets.get();
+
+    // A setup naming the established peer: the shape an inbound rekey has.
+    let setup = forge_setup_from_stranger(&nodes);
+    let datagram = SessionDatagram::new(node0_addr, node1_addr, setup).with_ttl(64);
+    let encoded = datagram.encode();
+    nodes[1]
+        .node
+        .handle_session_datagram(&node0_addr, &encoded[1..], false)
+        .await;
+
+    assert_eq!(
+        nodes[1].node.stats().session.table_full,
+        refused_before,
+        "a setup that cannot grow the table must not be refused by the cap"
+    );
+    assert!(
+        nodes[1].node.metrics().forwarding.originated_packets.get() > originated,
+        "and it must still be answered"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_a_full_session_table_does_not_evict_an_established_session() {
+    // Pins refuse-not-evict. The setup that triggers the decision is
+    // unauthenticated at that point, so evicting would hand a stranger a way
+    // to tear down a session it has nothing to do with.
+    let mut nodes = make_session_capped_pair(1).await;
+    establish_pair_session(&mut nodes).await;
+    let node0_addr = *nodes[0].node.node_addr();
+
+    for _ in 0..4 {
+        deliver_forged_setup_over_link(&mut nodes).await;
+    }
+
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .expect("the established session must survive a flood at the cap")
+            .is_established(),
+        "a stranger's setup must never cost an established peer its session"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_the_session_table_admits_again_after_the_handshake_reaper_drains_it() {
+    // The cap is a ceiling, not a latch: half-open entries are reaped after
+    // `handshake_timeout_secs` and the room they free must be usable.
+    const MAX: usize = 8;
+    let share = MAX / 2;
+    let mut nodes = make_session_capped_pair(MAX).await;
+
+    for _ in 0..(share + 2) {
+        deliver_forged_setup_over_link(&mut nodes).await;
+    }
+    assert!(
+        nodes[1].node.stats().session.half_open_full > 0,
+        "precondition: the table is refusing before the reaper runs"
+    );
+
+    let timeout_ms = nodes[1]
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_timeout_secs
+        * 1000;
+    let now_ms = Node::now_ms();
+    nodes[1]
+        .node
+        .resend_pending_session_handshakes(now_ms + timeout_ms + 1)
+        .await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        0,
+        "precondition: the reaper freed the half-open entries"
+    );
+
+    deliver_forged_setup_over_link(&mut nodes).await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        1,
+        "room freed by the reaper must be usable, or the cap is a latch"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_half_open_setups_cannot_consume_more_than_their_share_of_the_table() {
+    // Half-open entries are unauthenticated and cheap to create, so they are
+    // held to a share of the table rather than being allowed to fill it and
+    // deny it to every peer that would complete a handshake.
+    const MAX: usize = 16;
+    let share = MAX / 2;
+    let mut nodes = make_session_capped_pair(MAX).await;
+
+    for _ in 0..(share + 2) {
+        deliver_forged_setup_over_link(&mut nodes).await;
+    }
+
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        share,
+        "half-open entries must stop at their share, well below the table cap"
+    );
+    assert_eq!(nodes[1].node.stats().session.half_open_full, 2);
+    assert_eq!(
+        nodes[1].node.stats().session.table_full,
+        0,
+        "the table itself is not full, so the refusals must be attributed to \
+         the share rather than to the cap"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[test]
+fn test_session_entry_size_stays_within_the_budget_the_cap_is_derived_from() {
+    // The default `max_sessions` is derived from what one entry costs.
+    // Measured at 6608 bytes of inline state when the cap was written, plus
+    // heap for the MMP window and handshake payloads, so 1024 sessions is
+    // roughly 7 MB. This is what fires if a large field is added later and
+    // the arithmetic behind that default stops holding.
+    const BUDGET: usize = 8192;
+    assert!(
+        std::mem::size_of::<SessionEntry>() <= BUDGET,
+        "SessionEntry is {} bytes, over the {} the max_sessions default \
+         assumes; re-derive the default or shrink the entry",
+        std::mem::size_of::<SessionEntry>(),
+        BUDGET
+    );
+}
+
+// ============================================================================
 // Integration tests: a forged SessionAck against an in-flight initiation
 // ============================================================================
 
