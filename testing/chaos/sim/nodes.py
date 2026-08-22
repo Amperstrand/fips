@@ -113,7 +113,7 @@ class NodeManager:
         and so the `protect_connectivity` guard, and the shared
         `down_nodes` set that netem, links and traffic all skip. Returning
         before the mutation keeps the model equal to the mesh and lets the
-        next churn tick retry the node. See ISSUE-2026-0081.
+        next churn tick retry the node.
         """
         container = self.topology.container_name(node_id)
         docker_exec_quiet(container, "kill 1", timeout=5)  # SIGTERM to PID 1

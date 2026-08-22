@@ -246,7 +246,7 @@ unset -f docker
 
 # --- Case 6: the verdict discriminates non-convergence from connectivity --
 #
-# This is the break-what-it-guards check for ISSUE-2026-0069. The recorded
+# This is the break-what-it-guards check for the verdict itself. The recorded
 # failure exited 1 while reporting "20 passed, 0 failed": every connectivity
 # pair passed and only the tree fell short, and nothing in the summary told
 # the two apart. The gate now names its verdict, so drive it into each

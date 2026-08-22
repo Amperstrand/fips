@@ -587,7 +587,7 @@ class SimRunner:
         project before the stragglers have registered, finds nothing to
         remove, and says so successfully. Nothing downstream looks at what
         survived, so the leak is invisible at the one moment it is cheap to
-        see. See ISSUE-2026-0079.
+        see.
         """
         log.info("Stopping containers...")
         docker_compose(self.compose_file, ["down"], check=False)

@@ -294,6 +294,7 @@ results_line() {
         line+=" relationships, $CONVERGE_OUTCOME)"
     fi
     echo "$line ==="
+    return 0
 }
 
 phase_result() {
