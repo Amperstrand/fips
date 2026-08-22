@@ -325,7 +325,9 @@ fn an_empty_datagram_queued_before_the_close_is_not_read_as_the_close() {
 /// The open question this platform's arm of [`super::seqpacket`] rests on, and
 /// the counterpart of [`darwin_reports_a_closed_dgram_peer_somehow`]. The three
 /// kernels do three different things: Linux reports nothing at all, Darwin
-/// reports `ECONNRESET`, and FreeBSD has not been measured. `recv_once` accepts
+/// reports `ECONNRESET`, and FreeBSD does signal it — this probe passed on the
+/// 15.1 CI image on 2026-08-22, so the flow's end of file can come from the
+/// descriptor there and no line-protocol fallback is needed. `recv_once` accepts
 /// either `ECONNRESET` or a zero-byte read plus `POLLHUP`, so either signal is
 /// enough and the assertion does not care which.
 ///

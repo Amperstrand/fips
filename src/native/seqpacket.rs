@@ -16,12 +16,13 @@
 //! is not an atomic-record socket: `seqpacketproto` carries no `PR_ATOMIC` and
 //! shares its send and receive handlers with `SOCK_STREAM`, so consecutive
 //! messages coalesce and a zero-length message is queued nowhere and delivered
-//! never. **This was read out of the FreeBSD kernel source and inferred from a
-//! CI log; nobody has run it on FreeBSD.** What was observed is a CI run in
-//! which the zero-length-message test hung until the job was killed and five
-//! boundary tests failed within 360 ms, which is the shape the source predicts.
-//! The probes in [`super::dgram_probe`] are what would turn that into a
-//! measurement, and they have not been run on FreeBSD either.
+//! never. **Measured on the FreeBSD 15.1 CI image on 2026-08-22**, by the two
+//! probes in [`super::dgram_probe`] named for it: a `SOCK_SEQPACKET` pair there
+//! does not keep message boundaries, and it drops a zero-length message instead
+//! of delivering it. The reading of the kernel source came first and the
+//! measurement agreed with it; before that run the mechanism was inferred from
+//! a CI log in which the zero-length-message test hung until the job was killed
+//! and five boundary tests failed within 360 ms.
 //! Everything else this module needs works on both: `SCM_RIGHTS` is supported,
 //! `AsyncFd` is backed by kqueue, and a connected `SOCK_DGRAM` pair keeps
 //! message boundaries and delivers an empty datagram, which `SOCK_SEQPACKET`
