@@ -747,6 +747,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before this loop ever sees it, which no receiver-side change short of
   dropping the subscription can avoid.
 
+- A STUN binding response is now accepted only from the address the binding
+  request was sent to. The client discarded the source address `recv_from`
+  returned and let the parser decide, and the parser checks only the message
+  type, the magic cookie and the 12-byte transaction id. An on-path attacker
+  who could read the outbound request could therefore inject a reply carrying
+  a transaction id copied from it, and its chosen address became the reflexive
+  candidate the node published in a traversal offer or answer, redirecting the
+  peer's hole-punch packets. Datagrams from any other source are counted and
+  discarded, and one debug record per STUN attempt reports the count and the
+  last unexpected source, so a rejection is diagnosable without giving a
+  flooder control of the log rate. A server that answers from an address other
+  than the one dialed, which RFC 5389 forbids, now times out and the next
+  configured server is tried.
+
 - Traversal punch targets taken from a peer's offer or answer are now
   filtered and bounded. A rendezvous-enabled node previously punched every
   address a signed offer named, including loopback, link-local, multicast,

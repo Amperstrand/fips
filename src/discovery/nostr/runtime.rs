@@ -1210,6 +1210,10 @@ impl NostrDiscovery {
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
         base_socket.set_nonblocking(true)?;
 
+        // This drains every datagram on the traversal socket until the STUN
+        // deadline, so it must complete before any punch can be in flight: a
+        // retry or re-observation once punching has started would swallow the
+        // peer's punch packets.
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
             &base_socket,
             &self.config.stun_servers,
@@ -1461,6 +1465,10 @@ impl NostrDiscovery {
 
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
         base_socket.set_nonblocking(true)?;
+        // This drains every datagram on the traversal socket until the STUN
+        // deadline, so it must complete before any punch can be in flight: a
+        // retry or re-observation once punching has started would swallow the
+        // peer's punch packets.
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
             &base_socket,
             &self.config.stun_servers,
