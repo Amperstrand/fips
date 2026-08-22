@@ -8,6 +8,7 @@
 
 use crate::NodeAddr;
 use crate::node::reject::ForwardingReject;
+use crate::node::routing_error_rate_limit::LimitVerdict;
 use crate::node::session_wire::{
     FSP_COMMON_PREFIX_SIZE, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED, FSP_PHASE_MSG1, FSP_PHASE_MSG2,
     FspCommonPrefix, FspEncryptedHeader, parse_encrypted_coords,
@@ -101,7 +102,7 @@ impl Node {
                     bytes = payload.len(),
                     "Dropping transit SessionDatagram: no route to destination"
                 );
-                self.send_routing_error(&datagram).await;
+                self.send_routing_error(from, &datagram).await;
                 return;
             }
         };
@@ -145,7 +146,7 @@ impl Node {
                     self.metrics()
                         .forwarding
                         .record_reject_bytes(ForwardingReject::MtuExceeded, payload.len());
-                    self.send_mtu_exceeded_error(&datagram, mtu).await;
+                    self.send_mtu_exceeded_error(from, &datagram, mtu).await;
                 }
                 _ => {
                     self.metrics()
@@ -283,6 +284,43 @@ impl Node {
         }
     }
 
+    /// Decide whether this node may emit a routing error induced by `from`
+    /// about `dest`.
+    ///
+    /// Two gates, in this order. The per-link-peer budget bounds what one
+    /// admitted peer can induce, and is the only one keyed on something the
+    /// sender cannot mint; it is consulted first so the per-destination map
+    /// only grows at the budget rate. The per-destination interval is the
+    /// aggregate suppressor during a genuine outage.
+    ///
+    /// The budget token is peeked and only committed once the destination gate
+    /// has also admitted. Charging it on a suppressed signal would let a single
+    /// unroutable destination behind a high-fanout peer spend that peer's whole
+    /// budget on emissions nothing sends, silencing every other destination
+    /// behind it.
+    fn admit_error_emission(&mut self, from: &NodeAddr, dest: &NodeAddr) -> bool {
+        let now = Instant::now();
+
+        if !self.peer_error_budget.has_token(from, now) {
+            self.metrics().errors.emit_over_peer_budget.inc();
+            return false;
+        }
+
+        match self.routing_error_rate_limiter.check(dest, now) {
+            LimitVerdict::Suppress => {
+                self.metrics().errors.emit_over_dest_interval.inc();
+                return false;
+            }
+            LimitVerdict::AdmitAtCapacity => {
+                self.metrics().errors.emit_limiter_at_capacity.inc();
+            }
+            LimitVerdict::Admit => {}
+        }
+
+        self.peer_error_budget.commit(from, now);
+        true
+    }
+
     /// Generate and send a routing error signal back to the datagram's source.
     ///
     /// If we have cached coords for the destination, send PathBroken (we know
@@ -291,12 +329,11 @@ impl Node {
     ///
     /// If we can't route the error back to the source either, drop silently.
     /// No cascading errors.
-    async fn send_routing_error(&mut self, original: &SessionDatagram) {
-        // Rate limit: one error signal per destination per 100ms
-        if !self
-            .routing_error_rate_limiter
-            .should_send(&original.dest_addr)
-        {
+    ///
+    /// `from` is the authenticated link peer the original datagram arrived
+    /// from, and is what the emission is charged against.
+    async fn send_routing_error(&mut self, from: &NodeAddr, original: &SessionDatagram) {
+        if !self.admit_error_emission(from, &original.dest_addr) {
             return;
         }
 
@@ -307,15 +344,21 @@ impl Node {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let error_payload =
-            if let Some(coords) = self.coord_cache().get(&original.dest_addr, now_ms) {
-                let coords = coords.clone();
-                PathBroken::new(original.dest_addr, my_addr)
-                    .with_last_coords(coords)
-                    .encode()
-            } else {
-                CoordsRequired::new(original.dest_addr, my_addr).encode()
-            };
+        // The choice between the two signals still leaks whether this node
+        // holds coords for the destination, but the coordinates themselves
+        // are not attached: the address the error is returned to is the
+        // datagram's own src_addr, which nothing binds to the peer that sent
+        // it, so attaching them would answer a cache read to whoever names an
+        // address. No receiver reads the field.
+        let error_payload = if self
+            .coord_cache()
+            .get(&original.dest_addr, now_ms)
+            .is_some()
+        {
+            PathBroken::new(original.dest_addr, my_addr).encode()
+        } else {
+            CoordsRequired::new(original.dest_addr, my_addr).encode()
+        };
 
         let error_dg = SessionDatagram::new(my_addr, original.src_addr, error_payload)
             .with_ttl(self.config().node.session.default_ttl);
@@ -356,12 +399,20 @@ impl Node {
     /// Called when `send_encrypted_link_message()` fails with
     /// `NodeError::MtuExceeded` during forwarding. The signal tells the
     /// source the bottleneck MTU so it can immediately reduce its path MTU.
-    async fn send_mtu_exceeded_error(&mut self, original: &SessionDatagram, bottleneck_mtu: u16) {
-        // Rate limit: reuse routing_error_rate_limiter keyed on dest_addr
-        if !self
-            .routing_error_rate_limiter
-            .should_send(&original.dest_addr)
-        {
+    ///
+    /// `from` is the authenticated link peer the original datagram arrived
+    /// from, and is what the emission is charged against. MtuExceeded shares
+    /// the link peer's budget with the routing errors rather than holding its
+    /// own: a separate bucket would insulate path-MTU discovery from
+    /// routing-error pressure, at the cost of a second knob and of letting one
+    /// peer induce twice the total emission.
+    async fn send_mtu_exceeded_error(
+        &mut self,
+        from: &NodeAddr,
+        original: &SessionDatagram,
+        bottleneck_mtu: u16,
+    ) {
+        if !self.admit_error_emission(from, &original.dest_addr) {
             return;
         }
 

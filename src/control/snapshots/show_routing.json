@@ -33,6 +33,9 @@
     },
     "error_signals": {
       "coords_required": 0,
+      "emit_limiter_at_capacity": 0,
+      "emit_over_dest_interval": 0,
+      "emit_over_peer_budget": 0,
       "lookup_resp_mtu_below_floor": 0,
       "mtu_exceeded": 0,
       "mtu_exceeded_below_floor": 0,

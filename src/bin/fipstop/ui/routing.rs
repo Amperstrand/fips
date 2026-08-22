@@ -298,6 +298,9 @@ fn draw_routing_stats(
             ("Path Broken Refused", err("unbound_broken")),
             ("MTU Exceeded Refused", err("unbound_mtu")),
             ("Forged Pairing", err("unbound_forged")),
+            ("Emit Over Peer Budget", err("emit_over_peer_budget")),
+            ("Emit Over Dest Interval", err("emit_over_dest_interval")),
+            ("Emit Limiter At Capacity", err("emit_limiter_at_capacity")),
         ],
     ));
     right.push(Line::from(""));

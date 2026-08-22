@@ -508,6 +508,19 @@ pub struct ErrorMetrics {
     /// annotation.
     pub lookup_resp_mtu_below_floor: Counter,
     pub unbound: UnboundSignals,
+    /// Routing errors this node declined to emit because the authenticated
+    /// link peer that induced them had spent its budget. A rising count is
+    /// either a peer flooding unroutable traffic or a hub relaying more
+    /// simultaneously-broken destinations than the budget allows.
+    pub emit_over_peer_budget: Counter,
+    /// Routing errors this node declined to emit because one for the same
+    /// destination went out within the per-destination interval. This is the
+    /// aggregate suppression a real outage produces.
+    pub emit_over_dest_interval: Counter,
+    /// Routing errors emitted without recording their destination, because
+    /// the per-destination limiter's map was full. The signal was still sent;
+    /// what was lost is interval suppression for that destination.
+    pub emit_limiter_at_capacity: Counter,
 }
 
 impl ErrorMetrics {
@@ -524,6 +537,9 @@ impl ErrorMetrics {
             unbound_broken: self.unbound.broken.get(),
             unbound_mtu: self.unbound.mtu.get(),
             unbound_forged: self.unbound.forged.get(),
+            emit_over_peer_budget: self.emit_over_peer_budget.get(),
+            emit_over_dest_interval: self.emit_over_dest_interval.get(),
+            emit_limiter_at_capacity: self.emit_limiter_at_capacity.get(),
         }
     }
 }

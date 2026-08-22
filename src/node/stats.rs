@@ -421,6 +421,9 @@ pub struct ErrorSignalStatsSnapshot {
     pub unbound_broken: u64,
     pub unbound_mtu: u64,
     pub unbound_forged: u64,
+    pub emit_over_peer_budget: u64,
+    pub emit_over_dest_interval: u64,
+    pub emit_limiter_at_capacity: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

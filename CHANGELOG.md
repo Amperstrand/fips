@@ -939,6 +939,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Data-plane / routing signals
 
+- A transit node's induced routing errors are now bounded by the authenticated
+  link peer that induced them. The 100 ms suppression gate on
+  `CoordsRequired`, `PathBroken` and `MtuExceeded` was keyed on the failed
+  datagram's destination address, which is an envelope field the sender picks,
+  so a fresh random destination on every packet was always a first sighting and
+  every packet was admitted. Each admission also inserted a key and then walked
+  the whole map, so per-packet cost grew with the flood rate while the sender's
+  cost stayed flat, and the error itself is addressed to the datagram's source
+  address, which nothing binds to the sender either. A new per-link-peer token
+  bucket, 20 signals a second sustained with a burst of 50, is now consulted
+  first, keyed on the AEAD-authenticated peer the frame arrived over: the one
+  value at that point a sender cannot mint. The per-destination interval is
+  kept unchanged behind it, because it still does the aggregate suppression a
+  genuine outage needs, and no gate was added on the address the error is
+  returned to, which would have handed a sender a way to silence honest errors
+  toward a victim it names by keeping that victim's key hot.
+
+  Two ordering choices in there rather than left to be discovered. The peer's
+  token is peeked and only spent once the destination gate has also admitted,
+  so a single unroutable destination behind a high-fanout peer cannot burn that
+  peer's whole budget on signals nothing sends and silence every other
+  destination behind it. And the destination map now carries a hard ceiling of
+  4096 entries with its expiry sweep amortized to once per eviction interval
+  rather than run on every admission; when it is full it admits without
+  recording rather than refusing, because refusing would turn a full map into
+  node-wide silence exactly during partition healing, when many destinations
+  are legitimately unroutable at once. Emission stays bounded by the peer
+  budget in that state. Three counters, rendered on the fipstop Routing tab,
+  make each of the three outcomes visible instead of silent.
+
+- A transit-emitted `PathBroken` no longer carries the reporter's cached
+  coordinates for the unreachable destination. The signal is returned to the
+  datagram's source address, so anyone able to reach the node could name any
+  address and have the node's coordinate cache read back to them, one entry per
+  packet. The field is optional on the wire and no receiver reads it, so this
+  is an emission change only: an unmodified peer parses the frame exactly as
+  before. Which of the two signals is emitted still discloses whether the entry
+  exists.
+
 - The influence a remote party has over path MTU is now bounded, and the
   per-destination path MTU cache has a way back. The `path_mtu` field is an
   unsigned per-hop transit annotation carried outside the signed proof, and the

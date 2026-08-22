@@ -17,6 +17,7 @@ pub(crate) mod encrypt_worker;
 mod handlers;
 mod lifecycle;
 pub(crate) mod metrics;
+mod peer_error_budget;
 mod rate_limit;
 pub(crate) mod reject;
 mod reloadable;
@@ -32,6 +33,7 @@ mod tree;
 pub(crate) mod wire;
 
 use self::discovery_rate_limit::{DiscoveryBackoff, DiscoveryForwardRateLimiter};
+use self::peer_error_budget::PeerErrorBudget;
 use self::rate_limit::{HandshakeRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
 use self::routing_error_rate_limit::RoutingErrorRateLimiter;
@@ -504,6 +506,10 @@ pub struct Node {
     icmp_rate_limiter: IcmpRateLimiter,
     /// Rate limiter for routing error signals (CoordsRequired / PathBroken).
     routing_error_rate_limiter: RoutingErrorRateLimiter,
+    /// Budget for routing errors this node may be induced to emit, charged to
+    /// the authenticated link peer whose datagram induced them. The only
+    /// bound on the emission that a sender cannot escape by varying a field.
+    peer_error_budget: PeerErrorBudget,
     /// Rate limiter for source-side CoordsRequired/PathBroken responses.
     coords_response_rate_limiter: RoutingErrorRateLimiter,
     /// Backoff for failed discovery lookups (originator-side).
@@ -799,6 +805,7 @@ impl Node {
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
+            peer_error_budget: PeerErrorBudget::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
                 std::time::Duration::from_millis(coords_response_interval_ms),
             ),
@@ -959,6 +966,7 @@ impl Node {
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             routing_error_rate_limiter: RoutingErrorRateLimiter::new(),
+            peer_error_budget: PeerErrorBudget::new(),
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval(
                 std::time::Duration::from_millis(coords_response_interval_ms),
             ),
