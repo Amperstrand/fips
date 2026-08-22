@@ -2568,3 +2568,31 @@ fn test_peer_display_name_tracks_alias_change() {
         peer_identity.short_npub()
     );
 }
+
+/// The DNS mesh-interface filter is keyed on the device the node actually
+/// created, not on the configured name. macOS and FreeBSD hand out utunN and
+/// tunN of the kernel's choosing, so a filter keyed on the configured name
+/// resolved to nothing there and was permanently off.
+#[cfg(unix)]
+#[test]
+fn mesh_filter_resolves_the_live_tun_device_rather_than_the_configured_name() {
+    let loopback = if cfg!(target_os = "macos") {
+        "lo0"
+    } else {
+        "lo"
+    };
+    let c_name = std::ffi::CString::new(loopback).unwrap();
+    let expected = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if expected == 0 {
+        return;
+    }
+
+    let mut config = Config::new();
+    config.tun.name = Some("fips-absent-dev".to_string());
+    let mut node = Node::new(config).unwrap();
+
+    assert_eq!(node.mesh_ifindex(), None);
+
+    node.tun_name = Some(loopback.to_string());
+    assert_eq!(node.mesh_ifindex(), Some(expected));
+}

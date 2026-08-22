@@ -732,6 +732,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attributes the acceptance to clock skew, since a peer configured with a longer
   signalling TTL than ours now reaches it too.
 
+#### DNS responder
+
+- The DNS responder's mesh-interface filter now works on macOS and FreeBSD,
+  where it had never run. The filter drops `.fips` queries that arrive over the
+  mesh TUN, which is what keeps a widened `dns.bind_addr` from exposing the
+  hosts file's alias space to every mesh peer. It was keyed on the interface
+  index resolved from the *configured* TUN name, but macOS and FreeBSD assign
+  the device a name of the kernel's choosing (`utunN`, `tunN`), so the lookup
+  found nothing, the index came back `None`, and `None` disables the filter.
+  The index is now resolved from the name of the device the node actually
+  created, which the TUN startup path already records, and a live device whose
+  index will not resolve is logged rather than passed off as "no mesh
+  interface". Linux is unaffected, since the configured name is the device's
+  name there. **Behaviour change on macOS and FreeBSD**: a node with a
+  non-loopback `dns.bind_addr` stops answering `.fips` queries that arrive over
+  the mesh interface. **What this does not close**: with an app-owned TUN the
+  node never learns a device name, so the filter stays off there. **Not
+  measured**: whether macOS and FreeBSD attribute a locally originated query
+  sent to the node's own mesh address to the TUN interface, as Linux does. If
+  they do, such a query is now dropped on those platforms; the shipped resolver
+  drop-in targets `[::1]` rather than the mesh address, so the packaged path is
+  not affected.
+
 #### Data-plane / routing signals
 
 - The influence a remote party has over path MTU is now bounded, and the
