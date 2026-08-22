@@ -433,6 +433,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Transports & config
 
+- The UDP transport's DNS cache is now bounded and actually evicts. The map
+  held one entry per distinct hostname string ever dialed, and the TTL was
+  applied only on the read, so a stale entry was overwritten on the next dial
+  of the same name and otherwise stayed for the life of the process. Under a
+  rendezvous policy that accepts advertised endpoints the keys are strings a
+  remote party chose, which made the growth theirs to drive. A store now
+  sweeps entries past their TTL and, if the map is still full, drops the
+  oldest, holding it to 256 hostnames. Refreshing a name already cached
+  evicts nothing. Eviction is by insertion time rather than last use, so a
+  rarely dialed name in a very large peer list may re-resolve more often; the
+  cost of a wrong eviction is one DNS lookup, not a failed dial.
+
 - A failed private-key write no longer leaves a node silently running an
   ephemeral identity. Six write results in the identity path were discarded,
   and the sharpest was in `persistent` mode: a failed write to `fips.key` fell
