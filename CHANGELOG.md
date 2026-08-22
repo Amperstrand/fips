@@ -540,6 +540,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other packaging paths did, so the contact of record in the new `.pkg` artifact
   would have been unreachable at its first release.
 
+### Security
+
+#### Tick profiler
+
+- The `--dir` given to `profile tick on` is now confined to `/var/log/fips`
+  when the daemon runs as root. The control socket is reachable by the `fips`
+  group, which the security model writes down as strictly weaker than root, yet
+  the directory travelled from the socket straight into a root `create_dir_all`
+  with no validation: a group member could create a root-owned directory
+  anywhere on the filesystem, including a path a later privileged component
+  reads. The path must now be absolute, must contain no `..`, and must still
+  resolve under the root once every existing ancestor has been followed through
+  its symlinks, so a symlinked parent does not launder a lexically clean path.
+  A daemon that is not running as root crosses no such boundary and takes
+  `--dir` as given, which keeps the documented non-root `cargo run` capture
+  working; the flag can no longer point a root daemon at a different log root,
+  which was its other documented use. This only ever affected a
+  `--features profiling` build: the subcommand is absent from a stock package.
+
+- A capture file is no longer written over whatever is already at its path. The
+  name is a one-second UTC stamp and therefore predictable, so `File::create`
+  would have followed a symlink pre-planted at the next name, and it truncated
+  any real file it found. The file is created only if it does not exist, and a
+  capture started in the same second as a previous one takes the next free
+  `-N` suffix instead of failing. Capture files are created private to their
+  owner and the capture directory is no longer left world-accessible by a
+  permissive umask; a capture carries the node npub, build, platform and a
+  timing series.
+
 ## [0.4.2] - unreleased
 
 ### Added
