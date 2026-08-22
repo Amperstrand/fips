@@ -445,6 +445,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rarely dialed name in a very large peer list may re-resolve more often; the
   cost of a wrong eviction is one DNS lookup, not a failed dial.
 
+- macOS: stopping an Ethernet transport under load no longer hangs the
+  process. The BPF reader thread handed each frame to the async consumer with
+  `blocking_send`, which parks with no way to be woken. Stopping the transport
+  aborts the consumer first, so nothing drains the 1024-frame channel, and the
+  socket's `Drop` then joined a thread that could never return: on a busy
+  interface the daemon had to be killed. The socket now drops the receiver
+  before joining, which releases a parked send at once, and the reader thread
+  sends through a helper that watches the same shutdown pipe its `select()`
+  already honours, so a send waiting for room cannot outlive a shutdown
+  request. The helper yields before it sleeps, so the saturated-path handoff
+  rate is unchanged. **Not covered by CI**: the reader thread is macOS-only
+  and Linux CI compiles none of it. What the tests prove is that the helper
+  the thread now waits in is cancellable; that a real BPF thread exits under
+  load still needs a manual check on a Mac.
+
 - A failed private-key write no longer leaves a node silently running an
   ephemeral identity. Six write results in the identity path were discarded,
   and the sharpest was in `persistent` mode: a failed write to `fips.key` fell
