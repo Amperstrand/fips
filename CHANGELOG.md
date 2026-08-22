@@ -828,6 +828,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seen in that tick, and anything able to flood raw frames on the segment can
   already jam the beacon at L2 more cheaply.
 
+- A read failure on `peers.allow`, `peers.deny` or the `hosts` file no longer
+  turns the node into an open one. Every read error other than a steadily
+  absent file was logged and swallowed, leaving that file's entries empty, and
+  the reloader published the result unconditionally: an unreadable `peers.deny`
+  admitted the peers it named, and an unreadable `peers.allow` took a node from
+  admitting a named few to admitting everyone, with one warning line as the
+  only signal. Because the recorded modification times advanced before the
+  load, nothing retried until the file changed again, so a persistent
+  permission or I/O fault left the empty ACL in force indefinitely. The
+  reloader now keeps the last loaded ACL when any input is present but
+  unreadable, leaves the modification times alone, retries on the next tick
+  regardless of them, and logs the fault once on the transition rather than
+  once per tick. An absent file is still a policy and still loads as an empty
+  set; a `NotFound` that a successful stat contradicts is treated as a file
+  being rewritten under us and held. A reload whose inputs all read cleanly but
+  which empties an enforcing ACL while its files are still on disk is held for
+  one tick, which catches a read that caught a non-atomic in-place edit
+  mid-write, and released on the next so a deliberate blanking still takes
+  effect. `fipsctl` ACL status gains a `stale` flag reporting that the policy
+  in force is older than the files on disk. **What this does not close**:
+  there is no last-good snapshot at startup, so a node whose ACL file is
+  unreadable at boot still comes up with no entries, now logged as an error and
+  armed to retry on the first tick. Admission is also checked only at handshake
+  time, so a peer admitted during a window that has already happened keeps its
+  link.
+
 - An accepted inbound TCP connection no longer holds a slot indefinitely
   without sending anything. The cap was tested at accept and the pool insert
   and counter bump followed with no read in between, while the frame reader's
