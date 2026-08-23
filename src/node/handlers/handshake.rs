@@ -19,8 +19,32 @@ use crate::proto::fmp::{
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use crate::utils::index::SessionIndex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Minimum interval between accepted epoch changes for one peer identity,
+/// and the recency threshold at which the peering an epoch change would
+/// destroy still counts as live.
+///
+/// An epoch-mismatch msg1 is authentic but replayable: a captured one stays
+/// valid indefinitely, and accepting it tears down a working peering. Both
+/// conditions are receiver-local. The liveness half is the one that closes
+/// the replay, since a peering under attack is by construction still
+/// heartbeating; the interval half bounds the churn a peer can drive on its
+/// own.
+///
+/// Sized against the peer's own recovery rather than against a round number:
+/// a genuinely restarting peer's msg1 resends fire at roughly t+1, t+3, t+7
+/// and t+15 seconds and its attempt is reaped at `handshake_timeout_secs`
+/// (30), so 15 is the largest value at which a real restart still re-peers
+/// inside its first handshake window with no reconnect backoff. It also sits
+/// below `link_dead_timeout_secs` (30), so the liveness gate can never
+/// outlive the reaper that would have removed the peering anyway.
+///
+/// Raising it lengthens the outage an attacker's accepted replay causes,
+/// because the genuine peer's recovery msg1 hits the same arm. Lowering it
+/// weakens both halves and, below the resend ladder, buys nothing.
+const EPOCH_RESTART_MIN_INTERVAL_SECS: u64 = 15;
 
 /// Why an inbound msg1 got past the `accept_connections` gate, and against
 /// what identity the post-DH confirmation must check it.
@@ -714,6 +738,58 @@ impl Node {
                 // executor's `InvalidateSendState`
                 // (`ambient.verified_identity.node_addr()`) targets the same addr
                 // as the pre-refactor `remove_active_peer(&peer)`.
+                // The epoch travels inside the AEAD, so this msg1 is
+                // authentic — but it stays authentic after capture, and
+                // replaying one destroys a working peering and the FSP session
+                // state it carries, from off the path. Two receiver-local
+                // conditions gate the teardown. The peering's last
+                // authenticated inbound frame is the evidence it is still
+                // alive, and nothing an unauthenticated sender emits can
+                // refresh it, so a peer that genuinely restarted clears this by
+                // having stopped sending. The interval half bounds the churn
+                // one peer can drive on its own.
+                let now_ms = Self::now_ms();
+                let peering_idle_ms = self
+                    .peers
+                    .get(&peer)
+                    .map(|p| p.idle_time(now_ms))
+                    .unwrap_or(u64::MAX);
+                let dampened = self
+                    .restart_dampener
+                    .get(&peer)
+                    .is_some_and(|t| t.elapsed().as_secs() < EPOCH_RESTART_MIN_INTERVAL_SECS);
+                if peering_idle_ms < EPOCH_RESTART_MIN_INTERVAL_SECS * 1000 || dampened {
+                    debug!(
+                        peer = %self.peer_display_name(&peer),
+                        idle_ms = peering_idle_ms,
+                        dampened,
+                        "Epoch mismatch dampened, dropping msg1"
+                    );
+                    // Silent drop: the stored msg2 is bound to the original
+                    // msg1's ephemeral, and answering an address the sender
+                    // chose is free amplification.
+                    //
+                    // No registry cleanup is needed here. On the pre-refactor
+                    // layout this arm removed the pending connection and its
+                    // link, because both were inserted before msg1 was
+                    // classified. The classification now runs against a local
+                    // `machine` that enters `peer_machines` only at the promote
+                    // tails below, and `link_id` is a bare allocation until
+                    // then, so dropping out of the arm is the whole cleanup.
+                    // The fresh leg holds no session index either (it is parked
+                    // at `Handshaking{ReceivedMsg1}` with `our_index == None`),
+                    // so nothing is leaked by returning.
+                    self.stats_mut()
+                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                    return;
+                }
+                // Stamped on acceptance only. A refusal that slid the window
+                // would let a sustained replay starve a genuinely restarting
+                // peer for as long as it kept sending.
+                let cutoff = Duration::from_secs(EPOCH_RESTART_MIN_INTERVAL_SECS);
+                self.restart_dampener.retain(|_, t| t.elapsed() < cutoff);
+                self.restart_dampener.insert(peer, Instant::now());
+
                 debug!(
                     peer = %self.peer_display_name(&peer),
                     "Peer restart detected (epoch mismatch), removing stale session"

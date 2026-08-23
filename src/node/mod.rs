@@ -17,6 +17,7 @@ pub(crate) mod encrypt_worker;
 mod handlers;
 mod lifecycle;
 pub(crate) mod metrics;
+mod peer_error_budget;
 mod peering;
 mod rate_limit;
 pub(crate) mod reject;
@@ -30,7 +31,8 @@ pub(crate) mod stats_history;
 mod tests;
 mod tree;
 
-use self::rate_limit::{HandshakeRateLimiter, SessionSetupRateLimiter};
+use self::peer_error_budget::PeerErrorBudget;
+use self::rate_limit::{HandshakeRateLimiter, LookupSignRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
 
 /// Half-range of the symmetric jitter applied to the per-session rekey timer.
@@ -473,6 +475,11 @@ pub struct Node {
     /// Discovery-subsystem state: recent-request dedup cache, in-flight
     /// lookups, originator-side backoff, and transit-side forward limiter.
     lookup: Lookup,
+    /// Signing budget for lookups we answer about ourselves (target-side),
+    /// keyed on the link peer the request arrived over. Held here rather than
+    /// inside `lookup` because it is an `Instant`-based limiter and the
+    /// `proto` tree is clockless.
+    discovery_sign_limiter: LookupSignRateLimiter,
 
     // === Diagnostics ===
     /// In-flight `probe` jobs plus their per-target ownership claims. Driven
@@ -538,6 +545,12 @@ pub struct Node {
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
+    /// When each peer identity's last ACCEPTED epoch change tore down its
+    /// peering. Keyed on identity rather than address, and held here rather
+    /// than on `ActivePeer`, because the teardown being dampened destroys
+    /// the peer entry itself. Pruned on insert; see
+    /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
+    restart_dampener: HashMap<NodeAddr, std::time::Instant>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -546,6 +559,12 @@ pub struct Node {
     setup_rate_limiter: SessionSetupRateLimiter,
     /// Rate limiter for ICMP Packet Too Big messages.
     icmp_rate_limiter: IcmpRateLimiter,
+    /// Budget bounding the routing errors one authenticated link peer can
+    /// induce this node to emit. Keyed on the link peer because that is the
+    /// only value at the emission point a sender cannot mint; the
+    /// per-destination interval inside `routing` is keyed on a field the
+    /// sender chooses and is an aggregate suppressor, not a bound.
+    peer_error_budget: PeerErrorBudget,
     /// Routing-subsystem state (routing error-signal rate limiter).
     routing: Router,
     /// FMP connection-lifecycle decision anchor (stateless; drives the
@@ -559,6 +578,12 @@ pub struct Node {
     mmp: Mmp,
     /// Rate limiter for source-side CoordsRequired/PathBroken responses.
     coords_response_rate_limiter: RoutingErrorRateLimiter,
+    /// Rate limiter for PathBroken-driven path-MTU releases, per destination.
+    /// Deliberately its own instance rather than a share of
+    /// `coords_response_rate_limiter`: a budget another signal can spend is
+    /// not a bound on this one, and one PathBroken drives both responses, so
+    /// a shared limiter would let the coord-warmup arm pay for the release.
+    path_mtu_release_limiter: RoutingErrorRateLimiter,
 
     // === Peering Homeostasis ===
     /// Owner of the peering-reconciler state relocated off `Node`: the sans-IO
@@ -806,9 +831,11 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            restart_dampener: HashMap::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
+            peer_error_budget: PeerErrorBudget::new(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -816,11 +843,15 @@ impl Node {
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 coords_response_interval_ms,
             ),
+            path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
+                handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
+            ),
             probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(
                 LookupBackoff::with_params(backoff_base_secs, backoff_max_secs),
                 LookupForwardRateLimiter::with_interval_ms(forward_min_interval_secs * 1000),
             ),
+            discovery_sign_limiter: LookupSignRateLimiter::new(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -963,9 +994,11 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            restart_dampener: HashMap::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
+            peer_error_budget: PeerErrorBudget::new(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -973,8 +1006,12 @@ impl Node {
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 coords_response_interval_ms,
             ),
+            path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
+                handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
+            ),
             probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(LookupBackoff::new(), LookupForwardRateLimiter::new()),
+            discovery_sign_limiter: LookupSignRateLimiter::new(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -1761,6 +1798,17 @@ impl Node {
     /// the way the rx_loop's handler does without standing up a client task and
     /// a socket pair. A parity test over an empty registry proves nothing about
     /// a publisher that drops fields, which is why this exists.
+    /// The instant at which `peer`'s last ACCEPTED epoch change was stamped,
+    /// or `None` if it has none. Test-only, and it exists for one assertion:
+    /// that a REFUSED epoch-mismatch msg1 leaves this untouched. The refusal
+    /// must not slide the window, or a sustained replay starves a genuinely
+    /// restarting peer for as long as it keeps sending — which is the whole
+    /// point of stamping on acceptance rather than on every sighting.
+    #[cfg(test)]
+    pub(crate) fn restart_dampener_stamp(&self, peer: &NodeAddr) -> Option<std::time::Instant> {
+        self.restart_dampener.get(peer).copied()
+    }
+
     #[cfg(test)]
     pub(crate) fn native_registry_for_test(&mut self) -> &mut crate::native::registry::Registry {
         &mut self.native
@@ -2754,6 +2802,12 @@ impl Node {
     // === End-to-End Sessions ===
 
     /// Get a session by remote NodeAddr.
+    /// Set the per-link-peer lookup signing budget (for tests).
+    #[cfg(test)]
+    pub(crate) fn set_discovery_sign_budget(&mut self, burst: f64, rate: f64) {
+        self.discovery_sign_limiter = LookupSignRateLimiter::with_params(burst, rate);
+    }
+
     /// Disable the discovery forward rate limiter (for tests).
     #[cfg(test)]
     pub(crate) fn disable_discovery_forward_rate_limit(&mut self) {
@@ -2846,6 +2900,12 @@ impl Node {
     /// `FipsAddress`-keyed map the TCP MSS clamp reads, and the session's own
     /// source-side path MTU estimate.
     fn path_mtu_lookup_release(&mut self, addr: &NodeAddr) {
+        // The evidence that corroborates a reactive MtuExceeded described the
+        // path being released, so it does not vouch for whatever replaces it.
+        if let Some(entry) = self.sessions.get_mut(addr) {
+            entry.clear_sent_wire_len();
+        }
+
         // The session's own source-side estimate described the same dead path,
         // and the increase ladder is the only thing that would ever raise it
         // again. Reset it here so the two halves of "this path is gone" stay
