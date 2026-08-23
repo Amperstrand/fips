@@ -1027,21 +1027,32 @@ mod tests {
         );
     }
 
+    /// The three permission-fault tests below make a file unreadable through
+    /// the unix mode bits, which Windows has no equivalent for: a read-only
+    /// NTFS file is still readable, so the fault they need cannot be produced.
+    /// They are gated to unix rather than made to pass vacuously elsewhere.
+    ///
+    /// **Coverage gap**: on Windows nothing exercises the reloader's
+    /// unreadable-input path, so the fail-open defect this fix closes is
+    /// unverified there.
     /// Make a file unreadable, returning false if the effective uid can read
     /// it anyway. Root bypasses the mode bits, so the permission-fault tests
     /// cannot run there and skip instead of passing vacuously; that leaves
     /// the EACCES path unexercised in any root CI job.
+    #[cfg(unix)]
     fn make_unreadable(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::read_to_string(path).is_err()
     }
 
+    #[cfg(unix)]
     fn make_readable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_acl_reload_holds_last_good_snapshot_when_deny_file_unreadable() {
         let dir = tempfile::tempdir().unwrap();
@@ -1075,6 +1086,7 @@ mod tests {
         make_readable(&deny);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_acl_reload_retries_after_a_transient_read_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1101,6 +1113,7 @@ mod tests {
         assert!(!reloader.status().stale);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_acl_reload_holds_last_good_when_the_hosts_file_becomes_unreadable() {
         let dir = tempfile::tempdir().unwrap();

@@ -1375,9 +1375,21 @@ async fn signal_events_use_current_timestamps() {
     assert!(created_at <= after);
 }
 
+/// These punch tests distinguish a spoofer from a planned target by source
+/// **IP**, so each needs its own loopback address. Only Linux treats the whole
+/// of 127/8 as local; macOS and Windows bind 127.0.0.1 alone unless an alias is
+/// added, so the bind panics there. They are gated to Linux rather than
+/// rewritten onto one address, because collapsing them onto 127.0.0.1 would
+/// make every source rank `RemappedPort` and the tests would stop testing what
+/// they are for.
+///
+/// **Coverage gap**: on macOS and Windows nothing exercises `run_punch_attempt`
+/// end to end. The ranking decision itself is covered on every platform by the
+/// `rank_punch_source_*` unit tests above, which take no sockets.
 /// A loopback socket bound on `host`, non-blocking as both production call
 /// sites leave it, since `run_punch_attempt` hands it straight to
 /// `UdpSocket::from_std`.
+#[cfg(target_os = "linux")]
 fn punch_socket(host: &str) -> std::net::UdpSocket {
     let socket = std::net::UdpSocket::bind(format!("{host}:0")).expect("bind a loopback socket");
     socket
@@ -1398,12 +1410,14 @@ fn immediate_punch_hint(duration_ms: u64) -> PunchHint {
 
 /// Send one well-formed probe carrying `session_id`'s hash from `from` to
 /// `to`, which is what a replay of captured punch bytes looks like.
+#[cfg(target_os = "linux")]
 fn send_probe(from: &std::net::UdpSocket, to: SocketAddr, session_id: &str) {
     let packet = build_punch_packet(PunchPacketKind::Probe, 1, session_id);
     from.send_to(&packet, to).expect("probe should send");
 }
 
 /// Whether anything readable on `socket` is a punch ack.
+#[cfg(target_os = "linux")]
 fn received_an_ack(socket: &std::net::UdpSocket) -> bool {
     let mut buf = [0u8; 2048];
     while let Ok((len, _)) = socket.recv_from(&mut buf) {
@@ -1448,6 +1462,7 @@ fn rank_punch_source_rejects_an_address_we_never_planned_to_probe() {
 /// every probe, so anyone who has seen one can replay it. Acceptance is now
 /// constrained to the targets this node planned; the spoofer is neither
 /// adopted nor acked, and an ack would be a reflection we control.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_matching_punch_packet_from_an_unplanned_source_is_neither_adopted_nor_acked() {
     let victim = punch_socket("127.0.0.3");
@@ -1477,6 +1492,7 @@ async fn a_matching_punch_packet_from_an_unplanned_source_is_neither_adopted_nor
 }
 
 /// The spoofer wins the race on arrival order and still loses on address.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_planned_source_is_adopted_even_when_a_spoofer_replies_first() {
     let victim = punch_socket("127.0.0.3");
@@ -1505,6 +1521,7 @@ async fn a_planned_source_is_adopted_even_when_a_spoofer_replies_first() {
 /// The healthy path, which is the check that the source constraint does not
 /// red a legitimately clean run: one probe from the single planned target is
 /// adopted immediately and acked.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_ordinary_probe_from_a_planned_target_is_still_adopted_and_acked() {
     let victim = punch_socket("127.0.0.3");
@@ -1534,6 +1551,7 @@ async fn the_ordinary_probe_from_a_planned_target_is_still_adopted_and_acked() {
 /// shares a planned target's IP. Adopting it is the main class of NAT pairing
 /// punching exists to rescue, and this test reds if the rule is ever tightened
 /// to exact matching without that being reopened deliberately.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_planned_targets_remapped_port_is_adopted_when_that_is_all_that_arrives() {
     let victim = punch_socket("127.0.0.3");
@@ -1562,6 +1580,7 @@ async fn a_planned_targets_remapped_port_is_adopted_when_that_is_all_that_arrive
 
 /// An exact match inside the settle window supersedes a remapped one that
 /// arrived first, which is what the window is for.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_exact_target_supersedes_a_remapped_port_inside_the_settle_window() {
     let victim = punch_socket("127.0.0.3");
