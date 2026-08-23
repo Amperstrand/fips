@@ -846,11 +846,17 @@ async fn pubkey_exchange<S: BleStream + 'static>(
     reader: &mut BleStreamRead<S>,
     local_pubkey: &[u8; 32],
 ) -> Result<XOnlyPublicKey, TransportError> {
-    // Send our pubkey
+    let timeout = std::time::Duration::from_secs(PUBKEY_EXCHANGE_TIMEOUT_SECS);
+
+    // Send our pubkey. The deadline matters as much as the one below it: a
+    // peer that never drains the L2CAP channel stalls the write instead.
     let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
     msg[0] = PUBKEY_EXCHANGE_PREFIX;
     msg[1..].copy_from_slice(local_pubkey);
-    stream.send(&msg).await?;
+    match tokio::time::timeout(timeout, stream.send(&msg)).await {
+        Ok(result) => result?,
+        Err(_) => return Err(TransportError::Timeout),
+    }
 
     // Receive peer's pubkey (with timeout to prevent indefinite blocking)
     let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE];
@@ -880,8 +886,30 @@ async fn pubkey_exchange<S: BleStream + 'static>(
 // in start_async, stopped in stop_async). BLE advertising overhead
 // is negligible (~0.15% duty cycle on advertising channels).
 
-/// Accept loop: accepts inbound L2CAP connections, exchanges pubkeys,
-/// and adds to pool.
+/// Inbound handshakes allowed to be in flight at once.
+///
+/// Deliberately independent of the pool capacity: that is the budget for
+/// established links, and tying the two together would mean an operator who
+/// sets `max_connections = 1` also gets a serial accept loop, which is the
+/// defect this bound exists to close. A healthy exchange is one round trip
+/// and completes in milliseconds, so this is never reached honestly. Raising
+/// it lets a flood hold more concurrent handshakes; lowering it makes a
+/// legitimate slow peer likelier to be aborted under flood.
+const INBOUND_HANDSHAKE_INFLIGHT: usize = 8;
+
+/// Accept loop: accepts inbound L2CAP connections and hands each to its own
+/// task for the pubkey exchange and pool insert.
+///
+/// One iteration is bounded by `accept()` alone. Nothing a connecting peer
+/// chooses to do can delay the next accept: the handshake runs off the loop,
+/// and when the in-flight budget is full the oldest pending handshake is
+/// aborted to make room rather than the loop waiting for one to finish.
+///
+/// The in-flight tasks live in a `JoinSet` and not behind a `Semaphore` for a
+/// reason that is easy to lose: `stop_async` aborts this task and nothing
+/// else, so dropping the `JoinSet` with it is what stops the handshakes. Bare
+/// `tokio::spawn` would leave them running past stop, able to insert into a
+/// pool that stop has just drained.
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop<A>(
     mut acceptor: A,
@@ -897,13 +925,25 @@ async fn accept_loop<A>(
     A: io::BleAcceptor,
     A::Stream: 'static,
 {
+    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Spawn order, so the oldest handshake is the one evicted at the budget.
+    let mut pending: std::collections::VecDeque<tokio::task::AbortHandle> =
+        std::collections::VecDeque::new();
+
     loop {
+        // Reap anything finished. Neither call waits. `retain` rather than
+        // popping the front run, so a handshake that completed out of order
+        // still frees its slot instead of being aborted as the oldest later.
+        while inflight.try_join_next().is_some() {}
+        pending.retain(|handle| !handle.is_finished());
+
         match acceptor.accept().await {
             Ok(stream) => {
                 let addr = stream.remote_addr().clone();
                 let ta = addr.to_transport_addr();
 
-                // Skip if already connected (outbound won the race)
+                // Skip if already connected (outbound won the race). This
+                // awaits only our own mutex, never the peer.
                 {
                     let pool_guard = pool.lock().await;
                     if pool_guard.contains(&ta) {
@@ -912,118 +952,29 @@ async fn accept_loop<A>(
                     }
                 }
 
-                let send_mtu = stream.send_mtu();
-                let recv_mtu = stream.recv_mtu();
-                let stream = Arc::new(stream);
-                // One reader across both phases — see `pubkey_exchange`.
-                let mut reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
-
-                // Pre-handshake pubkey exchange (temporary, pre-XX)
-                let mut peer_node_addr: Option<NodeAddr> = None;
-                if let Some(ref our_pubkey) = local_pubkey {
-                    match pubkey_exchange(stream.as_ref(), &mut reader, our_pubkey).await {
-                        Ok(peer_pubkey) => {
-                            debug!(addr = %ta, "BLE inbound pubkey exchange complete");
-                            let peer_node = NodeAddr::from_pubkey(&peer_pubkey);
-                            peer_node_addr = Some(peer_node);
-                            let announced = announced_addr(&pool, &peer_node, &addr).await;
-                            neighbor_buffer.add_peer_with_pubkey(&announced, peer_pubkey);
-
-                            // Already linked to this peer on another address?
-                            // A peer using resolvable private addresses rotates
-                            // continually, and every rotation dials in looking
-                            // like a new device. Admitting those would put one
-                            // peer in several pool slots and evict real ones.
-                            // The incumbent link is kept: it is known-good, and
-                            // a genuinely dead one is already reaped by the
-                            // send-error and receive-loop paths.
-                            let dup = {
-                                let pool_guard = pool.lock().await;
-                                pool_guard.find_by_node(&peer_node)
-                            };
-                            if let Some(existing) = dup
-                                && existing != ta
-                            {
-                                debug!(
-                                    addr = %ta,
-                                    role = "peripheral",
-                                    outcome = "duplicate-node-decline",
-                                    existing = %existing,
-                                    "BLE inbound: peer already connected on another address, dropping duplicate"
-                                );
-                                stats.record_duplicate_node_decline();
-                                continue;
-                            }
-
-                            // Cross-probe tie-breaker: smaller NodeAddr's
-                            // outbound wins. If we're smaller, our outbound
-                            // should win — drop this inbound.
-                            if let Some(ref our_addr) = local_node_addr
-                                && our_addr < &peer_node
-                            {
-                                stats.record_tiebreaker_drop();
-                                debug!(
-                                    addr = %ta,
-                                    role = "peripheral",
-                                    outcome = "tiebreaker-drop",
-                                    "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
-                                );
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            stats.record_pubkey_exchange_failure();
-                            debug!(
-                                addr = %ta, role = "peripheral",
-                                outcome = "pubkey-exchange-failed", error = %e,
-                                "BLE inbound pubkey exchange failed"
-                            );
-                            continue;
-                        }
-                    }
+                if pending.len() >= INBOUND_HANDSHAKE_INFLIGHT
+                    && let Some(oldest) = pending.pop_front()
+                {
+                    oldest.abort();
+                    stats.record_handshake_aborted();
+                    debug!(
+                        addr = %ta,
+                        budget = INBOUND_HANDSHAKE_INFLIGHT,
+                        "BLE inbound handshake budget full, aborting the oldest"
+                    );
                 }
 
-                // Spawn receive loop
-                let recv_task = tokio::spawn(receive_loop(
-                    reader,
-                    ta.clone(),
+                let handle = inflight.spawn(admit_inbound(
+                    stream,
                     Arc::clone(&pool),
                     packet_tx.clone(),
                     transport_id,
                     Arc::clone(&stats),
-                    recv_mtu,
+                    local_pubkey,
+                    Arc::clone(&neighbor_buffer),
+                    local_node_addr,
                 ));
-
-                let conn = BleConnection {
-                    stream,
-                    recv_task: Some(recv_task),
-                    send_mtu,
-                    recv_mtu,
-                    established_at: tokio::time::Instant::now(),
-                    is_static: false,
-                    addr,
-                    node_addr: peer_node_addr,
-                };
-
-                let mut pool_guard = pool.lock().await;
-                match pool_guard.insert(ta.clone(), conn) {
-                    Ok(Some(evicted)) => {
-                        stats.record_pool_eviction();
-                        info!(addr = %ta, evicted = %evicted, "BLE inbound accepted (evicted peer)");
-                    }
-                    Ok(None) => {
-                        info!(addr = %ta, send_mtu, recv_mtu, "BLE inbound connection accepted");
-                    }
-                    Err(e) => {
-                        stats.record_connection_rejected();
-                        warn!(
-                            addr = %ta, role = "peripheral", outcome = "pool-rejected",
-                            error = %e, "BLE pool full, inbound connection rejected"
-                        );
-                        continue;
-                    }
-                }
-                stats.record_connection_accepted();
+                pending.push_back(handle);
             }
             Err(e) => {
                 warn!(error = %e, "BLE accept error");
@@ -1031,6 +982,142 @@ async fn accept_loop<A>(
             }
         }
     }
+}
+
+/// Run one inbound connection's pubkey exchange and admit it to the pool.
+///
+/// Runs off the accept loop so a peer that never answers delays nobody else.
+/// Everything the accept loop used to do inline lives here, including the
+/// duplicate-node decline and the cross-probe tie-break that `fix/platform-ble`
+/// added: moving the work off the loop must not drop the checks that guard it.
+/// The loop's `continue` becomes `return` — this task admits one connection.
+#[allow(clippy::too_many_arguments)]
+async fn admit_inbound<S>(
+    stream: S,
+    pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
+    packet_tx: PacketTx,
+    transport_id: TransportId,
+    stats: Arc<BleStats>,
+    local_pubkey: Option<[u8; 32]>,
+    neighbor_buffer: Arc<NeighborBuffer>,
+    local_node_addr: Option<NodeAddr>,
+) where
+    S: BleStream + 'static,
+{
+    let addr = stream.remote_addr().clone();
+    let ta = addr.to_transport_addr();
+    let send_mtu = stream.send_mtu();
+    let recv_mtu = stream.recv_mtu();
+    let stream = Arc::new(stream);
+    // One reader across both phases — see `pubkey_exchange`.
+    let mut reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
+
+    // Pre-handshake pubkey exchange (temporary, pre-XX)
+    let mut peer_node_addr: Option<NodeAddr> = None;
+    if let Some(ref our_pubkey) = local_pubkey {
+        match pubkey_exchange(stream.as_ref(), &mut reader, our_pubkey).await {
+            Ok(peer_pubkey) => {
+                debug!(addr = %ta, "BLE inbound pubkey exchange complete");
+                let peer_node = NodeAddr::from_pubkey(&peer_pubkey);
+                peer_node_addr = Some(peer_node);
+                let announced = announced_addr(&pool, &peer_node, &addr).await;
+                neighbor_buffer.add_peer_with_pubkey(&announced, peer_pubkey);
+
+                // Already linked to this peer on another address?
+                // A peer using resolvable private addresses rotates
+                // continually, and every rotation dials in looking
+                // like a new device. Admitting those would put one
+                // peer in several pool slots and evict real ones.
+                // The incumbent link is kept: it is known-good, and
+                // a genuinely dead one is already reaped by the
+                // send-error and receive-loop paths.
+                let dup = {
+                    let pool_guard = pool.lock().await;
+                    pool_guard.find_by_node(&peer_node)
+                };
+                if let Some(existing) = dup
+                    && existing != ta
+                {
+                    debug!(
+                        addr = %ta,
+                        role = "peripheral",
+                        outcome = "duplicate-node-decline",
+                        existing = %existing,
+                        "BLE inbound: peer already connected on another address, dropping duplicate"
+                    );
+                    stats.record_duplicate_node_decline();
+                    return;
+                }
+
+                // Cross-probe tie-breaker: smaller NodeAddr's
+                // outbound wins. If we're smaller, our outbound
+                // should win — drop this inbound.
+                if let Some(ref our_addr) = local_node_addr
+                    && our_addr < &peer_node
+                {
+                    stats.record_tiebreaker_drop();
+                    debug!(
+                        addr = %ta,
+                        role = "peripheral",
+                        outcome = "tiebreaker-drop",
+                        "BLE inbound tie-breaker: dropping (our addr < peer, outbound wins)"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                stats.record_pubkey_exchange_failure();
+                debug!(
+                    addr = %ta, role = "peripheral",
+                    outcome = "pubkey-exchange-failed", error = %e,
+                    "BLE inbound pubkey exchange failed"
+                );
+                return;
+            }
+        }
+    }
+
+    // Spawn receive loop
+    let recv_task = tokio::spawn(receive_loop(
+        reader,
+        ta.clone(),
+        Arc::clone(&pool),
+        packet_tx.clone(),
+        transport_id,
+        Arc::clone(&stats),
+        recv_mtu,
+    ));
+
+    let conn = BleConnection {
+        stream,
+        recv_task: Some(recv_task),
+        send_mtu,
+        recv_mtu,
+        established_at: tokio::time::Instant::now(),
+        is_static: false,
+        addr,
+        node_addr: peer_node_addr,
+    };
+
+    let mut pool_guard = pool.lock().await;
+    match pool_guard.insert(ta.clone(), conn) {
+        Ok(Some(evicted)) => {
+            stats.record_pool_eviction();
+            info!(addr = %ta, evicted = %evicted, "BLE inbound accepted (evicted peer)");
+        }
+        Ok(None) => {
+            info!(addr = %ta, send_mtu, recv_mtu, "BLE inbound connection accepted");
+        }
+        Err(e) => {
+            stats.record_connection_rejected();
+            warn!(
+                addr = %ta, role = "peripheral", outcome = "pool-rejected",
+                error = %e, "BLE pool full, inbound connection rejected"
+            );
+            return;
+        }
+    }
+    stats.record_connection_accepted();
 }
 
 /// Receive loop: reads packets from a BLE stream and delivers to node.
@@ -2650,10 +2737,183 @@ mod tests {
             "advertisements_sent",
             "scan_results",
             "duplicate_node_declines",
+            "handshakes_aborted",
         ];
         for key in expected {
             assert!(object.contains_key(key), "snapshot lost `{key}`");
         }
         assert_eq!(object.len(), expected.len(), "snapshot gained a key");
+    }
+
+    /// A secret/public key pair from a fixed seed.
+    ///
+    /// The exchange parses the peer's 32 bytes with `XOnlyPublicKey::from_slice`,
+    /// so arbitrary bytes will not do.
+    fn test_keypair(seed: u8) -> ([u8; 32], XOnlyPublicKey) {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
+        let (xonly, _) = sk.public_key(&secp).x_only_public_key();
+        (xonly.serialize(), xonly)
+    }
+
+    /// Inject an inbound connection and return the peer end of the link.
+    ///
+    /// The peer end must be kept alive: dropping it closes the channel, which
+    /// the mock reports as a zero-length read rather than as silence.
+    async fn connect_inbound(
+        transport: &BleTransport<MockBleIo>,
+        peer: &BleAddr,
+    ) -> io::MockBleStream {
+        let (inbound, peer_end) = io::MockBleStream::pair(test_addr(1), peer.clone(), 512);
+        transport.io.inject_inbound(inbound).await;
+        peer_end
+    }
+
+    /// Complete the peer half of the pubkey exchange.
+    async fn send_pubkey(stream: &io::MockBleStream, pubkey: &XOnlyPublicKey) {
+        let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
+        msg[0] = PUBKEY_EXCHANGE_PREFIX;
+        msg[1..].copy_from_slice(&pubkey.serialize());
+        stream.send(&msg).await.unwrap();
+    }
+
+    /// Poll the discovery buffer until every wanted address has appeared.
+    ///
+    /// Asserts on the discovery buffer rather than the pool because the buffer
+    /// is populated before the cross-probe tie-breaker, which drops an inbound
+    /// whose NodeAddr sorts above ours and would make the result depend on the
+    /// keys the test happened to pick. Sleeps rather than yields, so a paused
+    /// clock advances instead of the runtime staying busy forever.
+    async fn wait_for_discovered(buffer: &NeighborBuffer, wanted: &[BleAddr]) -> bool {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..20_000 {
+            for peer in buffer.take() {
+                if let Some(addr) = peer.addr.as_str() {
+                    seen.insert(addr.to_string());
+                }
+            }
+            if wanted.iter().all(|a| seen.contains(&a.to_string_repr())) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_inbound_peer_does_not_delay_the_next_accept() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (mut transport, _rx) = make_transport(io);
+        let (our_pubkey, _) = test_keypair(1);
+        transport.set_local_pubkey(our_pubkey);
+        transport.start_async().await.unwrap();
+
+        // A connects and never says anything.
+        let _silent = connect_inbound(&transport, &test_addr(2)).await;
+
+        // B connects behind it and completes the exchange at once.
+        let good = connect_inbound(&transport, &test_addr(3)).await;
+        let (_, peer_pubkey) = test_keypair(7);
+        send_pubkey(&good, &peer_pubkey).await;
+
+        let start = tokio::time::Instant::now();
+        assert!(
+            wait_for_discovered(&transport.neighbor_buffer, &[test_addr(3)]).await,
+            "the well-behaved peer was never admitted"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the well-behaved peer waited {:?} on the silent one's handshake deadline",
+            elapsed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_silent_connectors_does_not_delay_a_well_behaved_one() {
+        // The test that breaks what the guard guards: it fails against a bound
+        // that waits for a slot rather than reclaiming one.
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (mut transport, _rx) = make_transport(io);
+        let (our_pubkey, _) = test_keypair(1);
+        transport.set_local_pubkey(our_pubkey);
+        transport.start_async().await.unwrap();
+
+        let mut silent = Vec::new();
+        for n in 0..INBOUND_HANDSHAKE_INFLIGHT + 1 {
+            silent.push(connect_inbound(&transport, &test_addr(20 + n as u8)).await);
+        }
+
+        let good = connect_inbound(&transport, &test_addr(3)).await;
+        let (_, peer_pubkey) = test_keypair(7);
+        send_pubkey(&good, &peer_pubkey).await;
+
+        let start = tokio::time::Instant::now();
+        assert!(
+            wait_for_discovered(&transport.neighbor_buffer, &[test_addr(3)]).await,
+            "the well-behaved peer was never admitted behind the flood"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the well-behaved peer waited {:?} behind {} silent connectors",
+            elapsed,
+            silent.len()
+        );
+        assert!(transport.stats.snapshot().handshakes_aborted > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_peers_within_the_handshake_budget_are_all_admitted() {
+        // The guard must not red a legitimately clean run.
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (mut transport, _rx) = make_transport(io);
+        let (our_pubkey, _) = test_keypair(1);
+        transport.set_local_pubkey(our_pubkey);
+        transport.start_async().await.unwrap();
+
+        let mut peers = Vec::new();
+        let mut wanted = Vec::new();
+        for n in 0..INBOUND_HANDSHAKE_INFLIGHT {
+            let addr = test_addr(40 + n as u8);
+            let stream = connect_inbound(&transport, &addr).await;
+            let (_, peer_pubkey) = test_keypair(10 + n as u8);
+            send_pubkey(&stream, &peer_pubkey).await;
+            peers.push(stream);
+            wanted.push(addr);
+        }
+
+        assert!(
+            wait_for_discovered(&transport.neighbor_buffer, &wanted).await,
+            "a well-behaved peer inside the budget was not admitted"
+        );
+        assert_eq!(transport.stats.snapshot().handshakes_aborted, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pubkey_exchange_send_half_has_a_deadline() {
+        // The mock's link is a 64-slot channel, so a peer that never reads
+        // parks our write once it is full — which is what an L2CAP peer that
+        // stops draining does.
+        let (ours, _peer) = io::MockBleStream::pair(test_addr(1), test_addr(2), 512);
+        for _ in 0..64 {
+            ours.send(&[0u8; 1]).await.unwrap();
+        }
+        let (our_pubkey, _) = test_keypair(1);
+        // `fix/platform-ble` split the read half out; the exchange takes it as
+        // its own argument now. The deadline under test is on the send half,
+        // which never reaches a read, so the reader is only here to type-check.
+        let recv_mtu = ours.recv_mtu();
+        let ours = Arc::new(ours);
+        let mut reader = BleStreamRead::new(Arc::clone(&ours), recv_mtu);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            pubkey_exchange(ours.as_ref(), &mut reader, &our_pubkey),
+        )
+        .await
+        .expect("the pubkey exchange send half parked with no deadline of its own");
+
+        assert!(matches!(result, Err(TransportError::Timeout)));
     }
 }

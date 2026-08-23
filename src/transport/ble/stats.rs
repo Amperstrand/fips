@@ -27,6 +27,7 @@ pub struct BleStats {
     pub connections_established: AtomicU64,
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
+    pub handshakes_aborted: AtomicU64,
     pub connect_timeouts: AtomicU64,
     /// Outbound connects that failed with an error rather than timing out.
     pub connect_errors: AtomicU64,
@@ -58,6 +59,7 @@ impl BleStats {
             connections_established: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
+            handshakes_aborted: AtomicU64::new(0),
             connect_timeouts: AtomicU64::new(0),
             connect_errors: AtomicU64::new(0),
             pubkey_exchange_failures: AtomicU64::new(0),
@@ -176,6 +178,11 @@ impl BleStats {
         self.duplicate_node_declines.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an inbound handshake aborted to free an in-flight slot.
+    pub fn record_handshake_aborted(&self) {
+        self.handshakes_aborted.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a snapshot of all counters.
     pub fn snapshot(&self) -> BleStatsSnapshot {
         BleStatsSnapshot {
@@ -189,6 +196,7 @@ impl BleStats {
             connections_established: self.connections_established.load(Ordering::Relaxed),
             connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
             connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
+            handshakes_aborted: self.handshakes_aborted.load(Ordering::Relaxed),
             connect_timeouts: self.connect_timeouts.load(Ordering::Relaxed),
             connect_errors: self.connect_errors.load(Ordering::Relaxed),
             pubkey_exchange_failures: self.pubkey_exchange_failures.load(Ordering::Relaxed),
@@ -221,6 +229,7 @@ pub struct BleStatsSnapshot {
     pub connections_established: u64,
     pub connections_accepted: u64,
     pub connections_rejected: u64,
+    pub handshakes_aborted: u64,
     pub connect_timeouts: u64,
     pub connect_errors: u64,
     pub pubkey_exchange_failures: u64,
