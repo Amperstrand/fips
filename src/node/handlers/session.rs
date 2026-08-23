@@ -57,7 +57,13 @@ pub(in crate::node) const PATH_MTU_RELEASE_MIN_INTERVAL: std::time::Duration =
 /// wire: the established FMP header, the 4-byte session-relative timestamp and
 /// the AEAD tag. Mirrors the buffer `send_encrypted_link_message_with_ce`
 /// builds.
-const LINK_FRAME_OVERHEAD: usize = ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
+///
+/// Spelled out in full rather than through the `crate::node::wire` import
+/// above, which is `#[cfg(unix)]`. This constant feeds `link_wire_len`, whose
+/// caller `send_session_datagram` is compiled on every platform, so taking the
+/// name from that import fails to build on Windows.
+const LINK_FRAME_OVERHEAD: usize =
+    crate::node::wire::ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
 
 /// Wire size of an encoded `SessionDatagram` of `encoded_len` bytes.
 fn link_wire_len(encoded_len: usize) -> usize {
