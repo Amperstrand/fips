@@ -205,6 +205,45 @@ async fn test_forwarding_direct_peer() {
 // ============================================================================
 
 #[tokio::test]
+async fn a_forged_warm_cannot_displace_a_coordinate_established_by_a_verified_lookup() {
+    let mut node = make_node();
+    let attacker_link = make_node_addr(0xAA);
+    let victim_dest = make_node_addr(0x02);
+    let root_addr = *node.tree_state.my_coords().root_id();
+
+    // The state a completed lookup leaves behind.
+    let real_coords = TreeCoordinate::from_addrs(vec![victim_dest, root_addr]).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    node.coord_cache_mut()
+        .insert_verified(victim_dest, real_coords.clone(), now_ms);
+
+    // One packet, claiming to be from the destination, carrying a different
+    // position for it under the same root. This is the whole attack.
+    let forged =
+        TreeCoordinate::from_addrs(vec![victim_dest, make_node_addr(0x77), root_addr]).unwrap();
+    let src_coords = TreeCoordinate::from_addrs(vec![victim_dest, root_addr]).unwrap();
+    let payload = SessionSetup::new(src_coords, forged.clone()).encode();
+    let encoded = SessionDatagram::new(victim_dest, victim_dest, payload).encode();
+
+    let rejected_before = node.metrics().forwarding.coord_hint_rejected.get();
+    node.handle_session_datagram(&attacker_link, &encoded[1..], false)
+        .await;
+
+    assert_eq!(
+        node.coord_cache().get(&victim_dest, now_ms),
+        Some(&real_coords),
+        "a forged warm displaced a verified coordinate"
+    );
+    assert!(
+        node.metrics().forwarding.coord_hint_rejected.get() > rejected_before,
+        "the refusal should be counted"
+    );
+}
+
+#[tokio::test]
 async fn warming_refuses_a_coordinate_rooted_in_a_tree_this_node_is_not_in() {
     let mut node = make_node();
     let from = make_node_addr(0xAA);
@@ -897,7 +936,7 @@ async fn test_forwarding_with_cache_warming_enables_routing() {
     // Node 0 gets full cache
     for (addr, coords) in &all_coords {
         if addr != nodes[0].node.node_addr() {
-            nodes[0]
+            let _ = nodes[0]
                 .node
                 .coord_cache_mut()
                 .insert(*addr, coords.clone(), now_ms);
@@ -926,7 +965,7 @@ async fn test_forwarding_with_cache_warming_enables_routing() {
                         .unwrap()
                         .1
                         .clone();
-                    nodes[i]
+                    let _ = nodes[i]
                         .node
                         .coord_cache_mut()
                         .insert(j_addr, coords, now_ms);

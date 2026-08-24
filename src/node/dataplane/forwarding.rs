@@ -263,7 +263,7 @@ impl Node {
         if *coords.node_addr() != key {
             self.metrics().forwarding.record_warm_key_mismatch();
         }
-        self.coord_cache_mut().insert(key, coords, now_ms);
+        self.insert_coord_hint(key, coords, now_ms);
     }
 
     fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>, outer_len: usize) {

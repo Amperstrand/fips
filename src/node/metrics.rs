@@ -13,6 +13,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cache::HintOutcome;
 use crate::node::reject::{BloomReject, DiscoveryReject, ForwardingReject, TreeReject};
 use crate::node::stats::{
     BloomStatsSnapshot, CongestionStatsSnapshot, ErrorSignalStatsSnapshot, ForwardingStatsSnapshot,
@@ -81,6 +82,15 @@ pub struct ForwardingMetrics {
     /// as its own child. It counts a defect honest nodes make, where a sender
     /// whose own cache missed sends its own coordinates as the destination's.
     pub coord_warm_key_mismatch: Counter,
+    /// Hint writes that replaced an existing entry with a different value.
+    /// A destination moving in the tree produces this, and so does a
+    /// poisoning; the two are not distinguishable here, so this is a rate to
+    /// watch rather than an alarm.
+    pub coord_hint_changed: Counter,
+    /// Hint writes refused because the entry they targeted was verified and
+    /// still inside its verification window, or because the cache was full of
+    /// live-verified entries and declined to evict one.
+    pub coord_hint_rejected: Counter,
     pub ttl_exhausted_packets: Counter,
     pub ttl_exhausted_bytes: Counter,
     pub delivered_packets: Counter,
@@ -156,6 +166,15 @@ impl ForwardingMetrics {
         self.coord_warm_key_mismatch.inc();
     }
 
+    /// Record the outcome of a hint write against the coordinate cache.
+    pub fn record_hint_outcome(&self, outcome: HintOutcome) {
+        match outcome {
+            HintOutcome::Changed => self.coord_hint_changed.inc(),
+            HintOutcome::Rejected => self.coord_hint_rejected.inc(),
+            HintOutcome::Inserted | HintOutcome::Unchanged => {}
+        }
+    }
+
     /// Record a forwarded (transit) packet of `bytes` payload.
     #[inline]
     pub fn record_forwarded(&self, bytes: usize) {
@@ -226,6 +245,8 @@ impl ForwardingMetrics {
             warm_malformed_bytes: self.warm_malformed_bytes.get(),
             coord_warm_foreign_root: self.coord_warm_foreign_root.get(),
             coord_warm_key_mismatch: self.coord_warm_key_mismatch.get(),
+            coord_hint_changed: self.coord_hint_changed.get(),
+            coord_hint_rejected: self.coord_hint_rejected.get(),
             ttl_exhausted_packets: self.ttl_exhausted_packets.get(),
             ttl_exhausted_bytes: self.ttl_exhausted_bytes.get(),
             delivered_packets: self.delivered_packets.get(),
