@@ -2532,20 +2532,21 @@ impl Node {
 
     /// Remove a link.
     ///
-    /// Only removes the addr_to_link reverse lookup if it still points to this
-    /// link. In cross-connection scenarios, a newer link may have replaced the
-    /// entry for the same address.
+    /// Drops every `addr_to_link` entry that still maps to this link, rather
+    /// than only the key rebuilt from the link's own remote address. A link can
+    /// be registered under more than one address form: the cross-connection
+    /// arms key the winner on the *packet's* source address, which need not
+    /// equal the winner's own (a hostname against its resolved numeric form, or
+    /// a different source port on a connection-oriented transport). Rebuilding
+    /// a single key left those entries naming a link that no longer exists, for
+    /// as long as the node ran.
+    ///
+    /// Entries a newer link has already claimed are left alone, since they no
+    /// longer name this link.
     pub fn remove_link(&mut self, link_id: &LinkId) -> Option<Link> {
-        if let Some(link) = self.links.remove(link_id) {
-            // Clean up reverse lookup only if it still maps to this link
-            let key = (link.transport_id(), link.remote_addr().clone());
-            if self.addr_to_link.get(&key) == Some(link_id) {
-                self.addr_to_link.remove(&key);
-            }
-            Some(link)
-        } else {
-            None
-        }
+        let link = self.links.remove(link_id)?;
+        self.addr_to_link.retain(|_, mapped| *mapped != *link_id);
+        Some(link)
     }
 
     /// Single choke-point for dropping a per-peer control machine. Also drops the

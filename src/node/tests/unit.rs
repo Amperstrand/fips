@@ -303,6 +303,52 @@ fn test_node_link_management() {
 }
 
 #[test]
+fn remove_link_clears_a_reverse_lookup_entry_keyed_on_a_second_address_form() {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+
+    let link_id = node.allocate_link_id();
+    node.add_link(Link::connectionless(
+        link_id,
+        transport_id,
+        TransportAddr::from_string("10.128.2.4:2121"),
+        LinkDirection::Inbound,
+        Duration::from_millis(50),
+    ))
+    .unwrap();
+
+    // The cross-connection arms key the surviving link on the *packet's*
+    // source address, which need not be the form the link itself carries.
+    node.addr_to_link.insert(
+        (transport_id, TransportAddr::from_string("node-b:2121")),
+        link_id,
+    );
+
+    // An entry another link has claimed is not this link's to remove.
+    let other_link_id = node.allocate_link_id();
+    node.addr_to_link.insert(
+        (transport_id, TransportAddr::from_string("10.128.2.5:2121")),
+        other_link_id,
+    );
+
+    node.remove_link(&link_id);
+
+    assert!(
+        node.find_link_by_addr(transport_id, &TransportAddr::from_string("10.128.2.4:2121"))
+            .is_none()
+    );
+    assert!(
+        node.find_link_by_addr(transport_id, &TransportAddr::from_string("node-b:2121"))
+            .is_none(),
+        "the second address form outlived the link it named"
+    );
+    assert_eq!(
+        node.find_link_by_addr(transport_id, &TransportAddr::from_string("10.128.2.5:2121")),
+        Some(other_link_id)
+    );
+}
+
+#[test]
 fn test_node_link_limit() {
     let mut node = make_node_with_max_links(2);
 
