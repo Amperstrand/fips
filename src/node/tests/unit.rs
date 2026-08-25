@@ -3386,8 +3386,8 @@ async fn app_owned_udp_fd_seam_stays_silent_without_a_udp_transport() {
 }
 
 /// A UDP transport that never bound has no fd to hand out. The bind address is
-/// deliberately unparseable — a busy port would not do it, since
-/// `UdpRawSocket::open` sets `SO_REUSEADDR`/`SO_REUSEPORT` before binding.
+/// deliberately unparseable, so the failure is in parsing and cannot depend on
+/// what else happens to hold a port while the suite runs.
 #[cfg(unix)]
 #[tokio::test]
 async fn app_owned_udp_fd_seam_stays_silent_when_the_udp_transport_fails_to_start() {
