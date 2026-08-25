@@ -2141,6 +2141,113 @@ async fn test_seed_path_mtu_keeps_tighter_value_when_reseeding_same_transport() 
     }
 }
 
+/// The seeding record is bounded by the same lifecycle that writes it.
+///
+/// Promotion seeds; release drops. Without the release the map keeps a row
+/// per peer this node has ever linked with, for the life of the process, and
+/// the two stores drift apart: `path_mtu_lookup` forgets the value while the
+/// record still names the transport that supplied it.
+#[tokio::test]
+async fn test_releasing_a_path_drops_the_seeding_transport_record_with_the_value() {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let udp = make_udp_transport_with_mtu(1, 1452).await;
+    node.transports.insert(TransportId::new(1), udp);
+
+    let peer_addr = make_node_addr(0xE4);
+    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let transport_addr = TransportAddr::from_string("10.0.0.11:2121");
+
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
+    assert_eq!(
+        node.path_mtu_seeded_by
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .copied(),
+        Some(TransportId::new(1)),
+        "the seed records the transport it came from"
+    );
+
+    // No entry in `node.peers`, so nothing reseeds behind the release — the
+    // departed-peer case.
+    node.path_mtu_lookup_release(&peer_addr);
+
+    assert!(
+        node.path_mtu_lookup
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .is_none(),
+        "release drops the stored value"
+    );
+    assert!(
+        node.path_mtu_seeded_by
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .is_none(),
+        "release must drop the seeding record with it, or the map grows for \
+         the life of the process"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+/// The live-link case: release is immediately followed by a reseed, so both
+/// stores come back rather than leaving a linked peer on the fallback ceiling.
+#[tokio::test]
+async fn test_releasing_a_path_for_a_still_linked_peer_reseeds_both_stores() {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let udp = make_udp_transport_with_mtu(1, 1452).await;
+    node.transports.insert(TransportId::new(1), udp);
+
+    let identity = make_peer_identity();
+    let peer_addr = *identity.node_addr();
+    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let transport_addr = TransportAddr::from_string("10.0.0.12:2121");
+
+    let mut peer = crate::peer::ActivePeer::new(identity, LinkId::new(1), 0);
+    peer.set_current_addr(TransportId::new(1), transport_addr.clone());
+    node.peers.insert(peer_addr, peer);
+
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
+    node.path_mtu_lookup_release(&peer_addr);
+
+    assert_eq!(
+        node.path_mtu_lookup
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .map(|e| e.mtu),
+        Some(1452),
+        "a peer whose link is still up is reseeded from that link"
+    );
+    assert_eq!(
+        node.path_mtu_seeded_by
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .copied(),
+        Some(TransportId::new(1)),
+        "and the seeding record comes back with it, so a later move is still \
+         detectable"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
 // === Outbound admission gate tests ===
 
 /// Inject `count` synthetic active peers into `node.peers` so peer_count()

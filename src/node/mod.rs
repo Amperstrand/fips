@@ -385,6 +385,11 @@ pub struct Node {
     /// value that still describes the current path from one that describes a
     /// path the peer has left. Absent for destinations reached over multiple
     /// hops: those are never link-seeded, so never-loosen applies unchanged.
+    ///
+    /// An entry lives exactly as long as the `path_mtu_lookup` entry it
+    /// describes: `path_mtu_lookup_release` drops both together, and peer
+    /// removal is one of its callers, so a peer that never comes back leaves
+    /// nothing behind.
     path_mtu_seeded_by: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, TransportId>>>,
 
     // === Transports & Links ===
@@ -2896,8 +2901,9 @@ impl Node {
     /// removal would silently drop a direct peer back to the conservative
     /// ceiling until its link re-handshakes.
     ///
-    /// Two stores describe the same dead path, so this releases both: the
-    /// `FipsAddress`-keyed map the TCP MSS clamp reads, and the session's own
+    /// Three stores describe the same dead path, so this releases all of
+    /// them: the `FipsAddress`-keyed map the TCP MSS clamp reads, the record
+    /// of which transport last link-seeded that map, and the session's own
     /// source-side path MTU estimate.
     fn path_mtu_lookup_release(&mut self, addr: &NodeAddr) {
         // The evidence that corroborates a reactive MtuExceeded described the
@@ -2941,6 +2947,24 @@ impl Node {
                 return;
             }
         }
+        // The seeding record describes the path just released, so it goes with
+        // it. Taken after the guard above is dropped, so
+        // `seed_path_mtu_for_link_peer` remains the only site holding both
+        // locks at once, and before the reseed below, so a peer whose link is
+        // still up writes its transport straight back in.
+        match self.path_mtu_seeded_by.write() {
+            Ok(mut seeded_by) => {
+                seeded_by.remove(&fips_addr);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    fips_addr = %fips_addr,
+                    error = %e,
+                    "path_mtu_seeded_by write lock poisoned; seeding record not released"
+                );
+            }
+        }
+
         // The write guard above must be dropped before the seed runs: it takes
         // the same lock, and `std::sync::RwLock` is not re-entrant.
         if let Some(peer) = self.peers.get(addr)
