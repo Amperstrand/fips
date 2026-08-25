@@ -1,7 +1,6 @@
 # FIPS v0.4.2
 
-**Released**: 2026-08-24 (provisional: the date is confirmed when the
-release is tagged)
+**Released**: 2026-08-25
 
 v0.4.2 is a maintenance release on the v0.4.x line, and the largest one
 this line has carried: 144 commits since v0.4.1. Most of it is security

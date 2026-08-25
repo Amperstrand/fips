@@ -7,13 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<!-- The 0.4.2 date below is provisional and is confirmed at the tag, together
-     with the same date in RELEASE-NOTES.md and in
-     docs/releases/release-notes-v0.4.2.md. All three carry it; a prior release
-     shipped a wrong date in two of the three because the confirm step was
-     scoped to one file. -->
-
-## [0.4.2] - 2026-08-24
+## [0.4.2] - 2026-08-25
 
 ### FMP/FSP sessions and rekey
 
