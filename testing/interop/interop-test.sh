@@ -51,7 +51,7 @@
 #   FIPS_INTEROP_STREAMS   data-plane stream pairs (`nid-nid` tokens, both
 #                          directions streamed). Enables Phase 1b/5b. Set
 #                          by --topology; empty = streams off.
-#   STREAM_LOSS_MARGIN_PCT rekey-vs-control loss margin (default 1).
+#   STREAM_LOSS_MARGIN_PCT rekey-vs-control loss margin (default 5).
 #   CONTROL_STREAM_SECS    quiet control-window length (default 12).
 #   MESH_SIZE_WARMUP       Phase 7 bloom warmup, from mesh start, before
 #                          any estimate counts (default 300).
@@ -179,9 +179,26 @@ LOG_POLL_INTERVAL=2
 # Data-plane continuity stream (control-differential). Streams run a
 # sustained ping6 over the overlay across the rekey window vs a quiet
 # control window; loss is compared to prove rekey is hitless.
-STREAM_RATE_HZ=5                                 # ping6 -i 0.2
+# The control window cannot be lengthened much: it has to fit inside one
+# rekey interval (REKEY_AFTER_SECS, 35s by default) to stand a chance of
+# being cutover-free, and it already gets contaminated sometimes at 12s.
+# So the sample is raised by rate instead. At 20 Hz the control window is
+# 240 packets and the rekey window ~3100, where at 5 Hz they were 60 and
+# ~775 and a 1% margin came to 0.6 of a control packet — below the
+# quantisation of its own measurement, so a one-packet difference decided
+# the verdict and the netem arm failed on same-version pairs as readily
+# as on mixed ones.
+STREAM_RATE_HZ=20
 CONTROL_STREAM_SECS="${CONTROL_STREAM_SECS:-12}" # quiet pre-rekey window
-STREAM_LOSS_MARGIN_PCT="${STREAM_LOSS_MARGIN_PCT:-1}"
+# 5% is 12 packets of the 240-packet control window and ~155 of the
+# ~3100-packet rekey window. On a path losing up to 6% (the range the
+# v0.4.2 netem runs baselined at, under `loss 2%` over several hops) the
+# difference of the two windows has a standard deviation below 1.6%, so
+# 5% is past three sigma and sampling spread can no longer produce a red.
+# It still catches what this check exists for: a rekey that is not
+# hitless blackholes until the session reconverges, which the harness
+# budgets 45s for, against the ~8s of traffic 5% of the rekey window is.
+STREAM_LOSS_MARGIN_PCT="${STREAM_LOSS_MARGIN_PCT:-5}"
 # The rekey-window stream must span Phases 2-5 (both cutovers + reconverge).
 REKEY_STREAM_SECS=$(( FIRST_REKEY_TIMEOUT + SECOND_REKEY_WAIT + POST_REKEY_TIMEOUT + 15 ))
 
@@ -551,8 +568,11 @@ _stream_one() {
     local from="$1" to="$2" dur="$3" outfile="$4"
     local from_ctr="${CONTAINER[$from]}" to_npub="${NPUB_OF[$to]}"
     local count=$(( dur * STREAM_RATE_HZ ))
-    local out tx rx
-    out=$(docker exec "$from_ctr" ping6 -i 0.2 -c "$count" -W "$PING_TIMEOUT" \
+    local out tx rx interval
+    # Interval and count both derive from STREAM_RATE_HZ, so the packet
+    # count the margin is reasoned about cannot drift from the rate sent.
+    interval=$(awk -v hz="$STREAM_RATE_HZ" 'BEGIN{ printf "%.3f", 1/hz }')
+    out=$(docker exec "$from_ctr" ping6 -i "$interval" -c "$count" -W "$PING_TIMEOUT" \
         "${to_npub}.fips" 2>&1)
     tx=$(echo "$out" | grep -oE '[0-9]+ packets transmitted' | grep -oE '^[0-9]+')
     rx=$(echo "$out" | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+')
