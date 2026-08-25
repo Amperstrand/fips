@@ -451,6 +451,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Peer and link state
+
+- A peer that goes away no longer leaves its path-MTU state behind. The record
+  of which transport link-seeded a destination's path MTU had no removal site
+  on any lifecycle, so the map grew one entry per peer this node had ever
+  linked with and held them for the life of the process. Both the stored value
+  and its seeding record are now released when the path they describe goes,
+  together rather than separately: releasing the record alone would leave the
+  value with nothing recording where it came from, and a peer returning over a
+  wider transport would then be refused by the never-loosen rule indefinitely.
+  A peer whose link is still up has both written straight back by the reseed
+  that already follows.
+
+- Removing a link now clears every reverse-lookup key it was inserted under.
+  The removal rebuilt one key from the link's own remote address, so an entry
+  inserted under a different address form — which the cross-connection
+  promotion arms do, keying on the packet's source address — outlived the link
+  it named. An entry a newer link has since claimed is still left alone.
+
+- A rejected handshake no longer strands a session index or a retry schedule.
+  Two reject arms freed neither, which the `next`-line versions already do;
+  master now carries the same shape, so an ACL-rejected outbound dial is
+  rescheduled and an abandoned rekey index is returned rather than held.
+
+#### Transport
+
+- The UDP listen socket's address-reuse flags are now set before its bind
+  rather than after, where they had no effect on the socket they were meant to
+  configure.
+
 #### Control socket
 
 - `disconnect` on the control socket now closes the transport connection
