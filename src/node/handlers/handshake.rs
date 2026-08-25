@@ -1317,6 +1317,19 @@ impl Node {
             if let Some(idx) = our_index {
                 let _ = self.index_allocator.free(idx);
             }
+            // Put the dial back on the retry schedule. The disposal above takes
+            // this leg out of the stuck-leg sweep — `has_pending_leg` reads false
+            // for it from here on, so the reap that normally reaches
+            // `note_handshake_timeout` never runs — and that reflex is the only
+            // thing that seeds `retry_pending` for a configured peer.
+            // `close_connection` only drops the transport's pool entry; it
+            // schedules nothing.
+            //
+            // `peer_identity` is safe to reschedule against here because this is
+            // an IK dial: the initiator's expected identity is fixed at
+            // `start_handshake` and `complete_handshake` never overwrites it, so
+            // it is still the peer we meant to dial and not whoever answered.
+            self.note_handshake_timeout(*peer_identity.node_addr(), packet.timestamp_ms);
             self.stats_mut()
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;
