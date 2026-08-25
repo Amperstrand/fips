@@ -234,6 +234,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Packaging & deployment
 
+- `fipsctl address [npub|hostname]` prints a node's `fd00::/8` mesh address and
+  nothing else, without contacting the daemon. With no argument it derives the
+  local node's address from `fips.key` in the default key directory, falling
+  back to the world-readable `fips.pub` beside it; `--key PATH` names a key or
+  public key file elsewhere. This lets an installer or image build write a mesh
+  address into a config file at a point where no node is running and none can
+  be, and keeps the derivation in one place rather than reimplemented by
+  whatever needs it.
+
 - `packaging/debian/build-deb.sh --features <list>` builds the `.deb` with a
   Cargo feature list, which is how an instrumented package is produced for a
   measurement run. The auto-derived dev Version gains a matching `+<features>`
