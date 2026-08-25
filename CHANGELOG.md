@@ -234,6 +234,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Packaging & deployment
 
+- A NixOS module and an overlay are exposed from the flake, so a flake consumer
+  enables the daemon with one line rather than hand-rolling a systemd unit.
+  `overlays.default` adds `pkgs.fips`, and `nixosModules.default` provides
+  `services.fips.*`: `enable`, `package`, `configFile`, `openFirewall` (UDP 2121
+  and TCP 8443) and `dns.enable`, which routes `.fips` to `[::1]:5354` through
+  systemd-resolved declaratively rather than with setup and teardown scripts.
+  `packaging/nixos/README.md` documents it with a full consumer `flake.nix`.
+  Contributed by Arjen. **Unexercised here**: no CI job builds the flake and no
+  Nix toolchain is present on the machine this release was assembled on, so the
+  module is untested outside its author's environment.
+
 - `fipsctl address [npub|hostname]` prints a node's `fd00::/8` mesh address and
   nothing else, without contacting the daemon. With no argument it derives the
   local node's address from `fips.key` in the default key directory, falling
