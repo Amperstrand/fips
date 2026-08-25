@@ -718,9 +718,35 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git ca-certificates build-essential meson ninja-build pkg-config \
             zlib1g-dev libssl-dev libzstd-dev liblzma-dev lua5.4-dev scdoc
-          git clone --quiet https://gitlab.alpinelinux.org/alpine/apk-tools.git /tmp/apk-tools
+          # The upstream host has failed this step twice in one run (early EOF,
+          # then a connect timeout), so fetch only the pinned commit and retry.
+          # The by-SHA fetch needs uploadpack.allowReachableSHA1InWant, which
+          # the server has today; the full clone stays as the fallback in case
+          # that policy changes.
+          APK_TOOLS_REPO=https://gitlab.alpinelinux.org/alpine/apk-tools.git
+          fetch_pinned() {
+            rm -rf /tmp/apk-tools
+            git init --quiet /tmp/apk-tools \
+              && git -C /tmp/apk-tools remote add origin "$APK_TOOLS_REPO" \
+              && git -C /tmp/apk-tools fetch --quiet --depth 1 origin "${APK_TOOLS_COMMIT}" \
+              && git -C /tmp/apk-tools checkout --quiet FETCH_HEAD
+          }
+          clone_full() {
+            rm -rf /tmp/apk-tools
+            git clone --quiet "$APK_TOOLS_REPO" /tmp/apk-tools \
+              && git -C /tmp/apk-tools checkout --quiet "${APK_TOOLS_COMMIT}"
+          }
+          got_source=
+          for method in fetch_pinned fetch_pinned fetch_pinned clone_full; do
+            if "$method"; then got_source=$method; break; fi
+            echo "apk-tools $method failed; retrying after backoff" >&2
+            sleep 20
+          done
+          if [ -z "$got_source" ]; then
+            echo "::error::could not obtain apk-tools ${APK_TOOLS_COMMIT} from $APK_TOOLS_REPO"
+            exit 1
+          fi
           cd /tmp/apk-tools
-          git checkout --quiet "${APK_TOOLS_COMMIT}"
           meson setup build
           ninja -C build src/apk
           APK_BIN=/tmp/apk-tools/build/src/apk
