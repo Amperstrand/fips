@@ -339,8 +339,8 @@ impl Node {
         // function returns, and that is what releases the pending slot on
         // every exit path. Renaming it to a bare `_` drops the guard right
         // here instead, releasing the slot at acquire time — silently, with
-        // no test and no clippy lint catching the difference. Do not "tidy"
-        // this binding.
+        // no clippy lint catching the difference. Do not "tidy" this
+        // binding; the assertion below is what reds if it is tidied.
         let _slot = match self.msg1_rate_limiter.start_handshake(class) {
             Ok(slot) => slot,
             Err(reason) => {
@@ -353,6 +353,19 @@ impl Node {
                 return;
             }
         };
+
+        // Test-build witness for the paragraph above, and the only thing that
+        // observes it. A guard released at acquire time leaves this msg1
+        // in flight with its slot already back in the pool, which no counter,
+        // log line or lint reports: by the time any test can look, the count
+        // has returned to its baseline either way. Sampling it here, on the
+        // handler's own stack, is what tells the two apart — see
+        // `msg1_handler_holds_its_pending_slot_while_the_handler_runs`.
+        #[cfg(test)]
+        assert!(
+            self.msg1_rate_limiter.pending_count() > 0,
+            "the msg1 pending slot was released before the handler ran"
+        );
 
         // accept_connections gate. Rekey/restart msg1 on an existing link
         // is always admitted; the gate only filters truly-fresh connections

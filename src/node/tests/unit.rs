@@ -2994,6 +2994,77 @@ async fn msg1_reject_arms_do_not_release_another_handshakes_slot() {
     assert_eq!(node.msg1_rate_limiter.pending_count(), 0);
 }
 
+/// The msg1 handler keeps its pending slot for as long as it is running.
+///
+/// The complement of `msg1_reject_arms_do_not_release_another_handshakes_slot`:
+/// that one covers releasing a slot the handler never took, this one covers
+/// releasing its own slot too early. Rebinding `handle_msg1`'s `let _slot` to
+/// a bare `_` drops the guard at acquire time, so the limiter's concurrency
+/// limb stops bounding anything — and every counter this test could read
+/// afterwards is identical either way, because the slot comes back at the end
+/// of the handler in both worlds. The difference exists only while the handler
+/// is on the stack, which is why the observation lives there: the
+/// `#[cfg(test)]` assertion in `handle_msg1` immediately below the acquire
+/// fires under the premature release and under nothing else.
+///
+/// Two packets, so the handler is entered twice on different paths past the
+/// acquire, and each arm asserts the reject counter it must bump. Without
+/// that, a msg1 refused before the acquire (an empty bucket, say) would leave
+/// this test passing while sampling nothing.
+#[tokio::test]
+async fn msg1_handler_holds_its_pending_slot_while_the_handler_runs() {
+    use crate::noise::HANDSHAKE_MSG1_SIZE;
+    use crate::proto::fmp::wire::build_msg1;
+    use crate::utils::index::SessionIndex;
+
+    // No transport is registered: both arms reject before any send, and the
+    // absent transport admits past the `accept_connections` gate.
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+    let source = TransportAddr::from_string("198.51.100.9:4141");
+    let packet = |data: Vec<u8>| ReceivedPacket {
+        transport_id,
+        remote_addr: source.clone(),
+        data,
+        timestamp_ms: 1000,
+    };
+
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        0,
+        "baseline: no handshake in flight"
+    );
+
+    // Arm 1: rejected at the header parse, the shortest path past the acquire.
+    let before = node.stats().handshake.bad_state;
+    node.handle_msg1(packet(vec![0u8; 8])).await;
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        before + 1,
+        "arm 1 must reach the invalid-header reject, not a rate-limit refusal"
+    );
+
+    // Arm 2: well-formed header, unusable Noise payload — rejected further in,
+    // after the duplicate short-circuit and the DH attempt.
+    let before = node.stats().handshake.bad_state;
+    node.handle_msg1(packet(build_msg1(
+        SessionIndex::new(0x4242),
+        &[0u8; HANDSHAKE_MSG1_SIZE],
+    )))
+    .await;
+    assert_eq!(
+        node.stats().handshake.bad_state,
+        before + 1,
+        "arm 2 must reach the receive_handshake_init reject"
+    );
+
+    assert_eq!(
+        node.msg1_rate_limiter.pending_count(),
+        0,
+        "each handler released its own slot exactly once on the way out"
+    );
+}
+
 /// The established-link bucket is wired from config at construction:
 /// derived from `max_peers` by default, overridden when the operator sets
 /// the key. This is the only test covering the config → limiter path.
