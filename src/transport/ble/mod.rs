@@ -1585,6 +1585,12 @@ async fn scan_probe_loop<I: io::BleIo>(
                             addr = %ta, role = "central", outcome = "pool-rejected",
                             error = %e, "BLE pool full, probe connection dropped"
                         );
+                        // The connection is dropped with `conn`, so there is
+                        // nothing to report and nothing to resolve. Leaving the
+                        // address in the retry book is the point: a slot may
+                        // free before the peer is advertised again. The inbound
+                        // path already returns here rather than falling through.
+                        continue;
                     }
                 }
                 drop(pool_guard);
@@ -2374,6 +2380,83 @@ mod tests {
             connects.lock().unwrap().len(),
             2,
             "a resolved alias of a live peer must not be re-dialled"
+        );
+
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A probe the pool refuses is not a connection, and must not be recorded
+    /// as one. The inbound path already returns on rejection
+    /// (`admit_inbound`); this pins the outbound probe path to the same shape.
+    ///
+    /// Reaching the refusal needs `max_connections: 0`. `ConnectionPool::insert`
+    /// only fails when the pool is full *and* every slot is static, and every
+    /// BLE connection is built with `is_static: false`, so a non-empty pool
+    /// always has an evictable slot. That makes this arm unreachable in a
+    /// default deployment today and reachable the moment anything marks a
+    /// connection static, which the pool is already written for.
+    #[tokio::test(start_paused = true)]
+    async fn a_pool_rejected_probe_is_neither_established_nor_reported() {
+        use std::sync::Mutex as StdMutex;
+
+        let (ours_pk, theirs_pk) = pubkeys_ordered_by_node_addr();
+        let io = MockBleIo::new("hci0", test_addr(1));
+
+        let connects: Arc<StdMutex<Vec<BleAddr>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let connects = Arc::clone(&connects);
+            io.set_connect_handler(move |addr, _psm| {
+                let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+                connects.lock().unwrap().push(addr.clone());
+                peer_tx
+                    .send(theirs)
+                    .map_err(|_| TransportError::ConnectionRefused)?;
+                Ok(mine)
+            });
+        }
+        tokio::spawn(async move {
+            let mut alive = Vec::new();
+            while let Some(theirs) = peer_rx.recv().await {
+                peer_side_exchange(&theirs, &theirs_pk).await;
+                alive.push(theirs);
+            }
+        });
+
+        let config = BleConfig {
+            scan: Some(true),
+            accept_connections: Some(false),
+            max_connections: Some(0),
+            ..identity_test_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        transport.set_local_pubkey(ours_pk);
+        transport.start_async().await.unwrap();
+
+        transport.io.inject_scan_result(test_addr(2)).await;
+        settle().await;
+
+        // The dial and the exchange both happened; only the pool refused.
+        assert_eq!(connects.lock().unwrap().len(), 1, "the peer was dialled");
+        let snap = transport.stats.snapshot();
+        assert_eq!(snap.connections_rejected, 1, "the refusal is recorded");
+        assert_eq!(
+            snap.connections_established, 0,
+            "a refused probe is not an established connection"
+        );
+        assert_eq!(transport.pool.lock().await.len(), 0);
+        assert!(
+            transport.neighbor_buffer.take().is_empty(),
+            "the node layer must not be handed a peer with no connection behind it"
+        );
+
+        // It stayed in the retry book, so a freed slot can still admit it.
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        settle().await;
+        assert!(
+            connects.lock().unwrap().len() >= 2,
+            "a refused address is retried, not resolved away"
         );
 
         transport.stop_async().await.unwrap();
