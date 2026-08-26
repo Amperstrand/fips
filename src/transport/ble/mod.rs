@@ -29,6 +29,16 @@
 
 pub mod addr;
 pub mod io;
+/// A backend whose radio is supplied by the embedder rather than opened in
+/// process.
+///
+/// Compiled under `cfg(test)` on every host as well as on the platform that
+/// will select it, so its channel machinery, slot semantics and connect
+/// routing are exercised by an ordinary test run on an ordinary runner. The
+/// platform build of it is linted but executed nowhere, which is exactly why
+/// the logic must not be behind a platform-only gate.
+#[cfg(any(target_os = "android", test))]
+pub mod io_android;
 #[cfg(bluer_available)]
 pub mod io_linux;
 pub mod neighbor;
