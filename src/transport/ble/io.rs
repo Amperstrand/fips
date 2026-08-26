@@ -163,6 +163,16 @@ pub trait BleIo: Send + Sync + 'static {
         &self,
     ) -> impl std::future::Future<Output = Result<Self::Scanner, TransportError>> + Send;
 
+    /// Stop scanning.
+    ///
+    /// The counterpart to [`Self::stop_advertising`], and needed for the same
+    /// reason: dropping the transport's scan task stops *us* reading adverts,
+    /// but on a backend whose radio is owned elsewhere it does not stop the
+    /// radio. A backend whose scan ends when its `Scanner` is dropped
+    /// implements this as a no-op and says so.
+    fn stop_scanning(&self)
+    -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+
     /// Get the adapter's BLE address.
     fn local_addr(&self) -> Result<BleAddr, TransportError>;
 
@@ -288,6 +298,8 @@ pub struct MockBleIo {
     bound_psm: std::sync::Mutex<Option<u16>>,
     /// PSM most recently passed to `start_advertising`.
     advertised_psm: std::sync::Mutex<Option<u16>>,
+    /// Number of times `stop_scanning` has been called.
+    stop_scans: std::sync::atomic::AtomicUsize,
 }
 
 impl MockBleIo {
@@ -305,7 +317,13 @@ impl MockBleIo {
             connect_handler: std::sync::Mutex::new(None),
             bound_psm: std::sync::Mutex::new(None),
             advertised_psm: std::sync::Mutex::new(None),
+            stop_scans: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many times the transport has asked this backend to stop scanning.
+    pub fn stop_scan_calls(&self) -> usize {
+        self.stop_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Inject an inbound connection (simulates a remote device connecting).
@@ -390,6 +408,12 @@ impl BleIo for MockBleIo {
     }
 
     async fn stop_advertising(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn stop_scanning(&self) -> Result<(), TransportError> {
+        self.stop_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

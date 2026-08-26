@@ -326,6 +326,11 @@ impl<I: BleIo> BleTransport<I> {
         // Stop advertising
         let _ = self.io.stop_advertising().await;
 
+        // Stop scanning. Aborting the scan task below stops us reading
+        // adverts; on a backend whose radio the embedder owns, only this
+        // stops the radio.
+        let _ = self.io.stop_scanning().await;
+
         // Abort accept loop
         if let Some(task) = self.accept_task.take() {
             task.abort();
@@ -1936,6 +1941,34 @@ mod tests {
 
         transport.stop_async().await.unwrap();
         assert_eq!(transport.state(), TransportState::Down);
+    }
+
+    /// `stop_async` has always stopped advertising; it must stop scanning
+    /// too. Aborting the scan task only stops the transport reading adverts —
+    /// on a backend whose radio the embedder owns, the radio keeps scanning
+    /// until it is told, which on a phone costs battery and keeps
+    /// broadcasting after the feature was switched off.
+    #[tokio::test]
+    async fn stop_async_tells_the_backend_to_stop_scanning() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let config = BleConfig {
+            adapter: Some("hci0".to_string()),
+            scan: Some(true),
+            advertise: Some(false),
+            accept_connections: Some(false),
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        transport.start_async().await.unwrap();
+        assert_eq!(transport.io.stop_scan_calls(), 0);
+
+        transport.stop_async().await.unwrap();
+        assert_eq!(
+            transport.io.stop_scan_calls(),
+            1,
+            "stopping the transport must reach the backend's scan"
+        );
     }
 
     #[tokio::test(start_paused = true)]

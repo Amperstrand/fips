@@ -368,6 +368,14 @@ impl BleIo for BluerIo {
         Ok(())
     }
 
+    /// A no-op: BlueZ discovery ends when [`BluerScanner`]'s event stream is
+    /// dropped, which happens when the transport drops the scanner. There is
+    /// no separate adapter-level stop to issue.
+    async fn stop_scanning(&self) -> Result<(), TransportError> {
+        debug!("BLE scanning stops with the scanner");
+        Ok(())
+    }
+
     async fn start_scanning(&self) -> Result<Self::Scanner, TransportError> {
         // Clear cached devices so BlueZ fires DeviceAdded for every
         // advertisement. Without this, already-known devices only

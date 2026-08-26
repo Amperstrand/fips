@@ -421,6 +421,18 @@ impl AndroidBleBridge {
         }
     }
 
+    /// Stop scanning, so a later request starts it again.
+    ///
+    /// The embedder's radio outlives this transport, so a scan nobody stops
+    /// runs for the life of the process: on a phone that is battery and a
+    /// broadcast of the user's presence, both after the feature was switched
+    /// off.
+    fn end_scanning(&self) {
+        if self.scanning.swap(false, Ordering::AcqRel) {
+            self.radio.stop_scanning();
+        }
+    }
+
     /// Allocate a channel, registering the bridge-side half and returning the
     /// stream-side half.
     fn make_channel(&self, remote: BleAddr, send_mtu: u16, recv_mtu: u16) -> StreamEndpoints {
@@ -986,6 +998,17 @@ impl BleIo for AndroidIo {
         Ok(())
     }
 
+    /// Clearing the intent matters as much as stopping the radio: without it a
+    /// radio installed after the transport stopped would be told to scan by
+    /// `RadioIntent::apply`, with nothing left to consume the adverts.
+    async fn stop_scanning(&self) -> Result<(), TransportError> {
+        self.intent.scan.store(false, Ordering::Relaxed);
+        if let Some(bridge) = self.slot.current() {
+            bridge.end_scanning();
+        }
+        Ok(())
+    }
+
     async fn start_scanning(&self) -> Result<AndroidScanner, TransportError> {
         self.intent.scan.store(true, Ordering::Relaxed);
         let mut seen = None;
@@ -1040,6 +1063,7 @@ mod tests {
         advertised_psm: AtomicU16,
         advertise_calls: AtomicU32,
         scan_calls: AtomicU32,
+        stop_scan_calls: AtomicU32,
         closed_channels: Mutex<Vec<i64>>,
         dials: Mutex<Vec<(i64, BleAddr, u16)>>,
     }
@@ -1075,7 +1099,9 @@ mod tests {
         fn start_scanning(&self) {
             self.scan_calls.fetch_add(1, Ordering::Relaxed);
         }
-        fn stop_scanning(&self) {}
+        fn stop_scanning(&self) {
+            self.stop_scan_calls.fetch_add(1, Ordering::Relaxed);
+        }
         fn close_channel(&self, ch_id: i64) {
             self.closed_channels.lock().unwrap().push(ch_id);
         }
@@ -1706,5 +1732,44 @@ mod tests {
         let mut tail = [0u8; 6];
         reader.read_exact(&mut tail).await.unwrap();
         assert_eq!(&tail, b"456789");
+    }
+
+    /// The embedder's radio outlives the transport, so stopping the transport
+    /// has to reach the radio. Nothing did: `stop_scanning` was declared on
+    /// `AndroidRadio` and called from nowhere, so a scan started by a
+    /// transport that has since stopped ran for the life of the process.
+    #[tokio::test]
+    async fn stopping_the_transport_stops_the_radio_scanning() {
+        let radio = MockRadio::with_psm(0x0081);
+        let slot = Arc::new(BleRadioSlot::new());
+        slot.install(AndroidBleBridge::new(
+            Arc::clone(&radio) as Arc<dyn AndroidRadio>
+        ));
+        let io = AndroidIo::new(Arc::clone(&slot));
+
+        let _scanner = io.start_scanning().await.unwrap();
+        assert_eq!(radio.scan_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(radio.stop_scan_calls.load(Ordering::Relaxed), 0);
+
+        io.stop_scanning().await.unwrap();
+        assert_eq!(
+            radio.stop_scan_calls.load(Ordering::Relaxed),
+            1,
+            "the radio must be told, not just the scanner dropped"
+        );
+
+        // The intent is cleared too, so a radio installed after the stop is
+        // not told to scan with nothing left to read the adverts.
+        let later = MockRadio::with_psm(0x0081);
+        slot.install(AndroidBleBridge::new(
+            Arc::clone(&later) as Arc<dyn AndroidRadio>
+        ));
+        let mut seen = None;
+        resolve(&slot, &mut seen, &io.intent);
+        assert_eq!(
+            later.scan_calls.load(Ordering::Relaxed),
+            0,
+            "a radio installed after the stop must not be told to scan"
+        );
     }
 }
