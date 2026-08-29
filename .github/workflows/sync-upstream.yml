@@ -49,7 +49,7 @@ jobs:
           OTHER_COUNT=0
           for sha in $UNIQUE_SHAS; do
             # Files this commit touched, excluding this workflow file
-            FILES=$(git show --name-only --format='' "$sha" | grep -v '^\.github/workflows/upstream-sync\.yml$' || true)
+            FILES=$(git show --name-only --format='' "$sha" | grep -vE '^\.github/workflows/(upstream-sync|sync-upstream|fork-ci)\.yml$|^deny\.toml$|^\.githooks/|^\.github/(workflows|actions)/fork-|^scripts/fork-' || true)
             if [ -n "$FILES" ]; then
               FORK_INFRA_OK=false
               OTHER_COUNT=$((OTHER_COUNT + 1))
@@ -62,21 +62,12 @@ jobs:
           AHEAD=$(git rev-list --count origin/master..upstream/master || echo 0)
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
 
-      - name: Sync (fast-forward + restore workflow file)
+      - name: Sync (merge upstream/master)
         if: steps.classify.outputs.fork_infra_ok == 'true' && steps.classify.outputs.ahead != '0'
         run: |
-          cp .github/workflows/upstream-sync.yml /tmp/upstream-sync.yml
           git checkout master
-          git reset --hard upstream/master
-          mkdir -p .github/workflows
-          cp /tmp/upstream-sync.yml .github/workflows/upstream-sync.yml
-          git add .github/workflows/upstream-sync.yml
-          git commit -m "ci: add daily upstream-sync workflow (auto-restored by sync job)
-
-          Fork-local workflow. See AGENTS.md."
+          git merge --no-edit upstream/master
           git push origin master
-          git push origin --force-with-lease upstream/master:main
-          echo "::notice::Synced ${{ steps.classify.outputs.ahead }} commit(s) from upstream/master, restored sync workflow"
 
       - name: Open issue if non-infra divergence detected
         if: steps.classify.outputs.fork_infra_ok == 'false'
