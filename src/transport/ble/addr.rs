@@ -11,6 +11,23 @@ pub struct BleAddr {
     pub adapter: String,
     /// 6-byte Bluetooth device address.
     pub device: [u8; 6],
+    /// Peer address type learned from discovery (or accept).
+    ///
+    /// The L2CAP socket dial must use the type the peer actually advertises
+    /// with: the kernel never completes a connection whose peer-address type
+    /// mismatches (it fails at mgmt level without ever issuing
+    /// `LE Create Connection`, and — as observed with bluer 0.17 — the
+    /// socket connect future is never told, so the dialer only ever sees
+    /// its own timeout). ESP32 peers advertise as Random; a hardcoded
+    /// LePublic made every probe against them time out.
+    pub kind: BleAddrKind,
+}
+
+/// BLE peer address type, mirroring the two LE types the kernel dials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BleAddrKind {
+    Public,
+    Random,
 }
 
 impl BleAddr {
@@ -31,6 +48,9 @@ impl BleAddr {
         Ok(Self {
             adapter: adapter.to_string(),
             device,
+            // Config-pinned addresses carry no type information; Public
+            // preserves the pre-`kind` dial behavior for static peers.
+            kind: BleAddrKind::Public,
         })
     }
 
@@ -59,12 +79,30 @@ impl BleAddr {
 // ============================================================================
 
 #[cfg(bluer_available)]
+impl From<bluer::AddressType> for BleAddrKind {
+    fn from(ty: bluer::AddressType) -> Self {
+        match ty {
+            bluer::AddressType::LePublic => BleAddrKind::Public,
+            bluer::AddressType::LeRandom => BleAddrKind::Random,
+            // BR/EDR is not a dialable LE type; Public keeps legacy behavior.
+            bluer::AddressType::BrEdr => BleAddrKind::Public,
+        }
+    }
+}
+
+#[cfg(bluer_available)]
 impl BleAddr {
-    /// Construct from a bluer `Address` and adapter name.
-    pub fn from_bluer(addr: bluer::Address, adapter: &str) -> Self {
+    /// Construct from a bluer `Address` and adapter name, learning the peer
+    /// address type from discovery/accept.
+    pub fn from_bluer_with_kind(
+        addr: bluer::Address,
+        kind: BleAddrKind,
+        adapter: &str,
+    ) -> Self {
         Self {
             adapter: adapter.to_string(),
             device: addr.0,
+            kind,
         }
     }
 
@@ -75,7 +113,11 @@ impl BleAddr {
 
     /// Convert to a bluer L2CAP `SocketAddr` with the given PSM.
     pub fn to_socket_addr(&self, psm: u16) -> bluer::l2cap::SocketAddr {
-        bluer::l2cap::SocketAddr::new(self.to_bluer_address(), bluer::AddressType::LePublic, psm)
+        let ty = match self.kind {
+            BleAddrKind::Public => bluer::AddressType::LePublic,
+            BleAddrKind::Random => bluer::AddressType::LeRandom,
+        };
+        bluer::l2cap::SocketAddr::new(self.to_bluer_address(), ty, psm)
     }
 }
 
@@ -177,5 +219,34 @@ mod tests {
     fn test_adapter_from_addr_no_slash() {
         let ta = TransportAddr::from_string("invalid");
         assert_eq!(adapter_from_addr(&ta), None);
+    }
+
+    #[cfg(bluer_available)]
+    #[test]
+    fn test_parse_defaults_to_public_kind() {
+        let addr = BleAddr::parse("hci0/0C:00:00:00:00:FF").unwrap();
+        assert_eq!(addr.kind, BleAddrKind::Public);
+        assert_eq!(
+            addr.to_socket_addr(133).addr_type,
+            bluer::AddressType::LePublic
+        );
+    }
+
+    #[cfg(bluer_available)]
+    #[test]
+    fn test_learned_random_kind_drives_socket_addr() {
+        let addr = bluer::Address([0x0C, 0, 0, 0, 0, 0xFF]);
+        let ble = BleAddr::from_bluer_with_kind(addr, BleAddrKind::Random, "hci0");
+        let sa = ble.to_socket_addr(133);
+        assert_eq!(sa.addr, addr);
+        assert_eq!(sa.addr_type, bluer::AddressType::LeRandom);
+        assert_eq!(sa.psm, 133);
+    }
+
+    #[cfg(bluer_available)]
+    #[test]
+    fn test_bluer_address_type_conversion() {
+        assert_eq!(BleAddrKind::from(bluer::AddressType::LeRandom), BleAddrKind::Random);
+        assert_eq!(BleAddrKind::from(bluer::AddressType::LePublic), BleAddrKind::Public);
     }
 }

@@ -222,10 +222,12 @@ mod tests {
         TransportAddr::from_string(&format!("hci0/AA:BB:CC:DD:EE:{n:02X}"))
     }
 
+    use crate::transport::ble::addr::BleAddrKind;
     fn test_ble_addr(n: u8) -> BleAddr {
         BleAddr {
             adapter: "hci0".to_string(),
             device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            kind: BleAddrKind::Public,
         }
     }
 

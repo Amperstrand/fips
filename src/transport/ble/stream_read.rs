@@ -152,7 +152,7 @@ impl<S: BleStream + 'static> AsyncRead for BleStreamRead<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::ble::addr::BleAddr;
+    use crate::transport::ble::addr::{BleAddr, BleAddrKind};
     use crate::transport::ble::io::MockBleStream;
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex as TokioMutex;
@@ -161,6 +161,7 @@ mod tests {
         BleAddr {
             adapter: "hci0".to_string(),
             device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            kind: BleAddrKind::Public,
         }
     }
 
