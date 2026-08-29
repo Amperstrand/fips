@@ -86,7 +86,7 @@ use tracing::{debug, trace};
 
 use crate::transport::TransportError;
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleAddrKind};
 use super::io::{BleAcceptor, BleIo, BleScanner, BleStream, ScanAdvert};
 
 /// Adapter label reported by this backend.
@@ -1103,6 +1103,7 @@ impl BleIo for RadioIo {
         Ok(BleAddr {
             adapter: RADIO_ADAPTER.to_string(),
             device: [0; 6],
+            kind: BleAddrKind::Public,
         })
     }
 
@@ -1177,6 +1178,7 @@ mod tests {
         BleAddr {
             adapter: RADIO_ADAPTER.to_string(),
             device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            kind: BleAddrKind::Public,
         }
     }
 

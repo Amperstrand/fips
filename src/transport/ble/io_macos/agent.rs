@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::super::addr::BleAddr;
+use super::super::addr::{BleAddr, BleAddrKind};
 use super::super::io::{BleAcceptor, BleIo, BleScanner, BleStream};
 use super::agent_proto::{Frame, MAX_FRAME, VERSION, read_frame_async};
 
@@ -560,6 +560,7 @@ mod tests {
         BleAddr {
             adapter: RADIO_ADAPTER.to_string(),
             device: [0x02, 0, 0, 0, 0, n],
+            kind: BleAddrKind::Random,
         }
     }
 
