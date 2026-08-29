@@ -37,7 +37,7 @@
 
 use std::io;
 
-use super::super::addr::BleAddr;
+use super::super::addr::{BleAddr, BleAddrKind};
 use super::super::io_radio::RADIO_ADAPTER;
 
 /// Protocol version carried in [`Frame::Hello`].
@@ -369,6 +369,10 @@ impl Reader<'_> {
         Ok(BleAddr {
             adapter: RADIO_ADAPTER.to_string(),
             device: self.take()?,
+            // The agent protocol's wire form carries only the six device
+            // bytes; every address it can carry is a peer_addr() hash, which
+            // is locally administered and therefore Random class.
+            kind: BleAddrKind::Random,
         })
     }
     fn rest(&mut self) -> Vec<u8> {
@@ -384,6 +388,7 @@ mod tests {
         BleAddr {
             adapter: RADIO_ADAPTER.to_string(),
             device: [0x02, 1, 2, 3, 4, n],
+            kind: BleAddrKind::Random,
         }
     }
 

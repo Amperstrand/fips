@@ -51,7 +51,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleAddrKind};
 use super::io_radio::{BleRadioBridge, RADIO_ADAPTER};
 use super::psm;
 
@@ -122,6 +122,9 @@ pub fn peer_addr(identifier: [u8; 16]) -> BleAddr {
     BleAddr {
         adapter: RADIO_ADAPTER.to_string(),
         device,
+        // A locally-administered synthetic hash, not a real adapter address,
+        // so it reads as the Random class rather than Public.
+        kind: BleAddrKind::Random,
     }
 }
 

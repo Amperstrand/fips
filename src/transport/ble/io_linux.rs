@@ -16,7 +16,7 @@ use std::pin::Pin;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleAddrKind};
 use super::psm;
 
 /// FIPS BLE service UUID.
@@ -133,7 +133,11 @@ impl BleAcceptor for BluerAcceptor {
             .await
             .map_err(|e| map_io_err("accept", e))?;
 
-        let remote = BleAddr::from_bluer(peer_sa.addr, &self.adapter_name);
+        let remote = BleAddr::from_bluer_with_kind(
+            peer_sa.addr,
+            peer_sa.addr_type.into(),
+            &self.adapter_name,
+        );
         BluerStream::new(conn, remote)
     }
 }
@@ -164,7 +168,13 @@ impl BleScanner for BluerScanner {
                     if let Ok(device) = self.adapter.device(addr) {
                         match device.uuids().await {
                             Ok(Some(uuids)) if uuids.contains(&FIPS_SERVICE_UUID) => {
-                                let ble_addr = BleAddr::from_bluer(addr, &self.adapter_name);
+                                let kind = device
+                                    .address_type()
+                                    .await
+                                    .map(BleAddrKind::from)
+                                    .unwrap_or(BleAddrKind::Public);
+                                let ble_addr =
+                                    BleAddr::from_bluer_with_kind(addr, kind, &self.adapter_name);
                                 let psm =
                                     device.service_data().await.ok().flatten().and_then(|sd| {
                                         sd.get(&PSM_SERVICE_DATA_UUID)
@@ -429,7 +439,10 @@ impl BleIo for BluerIo {
         // the D-Bus call is fast.
         let addr = futures::executor::block_on(self.adapter.address())
             .map_err(|e| map_err("address", e))?;
-        Ok(BleAddr::from_bluer(addr, &self.adapter_name))
+        let kind = futures::executor::block_on(self.adapter.address_type())
+            .map(BleAddrKind::from)
+            .unwrap_or(BleAddrKind::Public);
+        Ok(BleAddr::from_bluer_with_kind(addr, kind, &self.adapter_name))
     }
 
     fn adapter_name(&self) -> &str {

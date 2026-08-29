@@ -7,7 +7,7 @@
 use super::*;
 use crate::config::BleConfig;
 use crate::transport::ble::BleTransport;
-use crate::transport::ble::addr::BleAddr;
+use crate::transport::ble::addr::{BleAddr, BleAddrKind};
 use crate::transport::ble::io::{MockBleIo, MockBleStream};
 use crate::transport::{Transport, TransportHandle, TransportId, packet_channel};
 use spanning_tree::{
@@ -21,6 +21,7 @@ fn ble_addr(n: u8) -> BleAddr {
     BleAddr {
         adapter: "hci0".to_string(),
         device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+        kind: BleAddrKind::Random,
     }
 }
 
