@@ -78,7 +78,7 @@ use tracing::{debug, trace};
 
 use crate::transport::TransportError;
 
-use super::addr::BleAddr;
+use super::addr::{BleAddr, BleAddrKind};
 use super::io::{BleAcceptor, BleIo, BleScanner, BleStream, ScanAdvert};
 
 /// Adapter label reported by this backend.
@@ -1037,6 +1037,7 @@ impl BleIo for AndroidIo {
         Ok(BleAddr {
             adapter: ANDROID_ADAPTER.to_string(),
             device: [0; 6],
+            kind: BleAddrKind::Public,
         })
     }
 
@@ -1111,6 +1112,7 @@ mod tests {
         BleAddr {
             adapter: ANDROID_ADAPTER.to_string(),
             device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            kind: BleAddrKind::Public,
         }
     }
 
