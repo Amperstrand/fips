@@ -103,7 +103,7 @@ pub struct UdpConfig {
     /// unfamiliar addresses. The Node-level gate at
     /// `src/node/handlers/handshake.rs` carves out msg1 from peers
     /// already established on this transport (so rekey continues to
-    /// work) — see ISSUE-2026-0004.
+    /// work).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accept_connections: Option<bool>,
 }
@@ -711,6 +711,12 @@ pub struct BleConfig {
     pub adapter: Option<String>,
 
     /// L2CAP PSM for FIPS connections. Default: 0x0085 (133).
+    ///
+    /// This is the PSM to request for this node's listener, and the PSM to
+    /// dial a peer at when that peer advertises none. It is not always the
+    /// PSM finally used: platforms that assign listener PSMs themselves
+    /// report back what they bound and advertise that, and a peer that
+    /// advertises its own PSM is dialled there instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psm: Option<u16>,
 

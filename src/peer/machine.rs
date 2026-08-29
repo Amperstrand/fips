@@ -31,8 +31,9 @@
 //! (the three epoch slots, transport target, connected-UDP handle, hot counters)
 //! becomes `PeerSendState` and is *not* built here; the machine emits
 //! actions (`PromoteToActive`, `SwapSendState`, `RegisterDecryptSession`, …) that
-//! the driver applies to the published send-state. `remote_epoch` is
-//! establish-path-only, hence control-tier, and lives here.
+//! the driver applies to the published send-state. The remote startup epoch is
+//! establish-path-only, hence control-tier, and lives on `conn` as the sole
+//! carrier (`conn_remote_epoch`).
 //!
 //! ## Realizability notes
 //!
@@ -56,6 +57,7 @@
 
 #![allow(dead_code)]
 
+use crate::identity::ErasingKeypair;
 use crate::noise::{self, NoiseError, NoiseSession};
 use crate::proto::fmp::{
     ConnAction, ConnSnapshot, ConnectionState, EstablishSnapshot, Fmp, InboundDecision,
@@ -88,10 +90,24 @@ const RESEND_BACKOFF: f64 = 2.0;
 const REKEY_CADENCE_INTERVAL_MS: u64 = 60_000;
 const REKEY_RESEND_INTERVAL_MS: u64 = 1_000;
 const REKEY_MAX_RESENDS: u32 = 5;
-const REKEY_AFTER_SECS: u64 = 3_600;
-const REKEY_AFTER_MESSAGES: u64 = 1_000_000;
-const DRAIN_WINDOW_MS: u64 = 5_000;
-const LIVENESS_INTERVAL_MS: u64 = 15_000;
+// `REKEY_AFTER_SECS`, `REKEY_AFTER_MESSAGES` and `LIVENESS_INTERVAL_MS` below
+// are placeholders pinned to today's `RekeyConfig` and `NodeConfig` defaults.
+// They are not a wiring to the config: nothing here reads a config value, so
+// an operator override is not tracked. They are what the machine falls back to
+// until it is wired to config. The tie to the defaults is asserted by
+// `rekey_constants_match_the_rekey_config_defaults` and
+// `liveness_interval_matches_the_heartbeat_config_default` rather than stated
+// in these declarations, because `Default for NodeConfig` is an ordinary impl
+// and cannot be called from a `const` initializer.
+const REKEY_AFTER_SECS: u64 = 120;
+const REKEY_AFTER_MESSAGES: u64 = 65_536;
+/// Drain-window deadline armed at rekey cutover. Sourced from the value that
+/// actually governs the live drain so the two cannot drift; the armed timer
+/// is currently stored and never fired (`drive_peer_timers` has no
+/// `DrainExpiry` arm), so this is a stored-value correction, not a live
+/// timing change.
+const DRAIN_WINDOW_MS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 1_000;
+const LIVENESS_INTERVAL_MS: u64 = 10_000;
 const REKEY_DAMPEN_MS: u64 = 30_000;
 const CLOSED_BACKOFF_MS: u64 = 5_000;
 
@@ -374,8 +390,9 @@ pub(crate) enum PeerAction {
     /// resolution; it must never reach the action executor.
     ResolveCrossConnection { swap: bool },
     /// Initiator-side rekey cutover: swap the published send-state to the pending
-    /// epoch.
-    SwapSendState { epoch: [u8; 8] },
+    /// epoch. The remote epoch is not carried here: `conn` is its sole carrier
+    /// and promotion reads it from there via `conn_remote_epoch`.
+    SwapSendState,
     /// Complete an initiator-side rekey drain: retire the previous session slot
     /// (drop its `peers_by_index`/decrypt-worker entry, free its index). The
     /// executor reads the REAL previous index from `ActivePeer::complete_drain`
@@ -473,8 +490,6 @@ pub(crate) struct PeerMachine {
     /// Pure handshake-phase bookkeeping (link/direction/indices/transport/
     /// stored handshake bytes/epoch). Reused verbatim from the FMP state core.
     conn: ConnectionState,
-    /// Remote startup epoch (establish-path-only; NOT in send-state).
-    remote_epoch: Option<[u8; 8]>,
     /// Inbound two-phase authorize: the opaque Noise msg2
     /// payload stashed in Phase 1 (`InboundMsg1`) and emitted in Phase 2
     /// (`on_authorized`), so a rejected/unauthorized msg1 allocates no index.
@@ -523,7 +538,6 @@ impl PeerMachine {
             identity: Some(identity),
             leg: None,
             conn: ConnectionState::outbound(link, identity, now),
-            remote_epoch: None,
             pending_msg2_payload: None,
             send_failed: false,
             rekey_in_progress: false,
@@ -550,7 +564,6 @@ impl PeerMachine {
             identity: None,
             leg: None,
             conn: ConnectionState::inbound(link, now),
-            remote_epoch: None,
             pending_msg2_payload: None,
             send_failed: false,
             rekey_in_progress: false,
@@ -603,10 +616,15 @@ impl PeerMachine {
     /// The epoch is our startup epoch, encrypted into msg1 for restart detection.
     pub(crate) fn start_handshake(
         &mut self,
-        our_keypair: Keypair,
+        mut our_keypair: Keypair,
         epoch: [u8; 8],
         current_time_ms: u64,
     ) -> Result<Vec<u8>, NoiseError> {
+        // The parameter is this frame's own copy of the node's long-term
+        // private key, and the state checks below return before it is used.
+        // The guard clears it on every exit path.
+        let our_keypair = ErasingKeypair::take(&mut our_keypair);
+
         let msg1 = {
             let direction = self.conn.direction();
             let expected_identity = self.conn.expected_identity().copied();
@@ -623,7 +641,9 @@ impl PeerMachine {
                 .expect("outbound must have expected identity")
                 .pubkey_full();
 
-            let mut hs = noise::HandshakeState::new_initiator(our_keypair, remote_static);
+            let mut kp = *our_keypair.get();
+            let mut hs = noise::HandshakeState::new_initiator(kp, remote_static);
+            kp.non_secure_erase();
             hs.set_local_epoch(epoch);
             let msg1 = hs.write_message_1()?;
 
@@ -642,11 +662,15 @@ impl PeerMachine {
     /// The epoch is our startup epoch, encrypted into msg2 for restart detection.
     pub(crate) fn receive_handshake_init(
         &mut self,
-        our_keypair: Keypair,
+        mut our_keypair: Keypair,
         epoch: [u8; 8],
         message: &[u8],
         current_time_ms: u64,
     ) -> Result<Vec<u8>, NoiseError> {
+        // Same as `start_handshake`: the parameter copy outlives two early
+        // returns, so the guard owns it rather than an erase per exit path.
+        let our_keypair = ErasingKeypair::take(&mut our_keypair);
+
         let (msg2, learned_identity, remote_epoch) = {
             let direction = self.conn.direction();
             let leg = self.leg.as_mut().ok_or_else(no_pending_connection)?;
@@ -658,7 +682,9 @@ impl PeerMachine {
                 });
             }
 
-            let mut hs = noise::HandshakeState::new_responder(our_keypair);
+            let mut kp = *our_keypair.get();
+            let mut hs = noise::HandshakeState::new_responder(kp);
+            kp.non_secure_erase();
             hs.set_local_epoch(epoch);
 
             // Process message 1 (this reveals the initiator's identity and epoch)
@@ -1257,7 +1283,7 @@ impl PeerMachine {
     }
 
     /// Inbound **Phase 1**: classify the fresh leg *without*
-    /// allocating an index. Records identity/epoch/their-index and stashes the
+    /// allocating an index. Records identity/their-index and stashes the
     /// opaque msg2 payload, parking at `Handshaking{ReceivedMsg1}` — the
     /// "awaiting Authorized" marker. The index allocation and the msg2/promote
     /// emission happen in Phase 2 ([`Self::on_authorized`]) only after the
@@ -1265,7 +1291,6 @@ impl PeerMachine {
     /// nothing (preserving the pre-refactor global index-allocation sequence).
     fn inbound_classify(&mut self, link: LinkId, wire: &WireOutcome) -> Vec<PeerAction> {
         self.identity = Some(wire.peer_identity);
-        self.remote_epoch = wire.remote_epoch;
         self.conn.set_their_index(wire.their_index);
         self.pending_msg2_payload = Some(wire.msg2_payload.clone());
         self.state = PeerState::Handshaking {
@@ -1452,9 +1477,7 @@ impl PeerMachine {
                     addr: peer,
                     kind: MaintainKind::Rekey(RekeyPhase::Draining),
                 };
-                let mut actions = vec![PeerAction::SwapSendState {
-                    epoch: self.remote_epoch.unwrap_or_default(),
-                }];
+                let mut actions = vec![PeerAction::SwapSendState];
                 if let Some(idx) = self.conn.our_index() {
                     actions.push(PeerAction::RegisterDecryptSession { index: idx });
                 }
@@ -1921,7 +1944,7 @@ mod tests {
                 link: LinkId::new(7),
             },
             PeerAction::ResolveCrossConnection { swap: true },
-            PeerAction::SwapSendState { epoch: [1u8; 8] },
+            PeerAction::SwapSendState,
             PeerAction::CompleteDrain { peer },
             PeerAction::InvalidateSendState,
             PeerAction::RegisterDecryptSession {
@@ -1957,7 +1980,7 @@ mod tests {
                 | PeerAction::SendLinkMessage { .. }
                 | PeerAction::PromoteToActive { .. }
                 | PeerAction::ResolveCrossConnection { .. }
-                | PeerAction::SwapSendState { .. }
+                | PeerAction::SwapSendState
                 | PeerAction::CompleteDrain { .. }
                 | PeerAction::InvalidateSendState
                 | PeerAction::RegisterDecryptSession { .. }
@@ -2009,7 +2032,12 @@ mod tests {
         };
         m.rekey_our_index = Some(SessionIndex::new(0x2222));
         m.conn.set_our_index(SessionIndex::new(0x1111));
-        m.remote_epoch = Some([9u8; 8]);
+        // The remote startup epoch lives on the surviving carrier, written
+        // there by BOTH handshake legs (`receive_handshake_init` from msg1,
+        // `complete_handshake` from msg2) through this same setter. Seed it the
+        // way production does, so the value asserted below is one an outbound
+        // machine can actually hold.
+        m.conn.set_remote_epoch(Some([9u8; 8]));
         m.session_established_at_ms = 0;
 
         let actions = m.step(
@@ -2023,7 +2051,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                PeerAction::SwapSendState { epoch: [9u8; 8] },
+                PeerAction::SwapSendState,
                 PeerAction::RegisterDecryptSession {
                     index: SessionIndex::new(0x2222)
                 },
@@ -2040,6 +2068,9 @@ mod tests {
                 kind: MaintainKind::Rekey(RekeyPhase::Draining)
             }
         );
+        // The cutover carries no epoch of its own; `conn` is the sole carrier
+        // and the cutover must leave it exactly as the handshake wrote it.
+        assert_eq!(m.conn_remote_epoch(), Some([9u8; 8]));
 
         // A second cadence tick from the (expired) drain window completes the
         // drain: the machine now emits the single `CompleteDrain` send-state
@@ -2057,6 +2088,7 @@ mod tests {
             vec![PeerAction::CompleteDrain { peer: addr }]
         );
         assert_eq!(m.state(), PeerState::Active { addr });
+        assert_eq!(m.conn_remote_epoch(), Some([9u8; 8]));
     }
 
     // ---- Test 2: responder cutover (data-plane owned) ---------------------
@@ -2085,7 +2117,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, PeerAction::SwapSendState { .. }))
+                .any(|a| matches!(a, PeerAction::SwapSendState))
         );
         assert_eq!(m.state(), PeerState::Active { addr });
     }
@@ -3064,7 +3096,8 @@ mod tests {
         };
         m.rekey_our_index = Some(SessionIndex::new(0x2222));
         m.conn.set_our_index(SessionIndex::new(0x1111));
-        m.remote_epoch = Some([9u8; 8]);
+        // Seeded through the setter both handshake legs use; see Test 1.
+        m.conn.set_remote_epoch(Some([9u8; 8]));
 
         // Consume the shell-decided Cutover: identical sequence to Test 1.
         let cut = m.step(
@@ -3077,7 +3110,7 @@ mod tests {
         assert_eq!(
             cut,
             vec![
-                PeerAction::SwapSendState { epoch: [9u8; 8] },
+                PeerAction::SwapSendState,
                 PeerAction::RegisterDecryptSession {
                     index: SessionIndex::new(0x2222)
                 },
@@ -3096,6 +3129,9 @@ mod tests {
         );
         // Cutover stashed the old index in the drain shadow.
         assert_eq!(m.draining_index, Some(SessionIndex::new(0x1111)));
+        // Consuming a shell-decided cutover is epoch-neutral too: `conn` still
+        // holds what the handshake wrote.
+        assert_eq!(m.conn_remote_epoch(), Some([9u8; 8]));
 
         // Consume the shell-decided Drain: single CompleteDrain, Active, and the
         // shadow drain index is CLEARED (double-free guard).
@@ -3109,6 +3145,7 @@ mod tests {
         assert_eq!(drain, vec![PeerAction::CompleteDrain { peer: addr }]);
         assert_eq!(m.state(), PeerState::Active { addr });
         assert_eq!(m.draining_index, None);
+        assert_eq!(m.conn_remote_epoch(), Some([9u8; 8]));
     }
 
     // ---- Test 10: RekeyInitiated observation ------------------------------
@@ -3384,6 +3421,85 @@ mod tests {
             inbound
                 .start_handshake(keypair, make_epoch(), 1100)
                 .is_err()
+        );
+    }
+
+    /// `LIVENESS_INTERVAL_MS` stays pinned to `NodeConfig`'s heartbeat default.
+    ///
+    /// The expectation is read from the default rather than repeated as a
+    /// literal, so raising or lowering `heartbeat_interval_secs` without
+    /// re-pinning the constant reds here instead of drifting unnoticed.
+    #[test]
+    fn liveness_interval_matches_the_heartbeat_config_default() {
+        assert_eq!(
+            LIVENESS_INTERVAL_MS,
+            crate::config::NodeConfig::default().heartbeat_interval_secs * 1_000
+        );
+    }
+
+    /// `REKEY_AFTER_SECS` and `REKEY_AFTER_MESSAGES` stay pinned to
+    /// `RekeyConfig`'s defaults, read from the impl for the same reason.
+    #[test]
+    fn rekey_constants_match_the_rekey_config_defaults() {
+        let defaults = crate::config::RekeyConfig::default();
+        assert_eq!(REKEY_AFTER_SECS, defaults.after_secs);
+        assert_eq!(REKEY_AFTER_MESSAGES, defaults.after_messages);
+    }
+
+    /// A rekey cutover arms the drain timer for the drain window FSP uses.
+    ///
+    /// The expected offset is the literal `10_000`: `DRAIN_WINDOW_SECS` in
+    /// `src/proto/fsp/limits.rs` is 10 seconds, and that is the value this
+    /// deadline is meant to carry. Writing it out rather than reusing
+    /// `DRAIN_WINDOW_MS` is what keeps the assertion able to fail; expressed
+    /// in terms of the constant under test it would move with any re-pointing
+    /// of that constant and assert nothing.
+    #[test]
+    fn drain_expiry_deadline_is_the_configured_drain_window() {
+        let mut alloc = IndexAllocator::new();
+        let id = peer_identity();
+        let addr = *id.node_addr();
+        let mut m = PeerMachine::new_outbound(LinkId::new(1), id, 0);
+        m.state = PeerState::Maintaining {
+            addr,
+            kind: MaintainKind::Rekey(RekeyPhase::PendingCutover),
+        };
+        m.rekey_our_index = Some(SessionIndex::new(0x2222));
+        m.conn.set_our_index(SessionIndex::new(0x1111));
+        m.session_established_at_ms = 0;
+
+        let actions = m.step(
+            PeerEvent::Timeout {
+                kind: TimerKind::RekeyCadence,
+            },
+            7_000,
+            &mut alloc,
+        );
+
+        let deadline = actions
+            .iter()
+            .find_map(|a| match a {
+                PeerAction::SetTimer {
+                    kind: TimerKind::DrainExpiry,
+                    at_ms,
+                } => Some(*at_ms),
+                _ => None,
+            })
+            .expect("the cutover must arm a DrainExpiry timer");
+        assert_eq!(deadline, 7_000 + 10_000);
+    }
+
+    /// `DRAIN_WINDOW_MS` is the FSP drain limit in milliseconds.
+    ///
+    /// This is a tautology as the constant is now declared, and is not
+    /// coverage: it is an executable statement of where the value comes from.
+    /// It reds only if a later edit replaces the const expression with a
+    /// literal that disagrees with the limit.
+    #[test]
+    fn drain_window_ms_is_sourced_from_the_fsp_limit() {
+        assert_eq!(
+            DRAIN_WINDOW_MS,
+            crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 1_000
         );
     }
 }

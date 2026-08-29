@@ -12,13 +12,14 @@ use crate::node::reject::ForwardingReject;
 use crate::node::{Node, NodeError, NodeRoutingView};
 use crate::proto::fsp::wire::{
     FSP_COMMON_PREFIX_SIZE, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED, FSP_PHASE_MSG1, FSP_PHASE_MSG2,
-    FspCommonPrefix, parse_encrypted_coords,
+    FspCommonPrefix, FspEncryptedHeader, parse_encrypted_coords,
 };
 use crate::proto::fsp::{SessionAck, SessionSetup};
 use crate::proto::link::{SessionDatagram, SessionDatagramRef};
-use crate::proto::routing::{DropReason, NextHop, RouteAction, RouteOutcome};
+use crate::proto::routing::{DropReason, LimitVerdict, NextHop, RouteAction, RouteOutcome};
+use crate::proto::stp::TreeCoordinate;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 impl Node {
     /// Handle an incoming SessionDatagram from a peer.
@@ -27,7 +28,7 @@ impl Node {
     /// has already had its msg_type byte stripped by dispatch.
     pub(in crate::node) async fn handle_session_datagram(
         &mut self,
-        _from: &NodeAddr,
+        from: &NodeAddr,
         payload: &[u8],
         incoming_ce: bool,
     ) {
@@ -51,7 +52,7 @@ impl Node {
         // coords a peer put on the wire are equally valid whichever way those
         // go, and the only arrivals this newly warms from are those with an
         // exhausted TTL, whose every insert is already achievable at TTL 1.
-        self.try_warm_coord_cache_ref(&datagram_ref);
+        self.try_warm_coord_cache_ref(&datagram_ref, payload.len());
 
         // Pre-resolve the next hop only for datagrams the core can actually
         // forward: not locally destined, and carrying a TTL that survives the
@@ -107,6 +108,7 @@ impl Node {
                 self.metrics().forwarding.record_delivered(payload.len());
                 self.handle_session_payload(
                     &datagram_ref.src_addr,
+                    from,
                     datagram_ref.payload,
                     datagram_ref.path_mtu,
                     incoming_ce,
@@ -124,7 +126,7 @@ impl Node {
                     bytes = payload.len(),
                     "Dropping transit SessionDatagram: no route to destination"
                 );
-                self.send_routing_error(&original).await;
+                self.send_routing_error(from, &original).await;
             }
             RouteOutcome::Forward {
                 next_hop,
@@ -156,7 +158,7 @@ impl Node {
                         self.metrics()
                             .forwarding
                             .record_reject_bytes(ForwardingReject::MtuExceeded, payload.len());
-                        self.send_mtu_exceeded_error(dest, datagram_ref.src_addr, mtu)
+                        self.send_mtu_exceeded_error(from, dest, datagram_ref.src_addr, mtu)
                             .await;
                     }
                     Err(e) => {
@@ -219,7 +221,52 @@ impl Node {
     ///
     /// Decode failures are logged and silently ignored — they don't block
     /// forwarding.
-    fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>) {
+    ///
+    /// `outer_len` is the length of the msg_type-stripped `SessionDatagram`
+    /// buffer this view was decoded from. It is carried in rather than
+    /// reconstructed from the header size so the malformed-frame byte counter
+    /// measures the same population as its siblings — which are charged the
+    /// outer slice — instead of the inner FSP payload.
+    /// Warm one coordinate-cache entry from a plaintext session header, after
+    /// the two write-side sanity checks.
+    ///
+    /// The key and the value both come off the wire unauthenticated, so this
+    /// is the only place a warm write can be filtered at all. Two checks, and
+    /// they are deliberately of different strengths:
+    ///
+    /// **Foreign root: refused.** A coordinate under a root other than ours
+    /// can never route. `StpState::find_next_hop` returns `None` outright on a
+    /// root mismatch, and the bloom fallback compares against a `my_distance`
+    /// of `usize::MAX`, so no candidate is ever strictly closer. Caching one
+    /// therefore buys nothing and costs something real: the entry's presence
+    /// is what `synth_routing_error` reads to choose `PathBroken` over
+    /// `CoordsRequired`, so a foreign-root plant turns this node into a
+    /// one-packet reflector aimed at whatever source the datagram claimed.
+    /// `CoordCache::invalidate_other_roots` already applies this same
+    /// invariant whenever our own tree position moves; this applies it at
+    /// write time instead of waiting for the next move.
+    ///
+    /// **Key mismatch: counted only.** A coordinate whose first element is not
+    /// the address it is filed under is wrong, but refusing it here would also
+    /// refuse a write honest nodes make: a sender whose own cache missed puts
+    /// its *own* coordinates in `SessionSetup.dest_coords`, by way of
+    /// `get_dest_coords`. What that costs a transit node on first contact is
+    /// not established, so this counts and does not refuse. It is **not** a
+    /// security check either way — an attacker satisfies it by naming the
+    /// victim as its own child, which is the forgery worth making.
+    fn warm_coord(&mut self, key: NodeAddr, coords: TreeCoordinate, now_ms: u64) {
+        if coords.root_id() != self.tree_state.my_coords().root_id() {
+            self.metrics().forwarding.record_warm_foreign_root();
+            trace!(addr = %key, "Warm write names a foreign root; not caching");
+            return;
+        }
+        if *coords.node_addr() != key {
+            self.metrics().forwarding.record_warm_key_mismatch();
+        }
+        self.insert_coord_hint(key, coords, now_ms);
+    }
+
+    fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>, outer_len: usize) {
         let prefix = match FspCommonPrefix::parse(datagram.payload) {
             Some(p) => p,
             None => return,
@@ -235,10 +282,8 @@ impl Node {
         match prefix.phase {
             FSP_PHASE_MSG1 => match SessionSetup::decode(inner) {
                 Ok(setup) => {
-                    self.coord_cache_mut()
-                        .insert(datagram.src_addr, setup.src_coords, now_ms);
-                    self.coord_cache_mut()
-                        .insert(datagram.dest_addr, setup.dest_coords, now_ms);
+                    self.warm_coord(datagram.src_addr, setup.src_coords, now_ms);
+                    self.warm_coord(datagram.dest_addr, setup.dest_coords, now_ms);
                     debug!(
                         src = %datagram.src_addr,
                         dest = %datagram.dest_addr,
@@ -251,10 +296,8 @@ impl Node {
             },
             FSP_PHASE_MSG2 => match SessionAck::decode(inner) {
                 Ok(ack) => {
-                    self.coord_cache_mut()
-                        .insert(datagram.src_addr, ack.src_coords, now_ms);
-                    self.coord_cache_mut()
-                        .insert(datagram.dest_addr, ack.dest_coords, now_ms);
+                    self.warm_coord(datagram.src_addr, ack.src_coords, now_ms);
+                    self.warm_coord(datagram.dest_addr, ack.dest_coords, now_ms);
                     debug!(
                         src = %datagram.src_addr,
                         dest = %datagram.dest_addr,
@@ -268,18 +311,32 @@ impl Node {
             FSP_PHASE_ESTABLISHED if prefix.has_coords() => {
                 // CP flag set: coords in cleartext between header and ciphertext.
                 // Parse coords from the cleartext section after the 12-byte header.
-                // inner starts after the 4-byte prefix, so we need 8 more bytes
-                // for the counter (header is 12 total = 4 prefix + 8 counter).
+                // Re-parse with the encrypted-header parser — the same guard the
+                // local-delivery path uses — so the slice below is bounded by
+                // FSP_ENCRYPTED_MIN_SIZE and not by the 4-byte prefix check.
+                if FspEncryptedHeader::parse(datagram.payload).is_none() {
+                    // Counter is the always-on surface; the debug fields are the
+                    // drill-down that separates a short frame from a bad version
+                    // or a U-flagged one. The level stays at debug: any peer past
+                    // the handshake can drive this at line rate.
+                    self.metrics().forwarding.record_warm_malformed(outer_len);
+                    debug!(
+                        len = datagram.payload.len(),
+                        outer_len,
+                        version = prefix.version,
+                        flags = prefix.flags,
+                        "Not a well-formed encrypted FSP message; not warming coords"
+                    );
+                    return;
+                }
                 let coord_data = &datagram.payload[FSP_HEADER_SIZE..];
                 match parse_encrypted_coords(coord_data) {
                     Ok((src_coords, dest_coords, _bytes_consumed)) => {
                         if let Some(coords) = src_coords {
-                            self.coord_cache_mut()
-                                .insert(datagram.src_addr, coords, now_ms);
+                            self.warm_coord(datagram.src_addr, coords, now_ms);
                         }
                         if let Some(coords) = dest_coords {
-                            self.coord_cache_mut()
-                                .insert(datagram.dest_addr, coords, now_ms);
+                            self.warm_coord(datagram.dest_addr, coords, now_ms);
                         }
                         debug!(
                             src = %datagram.src_addr,
@@ -298,6 +355,39 @@ impl Node {
         }
     }
 
+    /// Spend one peer-budget token, after a gate further down has admitted.
+    ///
+    /// The budget is keyed on the authenticated link peer the frame arrived
+    /// over, which is the one value at the emission point a sender cannot
+    /// mint: every field of the datagram itself is chosen by whoever sent it,
+    /// so a per-destination or per-source gate is escaped by varying the field
+    /// it keys on.
+    ///
+    /// Peek and commit are separate because the per-destination interval gate
+    /// lives inside `routing::synth_routing_error` and runs after this.
+    /// Charging a suppressed signal would let a single unroutable destination
+    /// behind a high-fanout peer spend that peer's whole budget on emissions
+    /// nothing sends, silencing every other destination behind it.
+    fn commit_error_emission(&mut self, from: &NodeAddr) {
+        self.peer_error_budget.commit(from, Instant::now());
+    }
+
+    /// Count what the core's per-destination gate decided about one candidate
+    /// error signal.
+    ///
+    /// The three verdicts are counted apart because they mean different
+    /// things to an operator: `Suppress` is the interval doing its job during
+    /// an outage, while `AdmitAtCapacity` says the destination map is full and
+    /// the interval is no longer suppressing anything for this destination, so
+    /// only the per-peer budget is still bounding emission.
+    fn record_error_verdict(&mut self, verdict: LimitVerdict) {
+        match verdict {
+            LimitVerdict::Suppress => self.metrics().errors.emit_over_dest_interval.inc(),
+            LimitVerdict::AdmitAtCapacity => self.metrics().errors.emit_limiter_at_capacity.inc(),
+            LimitVerdict::Admit => {}
+        }
+    }
+
     /// Generate and send a routing error signal back to the datagram's source.
     ///
     /// If we have cached coords for the destination, send PathBroken (we know
@@ -306,7 +396,20 @@ impl Node {
     ///
     /// If we can't route the error back to the source either, drop silently.
     /// No cascading errors.
-    async fn send_routing_error(&mut self, original: &SessionDatagram) {
+    /// `from` is the authenticated link peer the original datagram arrived
+    /// from, and is what the emission is charged against. It is the one value
+    /// at this point a sender cannot mint: every field of the datagram itself
+    /// is chosen by whoever sent it.
+    async fn send_routing_error(&mut self, from: &NodeAddr, original: &SessionDatagram) {
+        // Peeked, not spent. The destination gate inside the core may still
+        // suppress this signal, and charging a suppressed emission would let a
+        // single unroutable destination behind a high-fanout peer burn that
+        // peer's whole budget on signals nothing sends.
+        if !self.peer_error_budget.has_token(from, Instant::now()) {
+            self.metrics().errors.emit_over_peer_budget.inc();
+            return;
+        }
+
         let my_addr = *self.node_addr();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -333,11 +436,21 @@ impl Node {
                 default_ttl,
             )
         };
-        let RouteAction::SendError { toward, bytes } = match action {
+        self.record_error_verdict(action.verdict);
+        let RouteAction::SendError { toward, bytes } = match action.action {
             Some(action) => action,
             // Rate limited: drop silently. No cascading errors.
             None => return,
         };
+
+        // Both gates have admitted, so the token peeked above is now spent.
+        // Charged here rather than at the peek so a destination the core
+        // suppressed costs the link peer nothing; see
+        // `commit_error_emission`. A later failure to resolve the reverse hop
+        // still leaves the token spent, which is deliberate: the work the
+        // budget bounds is the synthesis this node was induced to perform,
+        // not whether a hop happened to exist for it.
+        self.commit_error_emission(from);
 
         // Resolve the reverse link hop only now, after the gate passed, so
         // `find_next_hop`'s coord-cache touch keeps its pre-refactor scope.
@@ -379,12 +492,28 @@ impl Node {
     ///
     /// `dest` is the failed datagram's destination (rate-limit key); `toward`
     /// is its source, where the signal is routed back.
+    ///
+    /// `from` is the authenticated link peer the original datagram arrived
+    /// from, and is what the emission is charged against. MtuExceeded shares
+    /// the link peer's budget with the routing errors rather than holding its
+    /// own: a separate bucket would insulate path-MTU discovery from
+    /// routing-error pressure, at the cost of a second knob and of letting one
+    /// peer induce twice the total emission.
     async fn send_mtu_exceeded_error(
         &mut self,
+        from: &NodeAddr,
         dest: NodeAddr,
         toward: NodeAddr,
         bottleneck_mtu: u16,
     ) {
+        // Peeked, not spent, for the same reason as in `send_routing_error`:
+        // the per-destination gate inside the core runs below and may still
+        // suppress this signal.
+        if !self.peer_error_budget.has_token(from, Instant::now()) {
+            self.metrics().errors.emit_over_peer_budget.inc();
+            return;
+        }
+
         let my_addr = *self.node_addr();
         let now_ms = Self::now_ms();
         let default_ttl = self.config().node.session.default_ttl;
@@ -398,11 +527,15 @@ impl Node {
             now_ms,
             default_ttl,
         );
-        let RouteAction::SendError { toward, bytes } = match action {
+        self.record_error_verdict(action.verdict);
+        let RouteAction::SendError { toward, bytes } = match action.action {
             Some(action) => action,
             // Rate limited: drop silently. No cascading errors.
             None => return,
         };
+
+        // Both gates have admitted; spend the token peeked above.
+        self.commit_error_emission(from);
 
         // Resolve the reverse link hop only now, after the gate passed, so
         // `find_next_hop`'s coord-cache touch keeps its pre-refactor scope.

@@ -13,10 +13,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cache::HintOutcome;
 use crate::node::reject::{BloomReject, DiscoveryReject, ForwardingReject, TreeReject};
 use crate::node::stats::{
     BloomStatsSnapshot, CongestionStatsSnapshot, ErrorSignalStatsSnapshot, ForwardingStatsSnapshot,
-    LookupStatsSnapshot, TreeStatsSnapshot,
+    LookupStatsSnapshot, NativeStatsSnapshot, TreeStatsSnapshot,
 };
 
 /// An atomic counter.
@@ -67,6 +68,29 @@ pub struct ForwardingMetrics {
     pub received_bytes: Counter,
     pub decode_error_packets: Counter,
     pub decode_error_bytes: Counter,
+    pub warm_malformed_packets: Counter,
+    pub warm_malformed_bytes: Counter,
+    /// Coordinate-cache warm writes refused because the coordinate names a
+    /// root other than this node's. Such an entry can never route — both
+    /// selectors reject a foreign root — so a write of one is either tree
+    /// churn or a plant, and the counter is the only place the difference
+    /// shows.
+    pub coord_warm_foreign_root: Counter,
+    /// Coordinate-cache warm writes whose coordinate does not name the address
+    /// it is filed under. Counted, not refused. **This is not a security
+    /// signal**: an attacker forges a passing coordinate by naming the victim
+    /// as its own child. It counts a defect honest nodes make, where a sender
+    /// whose own cache missed sends its own coordinates as the destination's.
+    pub coord_warm_key_mismatch: Counter,
+    /// Hint writes that replaced an existing entry with a different value.
+    /// A destination moving in the tree produces this, and so does a
+    /// poisoning; the two are not distinguishable here, so this is a rate to
+    /// watch rather than an alarm.
+    pub coord_hint_changed: Counter,
+    /// Hint writes refused because the entry they targeted was verified and
+    /// still inside its verification window, or because the cache was full of
+    /// live-verified entries and declined to evict one.
+    pub coord_hint_rejected: Counter,
     pub ttl_exhausted_packets: Counter,
     pub ttl_exhausted_bytes: Counter,
     pub delivered_packets: Counter,
@@ -108,6 +132,47 @@ impl ForwardingMetrics {
     pub fn record_delivered(&self, bytes: usize) {
         self.delivered_packets.inc();
         self.delivered_bytes.add(bytes as u64);
+    }
+
+    /// Record a coordinate-cache warm attempt abandoned because the frame was
+    /// not a well-formed encrypted FSP message.
+    ///
+    /// This is **not** a packet drop. The frame is still delivered or
+    /// forwarded by the normal path; only the opportunistic warm attempt was
+    /// abandoned, so this must never be folded into the rejection family or
+    /// rendered as dropped traffic. `bytes` is the outer `SessionDatagram`
+    /// payload of the frame whose warm attempt was abandoned — the buffer
+    /// after `dispatch_link_message` strips the msg_type byte, not the inner
+    /// FSP payload the warm path reads. That is the same basis as
+    /// [`Self::record_received`] and [`Self::record_reject_bytes`], and it has
+    /// to be: all three render through one `fwd_value` row on the fipstop
+    /// Routing tab, where a mixed basis reads as a smaller flood than the one
+    /// actually arriving. It is volume observed, not volume dropped, and is
+    /// carried so the counter can be rendered as a packets-and-bytes pair like
+    /// its siblings.
+    #[inline]
+    pub fn record_warm_malformed(&self, bytes: usize) {
+        self.warm_malformed_packets.inc();
+        self.warm_malformed_bytes.add(bytes as u64);
+    }
+
+    /// Record a warm write refused for naming a foreign root.
+    pub fn record_warm_foreign_root(&self) {
+        self.coord_warm_foreign_root.inc();
+    }
+
+    /// Record a warm write whose coordinate does not name its own key.
+    pub fn record_warm_key_mismatch(&self) {
+        self.coord_warm_key_mismatch.inc();
+    }
+
+    /// Record the outcome of a hint write against the coordinate cache.
+    pub fn record_hint_outcome(&self, outcome: HintOutcome) {
+        match outcome {
+            HintOutcome::Changed => self.coord_hint_changed.inc(),
+            HintOutcome::Rejected => self.coord_hint_rejected.inc(),
+            HintOutcome::Inserted | HintOutcome::Unchanged => {}
+        }
     }
 
     /// Record a forwarded (transit) packet of `bytes` payload.
@@ -176,6 +241,12 @@ impl ForwardingMetrics {
             received_bytes: self.received_bytes.get(),
             decode_error_packets: self.decode_error_packets.get(),
             decode_error_bytes: self.decode_error_bytes.get(),
+            warm_malformed_packets: self.warm_malformed_packets.get(),
+            warm_malformed_bytes: self.warm_malformed_bytes.get(),
+            coord_warm_foreign_root: self.coord_warm_foreign_root.get(),
+            coord_warm_key_mismatch: self.coord_warm_key_mismatch.get(),
+            coord_hint_changed: self.coord_hint_changed.get(),
+            coord_hint_rejected: self.coord_hint_rejected.get(),
             ttl_exhausted_packets: self.ttl_exhausted_packets.get(),
             ttl_exhausted_bytes: self.ttl_exhausted_bytes.get(),
             delivered_packets: self.delivered_packets.get(),
@@ -207,6 +278,8 @@ pub struct LookupMetrics {
     pub req_decode_error: Counter,
     pub req_duplicate: Counter,
     pub req_dedup_cache_full: Counter,
+    pub req_dedup_evicted: Counter,
+    pub req_sign_rate_limited: Counter,
     pub req_target_is_us: Counter,
     pub req_forwarded: Counter,
     pub req_ttl_exhausted: Counter,
@@ -222,6 +295,7 @@ pub struct LookupMetrics {
     pub resp_forwarded: Counter,
     pub resp_identity_miss: Counter,
     pub resp_proof_failed: Counter,
+    pub resp_unsolicited: Counter,
     pub resp_no_route: Counter,
     pub resp_accepted: Counter,
     pub resp_timed_out: Counter,
@@ -236,10 +310,12 @@ impl LookupMetrics {
             DiscoveryReject::ReqDecodeError => self.req_decode_error.inc(),
             DiscoveryReject::ReqDuplicate => self.req_duplicate.inc(),
             DiscoveryReject::ReqDedupCacheFull => self.req_dedup_cache_full.inc(),
+            DiscoveryReject::ReqSignRateLimited => self.req_sign_rate_limited.inc(),
             DiscoveryReject::ReqTtlExhausted => self.req_ttl_exhausted.inc(),
             DiscoveryReject::RespDecodeError => self.resp_decode_error.inc(),
             DiscoveryReject::RespIdentityMiss => self.resp_identity_miss.inc(),
             DiscoveryReject::RespProofFailed => self.resp_proof_failed.inc(),
+            DiscoveryReject::RespUnsolicited => self.resp_unsolicited.inc(),
             DiscoveryReject::RespNoRoute => self.resp_no_route.inc(),
         }
     }
@@ -251,6 +327,8 @@ impl LookupMetrics {
             req_decode_error: self.req_decode_error.get(),
             req_duplicate: self.req_duplicate.get(),
             req_dedup_cache_full: self.req_dedup_cache_full.get(),
+            req_dedup_evicted: self.req_dedup_evicted.get(),
+            req_sign_rate_limited: self.req_sign_rate_limited.get(),
             req_target_is_us: self.req_target_is_us.get(),
             req_forwarded: self.req_forwarded.get(),
             req_ttl_exhausted: self.req_ttl_exhausted.get(),
@@ -266,6 +344,7 @@ impl LookupMetrics {
             resp_forwarded: self.resp_forwarded.get(),
             resp_identity_miss: self.resp_identity_miss.get(),
             resp_proof_failed: self.resp_proof_failed.get(),
+            resp_unsolicited: self.resp_unsolicited.get(),
             resp_no_route: self.resp_no_route.get(),
             resp_accepted: self.resp_accepted.get(),
             resp_timed_out: self.resp_timed_out.get(),
@@ -400,12 +479,73 @@ impl CongestionMetrics {
     }
 }
 
+/// Routing signals refused by the sender-binding admission gate, split by
+/// signal type.
+///
+/// The sibling counters on `ErrorMetrics` count arrivals, incremented before
+/// the gate runs; these count the subset that was refused. Read together they
+/// give the refused fraction per signal type, which is what separates a node
+/// nobody is talking to from a node with a genuinely broken path from a node
+/// being fed forged signals.
+#[derive(Default)]
+pub struct UnboundSignals {
+    /// `CoordsRequired` refused because this node has not bound the
+    /// destination address the signal names.
+    pub coords: Counter,
+    /// `PathBroken` refused because this node has not bound the destination
+    /// address the signal names.
+    pub broken: Counter,
+    /// `MtuExceeded` refused because this node has not bound the destination
+    /// address the signal names.
+    pub mtu: Counter,
+    /// Subset of the above whose src/dest pairing is structurally impossible
+    /// for a legitimate emitter: the signal names this node as the
+    /// destination, or claims a source equal to the destination it names.
+    /// Neither can arise from an honest on-path forwarder, so any count here
+    /// is a fabricated signal rather than ordinary session churn.
+    pub forged: Counter,
+}
+
 /// Error-signal metric counters.
 #[derive(Default)]
 pub struct ErrorMetrics {
     pub coords_required: Counter,
     pub path_broken: Counter,
     pub mtu_exceeded: Counter,
+    /// `PathMtuNotification`s ignored for carrying a path MTU below the
+    /// actionable floor. This signal arrives inside an established session
+    /// on the decrypted path, so a rising count means an authenticated peer
+    /// is misconfigured or misbehaving.
+    pub path_mtu_notif_below_floor: Counter,
+    /// `MtuExceeded` signals whose bottleneck was ignored for falling below
+    /// the actionable floor. The signal is unencrypted, unauthenticated and
+    /// unmetered, so a rising count on its own is the forged-signal
+    /// signature; `mtu_exceeded` counts the whole population.
+    pub mtu_exceeded_below_floor: Counter,
+    /// `LookupResponse` path MTU annotations ignored for falling below the
+    /// actionable floor. The response carried a verified proof, so a rising
+    /// count means a forwarder on the reverse path is mangling the unsigned
+    /// annotation.
+    pub lookup_resp_mtu_below_floor: Counter,
+    /// `MtuExceeded` signals ignored because this node has not sent a frame
+    /// larger than the bottleneck they report since the last accepted
+    /// decrease. An honest report cannot arise without such a frame, so a
+    /// rising count is a forged or stale reactive signal.
+    pub mtu_exceeded_uncorroborated: Counter,
+    pub unbound: UnboundSignals,
+    /// Routing errors this node declined to emit because the authenticated
+    /// link peer that induced them had spent its budget. A rising count is
+    /// either a peer flooding unroutable traffic or a hub relaying more
+    /// simultaneously-broken destinations than the budget allows.
+    pub emit_over_peer_budget: Counter,
+    /// Routing errors this node declined to emit because one for the same
+    /// destination went out within the per-destination interval. This is the
+    /// aggregate suppression a real outage produces.
+    pub emit_over_dest_interval: Counter,
+    /// Routing errors emitted without recording their destination, because
+    /// the per-destination limiter's map was full. The signal was still sent;
+    /// what was lost is interval suppression for that destination.
+    pub emit_limiter_at_capacity: Counter,
 }
 
 impl ErrorMetrics {
@@ -415,6 +555,110 @@ impl ErrorMetrics {
             coords_required: self.coords_required.get(),
             path_broken: self.path_broken.get(),
             mtu_exceeded: self.mtu_exceeded.get(),
+            path_mtu_notif_below_floor: self.path_mtu_notif_below_floor.get(),
+            mtu_exceeded_below_floor: self.mtu_exceeded_below_floor.get(),
+            lookup_resp_mtu_below_floor: self.lookup_resp_mtu_below_floor.get(),
+            unbound_coords: self.unbound.coords.get(),
+            unbound_broken: self.unbound.broken.get(),
+            unbound_mtu: self.unbound.mtu.get(),
+            unbound_forged: self.unbound.forged.get(),
+            emit_over_peer_budget: self.emit_over_peer_budget.get(),
+            emit_over_dest_interval: self.emit_over_dest_interval.get(),
+            emit_limiter_at_capacity: self.emit_limiter_at_capacity.get(),
+            mtu_exceeded_uncorroborated: self.mtu_exceeded_uncorroborated.get(),
+        }
+    }
+}
+
+/// Native datagram API metric counters.
+///
+/// Every one of these is bumped on the rx_loop, in the native request handler,
+/// the outbound handler and the inbound dispatch arm. No client task touches a
+/// counter, so there is one path per counter rather than two.
+///
+/// `flows_accepted` counts flows promoted out of a listener's backlog, which
+/// happens before the daemon writes the arrival that carries one to its client.
+/// A hand-off that then fails is counted under `drop_listener_not_reading` or
+/// `drop_listener_gone` and is not taken back off `flows_accepted`, so what a
+/// client actually received is the first less the other two.
+#[derive(Default)]
+pub struct NativeMetrics {
+    pub flows_opened: Counter,
+    pub flows_accepted: Counter,
+    pub flows_closed: Counter,
+    pub flows_expired: Counter,
+    pub sent_datagrams: Counter,
+    pub sent_bytes: Counter,
+    pub received_datagrams: Counter,
+    pub received_bytes: Counter,
+    pub drop_no_port: Counter,
+    pub drop_backlog_full: Counter,
+    pub drop_too_many_flows: Counter,
+    pub drop_pending_queue_full: Counter,
+    pub drop_flow_queue_full: Counter,
+    pub drop_arrival_queue_full: Counter,
+    pub drop_listener_not_reading: Counter,
+    pub drop_listener_gone: Counter,
+    pub drop_oversize: Counter,
+}
+
+impl NativeMetrics {
+    /// Route a typed drop to its counter.
+    ///
+    /// Exhaustive over [`DropReason`](crate::native::link::DropReason) with no
+    /// wildcard arm, which is what makes a variant added later a compile error
+    /// here rather than a datagram that vanishes uncounted. `DropReason` rather
+    /// than `DropCause` because delivery can also fail after the registry has
+    /// agreed, and those cases are the ones a slow client causes.
+    #[inline]
+    pub fn record_drop(&self, reason: crate::native::link::DropReason) {
+        use crate::native::link::DropReason;
+        match reason {
+            DropReason::NoPort => self.drop_no_port.inc(),
+            DropReason::BacklogFull => self.drop_backlog_full.inc(),
+            DropReason::TooManyFlows => self.drop_too_many_flows.inc(),
+            DropReason::PendingQueueFull => self.drop_pending_queue_full.inc(),
+            DropReason::FlowQueueFull => self.drop_flow_queue_full.inc(),
+            DropReason::ArrivalQueueFull => self.drop_arrival_queue_full.inc(),
+            DropReason::ListenerNotReading => self.drop_listener_not_reading.inc(),
+            DropReason::ListenerGone => self.drop_listener_gone.inc(),
+        }
+    }
+
+    /// Count one datagram leaving a client for the mesh.
+    #[inline]
+    pub fn record_sent(&self, bytes: usize) {
+        self.sent_datagrams.inc();
+        self.sent_bytes.add(bytes as u64);
+    }
+
+    /// Count one datagram reaching a client from the mesh.
+    #[inline]
+    pub fn record_received(&self, bytes: usize) {
+        self.received_datagrams.inc();
+        self.received_bytes.add(bytes as u64);
+    }
+
+    /// Sample every counter into a serializable snapshot.
+    pub fn snapshot(&self) -> NativeStatsSnapshot {
+        NativeStatsSnapshot {
+            flows_opened: self.flows_opened.get(),
+            flows_accepted: self.flows_accepted.get(),
+            flows_closed: self.flows_closed.get(),
+            flows_expired: self.flows_expired.get(),
+            sent_datagrams: self.sent_datagrams.get(),
+            sent_bytes: self.sent_bytes.get(),
+            received_datagrams: self.received_datagrams.get(),
+            received_bytes: self.received_bytes.get(),
+            drop_no_port: self.drop_no_port.get(),
+            drop_backlog_full: self.drop_backlog_full.get(),
+            drop_too_many_flows: self.drop_too_many_flows.get(),
+            drop_pending_queue_full: self.drop_pending_queue_full.get(),
+            drop_flow_queue_full: self.drop_flow_queue_full.get(),
+            drop_arrival_queue_full: self.drop_arrival_queue_full.get(),
+            drop_listener_not_reading: self.drop_listener_not_reading.get(),
+            drop_listener_gone: self.drop_listener_gone.get(),
+            drop_oversize: self.drop_oversize.get(),
         }
     }
 }
@@ -422,8 +666,8 @@ impl ErrorMetrics {
 /// Atomic counter registry shared across the node via `Arc`.
 ///
 /// Sole storage for the forwarding, discovery, tree, bloom, congestion,
-/// and error counter families; these were migrated off `NodeStats`, which
-/// now holds only the session, handshake, mmp, and transport families.
+/// error, and native counter families; these were migrated off `NodeStats`,
+/// which now holds only the session, handshake, mmp, and transport families.
 #[derive(Default)]
 pub struct MetricsRegistry {
     pub forwarding: ForwardingMetrics,
@@ -432,6 +676,7 @@ pub struct MetricsRegistry {
     pub bloom: BloomMetrics,
     pub congestion: CongestionMetrics,
     pub errors: ErrorMetrics,
+    pub native: NativeMetrics,
 }
 
 impl MetricsRegistry {
@@ -443,6 +688,54 @@ impl MetricsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_record_drop_routes_every_reason_to_its_own_counter() {
+        use crate::native::link::DropReason;
+        let m = NativeMetrics::default();
+        for reason in [
+            DropReason::NoPort,
+            DropReason::BacklogFull,
+            DropReason::TooManyFlows,
+            DropReason::PendingQueueFull,
+            DropReason::FlowQueueFull,
+            DropReason::ArrivalQueueFull,
+            DropReason::ListenerNotReading,
+            DropReason::ListenerGone,
+        ] {
+            m.record_drop(reason);
+        }
+        let snap = m.snapshot();
+        // Each reason lands in one counter and no reason lands in two, which is
+        // what a shared counter would hide.
+        assert_eq!(snap.drop_no_port, 1);
+        assert_eq!(snap.drop_backlog_full, 1);
+        assert_eq!(snap.drop_too_many_flows, 1);
+        assert_eq!(snap.drop_pending_queue_full, 1);
+        assert_eq!(snap.drop_flow_queue_full, 1);
+        assert_eq!(snap.drop_arrival_queue_full, 1);
+        assert_eq!(snap.drop_listener_not_reading, 1);
+        assert_eq!(snap.drop_listener_gone, 1);
+        // Nothing bumped the send-side refusal, which no DropReason reaches.
+        assert_eq!(snap.drop_oversize, 0);
+    }
+
+    #[test]
+    fn native_pending_and_flow_queue_drops_read_alike_to_a_client_and_apart_to_a_counter() {
+        use crate::native::link::DropReason;
+        // The two render identically on purpose, so the debug arrival command
+        // answers the same strings it always has. A counter must still tell
+        // them apart, because only one of them means a slow client.
+        assert_eq!(
+            DropReason::PendingQueueFull.as_str(),
+            DropReason::FlowQueueFull.as_str()
+        );
+        let m = NativeMetrics::default();
+        m.record_drop(DropReason::FlowQueueFull);
+        let snap = m.snapshot();
+        assert_eq!(snap.drop_flow_queue_full, 1);
+        assert_eq!(snap.drop_pending_queue_full, 0);
+    }
 
     #[test]
     fn forwarding_received_tracks_packets_and_bytes() {

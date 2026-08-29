@@ -21,6 +21,7 @@ pub mod identity;
 #[macro_use]
 pub(crate) mod instr;
 pub mod mdns;
+pub mod native;
 pub mod node;
 pub mod noise;
 pub mod nostr;
@@ -100,4 +101,6 @@ pub use proto::fmp::{PromotionResult, cross_connection_winner};
 pub use peer::{ActivePeer, ConnectivityState, PeerError};
 
 // Re-export node types
+#[cfg(unix)]
+pub use node::AppOwnedUdpSocket;
 pub use node::{Node, NodeError, NodeState, UpdatePeersOutcome};

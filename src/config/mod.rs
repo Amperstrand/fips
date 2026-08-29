@@ -26,20 +26,22 @@ mod peer;
 mod transport;
 
 use crate::node::REKEY_JITTER_SECS;
+use crate::nostr::FRESHNESS_SKEW_TOLERANCE_MS;
 use crate::upper::config::{DnsConfig, TunConfig};
 use crate::{Identity, IdentityError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "linux")]
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, LimitsConfig, LookupConfig, MmpConfig,
-    NodeConfig, NostrRendezvousConfig, NostrRendezvousPolicy, RateLimitConfig, RekeyConfig,
-    RendezvousConfig, RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
+    NativeApiConfig, NodeConfig, NostrRendezvousConfig, NostrRendezvousPolicy, RateLimitConfig,
+    RekeyConfig, RendezvousConfig, RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
 };
-pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
+pub use peer::{ConnectPolicy, PeerAddress, PeerConfig, TransportSpec};
 pub use transport::{
     BleConfig, DirectoryServiceConfig, EthernetConfig, NymConfig, TcpConfig, TorConfig,
     TransportInstances, TransportsConfig, UdpConfig,
@@ -68,8 +70,7 @@ const PUB_FILENAME: &str = "fips.pub";
 /// Recognizes IPv4 `127.x.x.x`, IPv6 `::1` (with or without brackets), and
 /// the literal string `localhost`. Hostnames are conservatively assumed to
 /// be non-loopback. Used by `Config::validate()` to reject misconfigured
-/// loopback UDP binds combined with non-loopback peer addresses (see
-/// ISSUE-2026-0005).
+/// loopback UDP binds combined with non-loopback peer addresses.
 fn is_loopback_addr_str(addr: &str) -> bool {
     // Bracketed IPv6: `[::1]:port`
     if let Some(rest) = addr.strip_prefix('[')
@@ -138,18 +139,119 @@ pub fn pub_file_path(config_path: &Path) -> PathBuf {
         .join(PUB_FILENAME)
 }
 
-/// Resolve a default Unix-socket path under the canonical order:
-/// `/run/fips/<filename>` → `$XDG_RUNTIME_DIR/fips/<filename>` → `/tmp/fips-<filename>`.
+/// How `/var/run/fips` participates in Unix control-socket resolution.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VarRunPolicy {
+    /// Whether an existing `/var/run/fips` directory participates in resolution.
+    consult_existing: bool,
+    /// Whether to select `/var/run/fips` before its private leaf exists.
+    create_private_dir: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn default_var_run_policy() -> VarRunPolicy {
+    // LaunchDaemons run as root unless their plist declares another user.
+    // Selecting the private runtime path before it exists lets ControlSocket
+    // create it at every boot; non-root development runs retain XDG and /tmp
+    // fallbacks until a packaged daemon has created /var/run/fips.
+    VarRunPolicy {
+        consult_existing: true,
+        create_private_dir: unsafe { libc::geteuid() } == 0,
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn default_var_run_policy() -> VarRunPolicy {
+    // The rc.d service creates /var/run/fips before starting the daemon.
+    VarRunPolicy {
+        consult_existing: true,
+        create_private_dir: false,
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
+fn default_var_run_policy() -> VarRunPolicy {
+    VarRunPolicy {
+        consult_existing: false,
+        create_private_dir: false,
+    }
+}
+
+/// Pure path-selection core used by the host resolver and deterministic tests.
+#[cfg(unix)]
+fn resolve_default_socket_with(
+    filename: &str,
+    var_run_policy: VarRunPolicy,
+    xdg_runtime_dir: Option<&Path>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> String {
+    if is_dir(Path::new("/run/fips")) {
+        return format!("/run/fips/{filename}");
+    }
+
+    if var_run_policy.consult_existing {
+        let private_var_run = Path::new("/var/run/fips");
+        let may_create_private_dir =
+            var_run_policy.create_private_dir && is_dir(Path::new("/var/run"));
+        if is_dir(private_var_run) || may_create_private_dir {
+            return format!("/var/run/fips/{filename}");
+        }
+    }
+
+    if let Some(xdg) = xdg_runtime_dir
+        && is_dir(xdg)
+    {
+        return xdg
+            .join("fips")
+            .join(filename)
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    format!("/tmp/fips-{filename}")
+}
+
+/// Return whether `parent` is one of the private runtime directories used by
+/// the default Unix socket resolver.
 ///
-/// `/run/fips` is the packaged convention (`root:fips 0770` directory
-/// created by the daemon at bind time, or by the postinst script).
-/// `XDG_RUNTIME_DIR` covers dev runs where `/run/fips` does not exist.
-/// `/tmp` is the last-resort fallback.
+/// This is intentionally stricter than matching any leaf named `fips`: an
+/// explicitly configured existing directory remains operator-owned unless it
+/// is also a canonical resolver candidate.
+#[cfg(unix)]
+fn is_managed_socket_parent_with(
+    parent: &Path,
+    var_run_policy: VarRunPolicy,
+    xdg_runtime_dir: Option<&Path>,
+) -> bool {
+    parent == Path::new("/run/fips")
+        || (var_run_policy.consult_existing && parent == Path::new("/var/run/fips"))
+        || xdg_runtime_dir.is_some_and(|xdg| parent == xdg.join("fips"))
+}
+
+/// Return whether `parent` is a private runtime directory managed by the
+/// default Unix socket resolver on this host.
+#[cfg(unix)]
+pub(crate) fn is_managed_socket_parent(parent: &Path) -> bool {
+    let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    is_managed_socket_parent_with(parent, default_var_run_policy(), xdg_runtime_dir.as_deref())
+}
+
+/// Resolve a default Unix-socket path under the canonical order:
+/// `/run/fips/<filename>` → `/var/run/fips/<filename>` on macOS/FreeBSD →
+/// `$XDG_RUNTIME_DIR/fips/<filename>` → `/tmp/fips-<filename>`.
+///
+/// `/run/fips` is the packaged Linux convention. FreeBSD's rc.d service
+/// creates `/var/run/fips` before starting the daemon. A privileged macOS
+/// daemon selects `/var/run/fips` even when the private leaf does not exist so
+/// it can be recreated at bind time after every boot; non-root macOS clients
+/// select it once the daemon has created it. `XDG_RUNTIME_DIR` covers dev runs,
+/// and `/tmp` is the last-resort fallback.
 ///
 /// Selection is by *existence*, not writability. A fips-group member
 /// whose shell session has not picked up the supplementary group (no
 /// re-login after `usermod -aG fips`) cannot tempfile-probe a
-/// `root:fips 0770` directory but can still connect to a socket inside
+/// `root:fips 0750` directory but can still connect to a socket inside
 /// it once the kernel checks the actual group at `connect(2)` time —
 /// and even where the user genuinely cannot connect, surfacing an
 /// `EACCES` from the socket call is clearer than silently steering
@@ -163,37 +265,20 @@ pub fn pub_file_path(config_path: &Path) -> PathBuf {
 /// is treated as missing.
 #[cfg(unix)]
 pub(crate) fn resolve_default_socket(filename: &str) -> String {
-    // 1. /run/fips — preferred whenever the directory exists.
-    if Path::new("/run/fips").is_dir() {
-        return format!("/run/fips/{filename}");
-    }
-
-    // 1b. /var/run/fips — macOS and FreeBSD have no /run; the FreeBSD
-    //     rc.d script creates this directory at service start.
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    if Path::new("/var/run/fips").is_dir() {
-        return format!("/var/run/fips/{filename}");
-    }
-
-    // 2. $XDG_RUNTIME_DIR/fips/ — only if the variable points at an existing
-    //    directory.
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let xdg_path = Path::new(&xdg);
-        if xdg_path.is_dir() {
-            return format!("{xdg}/fips/{filename}");
-        }
-    }
-
-    // 3. Last resort: /tmp with a name-mangled prefix so multiple users
-    //    don't collide.
-    format!("/tmp/fips-{filename}")
+    let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    resolve_default_socket_with(
+        filename,
+        default_var_run_policy(),
+        xdg_runtime_dir.as_deref(),
+        Path::is_dir,
+    )
 }
 
 /// Default control socket path for fipsctl / fipstop.
 ///
 /// On Unix, delegates to [`resolve_default_socket`] for the canonical
-/// `/run/fips` → `XDG_RUNTIME_DIR` → `/tmp` order. On Windows, returns the
-/// default TCP port ("21210").
+/// platform runtime directory → `XDG_RUNTIME_DIR` → `/tmp` order. On Windows,
+/// returns the default TCP port ("21210").
 pub fn default_control_path() -> PathBuf {
     #[cfg(unix)]
     {
@@ -207,7 +292,7 @@ pub fn default_control_path() -> PathBuf {
 
 /// Default gateway control socket path.
 ///
-/// On Unix, delegates to [`resolve_default_socket`] (same canonical order as
+/// On Unix, delegates to [`resolve_default_socket`] (the same platform order as
 /// the main control socket). The gateway daemon itself uses a hardcoded
 /// `/run/fips/gateway.sock` since gateway operation requires root for
 /// NAT/conntrack management; this client-side resolver falls through
@@ -225,11 +310,16 @@ pub fn default_gateway_path() -> PathBuf {
 }
 
 /// Read a bare bech32 nsec from a key file.
+///
+/// The file contents are the private key, and trimming copies it into a
+/// second string, so the read buffer is cleared on every exit path rather
+/// than dropped as it stands. The returned nsec is the caller's.
 pub fn read_key_file(path: &Path) -> Result<String, ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
         path: path.to_path_buf(),
         source: e,
     })?;
+    let contents = Zeroizing::new(contents);
     let nsec = contents.trim().to_string();
     if nsec.is_empty() {
         return Err(ConfigError::EmptyKeyFile {
@@ -450,7 +540,9 @@ pub fn resolve_identity(
     if config.node.identity.persistent {
         // Persistent mode: load existing key file or generate-and-persist
         if key_path.exists() {
-            let nsec = read_key_file(&key_path)?;
+            // Held in a guard, not a bare `String`: if the parse below fails,
+            // the `?` returns and a bare local would be freed uncleared.
+            let nsec = Zeroizing::new(read_key_file(&key_path)?);
             let identity = Identity::from_secret_str(&nsec)?;
             warn_unmanaged_key_file(&key_path);
             if let Err(e) = write_pub_file(&pub_path, &identity.npub()) {
@@ -461,7 +553,7 @@ pub fn resolve_identity(
                 );
             }
             return Ok(ResolvedIdentity {
-                nsec,
+                nsec: nsec.to_string(),
                 source: IdentitySource::KeyFile(key_path),
             });
         }
@@ -475,7 +567,8 @@ pub fn resolve_identity(
             Path::new(SYSTEM_CONFIG_DIR),
             Path::new(LEGACY_SYSTEM_CONFIG_DIR),
         ) {
-            let nsec = read_key_file(&legacy)?;
+            // Guarded for the same reason as the current-path read above.
+            let nsec = Zeroizing::new(read_key_file(&legacy)?);
             let identity = Identity::from_secret_str(&nsec)?;
             tracing::warn!(
                 legacy = %legacy.display(),
@@ -492,14 +585,20 @@ pub fn resolve_identity(
                 );
             }
             return Ok(ResolvedIdentity {
-                nsec,
+                nsec: nsec.to_string(),
                 source: IdentitySource::KeyFile(legacy),
             });
         }
 
         // No key file anywhere — generate and persist
         let identity = Identity::generate();
-        let nsec = encode_nsec(&identity.keypair().secret_key());
+        // `keypair()` and `secret_key()` each hand back a whole private key
+        // rather than a handle, so both temporaries are bound and erased.
+        let mut our_keypair = identity.keypair();
+        let mut secret_key = our_keypair.secret_key();
+        let nsec = encode_nsec(&secret_key);
+        secret_key.non_secure_erase();
+        our_keypair.non_secure_erase();
         let npub = identity.npub();
 
         if let Some(parent) = key_path.parent() {
@@ -537,7 +636,13 @@ pub fn resolve_identity(
         // Ephemeral mode (default): fresh keypair every start, write key files
         // for operator visibility
         let identity = Identity::generate();
-        let nsec = encode_nsec(&identity.keypair().secret_key());
+        // `keypair()` and `secret_key()` each hand back a whole private key
+        // rather than a handle, so both temporaries are bound and erased.
+        let mut our_keypair = identity.keypair();
+        let mut secret_key = our_keypair.secret_key();
+        let nsec = encode_nsec(&secret_key);
+        secret_key.non_secure_erase();
+        our_keypair.non_secure_erase();
         let npub = identity.npub();
 
         if let Some(parent) = key_path.parent() {
@@ -579,11 +684,27 @@ pub fn resolve_identity(
 }
 
 /// Result of identity resolution.
+///
+/// `nsec` is the node's private key in plaintext. Every local that carries it
+/// through [`resolve_identity`] either moves into this struct or is held in a
+/// guard that clears it, so this is where the surviving string lives and where
+/// clearing it belongs.
+/// A caller that wants the value out should take it with [`Option::take`] or
+/// `std::mem::take` rather than moving the field, which the `Drop` below
+/// forbids.
 pub struct ResolvedIdentity {
     /// The nsec string (bech32 or hex) for creating an Identity.
     pub nsec: String,
     /// Where the identity came from.
     pub source: IdentitySource,
+}
+
+impl Drop for ResolvedIdentity {
+    /// Clear the plaintext private key rather than dropping the allocation
+    /// with the key still in it.
+    fn drop(&mut self) {
+        self.nsec.zeroize();
+    }
 }
 
 /// Where a resolved identity originated.
@@ -645,6 +766,20 @@ pub struct IdentityConfig {
     /// When true, the key file is reused across restarts.
     #[serde(default)]
     pub persistent: bool,
+}
+
+impl Drop for IdentityConfig {
+    /// Clear the plaintext private key.
+    ///
+    /// This field holds the node's private key for the whole process
+    /// lifetime, which is the longest any secret lives in this crate, so
+    /// leaving the allocation to be freed with the key still in it is the
+    /// largest residue the crate can reach. A caller that needs the value out
+    /// should take it with [`Option::take`]; moving the field is what the
+    /// `Drop` forbids.
+    fn drop(&mut self) {
+        self.nsec.zeroize();
+    }
 }
 
 /// Root configuration structure.
@@ -717,10 +852,16 @@ impl Config {
 
     /// Load configuration from a single file.
     pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        // The config file is the highest-priority home of a plaintext key:
+        // `node.identity.nsec` is read straight out of it, so the whole file
+        // text is treated as secret for as long as it is held.
+        let contents =
+            Zeroizing::new(
+                std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?,
+            );
 
         let mut config: Config =
             serde_yaml::from_str(&contents).map_err(|e| ConfigError::ParseYaml {
@@ -812,10 +953,19 @@ impl Config {
     /// Merge another configuration into this one.
     ///
     /// Values from `other` override values in `self` when present.
-    pub fn merge(&mut self, other: Config) {
-        // Merge node.identity section
+    pub fn merge(&mut self, mut other: Config) {
+        // Merge node.identity section. The nsec is taken rather than moved
+        // out of `other.node.identity`, which clears its private key on drop
+        // and so cannot be left partially moved.
         if other.node.identity.nsec.is_some() {
-            self.node.identity.nsec = other.node.identity.nsec;
+            // Clear whatever this field already held before overwriting it.
+            // Assigning over the field drops the old `String` in place, which
+            // does not run `Drop for IdentityConfig` and would free a
+            // plaintext key uncleared when two config files both carry one.
+            if let Some(mut old) = self.node.identity.nsec.take() {
+                old.zeroize();
+            }
+            self.node.identity.nsec = other.node.identity.nsec.take();
         }
         if other.node.identity.persistent {
             self.node.identity.persistent = true;
@@ -949,12 +1099,43 @@ impl Config {
             }
         }
 
+        let native = &self.node.native_api;
+        // Both floors refuse a node that would start, answer every setup call
+        // and then drop every datagram a peer sent. A zero `backlog` makes the
+        // registry refuse every arrival; a zero `pending_per_flow` makes it
+        // announce the arrival and then refuse the datagram that caused it, so
+        // a peer's opening message is lost with no refusal anywhere.
+        if native.backlog < 1 {
+            return Err(ConfigError::Validation(
+                "node.native_api.backlog is 0 but must be at least 1: a listener with no \
+                 backlog admits no flow, so every arrival would be dropped"
+                    .to_string(),
+            ));
+        }
+        if native.pending_per_flow < 1 {
+            return Err(ConfigError::Validation(
+                "node.native_api.pending_per_flow is 0 but must be at least 1: a flow that \
+                 can hold nothing loses its peer's opening datagram between the arrival \
+                 being announced and the client taking the flow"
+                    .to_string(),
+            ));
+        }
+        if native.pending_per_flow > NativeApiConfig::MAX_PENDING_PER_FLOW {
+            return Err(ConfigError::Validation(format!(
+                "node.native_api.pending_per_flow is {} but must not exceed {}: the whole batch \
+                 is written onto a socket pair the client cannot read yet, and a larger one \
+                 would not fit the send buffer",
+                native.pending_per_flow,
+                NativeApiConfig::MAX_PENDING_PER_FLOW
+            )));
+        }
+
         // Reject loopback UDP bind combined with non-loopback peer addresses.
         // Linux pins the source IP to a loopback-bound socket, so packets
         // sent from such a socket to external peers are dropped at the
-        // routing layer with no clear error in the daemon log. See
-        // ISSUE-2026-0005. Outbound-only mode is exempt because it
-        // overrides bind_addr to 0.0.0.0:0 (kernel-picked source).
+        // routing layer with no clear error in the daemon log.
+        // Outbound-only mode is exempt because it overrides bind_addr to
+        // 0.0.0.0:0 (kernel-picked source).
         for (name, cfg) in self.transports.udp.iter() {
             if cfg.outbound_only() {
                 continue;
@@ -972,6 +1153,52 @@ impl Config {
                          fips cannot reach external peers from a loopback-bound socket. \
                          Use bind_addr: \"0.0.0.0:2121\" (with kernel-firewall hardening if exposure is a concern), or set outbound_only: true.",
                         cfg.bind_addr()
+                    )));
+                }
+            }
+        }
+
+        // Reject a peer address naming a transport instance that no
+        // configured transport answers to. A qualified name deliberately never
+        // falls back: substituting a different instance is the wrong-lane dial
+        // the syntax exists to prevent, so the dialer refuses the address and
+        // says so at debug. Where the peer has a second address that does
+        // resolve, that refusal is invisible — the lane is simply never used,
+        // which is the failure the instance names were introduced to fix. A
+        // typo, a renamed transport, or a `Named` config collapsed back to
+        // `Single` all land here, and all of them are cheaper to find at
+        // startup than in a packet capture.
+        for peer in &self.peers {
+            for addr in &peer.addresses {
+                let spec = addr.spec();
+                let Some(want) = spec.instance else {
+                    continue;
+                };
+                if spec.kind != "udp" {
+                    return Err(ConfigError::Validation(format!(
+                        "peer `{}` has address `{}` on transport `{}`, but only `udp` resolves an instance name; \
+                         for any other type the dialer would have to pick an arbitrary instance, which is the wrong-lane dial the syntax exists to prevent. \
+                         Drop the `/{want}` qualifier to match any instance of `{}`.",
+                        peer.npub, addr.addr, addr.transport, spec.kind
+                    )));
+                }
+                let configured: Vec<&str> = self
+                    .transports
+                    .udp
+                    .iter()
+                    .filter_map(|(name, _)| name)
+                    .collect();
+                if !configured.contains(&want) {
+                    let known = if configured.is_empty() {
+                        "no named udp instances are configured (the udp transport is a single unnamed instance)".to_string()
+                    } else {
+                        format!("configured udp instances are: {}", configured.join(", "))
+                    };
+                    return Err(ConfigError::Validation(format!(
+                        "peer `{}` has address `{}` on transport `{}`, but no udp transport is configured under the instance name `{want}`; \
+                         a qualified name is never substituted, so this address would be skipped at every dial and the peer reached only over its other addresses, if it has any. \
+                         {known}.",
+                        peer.npub, addr.addr, addr.transport
                     )));
                 }
             }
@@ -1026,6 +1253,67 @@ impl Config {
                 "`node.rate_limit.established_handshake_rate` is {rate}, but must be a finite value greater than 0; \
                  a non-positive or non-finite refill rate never replenishes the established-link bucket, so rekey msg1 stops being admitted once the initial burst is spent. \
                  Omit the key to derive it from `node.limits.max_peers` and `node.rekey.after_secs`."
+            )));
+        }
+
+        // The per-link session-setup bucket. The same trap as above in a
+        // non-optional field: zero does not disable the limiter, it refuses
+        // every inbound setup message and so refuses every session.
+        if rl.session_setup_burst == 0 {
+            return Err(ConfigError::Validation(
+                "`node.rate_limit.session_setup_burst` is 0, which refuses every inbound SessionSetup rather than disabling the limit. \
+                 Set a positive burst; a very large value effectively disables it."
+                    .to_string(),
+            ));
+        }
+
+        let setup_rate = rl.session_setup_rate;
+        if !(setup_rate.is_finite() && setup_rate > 0.0) {
+            return Err(ConfigError::Validation(format!(
+                "`node.rate_limit.session_setup_rate` is {setup_rate}, but must be a finite value greater than 0; \
+                 a non-positive or non-finite refill rate never replenishes a link's setup bucket, so that link stops establishing sessions once its initial burst is spent."
+            )));
+        }
+
+        // The freshness window backstops session-id replay protection: an
+        // offer evicted from the replay cache must already be too old to pass
+        // the freshness check, or it can be accepted a second time. A signal
+        // is acceptable over `signal_ttl_secs` plus the skew tolerance on each
+        // side, so that span has to stay strictly inside `replay_window_secs`.
+        // Checked regardless of `nostr.enabled`, for the reason the rekey
+        // block above gives: enabling the feature later must not surface a
+        // config error at a surprising moment.
+        let skew_secs = FRESHNESS_SKEW_TOLERANCE_MS / 1000;
+        let freshness_window_secs = nostr.signal_ttl_secs.saturating_add(2 * skew_secs);
+        if freshness_window_secs >= nostr.replay_window_secs {
+            return Err(ConfigError::Validation(format!(
+                "`node.rendezvous.nostr.signal_ttl_secs` is {}, which with {skew_secs}s of clock-skew grace on each side makes a traversal signal acceptable over a {freshness_window_secs}s window, \
+                 but `node.rendezvous.nostr.replay_window_secs` is {}. \
+                 The freshness window must be strictly narrower than the replay window, or a session id evicted from the replay cache is still fresh enough to be accepted a second time. \
+                 Raise `replay_window_secs` above {freshness_window_secs}, or lower `signal_ttl_secs`.",
+                nostr.signal_ttl_secs, nostr.replay_window_secs
+            )));
+        }
+
+        // Zero here is the same trap as `established_handshake_burst`: it
+        // reads as "no limit" and in fact refuses every inbound offer. The
+        // upper bound exists because the per-npub semaphore is built lazily
+        // inside the intake path rather than at startup, so an oversized
+        // value would panic there instead of failing loudly at load.
+        if nostr.max_concurrent_offers_per_npub == 0 {
+            return Err(ConfigError::Validation(
+                "`node.rendezvous.nostr.max_concurrent_offers_per_npub` is 0, which refuses every inbound traversal offer rather than disabling the per-sender limit. \
+                 Omit the key for the default, or set a positive allowance; `max_concurrent_incoming_offers` remains the outer bound."
+                    .to_string(),
+            ));
+        }
+
+        if nostr.max_concurrent_offers_per_npub > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Validation(format!(
+                "`node.rendezvous.nostr.max_concurrent_offers_per_npub` is {}, which exceeds the maximum {} permits a semaphore can hold. \
+                 Use a value at or below `max_concurrent_incoming_offers`, which is the outer bound anything larger is inert against.",
+                nostr.max_concurrent_offers_per_npub,
+                tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
 
@@ -1455,58 +1743,9 @@ node:
         assert_eq!(metadata.mode() & 0o777, 0o644);
     }
 
-    /// Collect formatted tracing events on the current thread.
-    ///
-    /// `resolve_identity` reports its identity-loss conditions only in the
-    /// log, so the log is what the tests have to assert on. Installed with
-    /// `tracing::subscriber::with_default`, which is thread-local, so parallel
-    /// tests do not see each other's events.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl LogCapture {
-        fn warnings(&self) -> Vec<String> {
-            self.0
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|line| line.starts_with("WARN"))
-                .cloned()
-                .collect()
-        }
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Fields(String);
-            impl tracing::field::Visit for Fields {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!(" {}={:?}", field.name(), value));
-                }
-            }
-
-            let mut fields = Fields(event.metadata().level().to_string());
-            event.record(&mut fields);
-            self.0.lock().unwrap().push(fields.0);
-        }
-    }
-
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, LogCapture) {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let out = tracing::subscriber::with_default(subscriber, f);
-        (out, capture)
-    }
+    // `resolve_identity` reports its identity-loss conditions only in the log,
+    // so the log is what these tests assert on.
+    use crate::testutil::capture_logs;
 
     #[cfg(unix)]
     #[test]
@@ -2177,6 +2416,114 @@ node:
     }
 
     #[test]
+    fn test_a_peer_address_naming_a_configured_udp_instance_passes_validation() {
+        let mut config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                addresses: vec![PeerAddress::new("udp/aware", "203.0.113.1:2121")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.transports.udp = TransportInstances::Named(HashMap::from([
+            ("aware".to_string(), UdpConfig::default()),
+            ("infra".to_string(), UdpConfig::default()),
+        ]));
+
+        config
+            .validate()
+            .expect("an instance name that matches a configured transport must validate");
+    }
+
+    #[test]
+    fn test_a_peer_address_naming_an_unconfigured_udp_instance_is_rejected() {
+        let mut config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                addresses: vec![PeerAddress::new("udp/awre", "203.0.113.1:2121")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.transports.udp = TransportInstances::Named(HashMap::from([
+            ("aware".to_string(), UdpConfig::default()),
+            ("infra".to_string(), UdpConfig::default()),
+        ]));
+
+        let err = config
+            .validate()
+            .expect_err("a typo in an instance name must not validate");
+        let text = err.to_string();
+        assert!(
+            text.contains("awre"),
+            "the error must name the instance asked for: {text}"
+        );
+        assert!(
+            text.contains("aware") && text.contains("infra"),
+            "the error must list the instances that do exist: {text}"
+        );
+    }
+
+    #[test]
+    fn test_an_unqualified_peer_address_still_validates_against_named_instances() {
+        let mut config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                addresses: vec![PeerAddress::new("udp", "203.0.113.1:2121")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.transports.udp =
+            TransportInstances::Named(HashMap::from([("aware".to_string(), UdpConfig::default())]));
+
+        config
+            .validate()
+            .expect("a bare type matches any instance and must stay valid");
+    }
+
+    #[test]
+    fn test_a_qualified_peer_address_is_rejected_when_the_udp_transport_is_unnamed() {
+        let mut config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                addresses: vec![PeerAddress::new("udp/aware", "203.0.113.1:2121")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.transports.udp = TransportInstances::Single(UdpConfig::default());
+
+        let err = config
+            .validate()
+            .expect_err("a Single config has no instance name to match and must not validate");
+        assert!(
+            err.to_string().contains("no named udp instances"),
+            "the error must say why nothing matched: {err}"
+        );
+    }
+
+    #[test]
+    fn test_a_qualified_peer_address_on_a_non_udp_transport_is_rejected() {
+        let config = Config {
+            peers: vec![PeerConfig {
+                npub: "npub1peer".to_string(),
+                addresses: vec![PeerAddress::new("ethernet/eth0", "eth0/aa:bb:cc:dd:ee:ff")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("only udp resolves an instance name, so any other type must be refused");
+        assert!(
+            err.to_string().contains("only `udp` resolves"),
+            "the error must say which transport types support the syntax: {err}"
+        );
+    }
+
+    #[test]
     fn test_validate_loopback_bind_with_external_peer_rejected() {
         use crate::config::PeerAddress;
         let mut config = Config::default();
@@ -2287,6 +2634,68 @@ node:
     }
 
     #[test]
+    fn test_validate_pending_per_flow_above_its_ceiling_rejected() {
+        let mut config = Config::default();
+        config.node.native_api.pending_per_flow = NativeApiConfig::MAX_PENDING_PER_FLOW + 1;
+
+        let err = config.validate().expect_err("validation should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("pending_per_flow"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_pending_per_flow_at_its_ceiling_accepted() {
+        // The boundary is accepted, or the check would be refusing a value the
+        // send buffer takes and the ceiling would be a different number than
+        // the one it is documented as.
+        let mut config = Config::default();
+        config.node.native_api.pending_per_flow = NativeApiConfig::MAX_PENDING_PER_FLOW;
+
+        config
+            .validate()
+            .expect("the documented ceiling itself must validate");
+    }
+
+    #[test]
+    fn test_validate_native_api_backlog_zero_rejected() {
+        // Zero would start a node whose listeners admit no flow at all: the
+        // registry compares the pending depth against this number before it
+        // announces anything, so every arrival is dropped.
+        let mut config = Config::default();
+        config.node.native_api.backlog = 0;
+
+        let err = config.validate().expect_err("validation should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("node.native_api.backlog"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_native_api_pending_per_flow_zero_rejected() {
+        // Zero is the worse of the two: the arrival is announced and the
+        // datagram that caused it is then refused, so a peer's opening message
+        // is lost with no refusal a client or an operator can see.
+        let mut config = Config::default();
+        config.node.native_api.pending_per_flow = 0;
+
+        let err = config.validate().expect_err("validation should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("pending_per_flow"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_native_api_floors_accept_one() {
+        // The boundary itself validates, or the floors would be refusing a
+        // working node rather than a broken one.
+        let mut config = Config::default();
+        config.node.native_api.backlog = 1;
+        config.node.native_api.pending_per_flow = 1;
+
+        config
+            .validate()
+            .expect("a depth of one is a working node, not a refused one");
+    }
+
+    #[test]
     fn test_validate_rekey_after_messages_zero_rejected() {
         let mut config = Config::default();
         config.node.rekey.after_messages = 0;
@@ -2360,6 +2769,74 @@ node:
     }
 
     #[test]
+    fn test_validate_signal_ttl_at_or_above_the_replay_window_margin_rejected() {
+        // 180 is the boundary: 180 + 2 * 60 = 300, which is not strictly less
+        // than the default 300s replay window.
+        for signal_ttl_secs in [180, 181, 3600, u64::MAX] {
+            let mut config = Config::default();
+            config.node.rendezvous.nostr.signal_ttl_secs = signal_ttl_secs;
+
+            match config.validate() {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("signal_ttl_secs"), "got: {msg}");
+                    assert!(msg.contains("replay_window_secs"), "got: {msg}");
+                }
+                Ok(()) => panic!("signal_ttl_secs = {signal_ttl_secs} should be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_signal_ttl_just_inside_the_replay_window_margin_accepted() {
+        let mut config = Config::default();
+        config.node.rendezvous.nostr.signal_ttl_secs = 179;
+
+        config
+            .validate()
+            .expect("179 + 2 * 60 = 299 leaves the freshness window inside the 300s replay window");
+    }
+
+    #[test]
+    fn test_validate_per_npub_offer_allowance_of_zero_rejected() {
+        let mut config = Config::default();
+        config.node.rendezvous.nostr.max_concurrent_offers_per_npub = 0;
+
+        let err = config.validate().expect_err("validation should fail");
+        assert!(
+            err.to_string().contains("max_concurrent_offers_per_npub"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_per_npub_offer_allowance_of_one_accepted() {
+        let mut config = Config::default();
+        config.node.rendezvous.nostr.max_concurrent_offers_per_npub = 1;
+
+        config
+            .validate()
+            .expect("an allowance of one offer per sender is restrictive but well defined");
+    }
+
+    #[test]
+    fn test_validate_shipped_defaults_satisfy_the_freshness_invariant() {
+        Config::default()
+            .validate()
+            .expect("the shipped defaults must satisfy every validation rule");
+
+        // Stated against the constant rather than a literal, so this reds if
+        // anyone changes FRESHNESS_SKEW_TOLERANCE_MS or either default without
+        // re-checking the relation they jointly have to satisfy.
+        let defaults = Config::default();
+        let nostr = &defaults.node.rendezvous.nostr;
+        assert!(
+            nostr.signal_ttl_secs + 2 * (FRESHNESS_SKEW_TOLERANCE_MS / 1000)
+                < nostr.replay_window_secs
+        );
+    }
+
+    #[test]
     fn test_outbound_only_forces_ephemeral_bind() {
         let cfg = UdpConfig {
             bind_addr: Some("127.0.0.1:2121".to_string()),
@@ -2384,6 +2861,120 @@ node:
     fn test_udp_accept_connections_default_true() {
         let cfg = UdpConfig::default();
         assert!(cfg.accept_connections());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_privileged_macos_bootstraps_private_var_run_path() {
+        let path = resolve_default_socket_with(
+            "control.sock",
+            VarRunPolicy {
+                consult_existing: true,
+                create_private_dir: true,
+            },
+            Some(Path::new("/valid/xdg")),
+            |candidate| matches!(candidate.to_str(), Some("/var/run" | "/valid/xdg")),
+        );
+
+        assert_eq!(path, "/var/run/fips/control.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_non_privileged_macos_uses_xdg_before_private_var_run_exists() {
+        let path = resolve_default_socket_with(
+            "control.sock",
+            VarRunPolicy {
+                consult_existing: true,
+                create_private_dir: false,
+            },
+            Some(Path::new("/valid/xdg")),
+            |candidate| candidate == Path::new("/valid/xdg"),
+        );
+
+        assert_eq!(path, "/valid/xdg/fips/control.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_clients_follow_existing_private_var_run_path() {
+        let path = resolve_default_socket_with(
+            "control.sock",
+            VarRunPolicy {
+                consult_existing: true,
+                create_private_dir: false,
+            },
+            Some(Path::new("/valid/xdg")),
+            |candidate| matches!(candidate.to_str(), Some("/var/run/fips" | "/valid/xdg")),
+        );
+
+        assert_eq!(path, "/var/run/fips/control.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_linux_policy_ignores_var_run_fips() {
+        let path = resolve_default_socket_with(
+            "control.sock",
+            VarRunPolicy {
+                consult_existing: false,
+                create_private_dir: false,
+            },
+            Some(Path::new("/valid/xdg")),
+            |candidate| matches!(candidate.to_str(), Some("/var/run/fips" | "/valid/xdg")),
+        );
+
+        assert_eq!(path, "/valid/xdg/fips/control.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_managed_socket_parent_matches_only_resolver_candidates() {
+        let policy = VarRunPolicy {
+            consult_existing: true,
+            create_private_dir: true,
+        };
+
+        assert!(is_managed_socket_parent_with(
+            Path::new("/run/fips"),
+            policy,
+            Some(Path::new("/valid/xdg")),
+        ));
+        assert!(is_managed_socket_parent_with(
+            Path::new("/var/run/fips"),
+            policy,
+            Some(Path::new("/valid/xdg")),
+        ));
+        assert!(is_managed_socket_parent_with(
+            Path::new("/valid/xdg/fips"),
+            policy,
+            Some(Path::new("/valid/xdg")),
+        ));
+        assert!(!is_managed_socket_parent_with(
+            Path::new("/tmp"),
+            policy,
+            Some(Path::new("/valid/xdg")),
+        ));
+        assert!(!is_managed_socket_parent_with(
+            Path::new("/srv/application/fips"),
+            policy,
+            Some(Path::new("/valid/xdg")),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_linux_managed_socket_parent_excludes_var_run() {
+        let linux_policy = VarRunPolicy {
+            consult_existing: false,
+            create_private_dir: false,
+        };
+
+        assert!(!is_managed_socket_parent_with(
+            Path::new("/var/run/fips"),
+            linux_policy,
+            None,
+        ));
     }
 
     /// Mutex serializing tests that mutate `XDG_RUNTIME_DIR`. `cargo test`

@@ -1,9 +1,11 @@
 //! RX event loop and packet dispatch.
 
 use crate::control::{ControlSocket, commands};
+use crate::node::reject::{RejectReason, TransportReject};
 use crate::node::{Node, NodeError};
 use crate::proto::fmp::wire::{
     COMMON_PREFIX_SIZE, CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2,
+    expected_payload_len,
 };
 use crate::transport::ReceivedPacket;
 use std::time::Duration;
@@ -131,6 +133,51 @@ impl Node {
         }
         // Drop unused sender to avoid keeping channel open if control is disabled
         drop(control_tx);
+
+        // Native datagram API socket. Experimental, off by default, and built
+        // on Linux, FreeBSD and macOS: Windows has no way to pass a descriptor
+        // between processes at all, which is the mechanism itself. Bound
+        // synchronously so a bad path or a socket already in use is reported
+        // here, before the node starts serving, rather than at whatever later
+        // moment a spawned bind happened to run.
+        // Two channels, as the TUN plane has: registrations go one way and are
+        // rare, datagrams go the other and arrive in bursts. Keeping them apart
+        // lets the data arm drain in batches without a registration waiting
+        // behind a burst of traffic.
+        let (native_out_tx, mut native_outbound_rx) =
+            tokio::sync::mpsc::channel::<crate::native::link::Outbound>(1024);
+        let _native_out_guard = native_out_tx.clone();
+        let (mut native_rx, _native_guard) = {
+            let (tx, rx) = tokio::sync::mpsc::channel::<crate::native::link::NativeMessage>(64);
+            // The `cfg` sits on the binding rather than on the arm that drains
+            // the receiver, because `tokio::select!` does not accept one. Where
+            // there is no listener the channel exists and nothing ever sends,
+            // and the guard keeps it open so the arm never sees a closed
+            // receiver.
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+            let guard = {
+                let mut guard = Some(tx.clone());
+                if self.config().node.native_api.enabled {
+                    match crate::native::NativeApi::bind(&self.config().node.native_api) {
+                        Ok(socket) => {
+                            // The accept loop owns a sender, so the dummy guard
+                            // is dropped: the channel closes when the last
+                            // client task ends, not while one is still serving.
+                            guard = None;
+                            let npub = self.npub();
+                            tokio::spawn(socket.accept_loop(tx, native_out_tx.clone(), npub));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to bind native API socket");
+                        }
+                    }
+                }
+                guard
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+            let guard = Some(tx.clone());
+            (rx, guard)
+        };
 
         // Decrypt-worker fallback receiver. The worker pushes each
         // authenticated FMP plaintext here so rx_loop can finish the
@@ -271,6 +318,11 @@ impl Node {
                 // `PublishState`; other variants are ignored defensively.
                 maybe_child = child_exit_rx.recv() => {
                     if let Some(child) = maybe_child {
+                        // Drop anything the dead child published for embedders
+                        // (e.g. the DNS responder's bound address) before
+                        // republishing health, so nothing outside the node can
+                        // observe an address the listener no longer answers on.
+                        self.retract_child_publications(child);
                         let actions = self
                             .supervisor
                             .fsm
@@ -303,6 +355,30 @@ impl Node {
                         "Registering identity from DNS resolution"
                     );
                     self.register_identity(identity.node_addr, identity.pubkey);
+                }
+                // Native API datagrams a client wrote to its descriptor. Drained
+                // in a burst like the TUN arm, for the same reason: one wake-up
+                // should clear what a client handed over, not one datagram.
+                Some(out) = native_outbound_rx.recv() => {
+                    self.handle_native_outbound(out.key, out.peer, out.payload).await;
+                    let mut drained = 0;
+                    while drained < 256 {
+                        match native_outbound_rx.try_recv() {
+                            Ok(next) => {
+                                self.handle_native_outbound(next.key, next.peer, next.payload).await;
+                                drained += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                // Native API registry requests. Placed after the hot inbound
+                // path so a burst of client registrations cannot delay packet
+                // processing. No `cfg` here: `tokio::select!` does not accept
+                // one, so the channel exists on every platform and only the
+                // listener that feeds it is gated.
+                Some(message) = native_rx.recv() => {
+                    self.handle_native(message);
                 }
                 Some((request, response_tx)) = control_rx.recv() => {
                     // Only mutating COMMAND requests (`connect` / `disconnect`)
@@ -341,6 +417,10 @@ impl Node {
                     instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::WholeTick, {
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckTimeouts,
                         self.check_timeouts().await);
+                        // Discard flows the rx_loop announced and a listener's
+                        // own task never took. Cheap: it walks only the pending
+                        // map, which the backlog bounds.
+                        self.native_expire();
                         let now_ms = Self::now_ms();
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ReloadPeerAcl,
                         self.reload_peer_acl().await);
@@ -350,7 +430,10 @@ impl Node {
                         // distinct resources; the `path_mtu_lookup` cache and the
                         // `nostr_rendezvous` subsystem are deliberately excluded
                         // from `Reloadable` since neither reloads from a backing
-                        // file (see `node::reloadable`).
+                        // file (see `node::reloadable`). The `path_mtu_lookup`
+                        // cache is nevertheless swept on this tick, by
+                        // `purge_expired_path_mtu` below: that is expiry, not
+                        // reload.
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ReloadHostMap,
                         self.reload_host_map().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PollPendingConnects,
@@ -369,6 +452,8 @@ impl Node {
                         self.resend_pending_session_msg3(now_ms).await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PurgeIdleSessions,
                         self.purge_idle_sessions(now_ms));
+                        instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PurgeExpiredPathMtu,
+                        self.purge_expired_path_mtu(now_ms));
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ProcessPendingRetries,
                         self.process_pending_retries(now_ms).await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckTreeState,
@@ -391,6 +476,11 @@ impl Node {
                         self.check_session_rekey().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckPendingLookups,
                         self.check_pending_lookups(now_ms).await);
+                        // After CheckPendingLookups so a probe's resolve stage
+                        // observes this tick's lookup progress rather than the
+                        // previous tick's.
+                        instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PollProbes,
+                        self.poll_probes().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PollTransportDiscovery,
                         self.poll_transport_discovery().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::SampleTransportCongestion,
@@ -438,7 +528,11 @@ impl Node {
     /// Process a single received packet.
     ///
     /// Dispatches based on the phase field in the 4-byte common prefix.
-    async fn process_packet(&mut self, packet: ReceivedPacket) {
+    ///
+    /// Visible to the rest of `crate::node` so tests can drive a single
+    /// packet through the dispatch, the same reach `handle_msg1` and
+    /// `handle_msg2` already have.
+    pub(in crate::node) async fn process_packet(&mut self, packet: ReceivedPacket) {
         if packet.data.len() < COMMON_PREFIX_SIZE {
             return; // Drop packets too short for common prefix
         }
@@ -486,6 +580,39 @@ impl Node {
                     );
                 }
             }
+            return;
+        }
+
+        // Drop a frame whose declared payload length disagrees with the
+        // frame that arrived, before that field can be used as a parsing
+        // input.
+        //
+        // Every transport's packets converge here, but the two families
+        // reach this line differently. TCP, Tor and Nym read their frame
+        // boundary out of this same field, so for them the comparison holds
+        // by construction and never fires. UDP, Ethernet and BLE deliver one
+        // whole frame per packet, where the arrived length is known exactly
+        // and nothing compares the two today. A short read on those
+        // transports is a truncated frame, which fails the AEAD tag or the
+        // exact-size handshake parse already; this changes which reason it
+        // is dropped for, not whether it is dropped.
+        //
+        // A `None` means the phase carries no fixed relationship and the
+        // frame is left alone rather than rejected, so an unrecognised phase
+        // still reaches the dispatch below and is handled there.
+        if let Some(expected) = expected_payload_len(prefix.phase, packet.data.len())
+            && prefix.payload_len != expected
+        {
+            debug!(
+                phase = prefix.phase,
+                declared = prefix.payload_len,
+                expected,
+                len = packet.data.len(),
+                transport_id = %packet.transport_id,
+                "FMP payload_len disagrees with frame length, dropping"
+            );
+            self.stats_mut()
+                .record_reject(RejectReason::Transport(TransportReject::PayloadLenMismatch));
             return;
         }
 

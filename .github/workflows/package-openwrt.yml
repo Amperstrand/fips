@@ -718,9 +718,39 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git ca-certificates build-essential meson ninja-build pkg-config \
             zlib1g-dev libssl-dev libzstd-dev liblzma-dev lua5.4-dev scdoc
-          git clone --quiet https://gitlab.alpinelinux.org/alpine/apk-tools.git /tmp/apk-tools
+          # gitlab.alpinelinux.org has taken this step down repeatedly, both as
+          # a truncated clone and as a 135-second connect timeout, and it fails
+          # per runner rather than per run: one architecture fetched while the
+          # other could not reach the host at all. So prefer alpinelinux's
+          # GitHub mirror and keep the canonical host as the fallback. The
+          # commit is pinned by SHA, so the mirror cannot supply different
+          # content under the same name.
+          #
+          # Each attempt fetches only that commit at depth 1, which needs
+          # uploadpack.allowReachableSHA1InWant; both hosts allow it today. The
+          # timeout caps a dead host at a minute instead of curl's own 135.
+          APK_TOOLS_MIRRORS="https://github.com/alpinelinux/apk-tools.git https://gitlab.alpinelinux.org/alpine/apk-tools.git"
+          fetch_pinned() {
+            rm -rf /tmp/apk-tools
+            timeout 120 git init --quiet /tmp/apk-tools \
+              && git -C /tmp/apk-tools remote add origin "$1" \
+              && timeout 60 git -C /tmp/apk-tools fetch --quiet --depth 1 origin "${APK_TOOLS_COMMIT}" \
+              && git -C /tmp/apk-tools checkout --quiet FETCH_HEAD
+          }
+          got_source=
+          for round in 1 2 3; do
+            for repo in $APK_TOOLS_MIRRORS; do
+              if fetch_pinned "$repo"; then got_source=$repo; break 2; fi
+              echo "apk-tools: round $round failed against $repo" >&2
+            done
+            sleep 20
+          done
+          if [ -z "$got_source" ]; then
+            echo "::error::could not obtain apk-tools ${APK_TOOLS_COMMIT} from any of: $APK_TOOLS_MIRRORS"
+            exit 1
+          fi
+          echo "apk-tools ${APK_TOOLS_COMMIT} fetched from $got_source"
           cd /tmp/apk-tools
-          git checkout --quiet "${APK_TOOLS_COMMIT}"
           meson setup build
           ninja -C build src/apk
           APK_BIN=/tmp/apk-tools/build/src/apk
@@ -997,11 +1027,34 @@ jobs:
             | xargs sha256sum \
             > checksums-openwrt.txt
 
-      - name: Create release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
-            dist/*.ipk
-            dist/*.apk
-            dist/checksums-openwrt.txt
-          generate_release_notes: true
+      # This job used to create the Release object itself, with
+      # generate_release_notes. The three other packaging workflows wait for
+      # that object instead, so whichever got there first decided what the
+      # release page said: if this one won, the written notes were stranded
+      # behind an auto-generated commit list. Wait like the others, so the
+      # release is created once, deliberately, by whoever pushes the tag.
+      - name: Wait for tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 20); do
+            if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "Release ${GITHUB_REF_NAME} not available yet; waiting..."
+            sleep 15
+          done
+
+          echo "Timed out waiting for release ${GITHUB_REF_NAME}" >&2
+          exit 1
+
+      - name: Upload OpenWrt assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/*.ipk \
+            dist/*.apk \
+            dist/checksums-openwrt.txt \
+            --clobber \
+            --repo "${GITHUB_REPOSITORY}"

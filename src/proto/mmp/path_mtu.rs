@@ -129,7 +129,20 @@ impl PathMtuState {
     ///
     /// `now_ms` is the injected monotonic time in milliseconds. Returns `true`
     /// if the effective MTU changed.
+    ///
+    /// A reported value below [`MIN_ACTIONABLE_PATH_MTU`] is ignored entirely.
+    /// The notification carries a remote party's claim about the path, and
+    /// below that floor the claim cannot describe a usable path: acting on it
+    /// drives the send gate into answering every packet with an ICMPv6 Packet
+    /// Too Big instead of sending it. Returning `false` leaves whatever the
+    /// local seed established and correctly reports "no change".
+    ///
+    /// [`MIN_ACTIONABLE_PATH_MTU`]: super::limits::MIN_ACTIONABLE_PATH_MTU
     pub fn apply_notification(&mut self, reported_mtu: u16, now_ms: u64) -> bool {
+        if reported_mtu < super::limits::MIN_ACTIONABLE_PATH_MTU {
+            return false;
+        }
+
         if reported_mtu < self.current_mtu {
             // Decrease: immediate
             self.current_mtu = reported_mtu;
@@ -141,7 +154,7 @@ impl PathMtuState {
         if reported_mtu > self.current_mtu {
             // Increase: track consecutive notifications
             if reported_mtu == self.pending_increase_mtu {
-                self.consecutive_increase_count += 1;
+                self.consecutive_increase_count = self.consecutive_increase_count.saturating_add(1);
             } else {
                 // Different value: reset sequence
                 self.pending_increase_mtu = reported_mtu;
@@ -165,6 +178,35 @@ impl PathMtuState {
 
         // No change (equal or increase not yet confirmed)
         false
+    }
+
+    /// Forget the source-side path MTU after the path it described is gone.
+    ///
+    /// Called when a destination's path is declared broken. The tightened
+    /// value describes a path that no longer exists, and the increase ladder
+    /// in [`Self::apply_notification`] (three matching higher values spanning
+    /// two notification intervals) is far too slow to recover it on the
+    /// replacement path. Returning to the no-measurement state lets
+    /// [`Self::seed_source_mtu`] re-derive the value from the outbound
+    /// transport on the next send, exactly as a fresh session does.
+    ///
+    /// Returning to `u16::MAX` is not a licence to send oversized packets:
+    /// the TUN outbound path caps every packet at `effective_ipv6_mtu()`
+    /// before it consults the per-destination gate, and that gate is simply
+    /// inert at `u16::MAX` — the state [`Self::new`] already starts in. If
+    /// that earlier cap is ever removed or made conditional, this reset stops
+    /// being safe.
+    ///
+    /// Destination-side observation state (`last_observed_mtu`,
+    /// `observed_changed`, `last_notification_ms`) is deliberately left
+    /// alone: it describes the reverse direction, which this event says
+    /// nothing about, and clearing it would suppress our notifications to the
+    /// peer until a fresh observation arrived.
+    pub fn reset_source_mtu(&mut self) {
+        self.current_mtu = u16::MAX;
+        self.consecutive_increase_count = 0;
+        self.first_increase_ms = None;
+        self.pending_increase_mtu = 0;
     }
 }
 

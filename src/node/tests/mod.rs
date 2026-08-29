@@ -6,11 +6,12 @@ use crate::utils::index::SessionIndex;
 use std::time::Duration;
 
 mod acl;
-#[cfg(target_os = "linux")]
+#[cfg(ble_available)]
 mod ble;
 mod bloom;
 mod bloom_poison;
 mod bootstrap;
+mod control;
 mod decrypt_failure;
 mod disconnect;
 mod discovery;
@@ -19,6 +20,7 @@ mod forwarding;
 mod handshake;
 mod heartbeat;
 mod mmp_chartests;
+mod probe;
 mod routing;
 mod session;
 mod spanning_tree;

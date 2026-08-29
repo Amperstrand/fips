@@ -5,13 +5,16 @@
 //! multi-hop forwarding through live node topologies.
 
 use super::*;
+use crate::node::peer_error_budget::PEER_ERROR_BURST;
 use crate::proto::fsp::wire::{FSP_FLAG_CP, build_fsp_header};
 use crate::proto::fsp::{SessionAck, SessionSetup};
 use crate::proto::link::SessionDatagram;
 use crate::proto::stp::TreeCoordinate;
 use crate::proto::stp::encode_coords;
+
 use spanning_tree::{
-    TestNode, cleanup_nodes, process_available_packets, run_tree_test, verify_tree_convergence,
+    TestNode, cleanup_nodes, populate_all_coord_caches, process_available_packets, run_tree_test,
+    verify_tree_convergence,
 };
 
 // ============================================================================
@@ -202,12 +205,141 @@ async fn test_forwarding_direct_peer() {
 // ============================================================================
 
 #[tokio::test]
+async fn a_forged_warm_cannot_displace_a_coordinate_established_by_a_verified_lookup() {
+    let mut node = make_node();
+    let attacker_link = make_node_addr(0xAA);
+    let victim_dest = make_node_addr(0x02);
+    let root_addr = *node.tree_state.my_coords().root_id();
+
+    // The state a completed lookup leaves behind.
+    let real_coords = TreeCoordinate::from_addrs(vec![victim_dest, root_addr]).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    node.coord_cache_mut()
+        .insert_verified(victim_dest, real_coords.clone(), now_ms);
+
+    // One packet, claiming to be from the destination, carrying a different
+    // position for it under the same root. This is the whole attack.
+    let forged =
+        TreeCoordinate::from_addrs(vec![victim_dest, make_node_addr(0x77), root_addr]).unwrap();
+    let src_coords = TreeCoordinate::from_addrs(vec![victim_dest, root_addr]).unwrap();
+    let payload = SessionSetup::new(src_coords, forged.clone()).encode();
+    let encoded = SessionDatagram::new(victim_dest, victim_dest, payload).encode();
+
+    let rejected_before = node.metrics().forwarding.coord_hint_rejected.get();
+    node.handle_session_datagram(&attacker_link, &encoded[1..], false)
+        .await;
+
+    assert_eq!(
+        node.coord_cache().get(&victim_dest, now_ms),
+        Some(&real_coords),
+        "a forged warm displaced a verified coordinate"
+    );
+    assert!(
+        node.metrics().forwarding.coord_hint_rejected.get() > rejected_before,
+        "the refusal should be counted"
+    );
+}
+
+#[tokio::test]
+async fn warming_refuses_a_coordinate_rooted_in_a_tree_this_node_is_not_in() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let src_addr = make_node_addr(0x01);
+    let dest_addr = make_node_addr(0x02);
+    // Deliberately NOT this node's root. Such an entry can never route: both
+    // selectors reject a foreign root, so caching it only occupies a slot and
+    // flips the error-PDU choice in `synth_routing_error` from CoordsRequired
+    // to PathBroken, which is the primitive this guard removes.
+    let foreign_root = make_node_addr(0xF0);
+    assert_ne!(
+        &foreign_root,
+        node.tree_state.my_coords().root_id(),
+        "fixture must not accidentally share the node's root"
+    );
+
+    let src_coords = TreeCoordinate::from_addrs(vec![src_addr, foreign_root]).unwrap();
+    let dest_coords = TreeCoordinate::from_addrs(vec![dest_addr, foreign_root]).unwrap();
+    let setup_payload = SessionSetup::new(src_coords, dest_coords).encode();
+    let encoded = SessionDatagram::new(src_addr, dest_addr, setup_payload).encode();
+
+    let before = node.metrics().forwarding.coord_warm_foreign_root.get();
+    node.handle_session_datagram(&from, &encoded[1..], false)
+        .await;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(
+        node.coord_cache().get(&src_addr, now_ms).is_none(),
+        "a foreign-root src coordinate was cached"
+    );
+    assert!(
+        node.coord_cache().get(&dest_addr, now_ms).is_none(),
+        "a foreign-root dest coordinate was cached"
+    );
+    assert_eq!(
+        node.metrics().forwarding.coord_warm_foreign_root.get(),
+        before + 2,
+        "both refusals should be counted"
+    );
+}
+
+#[tokio::test]
+async fn warming_counts_but_still_caches_a_coordinate_that_does_not_name_its_own_key() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let src_addr = make_node_addr(0x01);
+    let dest_addr = make_node_addr(0x02);
+    let root_addr = *node.tree_state.my_coords().root_id();
+    let someone_else = make_node_addr(0x09);
+
+    // dest_coords names 0x09, not the 0x02 it will be filed under. This is the
+    // shape an honest sender produces when its own cache missed and
+    // `get_dest_coords` fell back to the sender's own coordinates, so it is
+    // counted and NOT refused.
+    let src_coords = TreeCoordinate::from_addrs(vec![src_addr, root_addr]).unwrap();
+    let dest_coords = TreeCoordinate::from_addrs(vec![someone_else, root_addr]).unwrap();
+    let setup_payload = SessionSetup::new(src_coords, dest_coords).encode();
+    let encoded = SessionDatagram::new(src_addr, dest_addr, setup_payload).encode();
+
+    let before = node.metrics().forwarding.coord_warm_key_mismatch.get();
+    node.handle_session_datagram(&from, &encoded[1..], false)
+        .await;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(
+        node.coord_cache().get(&dest_addr, now_ms).is_some(),
+        "the mismatching entry should still be cached; this check counts only"
+    );
+    assert_eq!(
+        node.metrics().forwarding.coord_warm_key_mismatch.get(),
+        before + 1,
+        "the mismatch should be counted exactly once"
+    );
+    assert_eq!(
+        node.metrics().forwarding.coord_warm_key_mismatch.get() - before,
+        1,
+        "the well-formed src coordinate must not be counted as a mismatch"
+    );
+}
+
+#[tokio::test]
 async fn test_coord_cache_warming_session_setup() {
     let mut node = make_node();
     let from = make_node_addr(0xAA);
     let src_addr = make_node_addr(0x01);
     let dest_addr = make_node_addr(0x02);
-    let root_addr = make_node_addr(0xF0);
+    // The warming path refuses a coordinate under a root other than this
+    // node's, so a fixture that wants the write to land has to share the
+    // node's root. A fresh node is its own root.
+    let root_addr = *node.tree_state.my_coords().root_id();
 
     let src_coords = TreeCoordinate::from_addrs(vec![src_addr, root_addr]).unwrap();
     let dest_coords = TreeCoordinate::from_addrs(vec![dest_addr, root_addr]).unwrap();
@@ -251,7 +383,10 @@ async fn test_coord_cache_warming_session_ack() {
     let from = make_node_addr(0xAA);
     let src_addr = make_node_addr(0x01);
     let dest_addr = make_node_addr(0x02);
-    let root_addr = make_node_addr(0xF0);
+    // The warming path refuses a coordinate under a root other than this
+    // node's, so a fixture that wants the write to land has to share the
+    // node's root. A fresh node is its own root.
+    let root_addr = *node.tree_state.my_coords().root_id();
 
     let src_coords = TreeCoordinate::from_addrs(vec![src_addr, root_addr]).unwrap();
     let dest_coords = TreeCoordinate::from_addrs(vec![dest_addr, root_addr]).unwrap();
@@ -295,7 +430,10 @@ async fn test_coord_cache_warming_encrypted_msg_with_coords() {
     let from = make_node_addr(0xAA);
     let src_addr = make_node_addr(0x01);
     let dest_addr = make_node_addr(0x02);
-    let root_addr = make_node_addr(0xF0);
+    // The warming path refuses a coordinate under a root other than this
+    // node's, so a fixture that wants the write to land has to share the
+    // node's root. A fresh node is its own root.
+    let root_addr = *node.tree_state.my_coords().root_id();
 
     let src_coords = TreeCoordinate::from_addrs(vec![src_addr, root_addr]).unwrap();
     let dest_coords = TreeCoordinate::from_addrs(vec![dest_addr, root_addr]).unwrap();
@@ -329,6 +467,13 @@ async fn test_coord_cache_warming_encrypted_msg_with_coords() {
     assert!(
         node.coord_cache().get(&dest_addr, now_ms).is_some(),
         "dest coords not cached from encrypted message"
+    );
+    // Changing what the malformed counter charges is close enough to changing
+    // when it fires that the well-formed case is pinned in the same place.
+    assert_eq!(
+        node.metrics().forwarding.warm_malformed_packets.get(),
+        0,
+        "a well-formed CP datagram must not be counted as an abandoned warm attempt"
     );
 }
 
@@ -382,7 +527,10 @@ async fn test_coord_cache_warming_ttl_zero_local_delivery() {
     let from = make_node_addr(0xAA);
     let my_addr = *node.node_addr();
     let src_addr = make_node_addr(0x01);
-    let root_addr = make_node_addr(0xF0);
+    // The warming path refuses a coordinate under a root other than this
+    // node's, so a fixture that wants the write to land has to share the
+    // node's root. A fresh node is its own root.
+    let root_addr = *node.tree_state.my_coords().root_id();
 
     let src_coords = TreeCoordinate::from_addrs(vec![src_addr, root_addr]).unwrap();
     let dest_coords = TreeCoordinate::from_addrs(vec![my_addr, root_addr]).unwrap();
@@ -428,7 +576,10 @@ async fn test_coord_cache_warming_ttl_zero_transit_drop() {
     let from = make_node_addr(0xAA);
     let src_addr = make_node_addr(0x01);
     let dest_addr = make_node_addr(0x02);
-    let root_addr = make_node_addr(0xF0);
+    // The warming path refuses a coordinate under a root other than this
+    // node's, so a fixture that wants the write to land has to share the
+    // node's root. A fresh node is its own root.
+    let root_addr = *node.tree_state.my_coords().root_id();
 
     let src_coords = TreeCoordinate::from_addrs(vec![src_addr, root_addr]).unwrap();
     let dest_coords = TreeCoordinate::from_addrs(vec![dest_addr, root_addr]).unwrap();
@@ -467,35 +618,6 @@ async fn test_coord_cache_warming_ttl_zero_transit_drop() {
 // ============================================================================
 // Integration Tests
 // ============================================================================
-
-/// Helper: populate all coordinate caches across a set of test nodes.
-fn populate_all_coord_caches(nodes: &mut [TestNode]) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    // Collect all coords first to avoid borrow conflicts
-    let all_coords: Vec<(NodeAddr, TreeCoordinate)> = nodes
-        .iter()
-        .map(|tn| {
-            (
-                *tn.node.node_addr(),
-                tn.node.tree_state().my_coords().clone(),
-            )
-        })
-        .collect();
-
-    for tn in nodes.iter_mut() {
-        for (addr, coords) in &all_coords {
-            if addr != tn.node.node_addr() {
-                tn.node
-                    .coord_cache_mut()
-                    .insert(*addr, coords.clone(), now_ms);
-            }
-        }
-    }
-}
 
 #[tokio::test]
 async fn test_forwarding_single_hop() {
@@ -814,7 +936,7 @@ async fn test_forwarding_with_cache_warming_enables_routing() {
     // Node 0 gets full cache
     for (addr, coords) in &all_coords {
         if addr != nodes[0].node.node_addr() {
-            nodes[0]
+            let _ = nodes[0]
                 .node
                 .coord_cache_mut()
                 .insert(*addr, coords.clone(), now_ms);
@@ -843,7 +965,7 @@ async fn test_forwarding_with_cache_warming_enables_routing() {
                         .unwrap()
                         .1
                         .clone();
-                    nodes[i]
+                    let _ = nodes[i]
                         .node
                         .coord_cache_mut()
                         .insert(j_addr, coords, now_ms);
@@ -1108,4 +1230,198 @@ fn test_sample_transport_congestion() {
     // (transport_drops entry stays unchanged)
     node.sample_transport_congestion();
     assert!(!node.transport_drops[&tid].dropping);
+}
+
+/// Acceptance: an inner FSP payload of 4 to 11 bytes with phase 0x0 and the
+/// CP flag set is dropped rather than panicking the forwarding path. That
+/// window sits between the common prefix parser's 4-byte floor and the
+/// 12-byte header slice the warm path takes, so before the fix the first
+/// iteration panicked with a range start index out of range.
+#[tokio::test]
+async fn test_coord_cache_warming_short_inner_payload_is_dropped_not_panic() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let src_addr = make_node_addr(0x01);
+    let dest_addr = make_node_addr(0x02);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    for extra in 0..=7 {
+        let mut data_payload = vec![0x00, FSP_FLAG_CP, 0x00, 0x00];
+        data_payload.resize(4 + extra, 0x00);
+
+        let dg = SessionDatagram::new(src_addr, dest_addr, data_payload).with_ttl(1);
+        let encoded = dg.encode();
+        node.handle_session_datagram(&from, &encoded[1..], false)
+            .await;
+    }
+
+    assert!(
+        node.coord_cache().get(&src_addr, now_ms).is_none(),
+        "Short inner payload must not warm src coords"
+    );
+    assert!(
+        node.coord_cache().get(&dest_addr, now_ms).is_none(),
+        "Short inner payload must not warm dest coords"
+    );
+    // Anti-vacuity: only a datagram that ran past the warm call reaches the
+    // TTL gate. `received_packets` is charged before decode and so would
+    // count a datagram rejected earlier.
+    assert_eq!(
+        node.metrics().forwarding.ttl_exhausted_packets.get(),
+        8,
+        "each short-inner-payload datagram must run past the warm call to the TTL gate"
+    );
+    // Discriminating: separates "the guard fired" from "coords parsed and
+    // yielded nothing", which the cache assertions above cannot tell apart.
+    assert_eq!(
+        node.metrics().forwarding.warm_malformed_packets.get(),
+        8,
+        "each short-inner-payload datagram must be counted as an abandoned warm attempt"
+    );
+
+    // Inner lengths 12 to 27 document the new 28-byte floor: they do not
+    // panic today either, so this half is not discriminating.
+    for len in 12..=27 {
+        let mut data_payload = vec![0x00, FSP_FLAG_CP, 0x00, 0x00];
+        data_payload.resize(len, 0x00);
+
+        let dg = SessionDatagram::new(src_addr, dest_addr, data_payload).with_ttl(1);
+        let encoded = dg.encode();
+        node.handle_session_datagram(&from, &encoded[1..], false)
+            .await;
+    }
+
+    assert!(
+        node.coord_cache().get(&src_addr, now_ms).is_none(),
+        "Payload below the encrypted minimum must not warm src coords"
+    );
+    assert!(
+        node.coord_cache().get(&dest_addr, now_ms).is_none(),
+        "Payload below the encrypted minimum must not warm dest coords"
+    );
+    assert_eq!(
+        node.metrics().forwarding.ttl_exhausted_packets.get(),
+        24,
+        "every datagram in both loops must reach the TTL gate"
+    );
+    assert_eq!(
+        node.metrics().forwarding.warm_malformed_packets.get(),
+        24,
+        "every datagram in both loops must be counted as an abandoned warm attempt"
+    );
+    // The byte counter shares a fipstop row with `received_bytes` and
+    // `decode_error_bytes`, so it has to measure the same population: the
+    // outer SessionDatagram payload, not the inner FSP one. Two assertions
+    // produced two different ways, because a single one cannot tell "the
+    // basis matches" from "two counters are wrong in the same direction".
+    //
+    // Self-derived: every one of the 24 datagrams reaches the warm guard, as
+    // the two packet counts above already pin, and `record_received` charges
+    // the identical outer slice.
+    assert_eq!(
+        node.metrics().forwarding.warm_malformed_bytes.get(),
+        node.metrics().forwarding.received_bytes.get(),
+        "the byte counter must be charged the same outer payload as its \
+         siblings on the same row"
+    );
+    // Literal cross-check. The first loop sends inner lengths 4..=11, so
+    // outer 39..=46, summing to 340; the second sends inner 12..=27, so
+    // outer 47..=62, summing to 872. Charging the inner payload instead
+    // reads 60 + 312 = 372, about 15% of the wire volume that arrived.
+    assert_eq!(
+        node.metrics().forwarding.warm_malformed_bytes.get(),
+        1212,
+        "24 frames of 39..=46 and 47..=62 outer bytes sum to 1212"
+    );
+}
+
+// --- Emission bounds on induced routing errors ---
+
+/// A distinct destination per index, standing for the fresh `dest_addr` a
+/// flooding sender puts on every datagram to escape the per-destination gate.
+fn minted_dest(val: u32) -> NodeAddr {
+    let mut bytes = [0u8; 16];
+    bytes[..4].copy_from_slice(&val.to_le_bytes());
+    bytes[15] = 0xfe;
+    NodeAddr::from_bytes(bytes)
+}
+
+/// Feed one transit datagram whose destination this node cannot route.
+async fn inject_unroutable(node: &mut Node, from: &NodeAddr, src: NodeAddr, dest: NodeAddr) {
+    let dg = SessionDatagram::new(src, dest, vec![0x10, 0x00, 0x00, 0x00]).with_ttl(8);
+    let encoded = dg.encode();
+    node.handle_session_datagram(from, &encoded[1..], false)
+        .await;
+}
+
+#[tokio::test]
+async fn one_link_peer_cannot_induce_unbounded_errors_by_varying_the_destination() {
+    let mut node = make_node();
+    let attacker = make_node_addr(0xAA);
+    let overshoot = 10u32;
+
+    for i in 0..PEER_ERROR_BURST + overshoot {
+        // Fresh destination and fresh spoofed source per packet: neither
+        // address-keyed gate sees a repeat.
+        inject_unroutable(
+            &mut node,
+            &attacker,
+            minted_dest(i + 1_000_000),
+            minted_dest(i),
+        )
+        .await;
+    }
+
+    let errors = &node.metrics().errors;
+    assert_eq!(
+        errors.emit_over_dest_interval.get(),
+        0,
+        "the per-destination gate cannot bound a sender that varies the destination"
+    );
+    assert_eq!(
+        errors.emit_over_peer_budget.get(),
+        u64::from(overshoot),
+        "everything past the link peer's burst must be refused"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_suppressed_error_does_not_spend_the_link_peer_budget() {
+    let mut node = make_node();
+    let peer = make_node_addr(0xAA);
+    let src = make_node_addr(0x01);
+    let dest = make_node_addr(0x02);
+    let injected = PEER_ERROR_BURST * 4;
+
+    for _ in 0..injected {
+        inject_unroutable(&mut node, &peer, src, dest).await;
+    }
+
+    let errors = &node.metrics().errors;
+    assert_eq!(
+        errors.emit_over_peer_budget.get(),
+        0,
+        "an outage on one destination must not spend the peer's budget for the others"
+    );
+    assert_eq!(
+        errors.emit_over_dest_interval.get(),
+        u64::from(injected - 1),
+        "only the first error for a destination goes out within the interval"
+    );
+}
+
+#[tokio::test]
+async fn a_single_unroutable_datagram_still_produces_its_error() {
+    let mut node = make_node();
+    let peer = make_node_addr(0xAA);
+
+    inject_unroutable(&mut node, &peer, make_node_addr(0x01), make_node_addr(0x02)).await;
+
+    let errors = &node.metrics().errors;
+    assert_eq!(errors.emit_over_peer_budget.get(), 0);
+    assert_eq!(errors.emit_over_dest_interval.get(), 0);
 }

@@ -406,14 +406,24 @@ impl Node {
     /// service. A wildcard IPv4 socket cannot send to an IPv6 link-local
     /// target, and vice versa, so callers must choose by socket family rather
     /// than by transport type alone.
+    ///
+    /// `instance` names a specific configured UDP instance
+    /// ([`TransportSpec`](crate::config::TransportSpec)) and is the only way to
+    /// discriminate two wildcard sockets: they are family-compatible with the
+    /// same addresses, so without a name the lowest `TransportId` always wins
+    /// and one socket carries everything. When it is `Some`, a non-matching
+    /// instance is never substituted — the caller gets `None` and can say so,
+    /// rather than dialing down the wrong lane.
     fn find_udp_transport_for_remote_addr(
         &self,
         remote_addr: SocketAddr,
+        instance: Option<&str>,
     ) -> Option<(TransportId, SocketAddr)> {
         self.transports
             .iter()
             .filter(|(id, handle)| {
                 handle.transport_type().name == "udp"
+                    && instance.is_none_or(|want| handle.name() == Some(want))
                     && handle.is_operational()
                     && !self.supervisor.nostr_rendezvous.is_bootstrap_transport(id)
             })
@@ -610,14 +620,17 @@ impl Node {
         };
 
         // Start the Noise handshake and get message 1
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let startup_epoch = self.startup_epoch();
-        let noise_msg1 = match self
+        let start_result = self
             .peer_machines
             .get_mut(&link_id)
             .expect("dial-time machine carries the connection")
-            .start_handshake(our_keypair, startup_epoch, current_time_ms)
-        {
+            .start_handshake(our_keypair, startup_epoch, current_time_ms);
+        our_keypair.non_secure_erase();
+        let noise_msg1 = match start_result {
             Ok(msg) => msg,
             Err(e) => {
                 // Clean up the index, link, and dial-time machine
@@ -1145,7 +1158,7 @@ impl Node {
         for event in events {
             let crate::mdns::LanEvent::Discovered(peer) = event;
             let Some((transport_id, _local_addr)) =
-                self.find_udp_transport_for_remote_addr(peer.addr)
+                self.find_udp_transport_for_remote_addr(peer.addr, None)
             else {
                 debug!(
                     addr = %peer.addr,
@@ -1482,6 +1495,21 @@ impl Node {
 
                     match handle.start().await {
                         Ok(()) => {
+                            // Hand the freshly-bound socket to an embedder that
+                            // armed `enable_app_owned_udp_fd`, labelled with the
+                            // instance it belongs to so two UDP listeners can be
+                            // told apart. Non-UDP handles report `None` for the
+                            // fd by construction, so no transport-type test is
+                            // needed here.
+                            #[cfg(unix)]
+                            if let (Some(tx), Some(fd)) =
+                                (&self.supervisor.udp_fd_tx, handle.raw_fd())
+                            {
+                                let _ = tx.send(crate::node::AppOwnedUdpSocket {
+                                    instance: name.clone(),
+                                    fd,
+                                });
+                            }
                             self.transports.insert(id, handle);
                             Event::SubstrateUp { child }
                         }
@@ -1747,6 +1775,12 @@ impl Node {
                             let bind = std::net::SocketAddr::new(ip, self.config().dns.port());
                             match Self::bind_dns_socket(bind) {
                                 Ok(socket) => {
+                                    // Read the bound address back off the socket
+                                    // rather than reusing `bind`: a port-0 config
+                                    // resolves to the kernel-assigned port here,
+                                    // and this is the address an embedder that
+                                    // proxies queries to us has to dial.
+                                    let local_addr = socket.local_addr().unwrap_or(bind);
                                     let dns_channel_size = self.config().node.buffers.dns_channel;
                                     let (identity_tx, identity_rx) =
                                         tokio::sync::mpsc::channel(dns_channel_size);
@@ -1763,15 +1797,23 @@ impl Node {
                                     );
                                     // Resolve the TUN ifindex so the responder can
                                     // drop queries arriving on the mesh interface
-                                    // (fips0). Without this, the `::` bind exposes
-                                    // /etc/fips/hosts alias probing to any mesh peer.
-                                    // When TUN isn't enabled or the name can't be
-                                    // resolved, `None` disables the filter (there
-                                    // is no mesh surface to defend anyway).
-                                    let mesh_ifindex =
-                                        Self::lookup_mesh_ifindex(self.config().tun.name());
+                                    // Without this, the `::` bind exposes the
+                                    // hosts file's alias space to any mesh peer.
+                                    // The name comes from the device the TUN
+                                    // path actually created, not the configured
+                                    // one: macOS and FreeBSD assign utunN/tunN
+                                    // of their own choosing and the configured
+                                    // name resolves to nothing there, which left
+                                    // the filter permanently off.
+                                    let mesh_ifindex = self.mesh_ifindex();
+                                    if self.tun_name.is_some() && mesh_ifindex.is_none() {
+                                        warn!(
+                                            device = ?self.tun_name,
+                                            "Mesh interface index unresolved; DNS mesh filter disabled"
+                                        );
+                                    }
                                     info!(
-                                        bind = %bind,
+                                        bind = %local_addr,
                                         hosts = reloader.hosts().len(),
                                         mesh_ifindex = ?mesh_ifindex,
                                         "DNS responder started for .fips domain (auto-reload enabled)"
@@ -1797,6 +1839,7 @@ impl Node {
                                     });
                                     self.supervisor.dns_identity_rx = Some(identity_rx);
                                     self.supervisor.dns_task = Some(handle);
+                                    self.supervisor.dns_local_addr = Some(local_addr);
                                     Event::SubstrateUp { child }
                                 }
                                 Err(e) => {
@@ -1957,12 +2000,21 @@ impl Node {
         Ok(())
     }
 
-    /// Resolve the mesh TUN interface index by name.
+    /// Resolve the index of the mesh TUN device this node actually created.
     ///
-    /// Returns `None` if the interface does not exist (e.g. TUN disabled
-    /// or not yet created). A `None` result disables the DNS responder's
-    /// mesh-interface filter — safe, because if there is no fips0 there
-    /// is no mesh exposure to defend against.
+    /// Reads the device name recorded when the TUN was brought up, which is
+    /// the kernel's name rather than the configured one. Returns `None` when
+    /// no TUN is up, which disables the DNS responder's mesh-interface
+    /// filter: with no mesh interface there is no mesh exposure to defend.
+    /// An app-owned TUN also leaves the name unset, so the filter stays off
+    /// there even though a mesh interface exists.
+    pub(crate) fn mesh_ifindex(&self) -> Option<u32> {
+        self.tun_name.as_deref().and_then(Self::lookup_mesh_ifindex)
+    }
+
+    /// Resolve an interface index by name.
+    ///
+    /// Returns `None` if the interface does not exist.
     fn lookup_mesh_ifindex(name: &str) -> Option<u32> {
         #[cfg(unix)]
         {
@@ -2057,6 +2109,10 @@ impl Node {
                         handle.abort();
                         debug!("DNS responder stopped");
                     }
+                    // Retract the published address in the same step that kills
+                    // the listener, so an embedder polling `dns_local_addr()`
+                    // never dials a socket that is already gone.
+                    self.supervisor.dns_local_addr.take();
                 }
                 Child::Nostr => {
                     // Stop Nostr overlay discovery background work and withdraw
@@ -2150,6 +2206,34 @@ impl Node {
         if !packet_taken {
             self.supervisor.packet_tx.take();
             self.packet_rx.take();
+        }
+    }
+
+    /// Retract anything a child published about itself, after it exited on its
+    /// own at runtime (as opposed to being torn down by [`Self::stop`]).
+    ///
+    /// The FSM's `ChildExited` handling only republishes node health; it does
+    /// not touch per-child handles. That is fine for state nobody outside the
+    /// node reads, but not for an address an embedder dials: a stale
+    /// [`Node::dns_local_addr`] would have the app proxying `.fips` queries
+    /// into a socket that is gone, and the only symptom would be resolution
+    /// quietly timing out.
+    ///
+    /// Deliberately narrow — it clears published facts, not handles.
+    /// `dns_task` is left alone because [`Self::reconstruct_supervised_up`]
+    /// reads it to rebuild the teardown set, and aborting an already-finished
+    /// handle there is harmless.
+    ///
+    /// **Dormant for `Dns` as written.** `run_dns_responder` is an unconditional
+    /// loop whose every failure arm continues, so it never returns and the
+    /// `Child::Dns` send that follows it is unreachable — nothing produces the
+    /// event this consumes. The consumer side is correct and lands here so the
+    /// producer fix does not have to rediscover it. A responder that *panics* is
+    /// not covered either way, since the unwind goes past the send rather than
+    /// through it; that is true of every child producer, not just this one.
+    pub(in crate::node) fn retract_child_publications(&mut self, child: Child) {
+        if matches!(child, Child::Dns) {
+            self.supervisor.dns_local_addr.take();
         }
     }
 
@@ -2356,7 +2440,12 @@ impl Node {
             if attempted >= max_attempts {
                 break;
             }
-            if addr.transport == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
+            // The transport field may name a specific instance
+            // (`"udp/aware"`); everything below dispatches on the type half
+            // and hands the instance half to whichever resolver can honour it.
+            let spec = addr.spec();
+
+            if spec.kind == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
                 if !allow_bootstrap_nat {
                     continue;
                 }
@@ -2385,7 +2474,7 @@ impl Node {
                     }
                 }
             } else if addr.transport == "ble" {
-                #[cfg(bluer_available)]
+                #[cfg(ble_available)]
                 {
                     match self.resolve_ble_addr(&addr.addr) {
                         Ok(result) => result,
@@ -2400,16 +2489,17 @@ impl Node {
                         }
                     }
                 }
-                #[cfg(not(bluer_available))]
+                #[cfg(not(ble_available))]
                 {
                     debug!(transport = %addr.transport, "BLE transport not available on this build");
                     continue;
                 }
             } else {
-                let tid = if addr.transport == "udp"
+                let tid = if spec.kind == "udp"
                     && let Ok(remote_socket_addr) = addr.addr.parse::<SocketAddr>()
                 {
-                    match self.find_udp_transport_for_remote_addr(remote_socket_addr) {
+                    match self.find_udp_transport_for_remote_addr(remote_socket_addr, spec.instance)
+                    {
                         Some((id, _)) => id,
                         None => {
                             debug!(
@@ -2420,8 +2510,20 @@ impl Node {
                             continue;
                         }
                     }
+                } else if spec.instance.is_some() {
+                    // Only the UDP resolver above can honour an instance name.
+                    // Matching any instance of the type here would be the
+                    // silent wrong-lane substitution this whole mechanism
+                    // exists to prevent, so refuse instead.
+                    debug!(
+                        transport = %addr.transport,
+                        addr = %addr.addr,
+                        "Instance-qualified address for a transport type that \
+                         does not support instance selection"
+                    );
+                    continue;
                 } else {
-                    match self.find_transport_for_type(&addr.transport) {
+                    match self.find_transport_for_type(spec.kind) {
                         Some(id) => id,
                         None => {
                             debug!(
@@ -3110,11 +3212,21 @@ impl Node {
         let current_transport = peer
             .transport_id()
             .and_then(|id| self.transports.get(&id))
-            .map(|transport| transport.transport_type().name);
+            .map(|transport| (transport.transport_type().name, transport.name()));
 
+        // Compare against the candidate's *parsed* transport: a peer address
+        // may name an instance (`"udp/aware"`), while a handle reports its type
+        // and its instance name separately. Comparing the raw field to the type
+        // name would call every instance-qualified address an alternative path,
+        // so a platform lane that re-pushes its peers — Wi-Fi Aware does, on
+        // every NDP callback — would re-dial a peer it is already connected to,
+        // forever.
+        let spec = candidate.spec();
         candidate.addr == current_addr
             && current_transport
-                .map(|transport| transport == candidate.transport)
+                .map(|(kind, instance)| {
+                    kind == spec.kind && spec.instance.is_none_or(|want| instance == Some(want))
+                })
                 .unwrap_or(true)
     }
 
@@ -3125,6 +3237,15 @@ impl Node {
     /// Creates an ephemeral peer connection (not persisted to config, no
     /// auto-reconnect). Reuses the same connection path as auto-connect
     /// peers. Returns JSON data on success or an error message.
+    ///
+    /// For a peer the node is already connected to, the supplied address is
+    /// tried as an *alternate path* rather than ignored — the same treatment
+    /// [`Node::update_peers`] gives a refreshed runtime peer. The handshake
+    /// runs in parallel with the live link and promotion happens only once it
+    /// authenticates, so an address the caller got wrong cannot displace a
+    /// healthy path. The response's `refreshed` field reports whether such a
+    /// handshake was started; it is `false` when the peer is already on this
+    /// exact path and that path is fresh.
     pub(crate) async fn api_connect(
         &mut self,
         npub: &str,
@@ -3140,11 +3261,41 @@ impl Node {
             via_nostr: false,
         };
 
-        // Pre-seed identity cache (same as initiate_peer_connections does)
-        if let Ok(identity) = PeerIdentity::from_npub(npub) {
+        // Pre-seed identity cache (same as initiate_peer_connections does).
+        // An unparseable npub is left to `initiate_peer_connection` below,
+        // which reports it as `InvalidPeerNpub`.
+        let peer_identity = PeerIdentity::from_npub(npub).ok();
+        if let Some(identity) = peer_identity.as_ref() {
             self.peer_aliases
                 .insert(*identity.node_addr(), identity.short_npub());
             self.register_identity(*identity.node_addr(), identity.pubkey_full());
+        }
+
+        // A peer we already hold a session to must not fall through to
+        // `initiate_peer_connection`: that returns Ok(()) the moment the peer
+        // is in `self.peers`, so the command would report success without ever
+        // trying the address it was handed. Route it through the same
+        // alternate-path helper `update_peers` uses instead.
+        if let Some(identity) = peer_identity
+            && self.peers.contains_key(identity.node_addr())
+        {
+            let refreshed = self
+                .try_active_peer_alternative_addresses(&peer_config, identity)
+                .await
+                .map_err(|e| e.to_string())?;
+            info!(
+                npub = %npub,
+                address = %address,
+                transport = %transport,
+                refreshed = refreshed,
+                "API connect resolved against an already-connected peer"
+            );
+            return Ok(serde_json::json!({
+                "npub": npub,
+                "address": address,
+                "transport": transport,
+                "refreshed": refreshed,
+            }));
         }
 
         self.initiate_peer_connection(&peer_config)
@@ -3160,6 +3311,7 @@ impl Node {
                     "npub": npub,
                     "address": address,
                     "transport": transport,
+                    "refreshed": false,
                 })
             })
             .map_err(|e| e.to_string())
@@ -3167,15 +3319,27 @@ impl Node {
 
     /// Disconnect a peer via the control API.
     ///
-    /// Notifies the peer, removes it locally, and suppresses auto-reconnect.
+    /// Notifies the peer, removes it locally, closes the transport connection
+    /// it was using, and suppresses auto-reconnect.
     pub(crate) async fn api_disconnect(&mut self, npub: &str) -> Result<serde_json::Value, String> {
         let peer_identity =
             PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub '{npub}': {e}"))?;
         let node_addr = *peer_identity.node_addr();
 
-        if !self.peers.contains_key(&node_addr) {
+        let Some(peer) = self.peers.get(&node_addr) else {
             return Err(format!("peer not found: {npub}"));
-        }
+        };
+
+        // Read the transport path the peer is actually sending over BEFORE the
+        // teardown below drops the peer and its link — afterwards there is
+        // nothing left to derive it from. `current_addr` rather than the
+        // link's remote address, because roaming updates the former and it is
+        // the address the pool entry (and its inbound-slot accounting) is
+        // keyed by.
+        let transport_path = match (peer.transport_id(), peer.current_addr()) {
+            (Some(transport_id), Some(addr)) => Some((transport_id, addr.clone())),
+            _ => None,
+        };
 
         // Notify the peer before we tear down the link, so it drops its own
         // session and re-handshakes symmetrically rather than holding a stale
@@ -3187,6 +3351,22 @@ impl Node {
 
         // Remove the peer (full cleanup: sessions, indices, links, tree, bloom)
         self.remove_active_peer(&node_addr);
+
+        // Tear down the transport connection, not just the node-side state.
+        // `remove_active_peer` frees every node-side structure but never
+        // touches the transport, so on a connection-oriented transport the
+        // pool entry, the socket and its inbound-slot accounting would
+        // otherwise survive the peer the node has just forgotten — an operator
+        // who disconnects a peer to free a slot would not free the slot. This
+        // mirrors `cleanup_stale_connection`, and the reasoning there applies
+        // verbatim: closing twice is harmless, because every
+        // `close_connection` implementation is `if let Some(conn) =
+        // pool.remove(addr)` and the connectionless default is a no-op.
+        if let Some((transport_id, addr)) = transport_path
+            && let Some(transport) = self.transports.get(&transport_id)
+        {
+            transport.close_connection(&addr).await;
+        }
 
         // Suppress any pending auto-reconnect
         self.peering.reconciler.retry_pending.remove(&node_addr);

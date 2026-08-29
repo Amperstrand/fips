@@ -17,18 +17,22 @@ pub(crate) mod encrypt_worker;
 mod handlers;
 mod lifecycle;
 pub(crate) mod metrics;
+mod peer_error_budget;
 mod peering;
 mod rate_limit;
 pub(crate) mod reject;
 mod reloadable;
 pub(crate) mod session;
+pub(crate) use handlers::probe::ProbeJob;
+
 pub(crate) mod stats;
 pub(crate) mod stats_history;
 #[cfg(test)]
 mod tests;
 mod tree;
 
-use self::rate_limit::HandshakeRateLimiter;
+use self::peer_error_budget::PeerErrorBudget;
+use self::rate_limit::{HandshakeRateLimiter, LookupSignRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
 
 /// Half-range of the symmetric jitter applied to the per-session rekey timer.
@@ -245,6 +249,37 @@ pub struct UpdatePeersOutcome {
     pub unchanged: usize,
 }
 
+/// One bound UDP listen socket, handed to an embedder that armed
+/// [`Node::enable_app_owned_udp_fd`].
+///
+/// A bare descriptor would be enough for the single-listener case and useless
+/// for any other: a node configured with several named UDP instances
+/// ([`TransportInstances::Named`](crate::config::TransportInstances::Named))
+/// delivers one message per instance, and the whole point of the seam — the
+/// embedder associating a socket with one host network — needs to know *which*
+/// socket it is holding. Naming it here rather than making the embedder infer
+/// it from arrival order is deliberate: transports are created from a
+/// `HashMap`, so arrival order carries no meaning, and guessing wrong pins a
+/// lane's socket to another lane's network, which is precisely the fault this
+/// seam exists to correct.
+///
+/// A struct rather than a tuple so the receiving side reads as
+/// `socket.instance` / `socket.fd`, and so a future addition (the bound local
+/// address, say) does not break every embedder.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppOwnedUdpSocket {
+    /// The configured instance name this listener was built from — the key in
+    /// a `Named` UDP config, and the same name a peer address qualifies its
+    /// transport field with (`"udp/aware"`, see
+    /// [`TransportSpec`](crate::config::TransportSpec)). `None` for a
+    /// `Single` config, which has no name to give.
+    pub instance: Option<String>,
+    /// The bound socket's raw descriptor. Borrowed, not owned: FIPS keeps the
+    /// socket, and the fd is valid only while the transport is running.
+    pub fd: std::os::unix::io::RawFd,
+}
+
 /// Key for addr_to_link reverse lookup.
 type AddrKey = (TransportId, TransportAddr);
 
@@ -338,7 +373,24 @@ pub struct Node {
     /// the TUN reader/writer threads at TCP MSS clamp time so the
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
     /// and the learned per-destination path MTU.
-    path_mtu_lookup: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, u16>>>,
+    path_mtu_lookup: crate::upper::tun::PathMtuLookup,
+    /// Which transport last supplied a *link seed* into `path_mtu_lookup`,
+    /// per destination.
+    ///
+    /// A `PathMtuEntry` is released when the link that seeded it goes away,
+    /// but two links to one peer can be up at the same time — a phone on both
+    /// BLE and Wi-Fi Aware, say. Then nothing releases the first entry and a
+    /// wider seed from the second transport is refused by the never-loosen
+    /// rule forever. Recording the seeding transport is what distinguishes a
+    /// value that still describes the current path from one that describes a
+    /// path the peer has left. Absent for destinations reached over multiple
+    /// hops: those are never link-seeded, so never-loosen applies unchanged.
+    ///
+    /// An entry lives exactly as long as the `path_mtu_lookup` entry it
+    /// describes: `path_mtu_lookup_release` drops both together, and peer
+    /// removal is one of its callers, so a peer that never comes back leaves
+    /// nothing behind.
+    path_mtu_seeded_by: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, TransportId>>>,
 
     // === Transports & Links ===
     /// Active transports (owned by Node).
@@ -412,10 +464,32 @@ pub struct Node {
     /// Keyed by destination NodeAddr, bounded per-dest and total.
     pending_tun_packets: HashMap<NodeAddr, VecDeque<Vec<u8>>>,
 
+    /// Native API registry: which local ports are held, and where an inbound
+    /// datagram goes. Reached only from the `rx_loop`, so it takes no lock.
+    native: crate::native::registry::Registry,
+
+    /// Native datagrams held per destination while its session establishes.
+    ///
+    /// Deliberately **not** `pending_tun_packets`: that queue is drained
+    /// through `send_ipv6_packet`, which compresses its bytes as an IPv6
+    /// header, and it records neither a port nor a kind, so nothing could tell
+    /// a native datagram from an IPv6 packet once it was in there.
+    pending_native: HashMap<NodeAddr, VecDeque<crate::node::handlers::PendingNative>>,
+
     // === Discovery ===
     /// Discovery-subsystem state: recent-request dedup cache, in-flight
     /// lookups, originator-side backoff, and transit-side forward limiter.
     lookup: Lookup,
+    /// Signing budget for lookups we answer about ourselves (target-side),
+    /// keyed on the link peer the request arrived over. Held here rather than
+    /// inside `lookup` because it is an `Instant`-based limiter and the
+    /// `proto` tree is clockless.
+    discovery_sign_limiter: LookupSignRateLimiter,
+
+    // === Diagnostics ===
+    /// In-flight `probe` jobs plus their per-target ownership claims. Driven
+    /// once per tick by `poll_probes`; see `node::handlers::probe`.
+    probes: handlers::probe::ProbeRegistry,
 
     // === Counters ===
     /// Next link ID to allocate.
@@ -440,26 +514,43 @@ pub struct Node {
     /// live mutable `stats_history` above stays on the tick.
     stats_snapshot: std::sync::Arc<arc_swap::ArcSwap<crate::control::snapshot::StatsSnapshot>>,
 
-    /// Read-side snapshot of the Category-D derived/routing/cache subsystems
+    /// Read-side snapshot of the derived/routing/cache subsystems
     /// (tree / bloom / coord cache / identity cache + F-queue scalars) that the
     /// `show_tree` / `show_bloom` / `show_cache` / `show_routing` /
     /// `show_identity_cache` queries render off the rx_loop. Published from the
-    /// tick (see [`Self::publish_routing_snapshot`] for the Q1 rationale).
+    /// tick (see [`Self::publish_routing_snapshot`] for the rationale).
     routing_snapshot: std::sync::Arc<arc_swap::ArcSwap<crate::control::snapshot::RoutingSnapshot>>,
 
-    /// Read-side snapshot of the Category-E per-entity tables (peers / sessions
+    /// Read-side snapshot of the per-entity tables (peers / sessions
     /// / links / connections / transports + mmp) that the `show_peers` /
     /// `show_sessions` / `show_links` / `show_connections` / `show_transports`
     /// / `show_mmp` queries render off the rx_loop. Published from the tick with
     /// `Vec<Arc<Row>>` structural sharing (unchanged rows reused by pointer);
-    /// see [`Self::publish_entities_snapshot`] for the Q1 rationale.
+    /// see [`Self::publish_entities_snapshot`] for the rationale.
     entities_snapshot: std::sync::Arc<arc_swap::ArcSwap<crate::control::snapshot::EntitySnapshot>>,
+
+    /// Read-side snapshot of the native datagram API registry (flows
+    /// / listeners) that the `show_native_flows` query renders off the rx_loop.
+    /// Published from the tick; see [`Self::publish_native_snapshot`] for why
+    /// the registry itself cannot be shared instead.
+    native_snapshot: std::sync::Arc<arc_swap::ArcSwap<crate::control::snapshot::NativeSnapshot>>,
 
     // === TUN Interface ===
     /// TUN device state.
     tun_state: TunState,
     /// TUN interface name (for cleanup).
     tun_name: Option<String>,
+
+    /// Slot the embedder installs its BLE radio into, armed by
+    /// [`Self::enable_app_owned_ble_radio`]. `None` unless armed.
+    ///
+    /// Gated on the BLE transport existing *and* on its backend being the
+    /// embedder-supplied one — the same condition
+    /// `transport::ble::io_android` itself is compiled under, so the seam is
+    /// absent on platforms whose radio is opened in process, and present in a
+    /// test build so its contract is covered on an ordinary runner.
+    #[cfg(all(ble_available, any(target_os = "android", test)))]
+    ble_radio: Option<Arc<crate::transport::ble::io_android::BleRadioSlot>>,
 
     // === Index-Based Session Dispatch ===
     /// Allocator for session indices.
@@ -470,12 +561,26 @@ pub struct Node {
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
+    /// When each peer identity's last ACCEPTED epoch change tore down its
+    /// peering. Keyed on identity rather than address, and held here rather
+    /// than on `ActivePeer`, because the teardown being dampened destroys
+    /// the peer entry itself. Pruned on insert; see
+    /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
+    restart_dampener: HashMap<NodeAddr, std::time::Instant>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
     msg1_rate_limiter: HandshakeRateLimiter,
+    /// Rate limiter for inbound FSP SessionSetup, keyed on the link peer.
+    setup_rate_limiter: SessionSetupRateLimiter,
     /// Rate limiter for ICMP Packet Too Big messages.
     icmp_rate_limiter: IcmpRateLimiter,
+    /// Budget bounding the routing errors one authenticated link peer can
+    /// induce this node to emit. Keyed on the link peer because that is the
+    /// only value at the emission point a sender cannot mint; the
+    /// per-destination interval inside `routing` is keyed on a field the
+    /// sender chooses and is an aggregate suppressor, not a bound.
+    peer_error_budget: PeerErrorBudget,
     /// Routing-subsystem state (routing error-signal rate limiter).
     routing: Router,
     /// FMP connection-lifecycle decision anchor (stateless; drives the
@@ -489,6 +594,12 @@ pub struct Node {
     mmp: Mmp,
     /// Rate limiter for source-side CoordsRequired/PathBroken responses.
     coords_response_rate_limiter: RoutingErrorRateLimiter,
+    /// Rate limiter for PathBroken-driven path-MTU releases, per destination.
+    /// Deliberately its own instance rather than a share of
+    /// `coords_response_rate_limiter`: a budget another signal can spend is
+    /// not a bound on this one, and one PathBroken drives both responses, so
+    /// a shared limiter would let the coord-warmup arm pay for the release.
+    path_mtu_release_limiter: RoutingErrorRateLimiter,
 
     // === Peering Homeostasis ===
     /// Owner of the peering-reconciler state relocated off `Node`: the sans-IO
@@ -585,6 +696,28 @@ fn build_msg1_rate_limiter(config: &Config) -> HandshakeRateLimiter {
     )
 }
 
+/// Build the per-link session-setup limiter's two bucket sizes.
+///
+/// The stranger bucket is configured directly. The established bucket is
+/// derived exactly as the FMP limiter's is, from `max_peers`, the rekey
+/// period and the resend budget: a hub neighbour can legitimately carry the
+/// rekey traffic of every session this node holds, so that is the population
+/// the per-link bucket has to cover.
+fn build_setup_rate_limiter(config: &Config) -> SessionSetupRateLimiter {
+    let rl = &config.node.rate_limit;
+    let established = rate_limit::derive_established_bucket(
+        config.node.limits.max_peers,
+        config.node.rekey.after_secs,
+        rl.handshake_max_resends,
+        rl.session_setup_burst,
+        rl.session_setup_rate,
+    );
+    SessionSetupRateLimiter::with_params(
+        (rl.session_setup_burst, rl.session_setup_rate),
+        established,
+    )
+}
+
 impl Node {
     /// Create a new node from configuration.
     pub fn new(config: Config) -> Result<Self, NodeError> {
@@ -630,6 +763,7 @@ impl Node {
             config.node.cache.coord_ttl_secs * 1000,
         );
         let msg1_rate_limiter = build_msg1_rate_limiter(&config);
+        let setup_rate_limiter = build_setup_rate_limiter(&config);
 
         let max_connections = config.node.limits.max_connections;
         let max_peers = config.node.limits.max_peers;
@@ -685,6 +819,12 @@ impl Node {
             sessions: HashMap::new(),
             identity_cache: HashMap::new(),
             pending_tun_packets: HashMap::new(),
+            pending_native: HashMap::new(),
+            native: crate::native::registry::Registry::new(crate::native::registry::Limits {
+                per_flow: config.node.native_api.pending_per_flow,
+                backlog: config.node.native_api.backlog,
+                max_flows: config.node.native_api.max_flows,
+            }),
             next_link_id: 1,
             next_transport_id: 1,
             stats: stats::NodeStats::new(),
@@ -699,13 +839,21 @@ impl Node {
             entities_snapshot: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::control::snapshot::EntitySnapshot::empty(),
             )),
+            native_snapshot: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::control::snapshot::NativeSnapshot::empty(),
+            )),
             tun_state,
             tun_name: None,
+            #[cfg(all(ble_available, any(target_os = "android", test)))]
+            ble_radio: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            restart_dampener: HashMap::new(),
             msg1_rate_limiter,
+            setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
+            peer_error_budget: PeerErrorBudget::new(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -713,10 +861,15 @@ impl Node {
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 coords_response_interval_ms,
             ),
+            path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
+                handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
+            ),
+            probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(
                 LookupBackoff::with_params(backoff_base_secs, backoff_max_secs),
                 LookupForwardRateLimiter::with_interval_ms(forward_min_interval_secs * 1000),
             ),
+            discovery_sign_limiter: LookupSignRateLimiter::new(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -727,6 +880,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -777,6 +931,7 @@ impl Node {
             config.node.cache.coord_ttl_secs * 1000,
         );
         let msg1_rate_limiter = build_msg1_rate_limiter(&config);
+        let setup_rate_limiter = build_setup_rate_limiter(&config);
 
         let max_connections = config.node.limits.max_connections;
         let max_peers = config.node.limits.max_peers;
@@ -829,6 +984,12 @@ impl Node {
             sessions: HashMap::new(),
             identity_cache: HashMap::new(),
             pending_tun_packets: HashMap::new(),
+            pending_native: HashMap::new(),
+            native: crate::native::registry::Registry::new(crate::native::registry::Limits {
+                per_flow: config.node.native_api.pending_per_flow,
+                backlog: config.node.native_api.backlog,
+                max_flows: config.node.native_api.max_flows,
+            }),
             next_link_id: 1,
             next_transport_id: 1,
             stats: stats::NodeStats::new(),
@@ -843,13 +1004,21 @@ impl Node {
             entities_snapshot: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::control::snapshot::EntitySnapshot::empty(),
             )),
+            native_snapshot: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::control::snapshot::NativeSnapshot::empty(),
+            )),
             tun_state,
             tun_name: None,
+            #[cfg(all(ble_available, any(target_os = "android", test)))]
+            ble_radio: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
+            restart_dampener: HashMap::new(),
             msg1_rate_limiter,
+            setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
+            peer_error_budget: PeerErrorBudget::new(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -857,7 +1026,12 @@ impl Node {
             coords_response_rate_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 coords_response_interval_ms,
             ),
+            path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
+                handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
+            ),
+            probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(LookupBackoff::new(), LookupForwardRateLimiter::new()),
+            discovery_sign_limiter: LookupSignRateLimiter::new(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -868,6 +1042,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -1004,7 +1179,7 @@ impl Node {
                 let transport_id = self.allocate_transport_id();
                 let adapter = ble_config.adapter().to_string();
                 let mtu = ble_config.mtu();
-                match crate::transport::ble::io::BluerIo::new(&adapter, mtu).await {
+                match crate::transport::ble::io_linux::BluerIo::new(&adapter, mtu).await {
                     Ok(io) => {
                         let mut ble = crate::transport::ble::BleTransport::new(
                             transport_id,
@@ -1026,6 +1201,33 @@ impl Node {
             if !ble_instances.is_empty() {
                 #[cfg(not(test))]
                 tracing::warn!("BLE transport configured but this build lacks BlueZ support");
+            }
+        }
+
+        // Create BLE transport instances over an embedder-supplied radio.
+        // Built whether or not a radio is installed yet: the backend resolves
+        // the slot per operation, so one that arrives later is adopted in
+        // place rather than needing the node rebuilt around it.
+        #[cfg(all(target_os = "android", not(bluer_available), not(test)))]
+        if let Some(slot) = self.ble_radio.clone() {
+            let ble_instances: Vec<_> = self
+                .config()
+                .transports
+                .ble
+                .iter()
+                .map(|(name, config)| (name.map(|s| s.to_string()), config.clone()))
+                .collect();
+            for (name, ble_config) in ble_instances {
+                let transport_id = self.allocate_transport_id();
+                let mut ble = crate::transport::ble::BleTransport::new(
+                    transport_id,
+                    name,
+                    ble_config,
+                    crate::transport::ble::io_android::AndroidIo::new(Arc::clone(&slot)),
+                    packet_tx.clone(),
+                );
+                ble.set_local_pubkey(self.identity().pubkey().serialize());
+                transports.push(TransportHandle::Ble(ble));
             }
         }
 
@@ -1095,7 +1297,7 @@ impl Node {
     /// Resolve a BLE address string (`"adapter/AA:BB:CC:DD:EE:FF"`) to a
     /// (TransportId, TransportAddr) pair by finding the BLE transport
     /// instance matching the adapter name.
-    #[cfg(bluer_available)]
+    #[cfg(ble_available)]
     fn resolve_ble_addr(&self, addr_str: &str) -> Result<(TransportId, TransportAddr), NodeError> {
         let ta = TransportAddr::from_string(addr_str);
         let adapter = crate::transport::ble::addr::adapter_from_addr(&ta).ok_or_else(|| {
@@ -1431,6 +1633,7 @@ impl Node {
             self.stats_snapshot.clone(),
             self.routing_snapshot.clone(),
             self.entities_snapshot.clone(),
+            self.native_snapshot.clone(),
         )
     }
 
@@ -1572,13 +1775,90 @@ impl Node {
         };
         self.stats_snapshot.store(std::sync::Arc::new(snapshot));
 
-        // Publish the Category-D routing read view alongside the stats
+        // Publish the routing read view alongside the stats
         // snapshot, from the same tick.
         self.publish_routing_snapshot();
 
-        // Publish the Category-E per-entity read view from the same tick, with
+        // Publish the per-entity read view from the same tick, with
         // `Vec<Arc<Row>>` structural sharing against the previous snapshot.
         self.publish_entities_snapshot();
+
+        // Publish the native datagram API read view from the same tick.
+        self.publish_native_snapshot();
+    }
+
+    /// Project the native datagram API registry into a
+    /// [`NativeSnapshot`](crate::control::snapshot::NativeSnapshot) and publish
+    /// it via `ArcSwap`, so `show_native_flows` renders off the rx_loop.
+    ///
+    /// **Publisher placement.** The registry is reached only from the rx_loop,
+    /// which is what lets the native receive path take no lock; sharing it with
+    /// the control task would mean locking it and giving that property back.
+    /// The tick is therefore the publisher, as it is for the other three cells.
+    /// The peer's npub needs nothing from `&Node`: the key rides on the
+    /// registry entry, captured where the session authenticated it.
+    fn publish_native_snapshot(&self) {
+        use crate::control::snapshot as snap;
+
+        let flows: Vec<snap::NativeFlowRow> = self
+            .native
+            .flows()
+            .into_iter()
+            .map(|view| snap::NativeFlowRow {
+                flow: view.flow,
+                peer: view.key.peer,
+                peer_key: view.pubkey,
+                local_port: view.key.local,
+                remote_port: view.key.remote,
+                established: view.established,
+                queued: view.queued,
+                since_ms: view.at,
+            })
+            .collect();
+
+        let listeners: Vec<snap::NativeListenerRow> = self
+            .native
+            .listeners()
+            .into_iter()
+            .map(|view| snap::NativeListenerRow {
+                local_port: view.port,
+                backlog: view.backlog,
+            })
+            .collect();
+
+        self.native_snapshot
+            .store(std::sync::Arc::new(snap::NativeSnapshot {
+                flows,
+                listeners,
+            }));
+    }
+
+    /// Borrow the native datagram API registry, read-only.
+    ///
+    /// For the on-loop `show_native_flows` oracle. Every mutation still goes
+    /// through the rx_loop's own handler.
+    pub(crate) fn native(&self) -> &crate::native::registry::Registry {
+        &self.native
+    }
+
+    /// Test-only: reach the native registry mutably, so a test can populate it
+    /// the way the rx_loop's handler does without standing up a client task and
+    /// a socket pair. A parity test over an empty registry proves nothing about
+    /// a publisher that drops fields, which is why this exists.
+    /// The instant at which `peer`'s last ACCEPTED epoch change was stamped,
+    /// or `None` if it has none. Test-only, and it exists for one assertion:
+    /// that a REFUSED epoch-mismatch msg1 leaves this untouched. The refusal
+    /// must not slide the window, or a sustained replay starves a genuinely
+    /// restarting peer for as long as it keeps sending — which is the whole
+    /// point of stamping on acceptance rather than on every sighting.
+    #[cfg(test)]
+    pub(crate) fn restart_dampener_stamp(&self, peer: &NodeAddr) -> Option<std::time::Instant> {
+        self.restart_dampener.get(peer).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_registry_for_test(&mut self) -> &mut crate::native::registry::Registry {
+        &mut self.native
     }
 
     /// Resolve the npub of the spanning-tree root for `show_tree`'s `root_npub`.
@@ -1603,7 +1883,7 @@ impl Node {
         None
     }
 
-    /// Project the Category-D derived/routing/cache state into a
+    /// Project the derived/routing/cache state into a
     /// [`RoutingSnapshot`](crate::control::snapshot::RoutingSnapshot) and
     /// publish it via `ArcSwap`, so `show_tree` / `show_bloom` / `show_cache`
     /// / `show_routing` / `show_identity_cache` render off the rx_loop.
@@ -1804,7 +2084,7 @@ impl Node {
         self.routing_snapshot.store(std::sync::Arc::new(snapshot));
     }
 
-    /// Project the Category-E per-entity tables (peers / sessions / links /
+    /// Project the per-entity tables (peers / sessions / links /
     /// connections / transports + mmp) into an
     /// [`EntitySnapshot`](crate::control::snapshot::EntitySnapshot) and publish
     /// it via `ArcSwap`, so `show_peers` / `show_sessions` / `show_links` /
@@ -1830,8 +2110,8 @@ impl Node {
     /// `Arc` is reused (kept by pointer) whenever it matches the prior row by
     /// identity and compares equal by value, so a tick in which only one
     /// peer/session changed re-allocates only that one row, not the whole table.
-    /// This is what keeps the publish cost off the hot path at scale (the exact
-    /// thing the umbrella warns a naive per-tick rebuild would violate).
+    /// This is what keeps the publish cost off the hot path at scale, which a
+    /// naive whole-table rebuild on every tick would not.
     fn publish_entities_snapshot(&self) {
         use crate::control::snapshot as snap;
 
@@ -2294,20 +2574,21 @@ impl Node {
 
     /// Remove a link.
     ///
-    /// Only removes the addr_to_link reverse lookup if it still points to this
-    /// link. In cross-connection scenarios, a newer link may have replaced the
-    /// entry for the same address.
+    /// Drops every `addr_to_link` entry that still maps to this link, rather
+    /// than only the key rebuilt from the link's own remote address. A link can
+    /// be registered under more than one address form: the cross-connection
+    /// arms key the winner on the *packet's* source address, which need not
+    /// equal the winner's own (a hostname against its resolved numeric form, or
+    /// a different source port on a connection-oriented transport). Rebuilding
+    /// a single key left those entries naming a link that no longer exists, for
+    /// as long as the node ran.
+    ///
+    /// Entries a newer link has already claimed are left alone, since they no
+    /// longer name this link.
     pub fn remove_link(&mut self, link_id: &LinkId) -> Option<Link> {
-        if let Some(link) = self.links.remove(link_id) {
-            // Clean up reverse lookup only if it still maps to this link
-            let key = (link.transport_id(), link.remote_addr().clone());
-            if self.addr_to_link.get(&key) == Some(link_id) {
-                self.addr_to_link.remove(&key);
-            }
-            Some(link)
-        } else {
-            None
-        }
+        let link = self.links.remove(link_id)?;
+        self.addr_to_link.retain(|_, mapped| *mapped != *link_id);
+        Some(link)
     }
 
     /// Single choke-point for dropping a per-peer control machine. Also drops the
@@ -2569,6 +2850,12 @@ impl Node {
     // === End-to-End Sessions ===
 
     /// Get a session by remote NodeAddr.
+    /// Set the per-link-peer lookup signing budget (for tests).
+    #[cfg(test)]
+    pub(crate) fn set_discovery_sign_budget(&mut self, burst: f64, rate: f64) {
+        self.discovery_sign_limiter = LookupSignRateLimiter::with_params(burst, rate);
+    }
+
     /// Disable the discovery forward rate limiter (for tests).
     #[cfg(test)]
     pub(crate) fn disable_discovery_forward_rate_limit(&mut self) {
@@ -2592,9 +2879,21 @@ impl Node {
         self.sessions.remove(remote)
     }
 
-    /// Read the path_mtu_lookup entry for a destination FipsAddress.
+    /// Read the path MTU stored for a destination FipsAddress.
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_get(&self, fips_addr: &crate::FipsAddress) -> Option<u16> {
+        self.path_mtu_lookup
+            .read()
+            .ok()
+            .and_then(|map| map.get(fips_addr).map(|e| e.mtu))
+    }
+
+    /// Read the whole path_mtu_lookup entry, including how it is released.
+    #[cfg(test)]
+    pub(crate) fn path_mtu_lookup_entry(
+        &self,
+        fips_addr: &crate::FipsAddress,
+    ) -> Option<crate::upper::tun::PathMtuEntry> {
         self.path_mtu_lookup
             .read()
             .ok()
@@ -2602,10 +2901,120 @@ impl Node {
     }
 
     /// Write a path_mtu_lookup entry directly (for tests that pre-seed the map).
+    ///
+    /// Writes a held entry, which is what a locally derived seed or a
+    /// session-carried value stores, so pre-seeding does not put a test at
+    /// the mercy of the expiry pass. Use `path_mtu_lookup_learn` for the
+    /// discovery-carrier shape.
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_insert(&self, fips_addr: crate::FipsAddress, mtu: u16) {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
-            map.insert(fips_addr, mtu);
+            map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
+        }
+    }
+
+    /// Write an expiring path_mtu_lookup entry directly, as the discovery
+    /// `LookupResponse` carrier does (for tests that drive the expiry pass).
+    #[cfg(test)]
+    pub(crate) fn path_mtu_lookup_learn(
+        &self,
+        fips_addr: crate::FipsAddress,
+        mtu: u16,
+        at_ms: u64,
+    ) {
+        if let Ok(mut map) = self.path_mtu_lookup.write() {
+            map.insert(
+                fips_addr,
+                crate::upper::tun::PathMtuEntry::learned(mtu, at_ms),
+            );
+        }
+    }
+
+    /// Drop the remote-learned path MTU for a destination whose path is no
+    /// longer valid, then restore what is known locally.
+    ///
+    /// Entries in `path_mtu_lookup` come from two sources: values a remote
+    /// party supplied (discovery responses, `MtuExceeded`, path MTU
+    /// notifications) and the link MTU this node reads from its own transport
+    /// configuration for a directly connected peer. When the path is declared
+    /// broken or the session goes away, the remote-supplied value describes a
+    /// path that no longer exists and must not outlive it, but the locally
+    /// derived one is still true. Removing the entry and then re-running the
+    /// link-peer seed keeps the second while discarding the first; a plain
+    /// removal would silently drop a direct peer back to the conservative
+    /// ceiling until its link re-handshakes.
+    ///
+    /// Three stores describe the same dead path, so this releases all of
+    /// them: the `FipsAddress`-keyed map the TCP MSS clamp reads, the record
+    /// of which transport last link-seeded that map, and the session's own
+    /// source-side path MTU estimate.
+    fn path_mtu_lookup_release(&mut self, addr: &NodeAddr) {
+        // The evidence that corroborates a reactive MtuExceeded described the
+        // path being released, so it does not vouch for whatever replaces it.
+        if let Some(entry) = self.sessions.get_mut(addr) {
+            entry.clear_sent_wire_len();
+        }
+
+        // The session's own source-side estimate described the same dead path,
+        // and the increase ladder is the only thing that would ever raise it
+        // again. Reset it here so the two halves of "this path is gone" stay
+        // together. The two timeout callers remove the session before calling
+        // this, so this arm is reached only from the PathBroken route, where
+        // the session survives the event.
+        //
+        // It runs first so the `&mut self.sessions` borrow ends before the
+        // shared `self.peers` borrow the reseed below takes.
+        if let Some(entry) = self.sessions.get_mut(addr)
+            && let Some(mmp) = entry.mmp_mut()
+        {
+            mmp.path_mtu.reset_source_mtu();
+        }
+
+        let fips_addr = crate::FipsAddress::from_node_addr(addr);
+        match self.path_mtu_lookup.write() {
+            Ok(mut map) => {
+                if map.remove(&fips_addr).is_some() {
+                    tracing::debug!(
+                        dest = %self.peer_display_name(addr),
+                        fips_addr = %fips_addr,
+                        "Released path_mtu_lookup entry for an invalidated path"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    fips_addr = %fips_addr,
+                    error = %e,
+                    "path_mtu_lookup write lock poisoned; entry not released"
+                );
+                return;
+            }
+        }
+        // The seeding record describes the path just released, so it goes with
+        // it. Taken after the guard above is dropped, so
+        // `seed_path_mtu_for_link_peer` remains the only site holding both
+        // locks at once, and before the reseed below, so a peer whose link is
+        // still up writes its transport straight back in.
+        match self.path_mtu_seeded_by.write() {
+            Ok(mut seeded_by) => {
+                seeded_by.remove(&fips_addr);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    fips_addr = %fips_addr,
+                    error = %e,
+                    "path_mtu_seeded_by write lock poisoned; seeding record not released"
+                );
+            }
+        }
+
+        // The write guard above must be dropped before the seed runs: it takes
+        // the same lock, and `std::sync::RwLock` is not re-entrant.
+        if let Some(peer) = self.peers.get(addr)
+            && let Some(transport_id) = peer.transport_id()
+            && let Some(transport_addr) = peer.current_addr().cloned()
+        {
+            self.seed_path_mtu_for_link_peer(addr, transport_id, &transport_addr);
         }
     }
 
@@ -2704,6 +3113,16 @@ impl Node {
         self.pending_tun_packets.len()
     }
 
+    /// Queue a TUN packet for a destination directly (for tests that need a
+    /// pending queue without driving the whole outbound path).
+    #[cfg(test)]
+    pub(crate) fn queue_pending_tun_packet_for_test(&mut self, dest: NodeAddr, packet: Vec<u8>) {
+        self.pending_tun_packets
+            .entry(dest)
+            .or_default()
+            .push_back(packet);
+    }
+
     /// Total TUN packets queued across all destinations.
     pub fn pending_tun_total_packets(&self) -> usize {
         self.pending_tun_packets.values().map(|q| q.len()).sum()
@@ -2755,6 +3174,23 @@ impl Node {
     /// cannot make loop-free forwarding decisions. The caller should signal
     /// `CoordsRequired` back to the source when `None` is returned for a
     /// non-local destination.
+    /// Write one unauthenticated coordinate hint, counting the outcome.
+    ///
+    /// Every production hint write goes through here, so the precedence rule
+    /// has exactly one enforcement point and the counters have exactly one
+    /// increment site. The verified path is deliberately not routed through
+    /// this: a caller that has checked a proof calls
+    /// `CoordCache::insert_verified` directly and says so.
+    pub(crate) fn insert_coord_hint(
+        &mut self,
+        addr: NodeAddr,
+        coords: TreeCoordinate,
+        now_ms: u64,
+    ) {
+        let outcome = self.coord_cache.insert(addr, coords, now_ms);
+        self.metrics().forwarding.record_hint_outcome(outcome);
+    }
+
     pub fn find_next_hop(&mut self, dest_node_addr: &NodeAddr) -> Option<&ActivePeer> {
         // 1. Local delivery
         if dest_node_addr == self.node_addr() {
@@ -2872,6 +3308,177 @@ impl Node {
         self.supervisor.tun_outbound_rx = Some(outbound_rx);
         self.tun_state = TunState::Active;
         (outbound_tx, tun_rx)
+    }
+
+    /// Set up an **app-owned UDP socket option**: FIPS keeps the socket, and
+    /// the embedder gets its raw fd so it can apply a host socket option FIPS
+    /// has no basis to choose. Call this after [`Node::new`] and **before**
+    /// [`Self::start`] — the fd does not exist until the transport binds.
+    ///
+    /// The UDP transport binds one socket and selects the egress path per
+    /// destination address, which assumes the host routes by destination
+    /// alone. Not every host does. Where each socket is instead associated
+    /// with exactly one network interface (or "network") and inbound traffic
+    /// is steered by that association, a peer reachable only over a secondary,
+    /// non-default network is unreachable in a way FIPS can neither see nor
+    /// correct: the address is well-formed, the send succeeds, the peer
+    /// receives our handshake and replies, and the host discards the reply
+    /// before it reaches our socket. Handshake msg1 then retries forever with
+    /// no error surfaced anywhere. Correcting it is a `setsockopt`-class call
+    /// against host-specific network state, on a descriptor the transport
+    /// otherwise keeps entirely private.
+    ///
+    /// ```no_run
+    /// # async fn f(node: &mut fips::Node) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rx = node.enable_app_owned_udp_fd();          // after new(), before start()
+    /// node.start().await?;
+    /// let socket = rx.recv_timeout(std::time::Duration::from_secs(1))?;
+    /// # let _ = (socket.instance, socket.fd); Ok(())
+    /// # }
+    /// ```
+    ///
+    /// One message is sent per UDP transport that successfully binds — the
+    /// usual single-listener configuration therefore yields exactly one, while
+    /// a config with several named UDP listeners yields one per listener, all
+    /// of which an embedder pinning sockets to a network needs. Each message
+    /// carries the instance name its listener was configured under
+    /// ([`AppOwnedUdpSocket::instance`]), which is the only thing that tells
+    /// two otherwise-identical descriptors apart: pinning the wrong socket to
+    /// the wrong network is exactly the fault this seam exists to let an
+    /// embedder fix, so an fd is never handed over unlabelled. A
+    /// [`Self::stop`] followed by another [`Self::start`] delivers the new
+    /// socket's fd on the same channel, since that is a genuinely different
+    /// descriptor. Nothing at all is sent when no UDP transport is configured
+    /// or a configured one fails to bind, so a receive that times out is how
+    /// an embedder tells "no socket" from "here is the socket". Calling this
+    /// twice replaces the first arming: the last receiver wins.
+    ///
+    /// Scope, stated precisely so it is not read as more than it is:
+    ///
+    /// - The fd is the transport's wildcard listen socket. On targets that
+    ///   also run the per-peer connected-UDP fast path (Linux and macOS), the
+    ///   additional `connect()`-ed sockets that path opens per established
+    ///   peer, after `start()` has returned, are not covered by this seam. On
+    ///   targets without that path the wildcard socket is the only UDP socket
+    ///   the transport opens.
+    /// - Transports that adopt a socket supplied from outside (the
+    ///   NAT-traversal bootstrap handoff) do not fire this, since whoever
+    ///   supplied the socket already held its fd and could bind it before
+    ///   handover.
+    /// - FIPS retains ownership. The fd is a borrow valid while the node is
+    ///   running; using it after the transport stops can touch an unrelated
+    ///   reused descriptor.
+    ///
+    /// Unix-only: `RawFd` is a unix concept and the Windows UDP backend has no
+    /// descriptor. The channel is a [`std::sync::mpsc`] one because the
+    /// embedder is not necessarily on a tokio runtime; the sending end lives on
+    /// the supervisor as `udp_fd_tx` and [`Self::start`] fires it from the
+    /// transport-spawn arm, right after the handle reports a successful start.
+    #[cfg(unix)]
+    pub fn enable_app_owned_udp_fd(&mut self) -> std::sync::mpsc::Receiver<AppOwnedUdpSocket> {
+        let (udp_fd_tx, udp_fd_rx) = std::sync::mpsc::channel();
+        self.supervisor.udp_fd_tx = Some(udp_fd_tx);
+        udp_fd_rx
+    }
+
+    /// Set up an **app-owned BLE radio**: the embedder supplies the radio the
+    /// BLE transport drives, because on this platform there is no
+    /// Rust-reachable one to open. Call this after [`Node::new`] and
+    /// **before** [`Self::start`] — the transport is built during `start`, and
+    /// only a node armed by then has a slot to build it over.
+    ///
+    /// Returns the slot. Installing, replacing and clearing a radio through it
+    /// is safe at any time, from any thread, including long after the node is
+    /// running:
+    ///
+    /// ```no_run
+    /// # async fn f(node: &mut fips::Node, radio: std::sync::Arc<dyn fips::transport::ble::io_android::AndroidRadio>)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// let slot = node.enable_app_owned_ble_radio();   // after new(), before start()
+    /// node.start().await?;
+    /// // ...whenever the embedder's radio service comes up, and again each
+    /// // time it restarts:
+    /// slot.install(fips::transport::ble::io_android::AndroidBleBridge::new(radio));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The lateness is the point rather than a convenience. The radio belongs
+    /// to a service whose lifetime is not the node's: the user can turn it on
+    /// after the mesh is already running, and off and on again, and each start
+    /// typically produces a fresh radio. A node that had to be built around an
+    /// existing radio would make that mean "tear the node down and rebuild
+    /// it", dropping every peer, session and route for as long as
+    /// re-handshaking takes. So the transport is built and started whether or
+    /// not a radio is installed, and resolves the slot per operation: it
+    /// listens and scans against whichever radio is there, dials fail while
+    /// there is none, and everything recovers on its own when one appears.
+    /// Streams already open keep the radio they were opened on rather than
+    /// migrating.
+    ///
+    /// Deliberately narrow, and shaped like the [`Self::enable_app_owned_tun`]
+    /// seam it sits beside: one call, no callbacks, and no lifecycle contract
+    /// beyond the slot outliving the node. Arming twice returns the same slot,
+    /// so a second call cannot orphan a radio installed through the first. The
+    /// seam does not exist on platforms whose BLE backend is opened in
+    /// process, since there is nothing there for an embedder to supply.
+    #[cfg(all(ble_available, any(target_os = "android", test)))]
+    pub fn enable_app_owned_ble_radio(
+        &mut self,
+    ) -> Arc<crate::transport::ble::io_android::BleRadioSlot> {
+        Arc::clone(self.ble_radio.get_or_insert_with(|| {
+            Arc::new(crate::transport::ble::io_android::BleRadioSlot::new())
+        }))
+    }
+
+    /// Address the built-in `.fips` DNS responder is listening on, or `None`
+    /// when it is not running (`dns.enabled = false`, the bind failed, or the
+    /// node is stopped).
+    ///
+    /// This is the companion to [`Self::enable_app_owned_tun`] for embedders
+    /// that own the TUN fd. On a platform with no system DNS socket to point
+    /// at us — an Android `VpnService`, whose `addDnsServer()` takes an address
+    /// with no port and aims the OS resolver *into* the tunnel — `.fips`
+    /// queries arrive as IPv6/UDP packets on the app's own fd. The app can
+    /// forward the DNS payload here and splice the answer back into a reply
+    /// packet, rather than reimplementing resolution:
+    ///
+    /// ```no_run
+    /// # async fn f(node: &fips::Node, query: &[u8]) -> std::io::Result<()> {
+    /// let Some(dns) = node.dns_local_addr() else { return Ok(()) };
+    /// let sock = tokio::net::UdpSocket::bind("[::1]:0").await?;
+    /// sock.send_to(query, dns).await?;          // payload only, no IP/UDP header
+    /// let mut answer = [0u8; 512];
+    /// let (n, _) = sock.recv_from(&mut answer).await?;
+    /// # let _ = n; Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Going through the responder rather than resolving in the app is what
+    /// keeps route warming working: answering a `<npub>.fips` query is what
+    /// populates the node's identity cache with that peer's public key, and a
+    /// `FipsAddress` is a truncated hash — the pubkey cannot be recovered from
+    /// the IPv6 address alone. Without a cache entry the first packet to a
+    /// freshly-resolved name is rejected with ICMPv6 "No route". Direct
+    /// neighbours mask this, since their identity comes from the Noise
+    /// handshake and never needed resolving.
+    ///
+    /// Read this **once, after [`Self::start`] returns and before the node is
+    /// moved into a background task** — that is the only window in which an
+    /// embedder running [`Self::run_rx_loop`] holds a `&Node` to call it on, and
+    /// the value is fixed by then: the responder is either up for the rest of
+    /// the node's life or it never came up. The address is read back off the
+    /// bound socket, so a `dns.port = 0` config reports the port the kernel
+    /// actually assigned.
+    ///
+    /// This is a one-shot read, not a liveness feed. `None` distinguishes "no
+    /// responder" from "responder at this address" at that moment; it is not a
+    /// signal an embedder can watch for a responder that dies later, because
+    /// `run_rx_loop` borrows the node exclusively for its whole lifetime.
+    /// Reading live node state from a backgrounded loop is a general gap, not
+    /// one this accessor tries to close.
+    pub fn dns_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.supervisor.dns_local_addr
     }
 
     // === Sending ===

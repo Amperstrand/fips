@@ -223,7 +223,10 @@ than network addresses. A session survives:
 
 FSP uses Noise XK for session encryption, distinct from the Noise IK
 pattern used at the link layer. The full Noise descriptor is
-`Noise_XK_secp256k1_ChaChaPoly_SHA256`.
+`Noise_XK_secp256k1_ChaChaPoly_SHA256`, with one deviation recorded in
+[the security reference](../reference/security.md): the handshake AEAD
+uses an empty associated-data field where standard Noise
+`EncryptAndHash` uses the handshake hash `h`.
 
 The XK pattern (pre-message: `← s`):
 

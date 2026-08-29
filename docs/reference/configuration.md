@@ -20,8 +20,10 @@ locations, lowest to highest priority:
 
 All found files are loaded and merged in priority order. Values from higher
 priority files override those from lower priority files. This allows a system
-administrator to set site-wide defaults in `/etc/fips/fips.yaml` while
-individual deployments override specific values in `./fips.yaml`.
+administrator to set site-wide defaults in the priority 1 path above,
+`/usr/local/etc/fips/fips.yaml` on macOS and `/etc/fips/fips.yaml` on other
+Unix systems, while individual deployments override specific values in
+`./fips.yaml`.
 
 ### CLI Option
 
@@ -54,7 +56,7 @@ peers:       # Static peer list
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `node.control.enabled` | bool | `true` | Enable the control socket |
-| `node.control.socket_path` | string | *(auto)* | **Linux:** Socket file path. Resolved at daemon startup: `$XDG_RUNTIME_DIR/fips/control.sock` if `XDG_RUNTIME_DIR` is set, else `/run/fips/control.sock` if `/run/fips` can be created (typical when running under the shipped systemd unit), else `/tmp/fips-control.sock`. (Note: the `fipsctl` / `fipstop` clients use a different fallback order — `/run/fips` first if it already exists, then `XDG_RUNTIME_DIR`, then `/tmp` — so when both schemes apply, set this field explicitly to avoid mismatch.) **Windows:** TCP port number (default: `21210`); the control socket listens on `127.0.0.1` at this port. |
+| `node.control.socket_path` | string | *(auto)* | **Unix:** Socket file path. Resolution is shared by daemon and clients: `/run/fips/control.sock` when `/run/fips` exists; then `/var/run/fips/control.sock` on macOS/FreeBSD when its private directory exists; then `$XDG_RUNTIME_DIR/fips/control.sock`; finally `/tmp/fips-control.sock`. A privileged macOS daemon selects `/var/run/fips/control.sock` even when the private directory must be created after boot. **Windows:** TCP port number (default: `21210`); the control socket listens on `127.0.0.1` at this port. |
 
 The control socket provides access to node state and runtime management
 via the `fipsctl` command-line tool. In addition to read-only status
@@ -62,7 +64,7 @@ queries, `fipsctl connect` and `fipsctl disconnect` enable runtime peer
 management. See the [`fipsctl` reference](cli-fipsctl.md) for the
 command list.
 
-On Linux, the control socket is a Unix domain socket with filesystem
+On Unix, the control socket is a Unix domain socket with filesystem
 permissions (mode 0770, group `fips`). On Windows, it is a TCP listener
 on localhost. TCP does not provide filesystem-level ACLs, so any local
 user can connect to the control port.
@@ -136,6 +138,8 @@ Handshake rate limiting protects against DoS on the Noise IK handshake path.
 | `node.rate_limit.handshake_max_resends` | u32 | `5` | Max resends per handshake attempt |
 | `node.rate_limit.established_handshake_burst` | u32 | derived | Burst capacity of the established-link bucket. Derived default is `node.limits.max_peers` (128) |
 | `node.rate_limit.established_handshake_rate` | f64 | derived | Refill rate of that bucket. Derived default is `(max_peers / max(node.rekey.after_secs, 1)) * (1 + handshake_max_resends)`, floored at 1.0/s — 6.4/s at shipped defaults |
+| `node.rate_limit.session_setup_burst` | u32 | `64` | Per-link-peer burst for inbound session-setup messages that would open a new session |
+| `node.rate_limit.session_setup_rate` | f64 | `16.0` | Per-link-peer refill rate for those messages, in tokens per second |
 
 Msg1 whose source matches an established link (rekey and restart
 maintenance traffic) draws on a second bucket rather than competing with
@@ -149,6 +153,25 @@ The node's total admitted msg1 rate is the **sum** of the two buckets: 228
 burst and 16.4/s at shipped defaults, of which the established half is
 reachable only by a source that already matches a live link. Size against
 the sum when budgeting handshake crypto load for a host.
+
+The `session_setup_*` pair is a separate limiter on the session layer, not
+the link layer. It is keyed on the authenticated link peer a session datagram
+arrived over, so each neighbour gets its own budget and a flood is
+attributable. Setup messages naming a peer this node is already established
+with (inbound rekey and restart traffic) draw on a second per-link bucket
+derived from `max_peers`, `node.rekey.after_secs` and `handshake_max_resends`,
+exactly as `established_handshake_*` is, so a stranger flood cannot suppress
+rekey traffic sharing the link.
+
+At the defaults one neighbour can force at most
+`session_setup_rate * handshake_timeout_secs` half-open entries (480) and
+`session_setup_rate * (1 + handshake_max_resends)` acks per second (96). The
+node-wide ceiling is still that times the peer count, since the limiter bounds
+each neighbour rather than the aggregate. A legitimate peer whose traffic
+reaches this node over the *same* link as an attacker's shares that
+attacker's stranger bucket, so establishment behind a flooded neighbour is
+refused until the bucket refills; the initiator's own resend schedule (1s, 2s,
+4s, 8s, 16s) covers a short drain.
 
 ### Retry / Backoff (`node.retry.*`)
 
@@ -207,6 +230,7 @@ inert otherwise.
 | `node.discovery.nostr.policy` | string | `"configured_only"` | Advert discovery policy: `disabled`, `configured_only`, `open` |
 | `node.discovery.nostr.open_discovery_max_pending` | usize | `64` | Max open-discovery peers queued in outbound retry/connection state at once |
 | `node.discovery.nostr.max_concurrent_incoming_offers` | usize | `16` | Max concurrent inbound traversal offers processed at once (rate limit against offer spam) |
+| `node.discovery.nostr.max_concurrent_offers_per_npub` | usize | `4` | Max concurrent inbound traversal offers accepted from any one sender npub, so a single identity cannot hold the whole pool. Sits inside `max_concurrent_incoming_offers`, which stays the outer bound; a larger value is inert. Zero is rejected, since it refuses every inbound offer rather than disabling the limit |
 | `node.discovery.nostr.advert_cache_max_entries` | usize | `2048` | Max cached overlay adverts retained from relay traffic |
 | `node.discovery.nostr.seen_sessions_max_entries` | usize | `2048` | Max seen-session IDs retained for replay detection |
 | `node.discovery.nostr.advertise` | bool | `true` | Publish local endpoint adverts |
@@ -326,7 +350,7 @@ cutover.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.rekey.enabled` | bool | `true` | Enable periodic Noise rekey on all links and sessions |
+| `node.rekey.enabled` | bool | `true` | Initiate periodic Noise rekey on links and sessions. A peer-driven session rekey is still answered when this is off, so session keys can still rotate |
 | `node.rekey.after_secs` | u64 | `120` | Initiate rekey after this many seconds on a session |
 | `node.rekey.after_messages` | u64 | `65536` | Initiate rekey after this many messages sent on a session |
 
@@ -379,6 +403,67 @@ tuning under high load or on memory-constrained devices.
 | `node.buffers.packet_channel` | usize | `1024` | Transport to Node packet channel capacity |
 | `node.buffers.tun_channel` | usize | `1024` | TUN to Node outbound channel capacity |
 | `node.buffers.dns_channel` | usize | `64` | DNS to Node identity channel capacity |
+
+### Native Datagram API (`node.native_api.*`)
+
+**Experimental, off by default, and built on Linux, FreeBSD and macOS only.** A
+client process connects to a Unix socket and asks either to open a flow to a
+remote pubkey or to hold a local port. Both answers carry a file descriptor:
+a flow's, which the client sends and receives datagrams on, or a listener's,
+which arriving flows are delivered on. There is no IPv6 emulation and no TUN
+device on this path.
+
+The surface is not stable, is not a reliability layer, and is not the v2
+external process API. No compatibility promise is made about it: the keys
+below, the line protocol behind them, and the Rust client that hides it may
+change or be withdrawn in any release.
+
+The listener is not built on macOS or Windows, and this section is ignored
+there. Two separate things bound that: Windows has no `SCM_RIGHTS` and so no
+way to hand a file descriptor to another process at all, while macOS has
+`SCM_RIGHTS` but does not implement `SOCK_SEQPACKET` for `AF_UNIX`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `node.native_api.enabled` | bool | `false` | Enable the native API socket |
+| `node.native_api.socket_path` | string | *(auto)* | Socket file path. Resolved the same way as the control socket, with the filename `api.sock`: `/run/fips/api.sock` when `/run/fips` exists; then `/var/run/fips/api.sock` on FreeBSD when its private directory exists; then `$XDG_RUNTIME_DIR/fips/api.sock`; finally `/tmp/fips-api.sock` |
+| `node.native_api.pending_per_flow` | usize | `16` | Datagrams held for one flow while it waits to be accepted, or while an established flow's client is slow to read. Refused above 64 at startup: the whole batch is written onto a socket pair the client cannot read yet. Refused below 1: a flow that can hold nothing loses its peer's opening datagram between the arrival being announced and the client taking the flow |
+| `node.native_api.backlog` | usize | `16` | Flows announced on one listener and not yet taken by its task. Refused below 1 at startup: a listener with no backlog admits no flow, so every arrival would be dropped |
+| `node.native_api.max_flows` | usize | `256` | Flows this node holds at once |
+| `node.native_api.debug_commands` | bool | `false` | Answer the `inject`, `stats` and `arrive` debug commands. Not a supported interface |
+
+> **Security note:** the socket is mode `0770`, owned by group `fips`, and
+> that is the whole of the authorization model. **Any user in the `fips` group
+> can impersonate this node on the mesh.** A process that can open the socket
+> can send datagrams under this node's identity to any peer it names, and can
+> hold a port and receive mesh traffic addressed to this node on it. There is
+> no per-client authentication, no capability check and no audit trail beyond
+> the daemon's own logs. On a node with the native API enabled, treat `fips`
+> group membership exactly as you would treat the node's private key. This is
+> why the API is disabled by default, and why enabling it is an explicit
+> operator decision rather than something a package turns on. See
+> [security.md](security.md#native-datagram-api).
+
+A client may hold ports 1024 through 65535. Ports 0 through 255 are reserved
+for protocol use and 256 through 1023 for FIPS standard services (the IPv6
+shim among them), and the daemon refuses both ranges by name. A client that
+names no local port is given one from 49152 upward.
+
+`debug_commands` is a separate gate on three commands that exist only so the
+test harness can drive the receive and dispatch paths without a wire.
+`inject` makes the daemon write bytes the client chose into one of that
+client's own flows, and `arrive` makes it dispatch a datagram as though a peer
+had sent it, reaching any listener this node holds. A node with the key off
+refuses each by name, so a client can tell "this node will not do that" from
+"this build has no such command". Leave it off outside the test harness.
+
+`fipsctl show native-flows` reports the open and pending flows, the bound
+listeners and the `native` counters; see the [`fipsctl`
+reference](cli-fipsctl.md) and
+[control-socket.md](control-socket.md#read-only-queries). A Rust program links
+the crate and speaks the API through the `fips::native::client` module, which
+hides the line protocol; see
+[../how-to/use-the-native-datagram-api.md](../how-to/use-the-native-datagram-api.md).
 
 ## TUN Interface (`tun.*`)
 
@@ -662,8 +747,15 @@ entries become no-ops. Communicates with BlueZ via D-Bus through the
 
 **Advertising and scanning.** When `advertise` is enabled, the transport
 advertises the FIPS service UUID continuously so that nearby nodes can
-discover and connect via L2CAP. When `scan` is enabled, the transport
-continuously scans for other FIPS nodes' advertisements. Discovered
+discover and connect via L2CAP, plus the L2CAP PSM its listener actually
+bound, as a service-data structure (see `src/transport/ble/psm.rs` for the
+wire layout and why platforms with OS-assigned PSMs need it). The
+advertisement carries no device name — alongside the PSM a name no longer
+fits the 31-byte legacy PDU, so the node shows up in generic Bluetooth
+scanners as an unnamed device with the FIPS UUID. When `scan` is enabled,
+the transport continuously scans for other FIPS nodes' advertisements and
+learns each peer's advertised PSM; a peer that advertises none is dialled
+at the configured `psm`. Discovered
 peers are probed immediately (L2CAP connect + pubkey exchange) with a
 cooldown (`probe_cooldown_secs`) to prevent rapid re-probing of the same
 address. If two nodes probe each other at the same time (cross-probe),
@@ -931,6 +1023,8 @@ node:
     handshake_resend_interval_ms: 1000
     handshake_resend_backoff: 2.0
     handshake_max_resends: 5
+    session_setup_burst: 64
+    session_setup_rate: 16.0
   retry:
     max_retries: 5
     base_interval_secs: 5
@@ -985,7 +1079,14 @@ node:
     after_messages: 65536            # rekey after N messages sent
   control:
     enabled: true
-    socket_path: null                # null = auto ($XDG_RUNTIME_DIR → /run/fips → /tmp fallback)
+    socket_path: null                # null = auto (platform runtime dir → XDG → /tmp)
+  # native_api:                      # uncomment to enable the experimental native datagram API
+  #   enabled: true                  # opt-in, default false; not on Windows
+  #   socket_path: /run/fips/api.sock  # omit the key for the resolution above
+  #   pending_per_flow: 16           # datagrams held for one flow; 1..=64
+  #   backlog: 16                    # flows announced on one listener, awaiting its task; at least 1
+  #   max_flows: 256                 # flows this node holds at once
+  #   debug_commands: false          # inject/stats/arrive; test harness only
   buffers:
     packet_channel: 1024
     tun_channel: 1024

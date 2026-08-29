@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use tokio::net::TcpStream;
@@ -141,6 +142,18 @@ pub(crate) trait ProxiedStats: Send + Sync + 'static {
 /// The terminal "receive loop stopped" log is **not** emitted here — it is
 /// hoisted into each per-transport wrapper (tor carries a `direction` field
 /// nym lacks), so this loop is silent on exit.
+///
+/// `first_frame_timeout` bounds the wait for the *first* complete frame only.
+/// It is `Some` for a connection that takes a capped inbound slot from accept
+/// — today only tor's onion listener — and `None` everywhere else, which
+/// covers every outbound connection and the whole of the nym transport (nym
+/// is outbound-only and keeps no counted slots). A deadline expiry is not a
+/// receive error and is deliberately not recorded as one.
+///
+/// `ready_rx`, when present, is the accept loop's readiness barrier: the loop
+/// must not run its cleanup before the accept loop has inserted the pool entry
+/// and bumped its counter, or the removal finds nothing, `on_remove` never
+/// fires, and the increment is stranded for the life of the process.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
     mut reader: OwnedReadHalf,
@@ -151,6 +164,8 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
     mtu: u16,
     stats: Arc<S>,
     label: &'static str,
+    first_frame_timeout: Option<Duration>,
+    ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     on_remove: impl Fn(&S, &M),
 ) {
     debug!(
@@ -160,40 +175,76 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
         label
     );
 
-    loop {
-        match read_fmp_packet(&mut reader, mtu).await {
-            Ok(data) => {
-                stats.record_recv(data.len());
+    // An `Err` here means the accept loop went away between the insert and
+    // the signal. Fall through to the cleanup below rather than returning,
+    // so a pooled entry cannot be stranded with the counter incremented.
+    let admitted = match ready_rx {
+        Some(rx) => rx.await.is_ok(),
+        None => true,
+    };
 
-                trace!(
-                    transport_id = %transport_id,
-                    remote_addr = %remote_addr,
-                    bytes = data.len(),
-                    "{} packet received",
-                    label
-                );
+    if admitted {
+        let mut first = true;
+        loop {
+            let read = match first_frame_timeout {
+                // Bound the first read only. A silent remote otherwise holds its
+                // inbound slot for as long as it keeps the socket open.
+                Some(d) if first => {
+                    match tokio::time::timeout(d, read_fmp_packet(&mut reader, mtu)).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // Not a recv error: `record_recv_error` means framing
+                            // or I/O failure, and folding deadline expiries into
+                            // it corrupts that counter.
+                            debug!(
+                                transport_id = %transport_id,
+                                remote_addr = %remote_addr,
+                                timeout_secs = d.as_secs_f64(),
+                                "No complete frame within the first-frame deadline, dropping inbound {} connection",
+                                label
+                            );
+                            break;
+                        }
+                    }
+                }
+                _ => read_fmp_packet(&mut reader, mtu).await,
+            };
+            first = false;
 
-                let packet = ReceivedPacket::new(transport_id, remote_addr.clone(), data);
+            match read {
+                Ok(data) => {
+                    stats.record_recv(data.len());
 
-                if packet_tx.send(packet).await.is_err() {
+                    trace!(
+                        transport_id = %transport_id,
+                        remote_addr = %remote_addr,
+                        bytes = data.len(),
+                        "{} packet received",
+                        label
+                    );
+
+                    let packet = ReceivedPacket::new(transport_id, remote_addr.clone(), data);
+
+                    if packet_tx.send(packet).await.is_err() {
+                        debug!(
+                            transport_id = %transport_id,
+                            "Packet channel closed, stopping {} receive loop",
+                            label
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    stats.record_recv_error();
                     debug!(
                         transport_id = %transport_id,
-                        "Packet channel closed, stopping {} receive loop",
+                        remote_addr = %remote_addr,
+                        error = %e,
+                        "{} receive error, removing connection",
                         label
                     );
                     break;
                 }
-            }
-            Err(e) => {
-                stats.record_recv_error();
-                debug!(
-                    transport_id = %transport_id,
-                    remote_addr = %remote_addr,
-                    error = %e,
-                    "{} receive error, removing connection",
-                    label
-                );
-                break;
             }
         }
     }

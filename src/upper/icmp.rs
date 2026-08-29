@@ -103,6 +103,31 @@ pub const FIPS_OVERHEAD: u16 = 16 + 16 + 5 + 35 + 12 + 6 + 16; // 106 bytes
 /// ```
 pub const FIPS_IPV6_OVERHEAD: u16 = 77;
 
+/// Smallest remote-supplied transport path MTU this node will act on.
+///
+/// Re-exported: the value is a protocol policy decision and is defined beside
+/// the path-MTU state machine that owns it, in
+/// [`crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU`]. It is named from here
+/// because every site that applies it — the MSS clamp, the lookup response and
+/// the `MtuExceeded` signal — reaches it through this module.
+pub use crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU;
+
+/// Smallest path MTU this node will act on when the claim arrives on the
+/// unauthenticated reactive carrier, `MtuExceeded`.
+///
+/// Held equal to [`MIN_ACTIONABLE_PATH_MTU`] so no hop legitimately configured
+/// with a small transport MTU loses reactive feedback. It is a separate
+/// constant because the two carriers differ in what they prove: the
+/// authenticated `PathMtuNotification` and the proof-carrying discovery
+/// response come from a party this node has verified, whereas this one comes
+/// from whoever could route a datagram here. What keeps a legal-but-forged
+/// claim from pinning a session is corroboration against what this node has
+/// actually sent, not this floor. Raising it (576 is the value the original
+/// path-MTU floor design proposed, and derives an inner IPv6 MTU of 499)
+/// bounds the outcome of an uncorroborated claim further, at the cost of
+/// ignoring an honest report from any hop configured between the two values.
+pub const MIN_REACTIVE_PATH_MTU: u16 = MIN_ACTIONABLE_PATH_MTU;
+
 /// Calculate the effective IPv6 MTU for FIPS-encapsulated traffic.
 ///
 /// Given a transport MTU (e.g., UDP payload size), returns the maximum
@@ -110,6 +135,21 @@ pub const FIPS_IPV6_OVERHEAD: u16 = 77;
 /// through the FIPS mesh after IPv6 header compression.
 pub fn effective_ipv6_mtu(transport_mtu: u16) -> u16 {
     transport_mtu.saturating_sub(FIPS_IPV6_OVERHEAD)
+}
+
+/// Largest TCP segment size a FIPS-encapsulated path of `transport_mtu`
+/// bytes on the wire admits: the effective inner IPv6 MTU less the 40-byte
+/// IPv6 header and the 20-byte TCP header.
+///
+/// Zero means the path has no room for even one payload byte, so no TCP
+/// segment fits and no clamp derived from it carries information. That is
+/// the one condition the SYN-time clamp treats as unusable regardless of
+/// where the MTU came from, and it is why the seed site warns; both read it
+/// from here so they cannot disagree about where the cliff is.
+pub fn mss_ceiling(transport_mtu: u16) -> u16 {
+    effective_ipv6_mtu(transport_mtu)
+        .saturating_sub(40)
+        .saturating_sub(20)
 }
 
 /// Check if we should send an ICMPv6 error for this packet.

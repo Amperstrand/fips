@@ -10,6 +10,7 @@ use crate::node::reject::DiscoveryReject;
 use crate::proto::lookup::{
     LookupAction, LookupRequest, LookupResponse, MAX_RECENT_LOOKUP_REQUESTS,
 };
+use crate::proto::probe::LookupOutcomeKind;
 use crate::transport::{TransportAddr, TransportId};
 use crate::{NodeAddr, PeerIdentity};
 use tracing::{debug, info, trace, warn};
@@ -24,6 +25,41 @@ use tracing::{debug, info, trace, warn};
 /// to borrow only `peers` + `tree_state` instead of the whole node.
 struct NodeRoutingView<'a> {
     node: &'a Node,
+}
+
+/// What [`Node::maybe_initiate_lookup`] did, for callers that report on the
+/// lookup rather than merely triggering it. The three existing data-path call
+/// sites are statement-position and discard it unchanged.
+pub(in crate::node) struct LookupInitiateOutcome {
+    kind: LookupOutcomeKind,
+    /// Peers the LookupRequest actually reached; `None` when the gate declined
+    /// and no request was built.
+    sent: Option<usize>,
+}
+
+impl LookupInitiateOutcome {
+    fn gated(kind: LookupOutcomeKind) -> Self {
+        Self { kind, sent: None }
+    }
+
+    fn sent(sent: usize) -> Self {
+        Self {
+            kind: if sent == 0 {
+                LookupOutcomeKind::ZeroFanout
+            } else {
+                LookupOutcomeKind::Sent
+            },
+            sent: Some(sent),
+        }
+    }
+
+    pub(in crate::node) fn kind(&self) -> LookupOutcomeKind {
+        self.kind
+    }
+
+    pub(in crate::node) fn fanout(&self) -> Option<usize> {
+        self.sent
+    }
 }
 
 impl crate::proto::lookup::RoutingView for NodeRoutingView<'_> {
@@ -68,7 +104,8 @@ impl Node {
         let recent_expiry_ms = self.config().node.lookup.recent_expiry_secs * 1000;
         let my_addr = *self.node_addr();
         use crate::proto::lookup::RequestOutcome;
-        match crate::proto::lookup::classify_request(
+        let peer_count = self.peers.len();
+        let classification = crate::proto::lookup::classify_request(
             &mut self.lookup,
             &request,
             from,
@@ -76,7 +113,22 @@ impl Node {
             now_ms,
             recent_expiry_ms,
             MAX_RECENT_LOOKUP_REQUESTS,
-        ) {
+            peer_count,
+        );
+        // A full cache evicts rather than refuses, and the core charges the
+        // eviction to the peer that filled the cache. Count and log it here:
+        // the core does no metrics and no logging of its own.
+        if let Some(evicted) = classification.evicted {
+            self.metrics().lookup.req_dedup_evicted.inc();
+            debug!(
+                request_id = evicted.request_id,
+                evicted_from = %self.peer_display_name(&evicted.peer),
+                admitting = %self.peer_display_name(from),
+                share = evicted.share,
+                "Lookup dedup cache full, evicting the oldest entry to make room"
+            );
+        }
+        match classification.outcome {
             RequestOutcome::Duplicate => {
                 self.metrics()
                     .lookup
@@ -87,19 +139,25 @@ impl Node {
                     "Duplicate LookupRequest, dropping"
                 );
             }
-            RequestOutcome::DedupCacheFull { len } => {
-                self.metrics()
-                    .lookup
-                    .record_reject(DiscoveryReject::ReqDedupCacheFull);
-                debug!(
-                    request_id = request.request_id,
-                    from = %self.peer_display_name(from),
-                    recent_requests = len,
-                    max_recent_requests = MAX_RECENT_LOOKUP_REQUESTS,
-                    "Discovery request dedup cache full, dropping LookupRequest"
-                );
-            }
             RequestOutcome::RespondAsTarget => {
+                // Answering costs a fresh Schnorr signature every time: the
+                // proof is bound to the requester's request_id, so it cannot
+                // be cached or served twice. Meter that per link peer, or a
+                // neighbour generating request_ids sets this node's signing
+                // rate. The dedup entry the core recorded stays regardless,
+                // so a refused request still occupies its id and a retry,
+                // which carries a fresh id, is unaffected.
+                if !self.discovery_sign_limiter.should_sign(from) {
+                    self.metrics()
+                        .lookup
+                        .record_reject(DiscoveryReject::ReqSignRateLimited);
+                    debug!(
+                        request_id = request.request_id,
+                        from = %self.peer_display_name(from),
+                        "Lookup signing budget spent for this peer, not answering"
+                    );
+                    return;
+                }
                 self.metrics().lookup.req_target_is_us.inc();
                 debug!(
                     request_id = request.request_id,
@@ -161,7 +219,11 @@ impl Node {
         let now_ms = Self::now_ms();
 
         // Check if we forwarded this request (transit node) or originated it
-        match crate::proto::lookup::classify_response(&mut self.lookup, response.request_id) {
+        match crate::proto::lookup::classify_response(
+            &mut self.lookup,
+            response.request_id,
+            &response.target,
+        ) {
             crate::proto::lookup::ResponseRoute::AlreadyForwarded => {
                 // Already forwarded a response for this request — drop to
                 // prevent response routing loops.
@@ -194,6 +256,25 @@ impl Node {
                         "Failed to forward LookupResponse"
                     );
                 }
+            }
+            crate::proto::lookup::ResponseRoute::Unsolicited => {
+                // Nothing outstanding matches this, so acting on it would let
+                // one harvested signed response be replayed at will: each
+                // injection cleared the pending lookup, recorded a
+                // reachability success, refreshed the cached coordinates for a
+                // further full TTL, and flushed queued packets onto a route at
+                // a moment the sender chose. Dropped here, before the identity
+                // resolve and before the verify, so an unsolicited response
+                // costs nothing. This counter has a nonzero floor in healthy
+                // operation: a request is flooded to every qualifying tree
+                // peer, so duplicate replies land here once the first has been
+                // accepted.
+                self.metrics().lookup.resp_unsolicited.inc();
+                debug!(
+                    request_id = response.request_id,
+                    target = %self.peer_display_name(&response.target),
+                    "LookupResponse does not match an outstanding request, dropping"
+                );
             }
             crate::proto::lookup::ResponseRoute::Originator => {
                 // We originated this request — verify proof before caching
@@ -253,6 +334,7 @@ impl Node {
                 // cross-subsystem effects for us to drive.
                 let actions = crate::proto::lookup::on_response_accepted(
                     &mut self.lookup,
+                    response.request_id,
                     &target,
                     response.target_coords,
                     now_ms,
@@ -270,36 +352,81 @@ impl Node {
         for action in actions {
             match action {
                 LookupAction::CacheCoords {
+                    request_id,
                     target,
                     coords,
                     now_ms,
                     path_mtu,
                 } => {
-                    self.coord_cache
-                        .insert_with_path_mtu(target, coords, now_ms, path_mtu);
+                    // The annotation is unsigned and accumulates hop by hop, so
+                    // any forwarder on the reverse path can lower it. A value
+                    // below the actionable floor cannot describe a usable path,
+                    // so treat it as absent: cache the coordinates, which are
+                    // what the proof covers, and store no path MTU from this
+                    // response at all.
+                    if path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+                        warn!(
+                            request_id = request_id,
+                            target = %self.peer_display_name(&target),
+                            path_mtu = path_mtu,
+                            floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
+                            "LookupResponse carries a path MTU below the actionable floor; \
+                             caching coordinates without it"
+                        );
+                        self.metrics().errors.lookup_resp_mtu_below_floor.inc();
+                        self.coord_cache.insert_verified(target, coords, now_ms);
+                    } else {
+                        self.coord_cache
+                            .insert_verified_with_path_mtu(target, coords, now_ms, path_mtu);
+                    }
                 }
-                LookupAction::WritePathMtu { target, path_mtu } => {
+                LookupAction::WritePathMtu {
+                    target,
+                    now_ms,
+                    path_mtu,
+                } => {
+                    // Refused as absent on the CacheCoords arm the core always
+                    // pairs with this one, so there is nothing to mirror; the
+                    // warning and the counter are emitted there, once.
+                    if path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+                        continue;
+                    }
                     // Mirror path_mtu into the FipsAddress-keyed read-only lookup
                     // map used by the TUN reader/writer at TCP MSS clamp time.
                     let fips_addr = crate::FipsAddress::from_node_addr(&target);
                     match self.path_mtu_lookup.write() {
                         Ok(mut map) => match map.get(&fips_addr).copied() {
-                            Some(existing) if existing <= path_mtu => {
+                            Some(existing) if existing.mtu <= path_mtu => {
                                 // Keep the tighter learned value; never loosen
                                 // the clamp. A reactive MtuExceeded or
                                 // PathMtuNotification tighten takes precedence
                                 // over a looser discovery estimate
                                 // (cross-carrier keep-tighter).
+                                //
+                                // This arm deliberately leaves `learned_ms`
+                                // alone. That is what bounds a replayed
+                                // response: the replay of a value already
+                                // stored takes this arm, so the entry still
+                                // expires at first-write plus the TTL rather
+                                // than being pushed out again on every
+                                // injection. Refreshing the stamp here would
+                                // read as a tidy-up and would silently restore
+                                // indefinite pinning.
                                 debug!(
                                     target = %self.peer_display_name(&target),
                                     fips_addr = %fips_addr,
                                     path_mtu = path_mtu,
-                                    existing = existing,
+                                    existing = existing.mtu,
                                     "LookupResponse: keeping tighter existing path_mtu_lookup value"
                                 );
                             }
                             other => {
-                                map.insert(fips_addr, path_mtu);
+                                // The one carrier with no release path, so this
+                                // is the one write that carries a deadline.
+                                map.insert(
+                                    fips_addr,
+                                    crate::upper::tun::PathMtuEntry::learned(path_mtu, now_ms),
+                                );
                                 debug!(
                                     target = %self.peer_display_name(&target),
                                     fips_addr = %fips_addr,
@@ -505,6 +632,15 @@ impl Node {
         };
         let request = LookupRequest::new(request_id, *target, origin, origin_coords, ttl, 0);
 
+        // Recorded here rather than in the callers, so "if a request went out,
+        // its id is recorded" holds for every caller. The response path
+        // correlates against this set.
+        self.lookup
+            .pending_lookups
+            .entry(*target)
+            .or_insert_with(|| crate::proto::lookup::PendingLookup::new(Self::now_ms()))
+            .record(request_id);
+
         // Tree-peer bloom-match selection + single encode live in the sans-IO
         // core. The core keeps the tree-only (no non-tree fallback) behavior;
         // the shell drives the sends and keeps all metrics/logging.
@@ -546,7 +682,10 @@ impl Node {
     /// Subsequent attempts (with fresh request_ids) are scheduled by
     /// [`Self::check_pending_lookups`] when each attempt's per-attempt timeout
     /// expires, using the sequence in `node.lookup.attempt_timeouts_secs`.
-    pub(in crate::node) async fn maybe_initiate_lookup(&mut self, dest: &NodeAddr) {
+    pub(in crate::node) async fn maybe_initiate_lookup(
+        &mut self,
+        dest: &NodeAddr,
+    ) -> LookupInitiateOutcome {
         let now_ms = Self::now_ms();
 
         // Bloom filter pre-check (view read) BEFORE the core call: if no peer's
@@ -563,6 +702,7 @@ impl Node {
                     target_node = %self.peer_display_name(dest),
                     "Discovery lookup deduplicated, already pending"
                 );
+                LookupInitiateOutcome::gated(LookupOutcomeKind::Deduplicated)
             }
             InitiateDecision::Suppressed { failures } => {
                 self.metrics().lookup.req_backoff_suppressed.inc();
@@ -571,6 +711,7 @@ impl Node {
                     failures = failures,
                     "Discovery lookup suppressed by backoff"
                 );
+                LookupInitiateOutcome::gated(LookupOutcomeKind::Suppressed)
             }
             InitiateDecision::BloomMiss => {
                 self.metrics().lookup.req_bloom_miss.inc();
@@ -578,6 +719,7 @@ impl Node {
                     target_node = %self.peer_display_name(dest),
                     "Discovery skipped, target not in any peer bloom filter"
                 );
+                LookupInitiateOutcome::gated(LookupOutcomeKind::BloomMiss)
             }
             InitiateDecision::Proceed => {
                 let ttl = self.config().node.lookup.ttl;
@@ -591,6 +733,7 @@ impl Node {
                         "Discovery failed, no tree peers with bloom match"
                     );
                 }
+                LookupInitiateOutcome::sent(sent)
             }
         }
     }
@@ -651,6 +794,21 @@ impl Node {
         }
     }
 
+    /// Remove expired entries from the recent-request dedup cache.
+    ///
+    /// The ordinary request path purges lazily inside `classify_request`;
+    /// this is the explicit entry point for callers that need the purge
+    /// without an arriving request. Cache and per-peer index are purged
+    /// together, or the eviction policy reads a stale index.
+    ///
+    /// Only the dedup regression tests call it: the production path's purge
+    /// happens inside `classify_request`.
+    #[cfg(test)]
+    pub(in crate::node) fn purge_expired_requests(&mut self, current_time_ms: u64) {
+        let expiry_ms = self.config().node.lookup.recent_expiry_secs * 1000;
+        self.lookup.purge_recent(current_time_ms, expiry_ms);
+    }
+
     /// Min-fold our outgoing-link MTU into a LookupResponse's `path_mtu`.
     ///
     /// Used at both transit-side reverse-path forward and at the target's
@@ -689,6 +847,19 @@ impl Node {
     /// `path_mtu_lookup` empty for their FipsAddress, causing
     /// `per_flow_max_mss` to fall back to the global ceiling and the
     /// SYN-time TCP MSS clamp to over-estimate the effective path.
+    ///
+    /// The never-loosen rule is scoped to a single link. A tighter value is
+    /// evidence about the path it was measured on, so re-seeding from a
+    /// *different* transport than the one that last seeded this destination
+    /// replaces it outright: the peer has moved, and the old measurement
+    /// describes a path it no longer uses. Without that, a peer once
+    /// reachable only over a low-MTU link stays clamped to it for the process
+    /// lifetime even after moving to a wider one.
+    ///
+    /// A destination with no prior seed keeps the never-loosen rule unchanged
+    /// — nothing yet says which link its value describes, so a value learned
+    /// from discovery or from reactive `MtuExceeded` is assumed to be about
+    /// the link now being seeded and is not discarded.
     pub(in crate::node) fn seed_path_mtu_for_link_peer(
         &self,
         peer_addr: &NodeAddr,
@@ -704,6 +875,22 @@ impl Node {
             return;
         };
         let link_mtu = transport.link_mtu(addr);
+        // A locally derived MTU is deliberately exempt from the actionable
+        // floor, so this seeds the value either way, and a narrow link is not
+        // by itself worth reporting: BLE negotiates its MTU per connection and
+        // lands below the floor routinely, where the tight clamp the seed
+        // produces is exactly what the flow needs. Warn only where the link
+        // admits no TCP payload byte at all, since there the SYN-time clamp
+        // has nothing usable to derive and drops the peer onto the
+        // conservative fallback ceiling for as long as the link stands.
+        if crate::upper::icmp::mss_ceiling(link_mtu) == 0 {
+            warn!(
+                peer = %self.peer_display_name(peer_addr),
+                link_mtu = link_mtu,
+                "Link MTU leaves no room for a TCP payload byte; TCP to this peer \
+                 will not work until the link or the transport's mtu setting changes"
+            );
+        }
         let fips_addr = crate::FipsAddress::from_node_addr(peer_addr);
         let Ok(mut map) = self.path_mtu_lookup.write() else {
             warn!(
@@ -712,24 +899,53 @@ impl Node {
             );
             return;
         };
+        // Taken while `path_mtu_lookup` is held. This is the only site that
+        // locks both, so no lock-order inversion is reachable.
+        let Ok(mut seeded_by) = self.path_mtu_seeded_by.write() else {
+            warn!(
+                peer = %self.peer_display_name(peer_addr),
+                "seed_path_mtu_for_link_peer: path_mtu_seeded_by write lock poisoned"
+            );
+            return;
+        };
+        // Only a *prior seed from another transport* proves the peer has
+        // moved. With no prior seed the existing value came from discovery or
+        // reactive learning about the path we are seeding now, so the
+        // never-loosen rule still applies to it.
+        let prior_seed = seeded_by.get(&fips_addr).copied();
+        let relinked = prior_seed.is_some_and(|prior| prior != transport_id);
+        // Recorded whether or not the value changes: the next seed needs to
+        // know which link this one described, otherwise a peer whose first
+        // seed was declined never registers a link at all and a later move
+        // cannot be detected.
+        seeded_by.insert(fips_addr, transport_id);
         match map.get(&fips_addr).copied() {
-            Some(existing) if existing <= link_mtu => {
-                // Keep the tighter learned value; never loosen the clamp.
+            Some(existing) if !relinked && existing.mtu <= link_mtu => {
+                // Keep the tighter learned value; never loosen within a link.
+                // `relinked` is the case upstream's held/release lifecycle does
+                // not reach: two links to one peer can be up at once, so the
+                // old entry is never released and a wider seed from the new
+                // transport would otherwise be refused forever.
                 debug!(
                     peer = %self.peer_display_name(peer_addr),
                     fips_addr = %fips_addr,
                     link_mtu = link_mtu,
-                    existing = existing,
+                    existing = existing.mtu,
                     "seed_path_mtu_for_link_peer: keeping tighter existing value"
                 );
             }
             other => {
-                map.insert(fips_addr, link_mtu);
+                // Held, not expiring: this describes a link this node can see
+                // for itself, and it is released when the link goes.
+                map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(link_mtu));
                 debug!(
                     peer = %self.peer_display_name(peer_addr),
                     fips_addr = %fips_addr,
                     link_mtu = link_mtu,
                     prior = ?other,
+                    prior_transport = ?prior_seed,
+                    transport_id = %transport_id,
+                    relinked = relinked,
                     map_len = map.len(),
                     "seed_path_mtu_for_link_peer: wrote link MTU"
                 );

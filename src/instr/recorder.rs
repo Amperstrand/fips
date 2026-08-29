@@ -57,6 +57,7 @@ pub(crate) enum Step {
     ResendPendingSessionHandshakes,
     ResendPendingSessionMsg3,
     PurgeIdleSessions,
+    PurgeExpiredPathMtu,
     ProcessPendingRetries,
     CheckTreeState,
     CheckBloomState,
@@ -68,6 +69,7 @@ pub(crate) enum Step {
     CheckRekey,
     CheckSessionRekey,
     CheckPendingLookups,
+    PollProbes,
     PollTransportDiscovery,
     SampleTransportCongestion,
     ActivateConnectedUdpSessions,
@@ -94,6 +96,7 @@ pub(crate) const STEPS: [Step; N_STEPS] = [
     Step::ResendPendingSessionHandshakes,
     Step::ResendPendingSessionMsg3,
     Step::PurgeIdleSessions,
+    Step::PurgeExpiredPathMtu,
     Step::ProcessPendingRetries,
     Step::CheckTreeState,
     Step::CheckBloomState,
@@ -105,6 +108,7 @@ pub(crate) const STEPS: [Step; N_STEPS] = [
     Step::CheckRekey,
     Step::CheckSessionRekey,
     Step::CheckPendingLookups,
+    Step::PollProbes,
     Step::PollTransportDiscovery,
     Step::SampleTransportCongestion,
     Step::ActivateConnectedUdpSessions,
@@ -126,6 +130,7 @@ impl Step {
             Step::ResendPendingSessionHandshakes => "resend_pending_session_handshakes",
             Step::ResendPendingSessionMsg3 => "resend_pending_session_msg3",
             Step::PurgeIdleSessions => "purge_idle_sessions",
+            Step::PurgeExpiredPathMtu => "purge_expired_path_mtu",
             Step::ProcessPendingRetries => "process_pending_retries",
             Step::CheckTreeState => "check_tree_state",
             Step::CheckBloomState => "check_bloom_state",
@@ -137,6 +142,7 @@ impl Step {
             Step::CheckRekey => "check_rekey",
             Step::CheckSessionRekey => "check_session_rekey",
             Step::CheckPendingLookups => "check_pending_lookups",
+            Step::PollProbes => "poll_probes",
             Step::PollTransportDiscovery => "poll_transport_discovery",
             Step::SampleTransportCongestion => "sample_transport_congestion",
             Step::ActivateConnectedUdpSessions => "activate_connected_udp_sessions",
@@ -375,9 +381,9 @@ mod tests {
     #[test]
     fn emitted_row_count_matches_build() {
         let emitted = STEPS.iter().filter(|s| s.emitted()).count();
-        // 24 unconditional subsystem steps + the whole-tick span, plus the two
+        // 26 unconditional subsystem steps + the whole-tick span, plus the two
         // conditionally-compiled steps where this build has them.
-        let mut expected = 25;
+        let mut expected = 27;
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             expected += 1;
         }

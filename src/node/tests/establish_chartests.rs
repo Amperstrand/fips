@@ -1032,3 +1032,107 @@ async fn chartest_msg1_rekey_dual_init_we_lose_becomes_responder() {
         "loser (now responder) emits a rekey msg2"
     );
 }
+
+// ===========================================================================
+// Rekey abandon (the tick-loop budget path). Not a `handle_msg1` branch, but it
+// reuses this module's rekey arming and establish helpers, so it lives here.
+// ===========================================================================
+
+/// A rekey cycle abandoned for exhausting its msg1 retransmission budget must
+/// return its session index to the allocator and clear both registry entries
+/// keyed by it, leaving the live session untouched.
+///
+/// `handshake_max_resends = 0` fires the abandon on the first
+/// `resend_pending_rekeys` call: the classifier tests `resend_count >=
+/// max_resends` before it consults the resend-due predicate, so the wall clock
+/// is out of the path entirely.
+#[tokio::test]
+async fn abandoned_rekey_frees_its_index_and_clears_both_registries() {
+    let mut config = Config::new();
+    config.node.rate_limit.handshake_max_resends = 0;
+    let mut node = make_node_with(config);
+    let transport_id = TransportId::new(1);
+    let (peer_sock, peer_addr) = register_udp_with_peer_socket(&mut node, transport_id).await;
+
+    let sender = Identity::generate();
+    let sender_addr = establish_active_peer_via_msg1(
+        &mut node,
+        &sender,
+        [9u8; 8],
+        transport_id,
+        &peer_addr,
+        &peer_sock,
+        1000,
+    )
+    .await;
+
+    let session_index = node
+        .get_peer(&sender_addr)
+        .expect("peer established")
+        .our_index()
+        .expect("the established peer holds a session index");
+    let rekey_index = arm_local_rekey(&mut node, &sender, &sender_addr, transport_id);
+    let allocated_before = node.index_allocator.count();
+
+    // Controls: without these the assertions after the abandon could pass
+    // against state that was never set up.
+    assert!(
+        node.index_allocator.is_allocated(rekey_index),
+        "control: the armed rekey holds an index"
+    );
+    assert!(
+        node.peers_by_index
+            .contains_key(&(transport_id, rekey_index.as_u32())),
+        "control: the rekey index is registered for dispatch"
+    );
+    assert!(
+        node.pending_outbound
+            .contains_key(&(transport_id, rekey_index.as_u32())),
+        "control: the rekey index is registered for msg2 dispatch"
+    );
+
+    // The rekey msg2 never arrives; the first poll spends the (zero) budget.
+    node.resend_pending_rekeys(2000).await;
+
+    let p = node.get_peer(&sender_addr).expect("peer still present");
+    assert!(
+        !p.rekey_in_progress(),
+        "control: the abandon actually fired"
+    );
+    assert!(p.rekey_our_index().is_none());
+
+    assert!(
+        !node.index_allocator.is_allocated(rekey_index),
+        "the abandoned cycle must return its index"
+    );
+    assert_eq!(
+        node.index_allocator.count(),
+        allocated_before - 1,
+        "and must free exactly one"
+    );
+    assert!(
+        !node
+            .peers_by_index
+            .contains_key(&(transport_id, rekey_index.as_u32())),
+        "the abandoned cycle must clear its dispatch registration"
+    );
+    assert!(
+        !node
+            .pending_outbound
+            .contains_key(&(transport_id, rekey_index.as_u32())),
+        "the abandoned cycle must clear its msg2 dispatch entry"
+    );
+
+    // The limb that catches a fix binding the wrong index: the live session is
+    // untouched.
+    assert_eq!(node.peer_count(), 1, "the session survives");
+    assert!(
+        node.index_allocator.is_allocated(session_index),
+        "the established session's own index must not be freed"
+    );
+    assert!(
+        node.peers_by_index
+            .contains_key(&(transport_id, session_index.as_u32())),
+        "the established session stays registered for dispatch"
+    );
+}

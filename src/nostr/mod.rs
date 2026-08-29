@@ -2,8 +2,10 @@ mod advert;
 mod driver;
 mod failure_state;
 mod handoff;
+mod offer_admission;
 mod runtime;
 mod signal;
+mod signal_gate;
 mod stun;
 mod traversal;
 mod traversal_machine;
@@ -11,6 +13,8 @@ mod types;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use signal::FRESHNESS_SKEW_TOLERANCE_MS;
 
 pub use driver::{AdvertTransportSnapshot, RendezvousDriver};
 pub use handoff::{BootstrapHandoffResult, EstablishedTraversal, is_punch_packet};

@@ -40,6 +40,53 @@ pub struct SessionStats {
     /// the key the session was established with. The rekey is
     /// abandoned and the existing session is left intact.
     pub rekey_key_mismatch: u64,
+    /// A setup message naming an already-established peer armed a
+    /// responder-side handshake alongside the running session and a
+    /// SessionAck was sent. The message carries no authenticator, so this
+    /// counts genuine peer restarts and forged setups alike; its rate is
+    /// the signal that something is spraying setup messages, which the
+    /// per-message DEBUG line cannot carry safely at line rate.
+    pub rekey_armed: u64,
+    /// A setup message named an established peer while our own rekey of
+    /// that session was in flight and our address sorted smaller, so the
+    /// tie-break dropped their msg1 and kept us as initiator.
+    pub rekey_tiebreak: u64,
+    /// A setup message named an established peer while our own rekey of
+    /// that session was in flight and our address sorted larger, so we
+    /// abandoned our own rekey and answered as responder. A sustained
+    /// rate here means local key rotation is being suppressed.
+    pub rekey_yielded: u64,
+    /// A setup message named an established peer that already holds a
+    /// completed rekey awaiting cut-over, so the message was dropped
+    /// rather than arming a second handshake.
+    pub rekey_pending: u64,
+    /// A responder-side handshake armed by a peer's setup message passed
+    /// the handshake timeout without a msg3 and was discarded. The
+    /// established session is retained.
+    pub rekey_expired: u64,
+    /// A completed rekey session still waiting for the peer's cut-over was
+    /// replaced by a newer one, completed from a msg3 carrying the same
+    /// authenticated peer key. This drops key material the peer may
+    /// already have adopted, so a sustained rate means one side keeps
+    /// rekeying while the other never appears on the new epoch.
+    pub pending_replaced: u64,
+    /// An inbound SessionAck failed the XK msg2 read against a session we
+    /// are initiating. The entry is kept and the handshake rolled back,
+    /// since the message authenticates nothing; a sustained rate is either
+    /// a broken path to the responder or forged acks holding establishment
+    /// down.
+    pub ack_handshake_failed: u64,
+    /// A setup message was refused by the per-link-peer setup limiter,
+    /// before any handshake state was created or any ack sent.
+    pub setup_rate_limited: u64,
+    /// A session would have been created but the table is at
+    /// `node.limits.max_sessions`. A sustained rate means either the cap
+    /// is sized below what this node legitimately carries, or something is
+    /// holding the table full.
+    pub table_full: u64,
+    /// A session would have been created but unauthenticated half-open
+    /// entries already hold their share of the table.
+    pub half_open_full: u64,
 }
 
 impl SessionStats {
@@ -49,6 +96,16 @@ impl SessionStats {
             bad_state: self.bad_state,
             addr_mismatch: self.addr_mismatch,
             rekey_key_mismatch: self.rekey_key_mismatch,
+            rekey_armed: self.rekey_armed,
+            rekey_tiebreak: self.rekey_tiebreak,
+            rekey_yielded: self.rekey_yielded,
+            rekey_pending: self.rekey_pending,
+            rekey_expired: self.rekey_expired,
+            pending_replaced: self.pending_replaced,
+            ack_handshake_failed: self.ack_handshake_failed,
+            setup_rate_limited: self.setup_rate_limited,
+            table_full: self.table_full,
+            half_open_full: self.half_open_full,
         }
     }
 
@@ -58,6 +115,13 @@ impl SessionStats {
             SessionReject::BadState => self.bad_state += 1,
             SessionReject::AddrMismatch => self.addr_mismatch += 1,
             SessionReject::RekeyKeyMismatch => self.rekey_key_mismatch += 1,
+            SessionReject::RekeyTiebreak => self.rekey_tiebreak += 1,
+            SessionReject::RekeyYielded => self.rekey_yielded += 1,
+            SessionReject::RekeyPending => self.rekey_pending += 1,
+            SessionReject::AckHandshakeFailed => self.ack_handshake_failed += 1,
+            SessionReject::SetupRateLimited => self.setup_rate_limited += 1,
+            SessionReject::TableFull => self.table_full += 1,
+            SessionReject::HalfOpenFull => self.half_open_full += 1,
         }
     }
 }
@@ -150,6 +214,10 @@ impl MmpStats {
 /// typed-rejection enum stays the canonical entry point and so a
 /// future transport-to-node bridge (event or sampling) has a
 /// well-known destination.
+///
+/// `payload_len_mismatch` is different in kind: it counts a framing
+/// drop the node itself performs at the receive dispatch point, so it
+/// has a live writer and can be non-zero on a running node.
 #[derive(Default)]
 pub struct TransportStats {
     /// Reserved for node-side inbound-cap-exceeded admission rejection
@@ -157,18 +225,24 @@ pub struct TransportStats {
     /// on the transport-level stats (`TcpStats::connections_rejected`,
     /// `TorStats::connections_rejected`) directly.
     pub inbound_cap_exceeded: u64,
+    /// Inbound FMP frames dropped because the payload length declared
+    /// in the common prefix did not match the frame the transport
+    /// delivered.
+    pub payload_len_mismatch: u64,
 }
 
 impl TransportStats {
     pub fn snapshot(&self) -> TransportStatsSnapshot {
         TransportStatsSnapshot {
             inbound_cap_exceeded: self.inbound_cap_exceeded,
+            payload_len_mismatch: self.payload_len_mismatch,
         }
     }
 
     pub(super) fn record_reject(&mut self, reason: TransportReject) {
         match reason {
             TransportReject::InboundCapExceeded => self.inbound_cap_exceeded += 1,
+            TransportReject::PayloadLenMismatch => self.payload_len_mismatch += 1,
         }
     }
 }
@@ -227,6 +301,12 @@ pub struct ForwardingStatsSnapshot {
     pub received_bytes: u64,
     pub decode_error_packets: u64,
     pub decode_error_bytes: u64,
+    pub warm_malformed_packets: u64,
+    pub warm_malformed_bytes: u64,
+    pub coord_warm_foreign_root: u64,
+    pub coord_warm_key_mismatch: u64,
+    pub coord_hint_changed: u64,
+    pub coord_hint_rejected: u64,
     pub ttl_exhausted_packets: u64,
     pub ttl_exhausted_bytes: u64,
     pub delivered_packets: u64,
@@ -255,6 +335,8 @@ pub struct LookupStatsSnapshot {
     pub req_decode_error: u64,
     pub req_duplicate: u64,
     pub req_dedup_cache_full: u64,
+    pub req_dedup_evicted: u64,
+    pub req_sign_rate_limited: u64,
     pub req_target_is_us: u64,
     pub req_forwarded: u64,
     pub req_ttl_exhausted: u64,
@@ -270,6 +352,7 @@ pub struct LookupStatsSnapshot {
     pub resp_forwarded: u64,
     pub resp_identity_miss: u64,
     pub resp_proof_failed: u64,
+    pub resp_unsolicited: u64,
     pub resp_no_route: u64,
     pub resp_accepted: u64,
     pub resp_timed_out: u64,
@@ -317,6 +400,16 @@ pub struct SessionStatsSnapshot {
     pub bad_state: u64,
     pub addr_mismatch: u64,
     pub rekey_key_mismatch: u64,
+    pub rekey_armed: u64,
+    pub rekey_tiebreak: u64,
+    pub rekey_yielded: u64,
+    pub rekey_pending: u64,
+    pub rekey_expired: u64,
+    pub pending_replaced: u64,
+    pub ack_handshake_failed: u64,
+    pub setup_rate_limited: u64,
+    pub table_full: u64,
+    pub half_open_full: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -334,6 +427,7 @@ pub struct MmpStatsSnapshot {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TransportStatsSnapshot {
     pub inbound_cap_exceeded: u64,
+    pub payload_len_mismatch: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -341,6 +435,17 @@ pub struct ErrorSignalStatsSnapshot {
     pub coords_required: u64,
     pub path_broken: u64,
     pub mtu_exceeded: u64,
+    pub path_mtu_notif_below_floor: u64,
+    pub mtu_exceeded_below_floor: u64,
+    pub lookup_resp_mtu_below_floor: u64,
+    pub unbound_coords: u64,
+    pub unbound_broken: u64,
+    pub unbound_mtu: u64,
+    pub unbound_forged: u64,
+    pub emit_over_peer_budget: u64,
+    pub emit_over_dest_interval: u64,
+    pub emit_limiter_at_capacity: u64,
+    pub mtu_exceeded_uncorroborated: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -349,6 +454,38 @@ pub struct CongestionStatsSnapshot {
     pub ce_received: u64,
     pub congestion_detected: u64,
     pub kernel_drop_events: u64,
+}
+
+/// Native datagram API counters.
+///
+/// Eight of the `drop_*` fields are one per
+/// [`DropReason`](crate::native::link::DropReason) variant, so a variant added
+/// later has nowhere to hide. `drop_oversize` is the ninth and has no reason
+/// because it is refused on the send side, before the registry sees the
+/// datagram.
+///
+/// Present on every platform even though the API builds only on Linux and
+/// FreeBSD, so `show_metrics` carries one schema everywhere and a consumer does
+/// not branch on the host.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeStatsSnapshot {
+    pub flows_opened: u64,
+    pub flows_accepted: u64,
+    pub flows_closed: u64,
+    pub flows_expired: u64,
+    pub sent_datagrams: u64,
+    pub sent_bytes: u64,
+    pub received_datagrams: u64,
+    pub received_bytes: u64,
+    pub drop_no_port: u64,
+    pub drop_backlog_full: u64,
+    pub drop_too_many_flows: u64,
+    pub drop_pending_queue_full: u64,
+    pub drop_flow_queue_full: u64,
+    pub drop_arrival_queue_full: u64,
+    pub drop_listener_not_reading: u64,
+    pub drop_listener_gone: u64,
+    pub drop_oversize: u64,
 }
 
 #[cfg(test)]
@@ -389,6 +526,33 @@ mod tests {
         stats.record_reject(SessionReject::RekeyKeyMismatch);
         assert_eq!(stats.rekey_key_mismatch, 1);
         assert_eq!(stats.addr_mismatch, 0);
+    }
+
+    #[test]
+    fn session_stats_record_reject_separates_the_three_rekey_arming_refusals() {
+        let mut stats = SessionStats::default();
+        stats.record_reject(SessionReject::RekeyTiebreak);
+        stats.record_reject(SessionReject::RekeyYielded);
+        stats.record_reject(SessionReject::RekeyYielded);
+        stats.record_reject(SessionReject::RekeyPending);
+        assert_eq!(stats.rekey_tiebreak, 1);
+        assert_eq!(stats.rekey_yielded, 2);
+        assert_eq!(stats.rekey_pending, 1);
+        assert_eq!(stats.rekey_armed, 0);
+    }
+
+    #[test]
+    fn session_stats_snapshot_carries_the_rekey_arming_counters() {
+        let mut stats = SessionStats::default();
+        stats.record_reject(SessionReject::RekeyTiebreak);
+        stats.rekey_armed = 7;
+        stats.rekey_expired = 3;
+        stats.pending_replaced = 2;
+        let snap = stats.snapshot();
+        assert_eq!(snap.rekey_tiebreak, 1);
+        assert_eq!(snap.rekey_armed, 7);
+        assert_eq!(snap.rekey_expired, 3);
+        assert_eq!(snap.pending_replaced, 2);
     }
 
     #[test]
@@ -480,5 +644,26 @@ mod tests {
         let mut stats = NodeStats::new();
         stats.record_reject(RejectReason::Transport(TransportReject::InboundCapExceeded));
         assert_eq!(stats.transport.inbound_cap_exceeded, 1);
+    }
+
+    /// Records both transport reasons so a swapped or shared arm shows up
+    /// as a mis-attributed counter rather than as a plausible total.
+    #[test]
+    fn transport_stats_record_reject_keeps_the_two_reasons_on_separate_counters() {
+        let mut s = TransportStats::default();
+        s.record_reject(TransportReject::PayloadLenMismatch);
+        s.record_reject(TransportReject::PayloadLenMismatch);
+        s.record_reject(TransportReject::InboundCapExceeded);
+        assert_eq!(s.payload_len_mismatch, 2);
+        assert_eq!(s.inbound_cap_exceeded, 1);
+    }
+
+    #[test]
+    fn node_stats_record_reject_dispatches_payload_len_mismatch_to_transport() {
+        let mut stats = NodeStats::new();
+        stats.record_reject(RejectReason::Transport(TransportReject::PayloadLenMismatch));
+        assert_eq!(stats.transport.payload_len_mismatch, 1);
+        assert_eq!(stats.transport.inbound_cap_exceeded, 0);
+        assert_eq!(stats.handshake.bad_state, 0);
     }
 }

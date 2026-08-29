@@ -17,7 +17,7 @@ use crate::proto::fsp::{
 };
 use crate::proto::link::SessionDatagram;
 use crate::transport::{TransportAddr, TransportId};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Keep previous session alive for this long after cutover.
 ///
@@ -28,6 +28,48 @@ const DRAIN_WINDOW_SECS: u64 = 10;
 /// Suppress local rekey initiation for this long after receiving
 /// a peer's rekey msg1. FMP-scoped copy for `check_rekey`.
 const REKEY_DAMPENING_SECS: u64 = 30;
+
+/// Floor on the absolute ceiling for `previous`-slot retention after a
+/// cutover, in seconds.
+///
+/// The drain deadline is peer-progress-aware: it slides forward on every
+/// inbound frame that authenticates against the old epoch, so a peer that
+/// keeps sealing in that epoch holds the retired key for as long as it
+/// likes. This bounds that. It has to stay longer than the worst-case
+/// recovery of a legitimate peer that lost msg3, which at stock defaults
+/// is the msg3 resend ladder (about 31 s) plus `handshake_timeout_secs`
+/// (30 s) before the responder abandons plus `REKEY_DAMPENING_SECS`
+/// (30 s) before it may re-initiate, so about 90 s. 120 s clears that
+/// with margin and still bounds retention to roughly one
+/// `node.rekey.after_secs` period. `drain_max_retention_ms` takes the
+/// larger of this floor and the budget the running configuration
+/// actually implies, so a shortened handshake timer cannot push the
+/// ceiling under the recovery it has to clear.
+///
+/// Lowering it below that budget cuts off legitimate slow peers: their
+/// frames go silently undecryptable until their own rekey retry
+/// re-converges the epochs, because nothing tears an established session
+/// down on repeated decrypt failure. Raising it lengthens the window in
+/// which a retired key stays resident.
+const DRAIN_MAX_RETENTION_SECS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 12;
+
+/// Effective ceiling on total `previous`-slot retention, in milliseconds.
+///
+/// The larger of `DRAIN_MAX_RETENTION_SECS` and the msg3 recovery budget
+/// the configured handshake timers imply, so the ceiling always clears
+/// the recovery it is supposed to leave room for.
+pub(in crate::node) fn drain_max_retention_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
+    let mut ladder_ms: u64 = 0;
+    let mut interval = rate_limit.handshake_resend_interval_ms as f64;
+    for _ in 0..rate_limit.handshake_max_resends {
+        ladder_ms = ladder_ms.saturating_add(interval as u64);
+        interval *= rate_limit.handshake_resend_backoff;
+    }
+    let recovery_budget_ms = ladder_ms
+        .saturating_add(rate_limit.handshake_timeout_secs.saturating_mul(1000))
+        .saturating_add(crate::proto::fsp::limits::REKEY_DAMPENING_SECS * 1000);
+    (DRAIN_MAX_RETENTION_SECS * 1000).max(recovery_budget_ms)
+}
 
 impl Node {
     /// Periodic rekey check. Called from the tick loop.
@@ -298,8 +340,11 @@ impl Node {
         };
 
         // Create IK initiator handshake directly (no PeerConnection)
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let mut hs = HandshakeState::new_initiator(our_keypair, peer_pubkey);
+        our_keypair.non_secure_erase();
         hs.set_local_epoch(self.startup_epoch());
 
         let noise_msg1 = match hs.write_message_1() {
@@ -375,8 +420,38 @@ impl Node {
             match action {
                 // Abandon rekey cycles that exhausted their retransmission budget.
                 ConnAction::AbandonRekey { peer: node_addr } => {
-                    if let Some(peer) = self.peers.get_mut(&node_addr) {
-                        peer.abandon_rekey();
+                    // `abandon_rekey` hands back whichever index the abandoned
+                    // cycle owned; dropping the return value orphans it, and the
+                    // `pending_outbound` entry seeded at rekey msg1 with it. Same
+                    // shape as the dual-initiation loser and the rekey-msg2
+                    // failure arm in `handshake.rs`.
+                    //
+                    // The `peers_by_index` removal is parity with those two arms
+                    // and is a no-op at THIS call site: `AbandonRekey` is emitted
+                    // only from the msg1-resend-budget classification, so no rekey
+                    // msg2 ever arrived and nothing was inserted.
+                    //
+                    // Known exposure, kept for parity rather than closed here:
+                    // `transport_id()` is RE-READ, while the `pending_outbound`
+                    // entry was keyed by whatever it was when rekey msg1 went out.
+                    // A roam in between (`set_current_addr` overwrites
+                    // `send.transport_id`) makes the removal miss, so the index is
+                    // freed with a stale entry still pointing at the peer's live
+                    // link. Walked to its end: a later msg2 naming that index on
+                    // the old transport resolves the stale link, finds the
+                    // promoted peer's machine leg-less, finds no peer with a
+                    // matching `rekey_our_index` (this arm cleared it), and takes
+                    // the "not a rekey" arm, which removes the stale entry and
+                    // records a reject. No teardown, no wrong-peer effect.
+                    // Removing by index VALUE would close it outright.
+                    if let Some(peer) = self.peers.get_mut(&node_addr)
+                        && let Some(idx) = peer.abandon_rekey()
+                    {
+                        if let Some(tid) = peer.transport_id() {
+                            self.peers_by_index.remove(&(tid, idx.as_u32()));
+                            self.pending_outbound.remove(&(tid, idx.as_u32()));
+                        }
+                        let _ = self.index_allocator.free(idx);
                     }
                     debug!(
                         peer = %self.peer_display_name(&node_addr),
@@ -548,17 +623,25 @@ impl Node {
     ///   timer, perform the K-bit cutover (overlapping-epoch decrypt
     ///   makes this safe on any schedule — see `FSP_CUTOVER_DELAY_MS`)
     /// - If the drain window has expired, clean up the previous session
+    /// - If a responder-side handshake the peer never finished has aged
+    ///   out, abandon it (the handshake only — a completed rekey session
+    ///   is never discarded on a timer, see
+    ///   [`FspAction::AbandonHandshake`])
     /// - If the rekey timer/counter fires, initiate a new XK handshake
+    ///   (this last one only when `node.rekey.enabled`)
     ///
     /// msg3 retransmission is handled separately by
     /// `resend_pending_session_msg3`; its lifetime is tied to the
     /// responder receiving msg3, not to this initiator's cutover.
     pub(in crate::node) async fn check_session_rekey(&mut self) {
-        if !self.config().node.rekey.enabled {
-            return;
-        }
-
+        // The cutover, drain and abandoned-handshake sweeps run whether or not
+        // periodic rekey is enabled: a peer's setup message is answered in
+        // either configuration, so both a superseded key epoch and an
+        // abandoned handshake can exist with rekey disabled. Only the trigger
+        // that starts a rekey of our own is gated, and the gate now travels
+        // into the core as `RekeyCfg::enabled`.
         let cfg = crate::proto::fsp::RekeyCfg {
+            enabled: self.config().node.rekey.enabled,
             after_secs: self.config().node.rekey.after_secs,
             after_messages: self.config().node.rekey.after_messages,
         };
@@ -566,8 +649,8 @@ impl Node {
 
         // The shell snapshots each established session's rekey ages/flags
         // (every clock read resolved here); the core decides
-        // cutover/drain/trigger with no clock, phase-grouped to preserve the
-        // pre-refactor execution order.
+        // cutover/drain/abandon/trigger with no clock, phase-grouped to
+        // preserve the pre-refactor execution order.
         let snapshots = self.session_rekey_snapshots(now_ms);
         for action in self.fsp.poll_rekey(snapshots, &cfg) {
             match action {
@@ -590,6 +673,25 @@ impl Node {
                         );
                     }
                 }
+                FspAction::AbandonHandshake { addr } => {
+                    // Cheap: no key material is lost, and the slot was
+                    // blocking re-establishment. A completed `pending`
+                    // beside it is left in place.
+                    let age_ms = self
+                        .sessions
+                        .get(&addr)
+                        .map(|entry| now_ms.saturating_sub(entry.last_peer_rekey_ms()))
+                        .unwrap_or(0);
+                    if let Some(entry) = self.sessions.get_mut(&addr) {
+                        entry.abandon_handshake();
+                        self.stats_mut().session.rekey_expired += 1;
+                        info!(
+                            peer = %self.peer_display_name(&addr),
+                            age_ms,
+                            "FSP rekey armed by peer expired without msg3, session retained"
+                        );
+                    }
+                }
                 FspAction::InitiateRekey { addr } => {
                     self.initiate_session_rekey(&addr).await;
                 }
@@ -605,6 +707,18 @@ impl Node {
     fn session_rekey_snapshots(&self, now_ms: u64) -> Vec<SessionSnapshot> {
         let drain_ms = crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 1000;
         let dampening_ms = crate::proto::fsp::limits::REKEY_DAMPENING_SECS * 1000;
+        // Bound for a responder-side handshake the peer armed and never
+        // finished, anchored on the peer's last accepted setup message, which
+        // is the only stamp that path writes. A *completed* rekey has no such
+        // bound and must not acquire one: see `FspAction::AbandonHandshake`.
+        let stale_handshake_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
+        // Absolute ceiling on `previous`-slot retention, measured from the
+        // cutover. The sliding drain deadline is peer-progress-aware, so an
+        // authenticated peer that keeps sealing in the old epoch can hold the
+        // retired key indefinitely; this bounds that without shortening the
+        // grace a peer that lost msg3 legitimately needs. Resolved here rather
+        // than in the core, which reads no clock and no configuration.
+        let drain_max_ms = drain_max_retention_ms(&self.config().node.rate_limit);
         self.sessions
             .iter()
             .filter(|(_, entry)| entry.is_established())
@@ -615,9 +729,11 @@ impl Node {
                 is_rekey_initiator: entry.is_rekey_initiator(),
                 cutover_timer_elapsed: cutover_timer_elapsed(now_ms, entry.rekey_completed_ms()),
                 is_draining: entry.is_draining(),
-                drain_expired: entry.drain_expired(now_ms, drain_ms),
+                drain_expired: entry.drain_expired(now_ms, drain_ms, drain_max_ms),
                 has_rekey_msg3_payload: entry.rekey_msg3_payload().is_some(),
                 is_dampened: entry.is_rekey_dampened(now_ms, dampening_ms),
+                armed_handshake_expired: entry.last_peer_rekey_ms() != 0
+                    && now_ms.saturating_sub(entry.last_peer_rekey_ms()) > stale_handshake_ms,
                 elapsed_secs: now_ms.saturating_sub(entry.session_start_ms()) / 1000,
                 counter: entry.send_counter(),
                 jitter_secs: entry.rekey_jitter_secs(),
@@ -646,8 +762,11 @@ impl Node {
         let dest_pubkey = *entry.remote_pubkey();
 
         // Create Noise XK initiator handshake
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
+        our_keypair.non_secure_erase();
         handshake.set_local_epoch(self.startup_epoch());
 
         let msg1 = match handshake.write_xk_message_1() {

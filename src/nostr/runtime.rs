@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nostr::nips::nip17;
@@ -12,20 +12,26 @@ use nostr::prelude::{
 };
 use nostr_sdk::{Client, ClientOptions, prelude::RelayPoolNotification};
 use serde::Serialize;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::advert::{AdvertMachine, PublishPlan};
 use super::failure_state::FailureState;
 use super::handoff::EstablishedTraversal;
+use super::offer_admission::{AdmissionReject, OfferAdmission};
 use super::signal::{
-    FreshnessOutcome, SignalEnvelope, build_signal_event, create_traversal_answer,
-    create_traversal_offer, estimate_clock_skew, unwrap_signal_event, validate_offer_freshness,
-    validate_traversal_answer_for_offer,
+    FRESHNESS_SKEW_TOLERANCE_MS, FreshnessOutcome, SignalEnvelope, build_signal_event,
+    create_traversal_answer, create_traversal_offer, estimate_clock_skew, unwrap_signal_event,
+    validate_offer_freshness, validate_traversal_answer_for_offer,
 };
+use super::signal_gate::SignalGate;
 use super::stun::observe_traversal_addresses;
-use super::traversal::{nonce, now_ms, planned_remote_endpoints, run_punch_attempt};
+use super::traversal::{
+    PunchTargetTally, is_doc_ip, is_never_punchable_ip, is_private_ip, nonce, now_ms,
+    planned_remote_endpoints, run_punch_attempt,
+};
 use super::traversal_machine::{OfferDisposition, SeenDecision, TraversalMachine};
 use super::types::{
     ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
@@ -45,11 +51,77 @@ fn short_npub(npub: &str) -> String {
         .unwrap_or_else(|| npub.to_string())
 }
 
-fn short_id(id: &str) -> String {
-    if id.len() > 8 {
-        id[..8].to_string()
+/// Whether an inbound-offer rejection belongs to a class that cannot be
+/// explained by ordinary relay delivery lag, and therefore warrants a warning
+/// on a node running at the default log level. A stale offer is benign and is
+/// deliberately excluded.
+pub(super) fn adversarial_offer_reject(err: &BootstrapError) -> bool {
+    matches!(
+        err,
+        BootstrapError::Protocol(reason)
+            if reason == "future-dated-offer"
+                || reason == "identity-mismatch"
+                || reason == "invalid-offer"
+    )
+}
+
+/// Shorten a peer-supplied identifier for logging.
+///
+/// Truncates on a character boundary rather than a byte index. The input is a
+/// session id taken straight from a remote party's JSON with no charset
+/// validation, and slicing by byte offset panics when the boundary falls
+/// inside a multi-byte character.
+pub(super) fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Record, once per planning call, the punch candidates a peer named that we
+/// declined to punch.
+///
+/// One aggregated record rather than one per candidate: a peer's candidate
+/// list is unbounded, so per-candidate logging would trade the packet
+/// amplification the filter closes for a log amplification. `warn` is used for
+/// the shapes no honest peer produces, because `info` is the level a shipped
+/// node collects by default and those refusals are the ones an operator needs
+/// to see; the routine off-subnet case stays at `debug`.
+fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
+    if tally.offered <= tally.admitted && tally.capped == 0 && tally.over_offered == 0 {
+        return;
+    }
+    let sample = tally.sample.as_deref().unwrap_or("-");
+    let reflexive = tally.reflexive.unwrap_or("-");
+    if tally.suspicious() {
+        warn!(
+            peer = %peer,
+            session = %session,
+            offered = tally.offered,
+            admitted = tally.admitted,
+            unparsable = tally.unparsable,
+            zeroport = tally.zeroport,
+            unroutable = tally.unroutable,
+            offsubnet = tally.offsubnet,
+            capped = tally.capped,
+            over_offered = tally.over_offered,
+            reflexive = %reflexive,
+            sample = %sample,
+            "traversal: punch candidates refused"
+        );
     } else {
-        id.to_string()
+        debug!(
+            peer = %peer,
+            session = %session,
+            offered = tally.offered,
+            admitted = tally.admitted,
+            unparsable = tally.unparsable,
+            zeroport = tally.zeroport,
+            unroutable = tally.unroutable,
+            offsubnet = tally.offsubnet,
+            capped = tally.capped,
+            over_offered = tally.over_offered,
+            reflexive = %reflexive,
+            sample = %sample,
+            "traversal: punch candidates refused"
+        );
     }
 }
 
@@ -61,26 +133,11 @@ fn endpoint_summary(endpoints: &[OverlayEndpointAdvert]) -> String {
         .join(",")
 }
 
-fn is_unroutable_direct_advert_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
+/// Addresses an advert must not name as a directly dialable endpoint: the
+/// never-punchable ranges plus the private and documentation ones, which are
+/// useless to a peer that found the advert on a relay.
+pub(super) fn is_unroutable_direct_advert_ip(ip: std::net::IpAddr) -> bool {
+    is_never_punchable_ip(ip) || is_private_ip(ip) || is_doc_ip(ip)
 }
 
 pub(super) fn endpoint_advert_is_publicly_usable(endpoint: &OverlayEndpointAdvert) -> bool {
@@ -152,7 +209,10 @@ pub struct NostrRendezvous {
     advert: AdvertMachine,
     traversal: TraversalMachine,
     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
-    offer_slots: Arc<Semaphore>,
+    admission: OfferAdmission,
+    signal_gate: SignalGate,
+    /// Inbound traversal signals shed before decryption, since process start.
+    shed_signals: AtomicU64,
     event_tx: mpsc::UnboundedSender<BootstrapEvent>,
     event_rx: Mutex<mpsc::UnboundedReceiver<BootstrapEvent>>,
     connect_task: Mutex<Option<JoinHandle<()>>>,
@@ -233,7 +293,15 @@ impl NostrRendezvous {
             return Err(BootstrapError::Disabled);
         }
 
-        let keys = nostr::Keys::parse(&hex::encode(identity.keypair().secret_bytes()))
+        // Three copies of the private key are made to reach `Keys::parse`:
+        // the keypair, its raw bytes, and the hex string. Each is bound and
+        // cleared here; `nostr::Keys` clears its own on drop.
+        let mut our_keypair = identity.keypair();
+        let mut secret_bytes = our_keypair.secret_bytes();
+        let secret_hex = Zeroizing::new(hex::encode(secret_bytes));
+        secret_bytes.zeroize();
+        our_keypair.non_secure_erase();
+        let keys = nostr::Keys::parse(secret_hex.as_str())
             .map_err(|e| BootstrapError::Nostr(e.to_string()))?;
         let client = Client::builder()
             .signer(keys.clone())
@@ -252,7 +320,10 @@ impl NostrRendezvous {
         let pubkey = keys.public_key();
         let npub = crate::encode_npub(&identity.pubkey());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let offer_slots = Arc::new(Semaphore::new(config.max_concurrent_incoming_offers));
+        let admission = OfferAdmission::new(
+            config.max_concurrent_incoming_offers,
+            config.max_concurrent_offers_per_npub,
+        );
 
         let failure_state = FailureState::new(
             config.failure_streak_threshold,
@@ -280,7 +351,9 @@ impl NostrRendezvous {
             advert,
             traversal,
             pending_answers: Mutex::new(HashMap::new()),
-            offer_slots,
+            admission,
+            signal_gate: SignalGate::new(Instant::now()),
+            shed_signals: AtomicU64::new(0),
             event_tx,
             event_rx: Mutex::new(event_rx),
             connect_task: Mutex::new(None),
@@ -541,21 +614,18 @@ impl NostrRendezvous {
             Err(_) => return NostrRefetchOutcome::Skipped,
         };
 
-        let mut newest: Option<(u64, &Event)> = None;
-        for ev in events.iter() {
-            let ts = ev.created_at.as_secs();
-            match newest {
-                Some((cur, _)) if ts <= cur => {}
-                _ => newest = Some((ts, ev)),
+        let Some(ev) = Self::newest_event_by_author(events.iter(), target_pubkey) else {
+            if !events.is_empty() {
+                // The relays answered, but nothing they returned was signed by
+                // this peer. That is no evidence of absence, so keep the entry.
+                return NostrRefetchOutcome::Skipped;
             }
-        }
-
-        let Some((relay_created_at, ev)) = newest else {
             // Absent on relays. Evict any stale cache entry.
             self.advert.remove(peer_npub);
             self.failure_state.reset_streak_after_refresh(peer_npub);
             return NostrRefetchOutcome::Evicted;
         };
+        let relay_created_at = Self::effective_created_at_secs(ev.created_at.as_secs(), now_ms());
 
         match cached_created_at {
             Some(cached) if relay_created_at <= cached => NostrRefetchOutcome::SameAdvert,
@@ -686,7 +756,15 @@ impl NostrRendezvous {
                                 Self::parse_overlay_advert_event(&event, &self.config.app)
                         {
                             let endpoints = endpoint_summary(&advert.endpoints);
-                            let created_at = event.created_at.as_secs();
+                            // Clamped forward to the signal path's skew
+                            // tolerance: an unbounded future `created_at` would
+                            // win every replacement comparison in
+                            // `observe_advert` and buy a proportionally distant
+                            // validity horizon.
+                            let created_at = Self::effective_created_at_secs(
+                                event.created_at.as_secs(),
+                                now_ms(),
+                            );
                             if self.advert.observe_advert(
                                 &author_npub,
                                 advert,
@@ -706,6 +784,41 @@ impl NostrRendezvous {
                     }
 
                     if event.kind != Kind::Custom(SIGNAL_KIND) {
+                        continue;
+                    }
+
+                    // Ahead of the unwrap, which is two NIP-44 decrypts and a
+                    // signature verify run inline on the single task that also
+                    // routes answers and processes adverts. Nothing about the
+                    // sender is known yet — the outer event is signed by a key
+                    // generated per event — so the allowance is necessarily
+                    // shared and indiscriminate, and the reserve is what keeps
+                    // a flood from also shedding the answers to traversals
+                    // this node started.
+                    let awaiting_answers = match self.pending_answers.try_lock() {
+                        Ok(pending) => !pending.is_empty(),
+                        // Contended rather than known empty, so treat it as
+                        // outstanding: the fail-open direction here spends the
+                        // reserve, it does not shed.
+                        Err(_) => true,
+                    };
+                    if let Err(shed) = self.signal_gate.admit(awaiting_answers, Instant::now()) {
+                        let total = self.shed_signals.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Debug, not warn, per event: the party that trips this
+                        // is by definition sending faster than the node wants,
+                        // so a record per drop turns the flood into log volume.
+                        // The doubling summary below is the operator's signal.
+                        debug!(
+                            reason = ?shed,
+                            total,
+                            "shed inbound traversal signal before decrypt"
+                        );
+                        if total.is_power_of_two() {
+                            warn!(
+                                shed = total,
+                                "inbound traversal signals shed before decrypt"
+                            );
+                        }
                         continue;
                     }
 
@@ -749,22 +862,61 @@ impl NostrRendezvous {
                         && offer.message_type == "offer"
                         && offer.recipient_npub == self.npub
                     {
-                        let Ok(permit) = self.offer_slots.clone().try_acquire_owned() else {
-                            warn!(
-                                sender_npub = %sender_npub,
-                                limit = self.config.max_concurrent_incoming_offers,
-                                "rate-limited inbound traversal offer (max_concurrent_incoming_offers reached); offer dropped"
-                            );
-                            continue;
+                        let permit = match self.admission.try_admit(&sender_npub) {
+                            Ok(permit) => permit,
+                            Err(AdmissionReject::GlobalFull) => {
+                                warn!(
+                                    sender_npub = %sender_npub,
+                                    limit = self.config.max_concurrent_incoming_offers,
+                                    "rate-limited inbound traversal offer (max_concurrent_incoming_offers reached); offer dropped"
+                                );
+                                continue;
+                            }
+                            // Debug, not warn: the party that trips this is by
+                            // definition sending faster than the node wants, so
+                            // a record per rejection turns the spam into log
+                            // volume. The global-full arm above stays at warn
+                            // and remains the operator's signal that the node
+                            // is actually saturated.
+                            Err(AdmissionReject::SenderFull) => {
+                                debug!(
+                                    sender_npub = %sender_npub,
+                                    limit = self.config.max_concurrent_offers_per_npub,
+                                    "inbound traversal offer refused: sender is at its per-npub offer allowance"
+                                );
+                                continue;
+                            }
                         };
                         let runtime = Arc::clone(&self);
+                        let peer_short = short_npub(&sender_npub);
+                        let session_short = short_id(&offer.session_id);
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Err(err) = runtime
                                 .handle_incoming_offer(offer, unwrapped.sender, sender_npub)
                                 .await
                             {
-                                debug!(error = %err, "failed to handle traversal offer");
+                                // An offer arriving stale is the expected
+                                // consequence of relay lag and stays at debug.
+                                // The remaining classes cannot arise from lag,
+                                // so they are the operator's only evidence that
+                                // a node is being fed malformed or forged
+                                // signals, and must clear the default level.
+                                if adversarial_offer_reject(&err) {
+                                    warn!(
+                                        peer = %peer_short,
+                                        session = %session_short,
+                                        error = %err,
+                                        "rejected traversal offer"
+                                    );
+                                } else {
+                                    debug!(
+                                        peer = %peer_short,
+                                        session = %session_short,
+                                        error = %err,
+                                        "failed to handle traversal offer"
+                                    );
+                                }
                             }
                         });
                     }
@@ -1000,6 +1152,10 @@ impl NostrRendezvous {
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
         base_socket.set_nonblocking(true)?;
 
+        // This drains every datagram on the traversal socket until the STUN
+        // deadline, so it must complete before any punch can be in flight: a
+        // retry or re-observation once punching has started would swallow the
+        // peer's punch packets.
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
             &base_socket,
             &self.config.stun_servers,
@@ -1107,7 +1263,9 @@ impl NostrRendezvous {
             debug!(
                 peer = %peer_short,
                 session = %short_id(&offer.session_id),
-                "traversal: answer accepted within clock-skew tolerance"
+                answer_issued_at = answer.payload.issued_at,
+                answer_expires_at = answer.payload.expires_at,
+                "traversal: answer accepted within freshness tolerance"
             );
         }
         if !answer.payload.accepted {
@@ -1119,12 +1277,13 @@ impl NostrRendezvous {
             ));
         }
 
-        let remotes = planned_remote_endpoints(
+        let (remotes, tally) = planned_remote_endpoints(
             &offer.local_addresses,
             offer.reflexive_address.as_ref(),
             &answer.payload.local_addresses,
             answer.payload.reflexive_address.as_ref(),
         )?;
+        log_refusals(&tally, &peer_short, &short_id(&session_id));
 
         let remote_addr = run_punch_attempt(
             &base_socket,
@@ -1190,8 +1349,9 @@ impl NostrRendezvous {
                 peer = %peer_short,
                 session = %short_id(&offer.session_id),
                 offer_issued_at = offer.issued_at,
+                offer_expires_at = offer.expires_at,
                 offer_received_at = offer_received_at,
-                "traversal: offer accepted within clock-skew tolerance"
+                "traversal: offer accepted within freshness tolerance"
             );
         }
         // Collapse the dual-`auto_connect` four-socket dance to a single
@@ -1265,6 +1425,10 @@ impl NostrRendezvous {
 
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
         base_socket.set_nonblocking(true)?;
+        // This drains every datagram on the traversal socket until the STUN
+        // deadline, so it must complete before any punch can be in flight: a
+        // retry or re-observation once punching has started would swallow the
+        // peer's punch packets.
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
             &base_socket,
             &self.config.stun_servers,
@@ -1311,14 +1475,15 @@ impl NostrRendezvous {
             return Ok(());
         }
 
-        let remotes = planned_remote_endpoints(
+        let (remotes, tally) = planned_remote_endpoints(
             &answer.local_addresses,
             answer.reflexive_address.as_ref(),
             &offer.local_addresses,
             offer.reflexive_address.as_ref(),
         )?;
+        log_refusals(&tally, &peer_short, &short_id(&offer.session_id));
 
-        if let Ok(remote_addr) = run_punch_attempt(
+        let punch = run_punch_attempt(
             &base_socket,
             &offer.session_id,
             &remotes,
@@ -1328,23 +1493,33 @@ impl NostrRendezvous {
                 .expect("accepted answers always include a punch hint"),
             Duration::from_secs(self.config.attempt_timeout_secs),
         )
-        .await
-        {
-            debug!(
-                peer = %peer_short,
-                session = %short_id(&offer.session_id),
-                remote = %remote_addr,
-                "traversal: responder punch succeeded"
-            );
-            let _ = self.event_tx.send(BootstrapEvent::Established {
-                traversal: EstablishedTraversal::new(
-                    offer.session_id,
-                    offer.sender_npub,
-                    remote_addr,
-                    base_socket,
-                )
-                .with_transport_name("nostr-nat"),
-            });
+        .await;
+        match punch {
+            Ok(remote_addr) => {
+                debug!(
+                    peer = %peer_short,
+                    session = %short_id(&offer.session_id),
+                    remote = %remote_addr,
+                    "traversal: responder punch succeeded"
+                );
+                let _ = self.event_tx.send(BootstrapEvent::Established {
+                    traversal: EstablishedTraversal::new(
+                        offer.session_id,
+                        offer.sender_npub,
+                        remote_addr,
+                        base_socket,
+                    )
+                    .with_transport_name("nostr-nat"),
+                });
+            }
+            Err(err) => {
+                debug!(
+                    peer = %peer_short,
+                    session = %short_id(&offer.session_id),
+                    error = %err,
+                    "traversal: responder punch failed"
+                );
+            }
         }
 
         let _ = self.publish_delete(&relays, [answer_event.id]).await;
@@ -1392,15 +1567,16 @@ impl NostrRendezvous {
             if author_npub != peer_npub {
                 continue;
             }
+            let created_at = Self::effective_created_at_secs(event.created_at.as_secs(), now_ms());
             let replace = best
                 .as_ref()
-                .map(|current| event.created_at.as_secs() >= current.created_at)
+                .map(|current| created_at >= current.created_at)
                 .unwrap_or(true);
             if replace {
                 best = Some(CachedOverlayAdvert {
                     author_npub,
                     advert,
-                    created_at: event.created_at.as_secs(),
+                    created_at,
                     valid_until_ms,
                 });
             }
@@ -1470,7 +1646,7 @@ impl NostrRendezvous {
                 return Ok(self.config.dm_relays.clone());
             }
         };
-        let newest = events.iter().max_by_key(|event| event.created_at.as_secs());
+        let newest = Self::newest_event_by_author(events.iter(), target_pubkey);
         if let Some(event) = newest {
             let relays = nip17::extract_relay_list(event)
                 .map(|relay| relay.to_string())
@@ -1574,6 +1750,42 @@ impl NostrRendezvous {
         self.advert.event_valid_until_ms(event, now_ms())
     }
 
+    /// Newest event in `events` that was actually signed by `author`.
+    ///
+    /// The relay pool verifies each event's signature but does not check a
+    /// reply against the REQ filter unless `verify_subscriptions` or
+    /// `ban_relay_on_mismatch` is set, and neither is. A relay may therefore
+    /// answer an author-filtered request with an event it signed itself, so
+    /// the author test happens here, before the timestamp contest, not after:
+    /// a future-dated foreign event must not be able to suppress the genuine
+    /// one by winning `created_at`.
+    pub(super) fn newest_event_by_author<'a>(
+        events: impl Iterator<Item = &'a Event>,
+        author: PublicKey,
+    ) -> Option<&'a Event> {
+        events
+            .filter(|event| event.pubkey == author)
+            .max_by_key(|event| event.created_at.as_secs())
+    }
+
+    /// A peer's advert `created_at`, in seconds, clamped so it can never read
+    /// more than `FRESHNESS_SKEW_TOLERANCE_MS` ahead of `now_ms`.
+    ///
+    /// An unbounded future `created_at` buys a cache entry two things it
+    /// should not have: a proportionally distant validity horizon, and an
+    /// unbeatable position in every replacement comparison, so a later genuine
+    /// advert can never displace it. Clamping rather than rejecting is
+    /// deliberate: a node whose own clock runs slow reads every peer's honest
+    /// advert as future-dated, and rejecting would take out Nostr-mediated
+    /// dialing for every peer at once with nothing but a cache miss to show
+    /// for it. Raising the tolerance widens the window in which a future-dated
+    /// advert outranks an honest one; lowering it makes an ordinary clock
+    /// difference look hostile.
+    pub(super) fn effective_created_at_secs(created_at_secs: u64, now_ms: u64) -> u64 {
+        let ceiling_secs = now_ms.saturating_add(FRESHNESS_SKEW_TOLERANCE_MS) / 1000;
+        created_at_secs.min(ceiling_secs)
+    }
+
     pub(super) fn compute_advert_valid_until_ms(
         event: &Event,
         advert_max_age_ms: u64,
@@ -1583,7 +1795,8 @@ impl NostrRendezvous {
             return None;
         }
 
-        let created_ms = event.created_at.as_secs().saturating_mul(1000);
+        let created_ms = Self::effective_created_at_secs(event.created_at.as_secs(), now_ms)
+            .saturating_mul(1000);
         let created_window_until = created_ms.saturating_add(advert_max_age_ms);
         if created_window_until <= now_ms {
             return None;
@@ -1702,7 +1915,10 @@ impl NostrRendezvous {
             .opts(ClientOptions::new().autoconnect(false))
             .build();
         let config = NostrRendezvousConfig::default();
-        let offer_slots = Arc::new(Semaphore::new(config.max_concurrent_incoming_offers));
+        let admission = OfferAdmission::new(
+            config.max_concurrent_incoming_offers,
+            config.max_concurrent_offers_per_npub,
+        );
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let failure_state = FailureState::new(
             config.failure_streak_threshold,
@@ -1729,7 +1945,9 @@ impl NostrRendezvous {
             advert,
             traversal,
             pending_answers: Mutex::new(HashMap::new()),
-            offer_slots,
+            admission,
+            signal_gate: SignalGate::new(Instant::now()),
+            shed_signals: AtomicU64::new(0),
             event_tx,
             event_rx: Mutex::new(event_rx),
             connect_task: Mutex::new(None),
@@ -1799,6 +2017,12 @@ impl NostrRendezvous {
     /// unit tests to set up consumer-side state without needing live relays.
     pub(crate) async fn insert_advert_for_test(&self, npub: String, advert: CachedOverlayAdvert) {
         self.advert.insert_fetched(&npub, advert);
+    }
+
+    /// The cached `created_at` for `npub`, or `None` when nothing is cached.
+    /// Lets a unit test observe whether a refetch evicted an entry.
+    pub(crate) async fn cached_created_at_for_test(&self, npub: &str) -> Option<u64> {
+        self.advert.cached_created_at(npub)
     }
 
     /// Queue a bootstrap event directly for lifecycle tests without live relays

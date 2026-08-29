@@ -1621,6 +1621,124 @@ pub(crate) fn show_identity_cache_from_handle(
     })
 }
 
+/// How `show_native_flows` names a flow's lifecycle state.
+///
+/// Two states and not three: the registry either holds a flow a client has
+/// taken, or one it announced and is still waiting to be answered about. A
+/// rejected or expired flow is gone from the registry entirely and has nothing
+/// to report.
+fn native_flow_state(established: bool) -> &'static str {
+    if established {
+        "established"
+    } else {
+        "pending_accept"
+    }
+}
+
+/// `show_native_flows` — Native datagram API flows and listeners.
+///
+/// Two representations of one peer, on purpose. `peer` is the npub, which is
+/// the address a client names and the only form the native API itself reports.
+/// `peer_addr` is the 16-byte node address, kept because this is an operator
+/// surface and it is what `show_sessions` and `show_routing` key on. Both are
+/// always present: the flow carries its peer's key, so nothing is resolved
+/// here and nothing can be missing.
+pub fn show_native_flows(node: &Node) -> Value {
+    let now = now_ms();
+
+    let flows: Vec<Value> = node
+        .native()
+        .flows()
+        .into_iter()
+        .map(|view| {
+            json!({
+                "flow_id": view.flow,
+                "peer": crate::identity::encode_npub(&view.pubkey),
+                "peer_addr": hex::encode(view.key.peer.as_bytes()),
+                "local_port": view.key.local,
+                "remote_port": view.key.remote,
+                "state": native_flow_state(view.established),
+                "queued": view.queued,
+                "age_ms": now.saturating_sub(view.at),
+            })
+        })
+        .collect();
+
+    let listeners: Vec<Value> = node
+        .native()
+        .listeners()
+        .into_iter()
+        .map(|view| {
+            json!({
+                "local_port": view.port,
+                "backlog": view.backlog,
+            })
+        })
+        .collect();
+
+    let native_stats = node.metrics().native.snapshot();
+
+    json!({
+        "flows": flows,
+        "listeners": listeners,
+        "stats": serde_json::to_value(&native_stats).unwrap_or_default(),
+    })
+}
+
+/// Off-loop variant of [`show_native_flows`]: renders from the tick-published
+/// [`NativeSnapshot`](super::snapshot::NativeSnapshot) plus the `native`
+/// counter family from the `MetricsRegistry`.
+/// `age_ms` is derived at render time from the captured `since_ms`, exactly as
+/// [`show_native_flows`] computed it. Output is byte-identical to
+/// [`show_native_flows`].
+///
+/// A flow's `queued` depth is as of the last publish rather than as of the
+/// read, which is the same point-in-time property every other snapshot cell
+/// has; the underlying channel is drained by the client's own task and has no
+/// value a control task could read anyway.
+pub(crate) fn show_native_flows_from_handle(
+    handle: &super::read_handle::ControlReadHandle,
+) -> Value {
+    let native = handle.native();
+    let now = now_ms();
+
+    let flows: Vec<Value> = native
+        .flows
+        .iter()
+        .map(|row| {
+            json!({
+                "flow_id": row.flow,
+                "peer": crate::identity::encode_npub(&row.peer_key),
+                "peer_addr": hex::encode(row.peer.as_bytes()),
+                "local_port": row.local_port,
+                "remote_port": row.remote_port,
+                "state": native_flow_state(row.established),
+                "queued": row.queued,
+                "age_ms": now.saturating_sub(row.since_ms),
+            })
+        })
+        .collect();
+
+    let listeners: Vec<Value> = native
+        .listeners
+        .iter()
+        .map(|row| {
+            json!({
+                "local_port": row.local_port,
+                "backlog": row.backlog,
+            })
+        })
+        .collect();
+
+    let native_stats = handle.metrics().native.snapshot();
+
+    json!({
+        "flows": flows,
+        "listeners": listeners,
+        "stats": serde_json::to_value(&native_stats).unwrap_or_default(),
+    })
+}
+
 /// `show_stats_list` — Enumerate available history metrics and their units.
 pub fn show_stats_list() -> Value {
     let metrics: Vec<Value> = ALL_METRICS
@@ -2340,6 +2458,7 @@ pub(crate) fn show_metrics_from_handle(handle: &super::read_handle::ControlReadH
         "bloom": m.bloom.snapshot(),
         "congestion": m.congestion.snapshot(),
         "errors": m.errors.snapshot(),
+        "native": m.native.snapshot(),
     })
 }
 
@@ -2565,7 +2684,7 @@ mod tests {
         }
     }
 
-    // ---- 18 handler snapshot tests --------------------------------------
+    // ---- 19 handler snapshot tests --------------------------------------
 
     #[test]
     fn snapshot_show_status() {
@@ -2646,6 +2765,12 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_show_native_flows() {
+        let node = build_test_node();
+        assert_snapshot("show_native_flows", &render(show_native_flows(&node)));
+    }
+
+    #[test]
     fn snapshot_show_stats_list() {
         // Static — no Node needed.
         assert_snapshot("show_stats_list", &render(show_stats_list()));
@@ -2687,8 +2812,8 @@ mod tests {
         assert_snapshot("show_stats_history_all_peers", &render_response(resp));
     }
 
-    /// The five Category-D queries cut over to off-loop serving in R3. Served
-    /// via `snapshot_dispatch`; coverage asserted in
+    /// The five derived/routing/cache queries served off-loop via
+    /// `snapshot_dispatch`; coverage asserted in
     /// `snapshot_dispatch_serves_category_d_queries` below.
     const OFF_LOOP_CATEGORY_D: &[&str] = &[
         "show_tree",
@@ -2698,7 +2823,7 @@ mod tests {
         "show_identity_cache",
     ];
 
-    /// The six Category-E queries cut over to off-loop serving in R4. Served via
+    /// The six per-entity table queries served off-loop via
     /// `snapshot_dispatch`; coverage asserted in
     /// `snapshot_dispatch_serves_category_e_queries`.
     const OFF_LOOP_CATEGORY_E: &[&str] = &[
@@ -2710,7 +2835,7 @@ mod tests {
         "show_mmp",
     ];
 
-    /// Milestone-completion contract: every pure-read `show_*` query is served
+    /// Contract: every pure-read `show_*` query is served
     /// off-loop via `snapshot_dispatch`, and the rx_loop control path carries no
     /// `show_*` arm at all — only the mutating COMMAND handlers (`connect` /
     /// `disconnect`) reach it. This test enumerates the full read surface and
@@ -2756,6 +2881,7 @@ mod tests {
             ("show_connections", None),
             ("show_transports", None),
             ("show_mmp", None),
+            ("show_native_flows", None),
         ];
         for (cmd, params) in read_queries {
             let req = Request {
@@ -2767,8 +2893,17 @@ mod tests {
             assert_eq!(resp.status, "ok", "{cmd} off-loop response not ok");
         }
 
-        // Mutations are NOT served off-loop; they take the rx_loop COMMAND path.
-        for cmd in ["connect", "disconnect"] {
+        // Mutations are NOT served off-loop; they take the rx_loop COMMAND
+        // path. A probe served from the one-tick-stale off-loop snapshot would
+        // silently never run, so the three probe commands are asserted here
+        // alongside connect/disconnect.
+        for cmd in [
+            "connect",
+            "disconnect",
+            "probe_start",
+            "probe_poll",
+            "probe_cancel",
+        ] {
             let req = Request {
                 command: cmd.to_string(),
                 params: None,
@@ -2780,12 +2915,106 @@ mod tests {
         }
     }
 
+    /// Schema guard for the probe report. Built by hand from a terminal
+    /// outcome so the fixture pins field names, nesting and the flattened
+    /// stage status.
+    #[test]
+    fn probe_report_json_shape() {
+        use crate::control::probe::{
+            BloomStage, CleanupInfo, DiscoveryStage, NextHopInfo, PathStage, ProbeReport, RttStage,
+            SessionStage, StageStatus, TargetInfo,
+        };
+
+        let status = |verdict, elapsed| StageStatus {
+            verdict,
+            reason: None,
+            detail: None,
+            elapsed_ms: Some(elapsed),
+        };
+        let report = ProbeReport {
+            probe_id: 7,
+            target: TargetInfo {
+                npub: "npub1qq8s4f7x".to_string(),
+                node_addr: "4a1f9c22e08b5d3714aa06fb92c1de55".to_string(),
+                display_name: "hydra".to_string(),
+                ipv6_addr: "fd00:4a1f:9c22:e08b:5d37:14aa:06fb:92c1".to_string(),
+            },
+            overall: "ok",
+            elapsed_ms: 4000,
+            tick_ms: 1000,
+            bloom: BloomStage {
+                status: status("ok", 0),
+                fanout: Some(3),
+            },
+            discovery: DiscoveryStage {
+                status: status("ok", 2000),
+                source: Some("lookup"),
+                attempts: Some(2),
+                attempt_timeouts_secs: vec![1, 2, 4, 8],
+            },
+            path: PathStage {
+                status: status("ok", 0),
+                computed_locally: true,
+                observed: false,
+                coords_known: true,
+                our_coords: vec!["4d2201ff".to_string(), "91b40c6e".to_string()],
+                their_coords: vec!["4a1f9c22".to_string(), "91b40c6e".to_string()],
+                our_depth: Some(1),
+                their_depth: Some(1),
+                same_root: Some(true),
+                lca: Some("91b40c6e".to_string()),
+                lca_depth: Some(0),
+                tree_hops_up: Some(1),
+                tree_hops_down: Some(1),
+                tree_distance: Some(2),
+                next_hop: Some(NextHopInfo {
+                    node_addr: "91b40c6e".to_string(),
+                    display_name: "relay-a".to_string(),
+                    class: "tree_up",
+                    direct_peer: false,
+                    leaves_tree_walk: false,
+                }),
+                no_hop_reason: None,
+            },
+            session: SessionStage {
+                status: status("ok", 1000),
+                preexisting: false,
+                established: true,
+                path_mtu: Some(1420),
+            },
+            rtt: RttStage {
+                status: status("ok", 1000),
+                rtt_ms: Some(18),
+                srtt_ms: Some(18.0),
+                reports_seen: 1,
+                samples: 1,
+                zero_samples: 0,
+                arith_failures: 0,
+            },
+            cleanup: CleanupInfo {
+                session_created_and_torn_down: true,
+                session_left_intact: false,
+                left_intact_reason: None,
+                lookup_issued: true,
+                coords_were_cached: false,
+                identity_was_cached: false,
+                warmups_sent: 1,
+            },
+        };
+
+        let mut value = serde_json::to_value(&report).expect("report serializes");
+        normalize_value(&mut value);
+        let sorted = sort_object_keys(&value);
+        let actual = serde_json::to_string_pretty(&sorted).expect("pretty");
+        assert_snapshot("probe_report", &actual);
+    }
+
     /// Structural confirmation that the rx_loop no longer dispatches `show_*`:
     /// the rx_loop source carries no `queries::dispatch` call and no
     /// `starts_with("show_")` routing branch. Reads the committed source of
     /// `src/node/dataplane/rx_loop.rs` and asserts both markers are absent. This
-    /// is the milestone's "remove `show_*` from the data-plane dispatch path"
-    /// invariant, guarded against regression.
+    /// guards the "no `show_*` on the data-plane dispatch path" invariant
+    /// against regression.
     #[test]
     fn rx_loop_has_no_show_dispatch() {
         let src = include_str!("../node/dataplane/rx_loop.rs");
@@ -2823,6 +3052,7 @@ mod tests {
             ("bloom", "accepted"),
             ("congestion", "ce_forwarded"),
             ("errors", "coords_required"),
+            ("native", "flows_opened"),
         ];
         assert_eq!(
             obj.len(),
@@ -2850,10 +3080,10 @@ mod tests {
         }
     }
 
-    /// The R1/R2 scalar-and-series queries are served off-loop via
+    /// The scalar-and-series queries are served off-loop via
     /// `snapshot_dispatch`; mutations return `None` and take the rx_loop COMMAND
     /// path. (`show_stats_peers` / `show_stats_history_all_peers`, formerly
-    /// asserted on-loop here, were cut over in R5 — see
+    /// asserted on-loop here, are now served off-loop too — see
     /// `snapshot_dispatch_serves_every_read_query` for the full read surface.)
     #[test]
     fn snapshot_dispatch_serves_scalar_and_series_queries() {
@@ -2888,7 +3118,7 @@ mod tests {
                 "show_stats_all_history",
                 Some(json!({ "window": "10s", "granularity": "1s" })),
             ),
-            // R3 Category-D cutover.
+            // Derived/routing/cache queries, served off-loop.
             ("show_tree", None),
             ("show_bloom", None),
             ("show_cache", None),
@@ -2910,7 +3140,7 @@ mod tests {
         }
     }
 
-    /// R5 cutover + byte-identity: after a `record_stats_history()` tick the
+    /// Byte-identity: after a `record_stats_history()` tick the
     /// off-loop `show_acl` / `show_stats_peers` / `show_stats_history_all_peers`
     /// renders each equal their on-loop oracle byte-for-byte, and all three are
     /// served off-loop via `snapshot_dispatch`.
@@ -2996,7 +3226,7 @@ mod tests {
         assert_eq!(snap.connection_count, node.connection_count());
         assert_eq!(snap.estimated_mesh_size, node.estimated_mesh_size());
         assert_eq!(snap.effective_ipv6_mtu, node.effective_ipv6_mtu());
-        // R5: the ACL status projection matches the node's live ACL status.
+        // The ACL status projection matches the node's live ACL status.
         assert_eq!(snap.acl_status, node.peer_acl_status());
 
         // Off-loop render must equal the on-loop render byte-for-byte.
@@ -3008,9 +3238,9 @@ mod tests {
         );
     }
 
-    /// The five Category-D queries are served off-loop via `snapshot_dispatch`
-    /// (return `Some` with status ok); everything not cut over stays on the
-    /// rx_loop path (`None`).
+    /// The five derived/routing/cache queries are served off-loop via
+    /// `snapshot_dispatch` (return `Some` with status ok); everything not cut
+    /// over stays on the rx_loop path (`None`).
     #[test]
     fn snapshot_dispatch_serves_category_d_queries() {
         use super::super::protocol::Request;
@@ -3033,7 +3263,7 @@ mod tests {
         }
 
         // Mutations take the rx_loop COMMAND path. (Every read query, including
-        // the per-peer stats-series queries, is served off-loop as of R5.)
+        // the per-peer stats-series queries, is served off-loop.)
         for cmd in ["connect", "disconnect"] {
             assert!(
                 snapshot_dispatch(&req(cmd), &handle).is_none(),
@@ -3043,7 +3273,7 @@ mod tests {
     }
 
     /// The tick-published `RoutingSnapshot` reflects node state, and each
-    /// off-loop Category-D render equals its on-loop render byte-for-byte
+    /// off-loop routing render equals its on-loop render byte-for-byte
     /// (modulo the volatile-key redaction the wire-schema tests already apply).
     #[test]
     fn routing_snapshot_matches_on_loop_after_tick() {
@@ -3102,10 +3332,11 @@ mod tests {
         );
     }
 
-    // ---- R4 Category-E coverage ------------------------------------------
+    // ---- per-entity table coverage ---------------------------------------
 
-    /// The six Category-E queries are served off-loop via `snapshot_dispatch`
-    /// (return `Some` with status ok); mutations take the rx_loop COMMAND path.
+    /// The six per-entity table queries are served off-loop via
+    /// `snapshot_dispatch` (return `Some` with status ok); mutations take the
+    /// rx_loop COMMAND path.
     #[test]
     fn snapshot_dispatch_serves_category_e_queries() {
         use super::super::protocol::Request;
@@ -3128,7 +3359,7 @@ mod tests {
         }
 
         // Mutations take the rx_loop COMMAND path. (Every read query is served
-        // off-loop as of R5.)
+        // off-loop.)
         for cmd in ["connect", "disconnect"] {
             assert!(
                 snapshot_dispatch(&req(cmd), &handle).is_none(),
@@ -3138,7 +3369,7 @@ mod tests {
     }
 
     /// Freshness + fidelity: after a `record_stats_history()` tick (the entity
-    /// publisher site) each off-loop Category-E render equals its on-loop render
+    /// publisher site) each off-loop per-entity render equals its on-loop render
     /// byte-for-byte, and the seeded snapshot is empty before the first tick.
     #[test]
     fn entity_snapshot_matches_on_loop_after_tick() {
@@ -3188,7 +3419,168 @@ mod tests {
         );
     }
 
-    /// Structural sharing (the R4 umbrella mandate): a republish in which only
+    // ---- native datagram API coverage ------------------------------------
+
+    /// Freshness + fidelity: after a `record_stats_history()` tick (the native
+    /// publisher site) the off-loop `show_native_flows` render equals its
+    /// on-loop oracle byte-for-byte, and the query is served off-loop.
+    #[test]
+    fn native_snapshot_matches_on_loop_after_tick() {
+        use super::super::protocol::Request;
+        use super::super::read_handle::snapshot_dispatch;
+
+        let mut node = build_test_node();
+
+        // Put something in the registry first. Asserting the seed cell is empty
+        // against an empty registry would observe the absence of the very thing
+        // it checks and could not fail; with a listener already bound, an empty
+        // cell says the handle reads a published snapshot rather than the live
+        // registry.
+        let (arrivals, _arrivals_rx) = tokio::sync::mpsc::channel(8);
+        node.native_registry_for_test()
+            .listen(Some(4242), arrivals)
+            .expect("port 4242 is free on a fresh node");
+
+        let handle = node.control_read_handle();
+        assert!(
+            handle.native().flows.is_empty() && handle.native().listeners.is_empty(),
+            "the seed native snapshot is empty until the first tick publishes"
+        );
+
+        // Advance one tick (the publisher site).
+        node.record_stats_history();
+        let handle = node.control_read_handle();
+        assert_eq!(
+            handle.native().listeners.len(),
+            1,
+            "the tick publishes the listener the registry already held"
+        );
+
+        let req = Request {
+            command: "show_native_flows".to_string(),
+            params: None,
+        };
+        let resp =
+            snapshot_dispatch(&req, &handle).expect("show_native_flows must be served off-loop");
+        assert_eq!(
+            resp.status, "ok",
+            "show_native_flows off-loop response not ok"
+        );
+
+        assert_eq!(
+            render(show_native_flows(&node)),
+            render(show_native_flows_from_handle(&handle)),
+            "off-loop show_native_flows must match on-loop output"
+        );
+    }
+
+    /// The publisher carries every field the oracle emits, for flows it can only
+    /// get wrong once there are some to get wrong. The registry is populated
+    /// directly (the rx_loop's own handler is what does this in the daemon) and
+    /// then published: an empty-registry parity test passes just as happily
+    /// against a publisher that drops every per-flow field.
+    ///
+    /// Both flow kinds appear, because they are rendered by different arms: a
+    /// flow the client opened, and one pending accept whose peer the node has
+    /// never had in any cache.
+    #[test]
+    fn native_snapshot_carries_a_populated_registry_faithfully() {
+        use crate::native::registry::Delivery;
+
+        let mut node = build_test_node();
+
+        // A flow the client opened, naming its peer by key.
+        let known = Identity::from_secret_bytes(&[0x11; 32]).expect("valid secret key");
+        let known_addr = *known.node_addr();
+
+        // And one a listener accepted, whose peer the node has never had in
+        // any cache: the key still reaches the report, because the flow
+        // carries it rather than the report resolving it.
+        let stranger = Identity::from_secret_bytes(&[0x5C; 32]).expect("valid secret key");
+        let unknown_addr = *stranger.node_addr();
+
+        let (sink, _sink_rx) = tokio::sync::mpsc::channel(8);
+        node.native_registry_for_test()
+            .connect(known.pubkey(), 5000, Some(6000), sink, 1_000)
+            .expect("a fresh node holds no flows");
+        let (arrivals, _arrivals_rx) = tokio::sync::mpsc::channel(8);
+        node.native_registry_for_test()
+            .listen(Some(4242), arrivals)
+            .expect("port 4242 is free on a fresh node");
+
+        let registry = node.native_registry_for_test();
+        let announced = match registry.deliver(unknown_addr, stranger.pubkey(), 5001, 4242, 2_000) {
+            Delivery::Arrived(_, arrival) => arrival.flow,
+            other => panic!("expected an arrival, got {other:?}"),
+        };
+        assert!(registry.hold(announced, b"held".to_vec()));
+
+        node.record_stats_history();
+        let handle = node.control_read_handle();
+
+        let on_loop = show_native_flows(&node);
+        let flows = on_loop["flows"].as_array().expect("flows is an array");
+        assert_eq!(flows.len(), 2, "both flows are reported");
+
+        assert_eq!(flows[0]["flow_id"], json!(1));
+        assert_eq!(
+            flows[0]["peer_addr"],
+            json!(hex::encode(known_addr.as_bytes()))
+        );
+        assert_eq!(flows[0]["peer"], json!(known.npub()));
+        assert_eq!(flows[0]["local_port"], json!(6000));
+        assert_eq!(flows[0]["remote_port"], json!(5000));
+        assert_eq!(flows[0]["state"], json!("established"));
+        assert_eq!(flows[0]["queued"], json!(0));
+
+        assert_eq!(flows[1]["flow_id"], json!(announced));
+        assert_eq!(
+            flows[1]["peer_addr"],
+            json!(hex::encode(unknown_addr.as_bytes()))
+        );
+        assert_eq!(
+            flows[1]["peer"],
+            json!(stranger.npub()),
+            "a flow learned from the wire reports its peer's npub too: the key \
+             was captured where the session authenticated it, so nothing has to \
+             invert the node address"
+        );
+        assert_eq!(flows[1]["local_port"], json!(4242));
+        assert_eq!(flows[1]["remote_port"], json!(5001));
+        assert_eq!(flows[1]["state"], json!("pending_accept"));
+        assert_eq!(flows[1]["queued"], json!(1), "the held datagram is queued");
+
+        let listeners = on_loop["listeners"]
+            .as_array()
+            .expect("listeners is an array");
+        assert_eq!(listeners.len(), 1, "the bound listener is reported");
+        assert_eq!(listeners[0]["local_port"], json!(4242));
+        assert_eq!(listeners[0]["backlog"], json!(1));
+
+        // `age_ms` is derived from `since_ms` and is redacted by `render`, so the
+        // parity assertion below cannot see the publisher dropping the flow
+        // timestamp. Pin the captured absolute times against the ones the
+        // registry was given.
+        assert_eq!(
+            handle.native().flows[0].since_ms,
+            1_000,
+            "the publisher carries the connect time the registry recorded"
+        );
+        assert_eq!(
+            handle.native().flows[1].since_ms,
+            2_000,
+            "the publisher carries the announce time the registry recorded"
+        );
+
+        // And the published snapshot renders the same thing.
+        assert_eq!(
+            render(on_loop),
+            render(show_native_flows_from_handle(&handle)),
+            "off-loop show_native_flows must match on-loop output for live flows"
+        );
+    }
+
+    /// Structural sharing: a republish in which only
     /// one row changed re-allocates only that one `Arc<Row>` — every unchanged
     /// row is reused by pointer (`Arc::ptr_eq`). Exercises
     /// [`reconcile_rows`](super::super::snapshot::reconcile_rows), the

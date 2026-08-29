@@ -75,13 +75,25 @@ async fn test_inbound_msg1_denied_by_acl() {
     assert_eq!(node_b.link_count(), 0);
 }
 
-#[tokio::test]
-async fn test_outbound_msg2_denied_after_acl_reload() {
-    let (dir, mut node_a) = make_acl_node();
+/// Drive a dialing node up to the instant a genuine msg2 arrives from a
+/// responder its denylist has just been reloaded to reject, and hand back the
+/// node, the responder's NodeAddr, and the msg2 packet ready to deliver.
+///
+/// `config_a` receives the responder's npub so a caller can list it as a
+/// configured peer, which is what makes the reject arm's retry reschedule
+/// observable.
+async fn outbound_denied_at_msg2(
+    config_a: impl FnOnce(&str) -> Config,
+) -> (tempfile::TempDir, Node, NodeAddr, ReceivedPacket) {
     let node_b = make_node();
+    let dir = tempfile::tempdir().unwrap();
+    let mut node_a = Node::new(config_a(&node_b.npub())).unwrap();
+    node_a.peer_acl = PeerAclReloader::with_paths(allow_path(&dir), deny_path(&dir));
+
     let transport_id = TransportId::new(1);
     let remote_addr = TransportAddr::from_string("127.0.0.1:5001");
     let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full());
+    let node_b_addr = *peer_b_identity.node_addr();
 
     let link_id_a = node_a.allocate_link_id();
     let our_index_a = node_a.index_allocator.allocate().unwrap();
@@ -134,10 +146,61 @@ async fn test_outbound_msg2_denied_after_acl_reload() {
     assert!(node_a.reload_peer_acl().await);
 
     let packet = ReceivedPacket::with_timestamp(transport_id, remote_addr, wire_msg2, 1100);
+    (dir, node_a, node_b_addr, packet)
+}
+
+#[tokio::test]
+async fn test_outbound_msg2_denied_after_acl_reload() {
+    let (_dir, mut node_a, _node_b_addr, packet) =
+        outbound_denied_at_msg2(|_npub| Config::new()).await;
+
     node_a.handle_msg2(packet).await;
 
     assert_eq!(node_a.peer_count(), 0);
     assert_eq!(node_a.connection_count(), 0);
+    assert_eq!(node_a.link_count(), 0);
+    assert!(node_a.pending_outbound.is_empty());
+}
+
+/// The outbound ACL reject arm disposes of the whole leg — machine, link and
+/// index — which takes it out of the stuck-leg sweep that would otherwise reach
+/// `note_handshake_timeout`. For a configured peer the dial must therefore be
+/// put back on the retry schedule from the arm itself, or the node never dials
+/// again after the ACL is relaxed.
+#[tokio::test]
+async fn test_outbound_msg2_acl_reject_reschedules_a_configured_peer() {
+    let (_dir, mut node_a, node_b_addr, packet) = outbound_denied_at_msg2(|npub| {
+        let mut config = Config::new();
+        config.peers.push(crate::config::PeerConfig::new(
+            npub,
+            "udp",
+            "127.0.0.1:5001",
+        ));
+        config
+    })
+    .await;
+
+    assert!(
+        node_a.peering.reconciler.retry_pending.is_empty(),
+        "control: nothing is scheduled before the reject"
+    );
+
+    node_a.handle_msg2(packet).await;
+
+    let state = node_a
+        .peering
+        .reconciler
+        .retry_pending
+        .get(&node_b_addr)
+        .expect("the rejected dial is back on the retry schedule");
+    assert_eq!(state.retry_count, 1, "counted as a first failure");
+    assert!(
+        state.retry_after_ms > 1100,
+        "scheduled after the msg2 that triggered it"
+    );
+
+    // The reschedule must not resurrect any of the disposed leg.
+    assert_eq!(node_a.peer_count(), 0);
     assert_eq!(node_a.link_count(), 0);
     assert!(node_a.pending_outbound.is_empty());
 }

@@ -7,6 +7,7 @@
 
 use crate::NodeAddr;
 use crate::node::handlers::mmp::format_throughput;
+use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{RejectReason, SessionReject};
 use crate::node::session::{EndToEndState, EpochSlot, SessionEntry};
 use crate::node::{Node, NodeError};
@@ -45,6 +46,49 @@ use crate::upper::icmp::FIPS_OVERHEAD;
 use secp256k1::PublicKey;
 use tracing::{debug, info, trace, warn};
 
+/// Minimum interval between path-MTU releases driven by `PathBroken` for one
+/// destination.
+///
+/// `PathBroken` is unauthenticated, so a release is a remote party's claim
+/// that the path a tightened MTU described is gone. Without an interval the
+/// claim can be repeated at line rate, discarding a genuinely learned
+/// bottleneck as fast as it is relearned. Raising it defers a legitimate
+/// release after a second real break, which costs throughput on the new path
+/// but never a blackhole, since the deferred value is the tighter one.
+pub(in crate::node) const PATH_MTU_RELEASE_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1000);
+
+/// Bytes the link layer adds to an encoded `SessionDatagram` on its way to the
+/// wire: the established FMP header, the 4-byte session-relative timestamp and
+/// the AEAD tag. Mirrors the buffer `send_encrypted_link_message_with_ce`
+/// builds.
+///
+/// Spelled out in full rather than through the `crate::proto::fmp::wire`
+/// import above, which is `#[cfg(unix)]`. This constant feeds `link_wire_len`,
+/// whose caller `send_session_datagram` is compiled on every platform, so
+/// taking the name from that import fails to build on Windows.
+const LINK_FRAME_OVERHEAD: usize =
+    crate::proto::fmp::wire::ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
+
+/// Wire size of an encoded `SessionDatagram` of `encoded_len` bytes.
+fn link_wire_len(encoded_len: usize) -> usize {
+    encoded_len + LINK_FRAME_OVERHEAD
+}
+
+/// Divisor giving the share of the session table that unauthenticated
+/// half-open entries may hold, as `max_sessions / DIVISOR`.
+///
+/// Two means a reconnect storm, where every peer that had a session
+/// initiates at once after a restart or a healed partition, still fits in
+/// half the table; a tighter share bites four times sooner and is felt by
+/// a hub before it is felt by an attacker. Half-open entries are reaped
+/// after `handshake_timeout_secs` while established ones survive
+/// `idle_timeout_secs`, so they turn over faster than the share suggests.
+/// Lowering the divisor raises the share, which lets a handshake flood
+/// crowd out peers that complete; raising it refuses legitimate initiators
+/// sooner in a storm.
+const HALF_OPEN_SHARE_DIVISOR: usize = 2;
+
 /// Inputs to `try_send_session_data_pipelined` — the FSP+FMP pipelined
 /// fast path that hands both AEAD operations to the encrypt worker
 /// in a single dispatch.
@@ -60,6 +104,35 @@ struct PipelinedSend<'a> {
     dest_coords: Option<&'a crate::proto::stp::TreeCoordinate>,
 }
 
+/// Outcome of the routing-signal admission test.
+///
+/// `Unbound` and `Forged` are both refusals, kept apart because they mean
+/// different things to an operator. `Unbound` is consistent with a benign
+/// race — a signal arriving just after a local session teardown. `Forged`
+/// is not consistent with any honest emitter, so it is the sharper
+/// indicator and is counted separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalVerdict {
+    /// The named destination is an address this node bound itself.
+    Admit,
+    /// The src/dest pairing is structurally impossible for a legitimate
+    /// emitter.
+    Forged,
+    /// No qualifying session entry exists for the named destination.
+    Unbound,
+}
+
+impl SignalVerdict {
+    /// Short stable label for the `verdict` log field.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Forged => "forged",
+            Self::Unbound => "unbound",
+        }
+    }
+}
+
 impl Node {
     /// Handle a locally-delivered session datagram payload.
     ///
@@ -71,9 +144,15 @@ impl Node {
     /// - Phase 0x3 → SessionMsg3 (XK handshake msg3)
     /// - Phase 0x0 + U flag → plaintext error signal (CoordsRequired/PathBroken)
     /// - Phase 0x0 + !U → encrypted session message (data, reports, etc.)
+    ///
+    /// `src_addr` is the datagram's claimed source, an envelope field the
+    /// sender chooses. `link_peer` is the authenticated FMP peer the datagram
+    /// arrived over, and is the only identity on this path worth keying a
+    /// limiter on.
     pub(in crate::node) async fn handle_session_payload(
         &mut self,
         src_addr: &NodeAddr,
+        link_peer: &NodeAddr,
         payload: &[u8],
         path_mtu: u16,
         ce_flag: bool,
@@ -93,7 +172,7 @@ impl Node {
 
         match prefix.phase {
             FSP_PHASE_MSG1 => {
-                self.handle_session_setup(src_addr, inner).await;
+                self.handle_session_setup(src_addr, link_peer, inner).await;
             }
             FSP_PHASE_MSG2 => {
                 self.handle_session_ack(src_addr, inner).await;
@@ -111,13 +190,13 @@ impl Node {
                 let error_body = &inner[1..];
                 match RoutingSignalType::from_byte(error_type) {
                     Some(RoutingSignalType::CoordsRequired) => {
-                        self.handle_coords_required(error_body).await;
+                        self.handle_coords_required(src_addr, error_body).await;
                     }
                     Some(RoutingSignalType::PathBroken) => {
-                        self.handle_path_broken(error_body).await;
+                        self.handle_path_broken(src_addr, error_body).await;
                     }
                     Some(RoutingSignalType::MtuExceeded) => {
-                        self.handle_mtu_exceeded(error_body).await;
+                        self.handle_mtu_exceeded(src_addr, error_body).await;
                     }
                     _ => {
                         debug!(error_type, "Unknown plaintext error signal type");
@@ -177,7 +256,7 @@ impl Node {
                             .plan_cache_coords(*src_addr, my_addr, src_coords, dest_coords)
                     {
                         if let FspAction::CacheCoords { addr, coords } = action {
-                            self.coord_cache.insert(addr, coords, now_ms);
+                            self.insert_coord_hint(addr, coords, now_ms);
                         }
                     }
                     ciphertext_offset += bytes_consumed;
@@ -353,6 +432,7 @@ impl Node {
                     debug!(len = rest.len(), "DataPacket too short for port header");
                     return;
                 }
+                let src_port = u16::from_le_bytes([rest[0], rest[1]]);
                 let dst_port = u16::from_le_bytes([rest[2], rest[3]]);
                 let service_payload = &rest[FSP_PORT_HEADER_SIZE..];
 
@@ -395,11 +475,43 @@ impl Node {
                         }
                     }
                     _ => {
-                        debug!(
-                            src = %self.peer_display_name(src_addr),
-                            dst_port,
-                            "Unknown FSP service port, dropping DataPacket"
-                        );
+                        // Every other port belongs to the native datagram API,
+                        // which decides between an established flow, a listener
+                        // and a drop. The same decision serves the debug
+                        // arrival command, so the rule was exercised before
+                        // this call site existed.
+                        // The peer's key comes from the session entry rather
+                        // than from the wire: the handler above refuses
+                        // anything but an Established session, and an
+                        // Established entry holds the key its handshake
+                        // attested. Nothing has to invert the node address.
+                        let payload = service_payload.to_vec();
+                        // The entry was removed for the trial-decrypt cascade
+                        // and re-inserted above, and this arm is reached only
+                        // for an Established session, so the lookup finds one.
+                        // It is written as a lookup rather than an unwrap
+                        // because a future path that skipped the re-insert
+                        // would otherwise panic on a peer's datagram. Skipping
+                        // is scoped to the native dispatch alone: the idle
+                        // timer and the pending-outbound flush at the end of
+                        // this function are this message's bookkeeping and are
+                        // owed whether or not it had anywhere to go.
+                        if let Some(peer_key) = self
+                            .sessions
+                            .get(src_addr)
+                            .map(|session| session.remote_pubkey().x_only_public_key().0)
+                        {
+                            let outcome = self
+                                .native_deliver(*src_addr, peer_key, src_port, dst_port, payload);
+                            if let crate::native::link::Outcome::Dropped(why) = outcome {
+                                debug!(
+                                    src = %self.peer_display_name(src_addr),
+                                    dst_port,
+                                    why = why.as_str(),
+                                    "Unknown FSP service port, dropping DataPacket"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -434,6 +546,7 @@ impl Node {
         // Flush any pending outbound packets (e.g., simultaneous initiation
         // where responder also had queued outbound packets)
         self.flush_pending_packets(src_addr).await;
+        self.flush_pending_native(src_addr).await;
     }
 
     /// Handle an incoming SessionSetup (Noise XK msg1).
@@ -441,7 +554,12 @@ impl Node {
     /// The remote node wants to establish an end-to-end session with us.
     /// We create an XK responder handshake, process msg1, send SessionAck with msg2,
     /// and transition to AwaitingMsg3.
-    async fn handle_session_setup(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
+    async fn handle_session_setup(
+        &mut self,
+        src_addr: &NodeAddr,
+        link_peer: &NodeAddr,
+        inner: &[u8],
+    ) {
         let setup = match SessionSetup::decode(inner) {
             Ok(s) => s,
             Err(e) => {
@@ -456,6 +574,53 @@ impl Node {
                 expected = XK_HANDSHAKE_MSG1_SIZE,
                 "Invalid handshake payload size in SessionSetup"
             );
+            return;
+        }
+
+        // Meter the setup before anything is spent on it. This sits ahead of
+        // every `send_session_datagram` call in the handler — the duplicate
+        // ack resend, the rekey ack and the fresh-setup ack alike — so a
+        // refused msg1 emits nothing at all, which is what bounds the ack
+        // amplification. It also precedes both responder handshake
+        // constructions, so a refusal costs no crypto. Moving it below the
+        // existing-entry lookup would leave the duplicate resend unmetered.
+        //
+        // The class is read from the session table but the *key* is the link
+        // peer: `src_addr` is chosen by the sender, so keying on it would be
+        // no limit at all. A setup naming an established peer cannot grow the
+        // table and is metered separately, so that a stranger flood over a
+        // shared link cannot stop that peer's rekey from arming.
+        // Population cap, ahead of the limiter so a full table costs no
+        // token, no responder handshake and no ack. The predicate is "would
+        // admitting this grow the table", not "is this a stranger": `class`
+        // is Stranger for an existing Initiating or AwaitingMsg3 entry too,
+        // and refusing those would break in-flight legitimate handshakes and
+        // the duplicate-ack resend. Same shape as the pending-destination cap
+        // in `queue_pending_packet`. Refuse rather than evict: msg1 is
+        // unauthenticated here, so evicting would hand a stranger a teardown
+        // primitive it does not have.
+        if !self.admit_new_session(src_addr) {
+            return;
+        }
+
+        let class = if self
+            .sessions
+            .get(src_addr)
+            .is_some_and(|e| e.is_established())
+        {
+            Msg1Class::EstablishedLink
+        } else {
+            Msg1Class::Stranger
+        };
+        if !self.setup_rate_limiter.try_admit(link_peer, class) {
+            debug!(
+                link_peer = %self.peer_display_name(link_peer),
+                src = %self.peer_display_name(src_addr),
+                ?class,
+                "SessionSetup rate limited"
+            );
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::SetupRateLimited));
             return;
         }
 
@@ -491,94 +656,148 @@ impl Node {
                 }
                 return;
             } else if existing.is_established() {
-                // Rekey: if rekey enabled, treat as rekey for key rotation.
-                // The existing established session remains active for traffic.
-                if self.config().node.rekey.enabled {
-                    let rekey_in_progress = existing.has_rekey_in_progress();
-                    let has_pending = existing.pending_new_session().is_some();
+                // A SessionSetup naming an already-established peer is
+                // unauthenticated: msg1 is a bare ephemeral and the source
+                // address is an envelope field, so anyone able to reach us
+                // can claim it. It may therefore only arm a handshake
+                // alongside the running session, never replace it. The new
+                // keys are adopted in `handle_session_msg3` and only when the
+                // authenticated static key matches the key this session was
+                // opened with, and the cut-over waits for a frame that
+                // authenticates against the pending epoch. Every exit below
+                // returns, so an established entry never reaches the
+                // re-establishment path that replaces it.
+                let rekey_in_progress = existing.has_rekey_in_progress();
+                // A completed rekey outranks a fresh setup message while the
+                // cut-over it is waiting for can still arrive. Once it has
+                // waited a full idle timeout for a peer that never appeared
+                // on the new epoch, it stops vetoing: a peer that restarted,
+                // or one whose own cycle lapsed, would otherwise be refused
+                // for as long as our own sends kept the session from idling
+                // out. The pending keys survive both outcomes of this test:
+                // the veto returns without touching them, and the
+                // fall-through only arms a handshake beside them. Adopting
+                // them is still an authenticated msg3's job alone. No arm
+                // below drops one either: the dual-initiation arm did until
+                // it was narrowed to abandon only the handshake, for the
+                // reason recorded at that site.
+                let pending_outranks = existing.pending_new_session().is_some()
+                    && !existing.pending_stale(
+                        Self::now_ms(),
+                        self.config().node.session.idle_timeout_secs * 1000,
+                    );
 
-                    // Dual-initiation detection: both sides sent SessionSetup
-                    // simultaneously. Apply tie-breaker — smaller NodeAddr
-                    // wins as initiator (same as initial session setup).
-                    if rekey_in_progress {
-                        if crate::proto::fsp::initiation_winner(
-                            self.identity().node_addr(),
-                            src_addr,
-                        ) {
-                            // We win as initiator — drop their msg1.
-                            debug!(
-                                src = %self.peer_display_name(src_addr),
-                                "Dual FSP rekey initiation: we win (smaller addr), dropping their msg1"
-                            );
-                            return;
-                        }
-                        // We lose — abandon our rekey, become responder below.
+                // Dual-initiation detection: both sides sent SessionSetup
+                // simultaneously. Apply tie-breaker — smaller NodeAddr
+                // wins as initiator (same as initial session setup).
+                if rekey_in_progress {
+                    if crate::proto::fsp::initiation_winner(self.identity().node_addr(), src_addr) {
+                        // We win as initiator — drop their msg1.
                         debug!(
                             src = %self.peer_display_name(src_addr),
-                            "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
+                            "Dual FSP rekey initiation: we win (smaller addr), dropping their msg1"
                         );
-                        let entry = self.sessions.get_mut(src_addr).unwrap();
-                        entry.abandon_rekey();
-                    } else if has_pending {
-                        // Guard: already have a pending session waiting for K-bit cutover
-                        debug!(
-                            src = %self.peer_display_name(src_addr),
-                            "FSP rekey msg1 received but already have pending session, dropping"
-                        );
+                        self.stats_mut()
+                            .record_reject(RejectReason::Session(SessionReject::RekeyTiebreak));
                         return;
                     }
-                    let our_keypair = self.identity().keypair();
-                    let mut handshake = HandshakeState::new_xk_responder(our_keypair);
-                    handshake.set_local_epoch(self.startup_epoch());
-
-                    if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
-                        debug!(error = %e, "Failed to process rekey XK msg1");
-                        return;
-                    }
-
-                    // Generate msg2
-                    let msg2 = match handshake.write_xk_message_2() {
-                        Ok(m) => m,
-                        Err(e) => {
-                            debug!(error = %e, "Failed to generate rekey XK msg2");
-                            return;
-                        }
-                    };
-
-                    // Build and send SessionAck
-                    let our_coords = self.tree_state.my_coords().clone();
-                    let ack = SessionAck::new(our_coords, setup.src_coords).with_handshake(msg2);
-                    let ack_payload = ack.encode();
-                    let my_addr = *self.node_addr();
-                    let mut datagram = SessionDatagram::new(my_addr, *src_addr, ack_payload)
-                        .with_ttl(self.config().node.session.default_ttl);
-
-                    if let Err(e) = self.send_session_datagram(&mut datagram).await {
-                        debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionAck");
-                        return;
-                    }
-
-                    // Store rekey state on the existing entry
-                    let now_ms = Self::now_ms();
-                    let entry = self.sessions.get_mut(src_addr).unwrap();
-                    entry.set_rekey_state(handshake, false);
-                    entry.record_peer_rekey(now_ms);
-
+                    // We lose — abandon the armed handshake, become responder
+                    // below.
+                    //
+                    // `abandon_handshake`, not `abandon_rekey`: the gate
+                    // above is `has_rekey_in_progress`, which says only that
+                    // *some* handshake is armed, not that we armed it. A
+                    // handshake the peer armed carries `rekey_initiator ==
+                    // false` and can sit beside a completed epoch that a
+                    // stale `pending_outranks` no longer vetoes, so a
+                    // stranger reaches this line with two unauthenticated
+                    // setup messages: one to arm the handshake, one to lose
+                    // the tie-break against it. Dropping the pending session
+                    // there kills the epoch the peer may already have cut
+                    // over to. Only the handshake is ours to discard, and
+                    // discarding it costs nothing, since an armed handshake
+                    // holds no key material either endpoint is using.
                     debug!(
                         src = %self.peer_display_name(src_addr),
-                        "FSP rekey: processed peer's msg1, sent msg2, awaiting msg3"
+                        "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
+                    );
+                    let entry = self.sessions.get_mut(src_addr).unwrap();
+                    entry.abandon_handshake();
+                    self.stats_mut()
+                        .record_reject(RejectReason::Session(SessionReject::RekeyYielded));
+                } else if pending_outranks {
+                    // Guard: already have a pending session waiting for K-bit cutover
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        "FSP rekey msg1 received but already have pending session, dropping"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Session(SessionReject::RekeyPending));
+                    return;
+                }
+                // This frame's own copy of the node's long-term private key;
+                // the handshake state keeps its own and clears that on drop.
+                let mut our_keypair = self.identity().keypair();
+                let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+                our_keypair.non_secure_erase();
+                handshake.set_local_epoch(self.startup_epoch());
+
+                if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        error = %e,
+                        "Failed to process rekey XK msg1"
                     );
                     return;
                 }
 
-                // Re-establishment: replace existing session below
-                debug!(src = %self.peer_display_name(src_addr), "Session re-establishment from peer");
+                // Generate msg2
+                let msg2 = match handshake.write_xk_message_2() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(
+                            src = %self.peer_display_name(src_addr),
+                            error = %e,
+                            "Failed to generate rekey XK msg2"
+                        );
+                        return;
+                    }
+                };
+
+                // Build and send SessionAck
+                let our_coords = self.tree_state.my_coords().clone();
+                let ack = SessionAck::new(our_coords, setup.src_coords).with_handshake(msg2);
+                let ack_payload = ack.encode();
+                let my_addr = *self.node_addr();
+                let mut datagram = SessionDatagram::new(my_addr, *src_addr, ack_payload)
+                    .with_ttl(self.config().node.session.default_ttl);
+
+                if let Err(e) = self.send_session_datagram(&mut datagram).await {
+                    debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionAck");
+                    return;
+                }
+
+                // Store rekey state on the existing entry
+                let now_ms = Self::now_ms();
+                let entry = self.sessions.get_mut(src_addr).unwrap();
+                entry.set_rekey_state(handshake, false);
+                entry.record_peer_rekey(now_ms);
+                self.stats_mut().session.rekey_armed += 1;
+
+                debug!(
+                    src = %self.peer_display_name(src_addr),
+                    "FSP rekey: processed peer's msg1, sent msg2, awaiting msg3"
+                );
+                return;
             }
         }
 
         // Create XK responder handshake and process msg1
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+        our_keypair.non_secure_erase();
         handshake.set_local_epoch(self.startup_epoch());
 
         if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
@@ -616,7 +835,11 @@ impl Node {
         // Store session entry in AwaitingMsg3 state with ack payload for potential resend.
         // Use a dummy pubkey since we don't know the initiator's identity yet.
         // We use our own pubkey as placeholder; it will be replaced in handle_session_msg3.
-        let placeholder_pubkey = self.identity().keypair().public_key();
+        // `keypair()` hands back a copy of the long-term private key, so the
+        // temporary is bound and erased rather than left to the statement end.
+        let mut our_keypair = self.identity().keypair();
+        let placeholder_pubkey = our_keypair.public_key();
+        our_keypair.non_secure_erase();
         let now_ms = Self::now_ms();
         let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
         let mut entry = SessionEntry::new(
@@ -665,6 +888,18 @@ impl Node {
         };
 
         // Rekey path: entry is Established with rekey_state
+        //
+        // `abandon_rekey` below, not `abandon_handshake` as in the responder
+        // arm of `handle_session_msg3`, and the difference rests on an
+        // invariant rather than on a different judgement: an entry with
+        // `rekey_initiator` set holds no pending session, so the two calls
+        // are the same action here. `set_rekey_state(_, true)` has one
+        // caller, `initiate_session_rekey`, which `check_session_rekey`
+        // never reaches for an entry holding a pending session; and
+        // `set_pending_session` clears `rekey_state`, so a completed
+        // initiator cycle leaves at most one of the two set. If that ever
+        // stops holding, these four sites become instances of the epoch
+        // discard the responder arm was fixed for.
         if entry.is_established() && entry.has_rekey_in_progress() && entry.is_rekey_initiator() {
             let mut handshake = match entry.take_rekey_state() {
                 Some(hs) => hs,
@@ -754,10 +989,33 @@ impl Node {
         };
 
         // Process XK msg2: read_xk_message_2 (extracts responder's epoch)
-        if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
+        //
+        // Nothing here has been authenticated: the only thing tying this
+        // message to the initiation is the datagram's source address, an
+        // envelope field the sender chooses. Dropping the entry would let
+        // anyone able to reach us cancel any initiation in flight, so the
+        // entry goes back with the handshake rolled back to its pre-read
+        // state and the stored msg1 still scheduled for resend. The rollback
+        // is what makes the reinsert worth anything: `read_xk_message_2`
+        // mixes the sender's ephemeral in before it authenticates, so a
+        // handshake put back as it was left could never read the genuine
+        // msg2. A real peer's corrupt ack is covered by the same path — the
+        // responder resends its stored msg2, and the handshake sweep reaps
+        // the entry on its original deadline if none arrives. `touch()` is
+        // deliberately not called, so a spray cannot push that deadline out.
+        if let Err(e) = handshake.try_read_xk_message_2(&ack.handshake_payload) {
             debug!(error = %e, "Failed to process Noise XK msg2 in SessionAck");
-            return; // Entry was already removed, don't put back a broken session
+            entry.set_state(EndToEndState::Initiating(handshake));
+            self.sessions.insert(*src_addr, entry);
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::AckHandshakeFailed));
+            return;
         }
+
+        // The three drops below stay drops. Each is downstream of a msg2 that
+        // already authenticated, so they are local failures rather than
+        // possible forgeries, and a handshake left at `Message2Done` cannot
+        // be re-driven from a resent msg1 anyway.
 
         // Generate XK msg3: write_xk_message_3 (sends encrypted static + epoch)
         let msg3 = match handshake.write_xk_message_3() {
@@ -797,10 +1055,11 @@ impl Node {
         entry.clear_handshake_payload();
         entry.touch(now_ms);
         self.sessions.insert(*src_addr, entry);
-        self.coord_cache.insert(*src_addr, ack.src_coords, now_ms);
+        self.insert_coord_hint(*src_addr, ack.src_coords.clone(), now_ms);
 
         // Flush any queued outbound packets for this destination
         self.flush_pending_packets(src_addr).await;
+        self.flush_pending_native(src_addr).await;
 
         info!(src = %self.peer_display_name(src_addr), "Session established (initiator, XK)");
     }
@@ -840,6 +1099,24 @@ impl Node {
         };
 
         // Rekey path: entry is Established with rekey_state (responder side)
+        //
+        // Every failure below abandons only the handshake. Nothing in a msg3
+        // is authenticated until `read_xk_message_3` has both succeeded and
+        // produced a static key matching this session's peer, so a failure
+        // here proves nothing about the sender and must not cost the entry
+        // anything it would miss. A `pending_new_session` beside the
+        // handshake is the epoch the real peer may already have cut over to,
+        // and dropping it kills the reverse direction on two unauthenticated
+        // messages: a forged msg1 to arm the handshake, then any garbage
+        // msg3. `abandon_handshake` keeps it; `abandon_rekey` does not.
+        //
+        // What `abandon_handshake` leaves behind, and why each is safe here:
+        // `rekey_completed_ms` must survive, since `pending_stale` reads it
+        // and a zeroed stamp reads as freshly completed. A stranded
+        // `rekey_msg3_payload` belongs to an initiator cycle and clears
+        // itself once `resend_pending_session_msg3` exhausts its budget.
+        // `peer_new_epoch_confirmed` only stops that retransmission, and
+        // `rekey_initiator` is false throughout this arm by its own gate.
         if entry.is_established() && entry.has_rekey_in_progress() && !entry.is_rekey_initiator() {
             let mut handshake = match entry.take_rekey_state() {
                 Some(hs) => hs,
@@ -851,8 +1128,12 @@ impl Node {
 
             // Process XK msg3
             if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg3");
-                entry.abandon_rekey();
+                debug!(
+                    src = %self.peer_display_name(src_addr),
+                    error = %e,
+                    "Failed to process rekey XK msg3"
+                );
+                entry.abandon_handshake();
                 self.sessions.insert(*src_addr, entry);
                 return;
             }
@@ -864,8 +1145,14 @@ impl Node {
             let rekey_pubkey = match handshake.remote_static() {
                 Some(pk) => *pk,
                 None => {
+                    // Not independently exercised by any test: a successful
+                    // `read_xk_message_3` always sets the remote static, so
+                    // reaching this needs fault injection into
+                    // `HandshakeState`. Changed with its three siblings so
+                    // the arm has one rule rather than three plus an
+                    // exception.
                     debug!("No remote static key after processing rekey XK msg3");
-                    entry.abandon_rekey();
+                    entry.abandon_handshake();
                     self.sessions.insert(*src_addr, entry);
                     return;
                 }
@@ -875,7 +1162,7 @@ impl Node {
                     src = %self.peer_display_name(src_addr),
                     "FSP rekey: initiator static key differs from the established peer key"
                 );
-                entry.abandon_rekey();
+                entry.abandon_handshake();
                 self.sessions.insert(*src_addr, entry);
                 self.stats_mut()
                     .record_reject(RejectReason::Session(SessionReject::RekeyKeyMismatch));
@@ -886,15 +1173,32 @@ impl Node {
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
+                    // Also not independently exercised, for the same reason
+                    // as the missing-static arm above: a handshake that read
+                    // msg3 successfully always converts.
                     debug!(error = %e, "Failed to create session from rekey XK msg3");
-                    entry.abandon_rekey();
+                    entry.abandon_handshake();
                     self.sessions.insert(*src_addr, entry);
                     return;
                 }
             };
 
+            // A pending session already held for this peer is superseded
+            // here rather than by any timer: only a msg3 carrying the
+            // session's own peer key can replace the epoch that peer moved
+            // to. The keys it displaces may still be in use, so the event is
+            // counted and logged rather than silent.
+            let superseded = entry.pending_new_session().is_some();
             entry.set_pending_session(session);
+            entry.set_rekey_completed_ms(Self::now_ms());
             self.sessions.insert(*src_addr, entry);
+            if superseded {
+                self.stats_mut().session.pending_replaced += 1;
+                warn!(
+                    src = %self.peer_display_name(src_addr),
+                    "FSP rekey: newly completed session replaced one still awaiting cutover"
+                );
+            }
 
             debug!(
                 src = %self.peer_display_name(src_addr),
@@ -975,6 +1279,7 @@ impl Node {
 
         // Flush any pending packets
         self.flush_pending_packets(src_addr).await;
+        self.flush_pending_native(src_addr).await;
 
         info!(src = %self.peer_display_name(src_addr), "Session established (responder, XK)");
     }
@@ -1320,6 +1625,23 @@ impl Node {
             return;
         };
 
+        // `apply_notification` refuses a sub-floor value, but it returns the
+        // same `false` it returns for the ordinary "no change" case, which is
+        // the common one. Test the floor here so the refusal is visible: this
+        // arrives on the decrypted service-payload path, so a value this low
+        // means an authenticated peer we hold a session with is sending
+        // something unusable.
+        if notif.path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+            warn!(
+                src = %peer_name,
+                reported_mtu = notif.path_mtu,
+                floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
+                "PathMtuNotification reports a path MTU below the actionable floor; ignoring"
+            );
+            self.metrics.errors.path_mtu_notif_below_floor.inc();
+            return;
+        }
+
         let old_mtu = mmp.path_mtu.current_mtu();
         let changed = mmp
             .path_mtu
@@ -1349,19 +1671,29 @@ impl Node {
                 // Read existing, decide, and apply the write under one guard so
                 // the keep-tighter update stays atomic.
                 let prior = map.get(&fips_addr).copied();
-                let actions = self.fsp.plan_path_mtu_tighten(fips_addr, prior, new_mtu);
+                let actions =
+                    self.fsp
+                        .plan_path_mtu_tighten(fips_addr, prior.map(|e| e.mtu), new_mtu);
                 if actions.is_empty() {
                     debug!(
                         dest = %peer_name,
                         fips_addr = %fips_addr,
                         new_mtu,
-                        existing = prior.unwrap_or(new_mtu),
+                        existing = prior.map(|e| e.mtu).unwrap_or(new_mtu),
                         "PathMtuNotification: keeping tighter existing path_mtu_lookup value"
                     );
                 }
                 for action in actions {
                     if let FspAction::TightenPathMtuLookup { fips_addr, mtu } = action {
-                        map.insert(fips_addr, mtu);
+                        // Held, not expiring. This value arrives inside a
+                        // session, and a session's teardown or a PathBroken
+                        // naming it already releases the entry. A deadline here
+                        // would instead recreate the gap this mirror exists to
+                        // close: a peer repeating an identical value on a stable
+                        // path takes the unchanged early-return above and never
+                        // rewrites the entry, so an expiring one would vanish
+                        // and stay gone.
+                        map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
                         debug!(
                             dest = %peer_name,
                             fips_addr = %fips_addr,
@@ -1385,13 +1717,58 @@ impl Node {
         }
     }
 
+    /// Whether a routing signal naming `dest`, arriving in a datagram
+    /// claiming source `src`, may be acted on, and if not, which kind of
+    /// refusal it is.
+    ///
+    /// `src` is the SessionDatagram's `src_addr`: a plain wire field,
+    /// authenticated only hop-by-hop by FMP Noise and never end to end. It
+    /// is therefore logged, not trusted. What is enforced here is that this
+    /// node has bound `dest` itself, either by initiating toward it or by
+    /// completing Noise XK, which binds the address to the peer's static
+    /// key (see the address-mismatch check in `handle_session_msg3`). A
+    /// responder entry that is still awaiting msg3 does NOT qualify: it is
+    /// keyed on an address the sender merely claimed, so admitting it would
+    /// let one forged SessionSetup unlock a signal about any address.
+    ///
+    /// The first two clauses reject nothing legitimate, and so return
+    /// `Forged` rather than `Unbound`. A datagram whose destination is this
+    /// node takes the deliver-local branch before any forwarding, so no node
+    /// ever emits a signal naming us as `dest`; and the emitter is by
+    /// construction a transit node for the datagram it is reporting on, so
+    /// it is never itself that datagram's destination.
+    ///
+    /// This narrows who can be targeted; it does not authenticate the
+    /// sender, which nothing short of a wire format change can do.
+    fn signal_verdict(&self, src: &NodeAddr, dest: &NodeAddr) -> SignalVerdict {
+        if dest == self.node_addr() || src == dest {
+            return SignalVerdict::Forged;
+        }
+        if self
+            .sessions
+            .get(dest)
+            .is_some_and(|e| e.is_established() || e.is_initiator())
+        {
+            SignalVerdict::Admit
+        } else {
+            SignalVerdict::Unbound
+        }
+    }
+
     /// Handle a CoordsRequired error signal from a transit router.
     ///
     /// The router couldn't route our packet because it lacks cached
     /// coordinates for the destination. Send a standalone CoordsWarmup
     /// immediately (rate-limited), trigger discovery, and reset the
     /// warmup counter for subsequent data packets.
-    async fn handle_coords_required(&mut self, inner: &[u8]) {
+    ///
+    /// `src_addr` is the datagram's claimed source and is not
+    /// end-to-end authenticated; see `signal_verdict`.
+    pub(in crate::node) async fn handle_coords_required(
+        &mut self,
+        src_addr: &NodeAddr,
+        inner: &[u8],
+    ) {
         self.metrics().errors.coords_required.inc();
 
         let msg = match CoordsRequired::decode(inner) {
@@ -1401,6 +1778,25 @@ impl Node {
                 return;
             }
         };
+
+        // The premise: this signal carries no end-to-end authentication, so
+        // the body's `dest_addr` is attacker-chosen. Everything below acts on
+        // it — warmup send, discovery, warmup-counter reset — so the gate has
+        // to run before any of that, and ahead of the rate limiter, whose
+        // state would otherwise be keyed on an attacker-chosen address.
+        let verdict = self.signal_verdict(src_addr, &msg.dest_addr);
+        if verdict != SignalVerdict::Admit {
+            debug!(src = %src_addr, dest = %msg.dest_addr, reporter = %msg.reporter,
+                signal = "CoordsRequired", verdict = verdict.label(),
+                "Routing signal names an address this node has not bound; dropping");
+            self.metrics().errors.unbound.coords.inc();
+            if verdict == SignalVerdict::Forged {
+                self.metrics().errors.unbound.forged.inc();
+            }
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::UnknownSession));
+            return;
+        }
 
         debug!(
             dest = %msg.dest_addr,
@@ -1459,7 +1855,10 @@ impl Node {
     /// The router has coordinates but still can't route to the destination.
     /// Send a standalone CoordsWarmup immediately (rate-limited), invalidate
     /// cached coordinates, trigger re-discovery, and reset the warmup counter.
-    async fn handle_path_broken(&mut self, inner: &[u8]) {
+    ///
+    /// `src_addr` is the datagram's claimed source and is not
+    /// end-to-end authenticated; see `signal_verdict`.
+    pub(in crate::node) async fn handle_path_broken(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
         self.metrics().errors.path_broken.inc();
 
         let msg = match PathBroken::decode(inner) {
@@ -1469,6 +1868,26 @@ impl Node {
                 return;
             }
         };
+
+        // The premise: this signal carries no end-to-end authentication, so
+        // the body's `dest_addr` is attacker-chosen. `plan_path_broken` emits
+        // its coord-cache invalidation unconditionally, and the path-MTU
+        // release below is likewise unguarded, so both act on whatever address
+        // the body names unless the gate refuses it here, in the shell, which
+        // is the only layer that knows who sent the datagram.
+        let verdict = self.signal_verdict(src_addr, &msg.dest_addr);
+        if verdict != SignalVerdict::Admit {
+            debug!(src = %src_addr, dest = %msg.dest_addr, reporter = %msg.reporter,
+                signal = "PathBroken", verdict = verdict.label(),
+                "Routing signal names an address this node has not bound; dropping");
+            self.metrics().errors.unbound.broken.inc();
+            if verdict == SignalVerdict::Forged {
+                self.metrics().errors.unbound.forged.inc();
+            }
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::UnknownSession));
+            return;
+        }
 
         debug!(
             dest = %msg.dest_addr,
@@ -1512,6 +1931,22 @@ impl Node {
                 _ => {}
             }
         }
+        // The path this destination's stored MTU described is gone, so release
+        // it rather than carrying it onto whatever path replaces it. Rate
+        // limited per destination on its own budget: PathBroken is
+        // unauthenticated, and an unlimited release discards a genuinely
+        // learned bottleneck as fast as it is relearned. The budget is not
+        // shared with any other signal, so nothing else can spend it.
+        if self
+            .path_mtu_release_limiter
+            .should_send(&msg.dest_addr, Self::now_ms())
+        {
+            self.path_mtu_lookup_release(&msg.dest_addr);
+        } else {
+            trace!(dest = %msg.dest_addr,
+                "PathBroken path MTU release rate-limited, keeping the stored value");
+        }
+
         if !has_cached_identity {
             debug!(dest = %msg.dest_addr,
                 "Skipping discovery after PathBroken: no cached identity for target");
@@ -1535,7 +1970,10 @@ impl Node {
     /// A transit router couldn't forward our packet because it exceeded the
     /// next-hop transport MTU. Apply the reported bottleneck MTU to our
     /// PathMtuState for the affected session, causing an immediate decrease.
-    pub(in crate::node) async fn handle_mtu_exceeded(&mut self, inner: &[u8]) {
+    ///
+    /// `src_addr` is the datagram's claimed source and is not
+    /// end-to-end authenticated; see `signal_verdict`.
+    pub(in crate::node) async fn handle_mtu_exceeded(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
         self.metrics().errors.mtu_exceeded.inc();
 
         let msg = match MtuExceeded::decode(inner) {
@@ -1546,6 +1984,28 @@ impl Node {
             }
         };
 
+        // The premise: this signal carries no end-to-end authentication, so
+        // the body's `dest_addr` is attacker-chosen, and the `path_mtu_lookup`
+        // write further down needs no session, no peer relationship and no
+        // prior state to reach. This gate is about WHICH address may be
+        // written; the floor guard below is about WHAT value may be written.
+        // They are independent refusals — a bound destination can still carry
+        // an unusable value — so neither subsumes the other and each keeps its
+        // own counter.
+        let verdict = self.signal_verdict(src_addr, &msg.dest_addr);
+        if verdict != SignalVerdict::Admit {
+            debug!(src = %src_addr, dest = %msg.dest_addr, reporter = %msg.reporter,
+                signal = "MtuExceeded", verdict = verdict.label(),
+                "Routing signal names an address this node has not bound; dropping");
+            self.metrics().errors.unbound.mtu.inc();
+            if verdict == SignalVerdict::Forged {
+                self.metrics().errors.unbound.forged.inc();
+            }
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::UnknownSession));
+            return;
+        }
+
         let peer_name = self.peer_display_name(&msg.dest_addr);
         debug!(
             dest = %peer_name,
@@ -1553,6 +2013,55 @@ impl Node {
             bottleneck_mtu = msg.mtu,
             "MtuExceeded: transit router reports oversized packet"
         );
+
+        // Both effects below — the session's own path MTU and the
+        // FipsAddress-keyed lookup the TUN MSS clamp reads — are refused from
+        // here, so one return covers both. The guards sit ahead of the apply
+        // rather than between the two effects, which is what makes the floor
+        // govern `current_mtu` and not only the lookup table.
+
+        // Refuse a bottleneck too small to describe a usable path; a stored
+        // value that low drives the SYN-time MSS clamp into single digits or
+        // zero. The reactive carrier is unauthenticated, so it has its own
+        // floor constant, currently equal to the actionable one.
+        if msg.mtu < crate::upper::icmp::MIN_REACTIVE_PATH_MTU {
+            warn!(
+                dest = %peer_name,
+                reporter = %msg.reporter,
+                bottleneck_mtu = msg.mtu,
+                floor = crate::upper::icmp::MIN_REACTIVE_PATH_MTU,
+                "MtuExceeded reports a path MTU below the actionable floor; ignoring"
+            );
+            self.metrics().errors.mtu_exceeded_below_floor.inc();
+            return;
+        }
+
+        // Corroboration. The admission gate narrows which destination may be
+        // named; it cannot authenticate the reporter, so a legal value is a
+        // legal value from anyone and the floor alone only sets the outcome of
+        // a forgery rather than preventing it. An honest report exists only
+        // because a frame this node emitted did not fit some hop, so require
+        // that this node has actually sent something larger than the value
+        // being claimed since the last accepted decrease. Honest path-MTU
+        // discovery satisfies this by construction; a forgery has to wait for
+        // us to emit a frame bigger than the value it wants to claim, which
+        // bounds every accepted claim from below by our own traffic.
+        let sent_wire_len = self
+            .sessions
+            .get(&msg.dest_addr)
+            .map(|e| e.max_sent_wire_len())
+            .unwrap_or(0);
+        if msg.mtu >= sent_wire_len {
+            debug!(
+                dest = %peer_name,
+                reporter = %msg.reporter,
+                bottleneck_mtu = msg.mtu,
+                max_sent_wire_len = sent_wire_len,
+                "MtuExceeded reports a bottleneck no smaller than anything this node has sent; ignoring"
+            );
+            self.metrics().errors.mtu_exceeded_uncorroborated.inc();
+            return;
+        }
 
         // Apply to PathMtuState: immediate decrease via apply_notification()
         if let Some(entry) = self.sessions.get_mut(&msg.dest_addr)
@@ -1574,31 +2083,50 @@ impl Node {
             }
         }
 
+        // Spent: the evidence vouched for this decrease and does not vouch for
+        // the next one. An initiating session has no `mmp` and so reaches this
+        // with the apply above skipped; the reset belongs to the acceptance,
+        // not to the apply.
+        if let Some(entry) = self.sessions.get_mut(&msg.dest_addr) {
+            entry.clear_sent_wire_len();
+        }
+
         // Mirror the bottleneck into the FipsAddress-keyed lookup used by
         // the TUN reader/writer at TCP MSS clamp time. Discovery's reverse-
         // path response can carry a value too generous for the actual
         // forward path; the reactive signal from a forwarder that actually
         // dropped a packet is authoritative for "what fits". Keep the
         // tighter of existing-or-new — never loosen the clamp.
+        //
+        // The admission gate above, not this block, is what restricts which
+        // addresses can be written here.
         let fips_addr = crate::FipsAddress::from_node_addr(&msg.dest_addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => {
                 // Read existing, decide, and apply the write under one guard so
                 // the keep-tighter update stays atomic.
                 let prior = map.get(&fips_addr).copied();
-                let actions = self.fsp.plan_path_mtu_tighten(fips_addr, prior, msg.mtu);
+                let actions =
+                    self.fsp
+                        .plan_path_mtu_tighten(fips_addr, prior.map(|e| e.mtu), msg.mtu);
                 if actions.is_empty() {
                     debug!(
                         dest = %peer_name,
                         fips_addr = %fips_addr,
                         bottleneck_mtu = msg.mtu,
-                        existing = prior.unwrap_or(msg.mtu),
+                        existing = prior.map(|e| e.mtu).unwrap_or(msg.mtu),
                         "Reactive MtuExceeded: keeping tighter existing path_mtu_lookup value"
                     );
                 }
                 for action in actions {
                     if let FspAction::TightenPathMtuLookup { fips_addr, mtu } = action {
-                        map.insert(fips_addr, mtu);
+                        // Held, not expiring. The admission gate above requires
+                        // a session for the named destination, and that
+                        // session's teardown releases this entry. Nothing
+                        // re-sends the signal once traffic is sized to fit, so a
+                        // deadline would drop a genuine persistent bottleneck
+                        // and start the next flow at the conservative ceiling.
+                        map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
                         debug!(
                             dest = %peer_name,
                             fips_addr = %fips_addr,
@@ -1629,6 +2157,59 @@ impl Node {
     /// Creates a Noise XK handshake as initiator, wraps msg1 in a
     /// SessionSetup, encapsulates in a SessionDatagram, and routes
     /// toward the destination.
+    /// Whether a session for `addr` may be created, given the table cap.
+    ///
+    /// Returns true when an entry already exists, since admitting it cannot
+    /// grow the table. Counts its own refusals, so the two reasons are
+    /// distinguishable without turning on debug logging.
+    pub(in crate::node) fn admit_new_session(&mut self, addr: &NodeAddr) -> bool {
+        let max_sessions = self.config().node.limits.max_sessions;
+        if max_sessions == 0 || self.sessions.contains_key(addr) {
+            return true;
+        }
+
+        if self.sessions.len() >= max_sessions {
+            debug!(
+                src = %self.peer_display_name(addr),
+                sessions = self.sessions.len(),
+                max_sessions = max_sessions,
+                "Session table full, refusing to create a session"
+            );
+            self.stats_mut()
+                .record_reject(RejectReason::Session(SessionReject::TableFull));
+            return false;
+        }
+
+        // Half-open entries are unauthenticated and are reaped after
+        // `handshake_timeout_secs`, so they are the cheap half of the table
+        // to fill. Holding them to a share keeps room for peers that
+        // complete. The outer length test makes the scan unreachable below
+        // the share, and the table is itself bounded by the cap above.
+        // At least one, or a table capped at one would admit no inbound
+        // session at all rather than one.
+        let half_open_share = (max_sessions / HALF_OPEN_SHARE_DIVISOR).max(1);
+        if self.sessions.len() >= half_open_share {
+            let half_open = self
+                .sessions
+                .values()
+                .filter(|e| e.is_awaiting_msg3())
+                .count();
+            if half_open >= half_open_share {
+                debug!(
+                    src = %self.peer_display_name(addr),
+                    half_open = half_open,
+                    half_open_share = half_open_share,
+                    "Half-open session share exhausted, refusing to create a session"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Session(SessionReject::HalfOpenFull));
+                return false;
+            }
+        }
+
+        true
+    }
+
     pub(in crate::node) async fn initiate_session(
         &mut self,
         dest_addr: NodeAddr,
@@ -1642,8 +2223,11 @@ impl Node {
         }
 
         // Create Noise XK initiator handshake
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let mut handshake = HandshakeState::new_xk_initiator(our_keypair, dest_pubkey);
+        our_keypair.non_secure_erase();
         handshake.set_local_epoch(self.startup_epoch());
         let msg1 = handshake
             .write_xk_message_1()
@@ -2093,6 +2677,7 @@ impl Node {
 
         if let Some(entry) = self.sessions.get_mut(dest_addr) {
             entry.record_sent(send.payload.len());
+            entry.record_sent_wire_len(wire_capacity);
             if let Some(mmp) = entry.mmp_mut() {
                 mmp.sender.record_sent(
                     fsp_counter,
@@ -2246,7 +2831,10 @@ impl Node {
     /// coordinates via `try_warm_coord_cache()` (same as CP-flagged data
     /// packets). The encrypted inner payload is the 6-byte inner header
     /// with no application data.
-    async fn send_coords_warmup(&mut self, dest_addr: &NodeAddr) -> Result<(), NodeError> {
+    pub(in crate::node) async fn send_coords_warmup(
+        &mut self,
+        dest_addr: &NodeAddr,
+    ) -> Result<(), NodeError> {
         let now_ms = Self::now_ms();
 
         let my_coords = self.tree_state.my_coords().clone();
@@ -2368,6 +2956,13 @@ impl Node {
         self.send_encrypted_link_message(&next_hop_addr, &encoded)
             .await?;
         self.metrics().forwarding.record_originated(encoded.len());
+
+        // Evidence for the reactive path-MTU carrier. A transit hop
+        // re-encapsulates what it forwards, so the frame that overflows a
+        // downstream link is the size this frame is here.
+        if let Some(entry) = self.sessions.get_mut(&datagram.dest_addr) {
+            entry.record_sent_wire_len(link_wire_len(encoded.len()));
+        }
         Ok(())
     }
 
@@ -2459,6 +3054,17 @@ impl Node {
             }
             // Session exists but not yet established — queue the packet
             self.queue_pending_packet(dest_addr, ipv6_packet);
+            return;
+        }
+
+        // No session, so this one would grow the table. Answer the local
+        // application the way an unroutable destination is answered rather
+        // than returning an error from `initiate_session`: the caller reads
+        // an error as "no route" and responds with a discovery lookup and a
+        // queued packet, which is outbound traffic on a node already at its
+        // limit.
+        if !self.admit_new_session(&dest_addr) {
+            self.send_icmpv6_dest_unreachable(&ipv6_packet);
             return;
         }
 
@@ -2586,6 +3192,10 @@ impl Node {
         if let Some(existing) = self.sessions.get(&dest_addr)
             && (existing.is_established() || existing.is_initiating())
         {
+            return;
+        }
+
+        if !self.admit_new_session(&dest_addr) {
             return;
         }
 

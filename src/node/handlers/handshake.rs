@@ -19,8 +19,54 @@ use crate::proto::fmp::{
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use crate::utils::index::SessionIndex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Minimum interval between accepted epoch changes for one peer identity,
+/// and the recency threshold at which the peering an epoch change would
+/// destroy still counts as live.
+///
+/// An epoch-mismatch msg1 is authentic but replayable: a captured one stays
+/// valid indefinitely, and accepting it tears down a working peering. Both
+/// conditions are receiver-local. The liveness half is the one that closes
+/// the replay, since a peering under attack is by construction still
+/// heartbeating; the interval half bounds the churn a peer can drive on its
+/// own.
+///
+/// Sized against the peer's own recovery rather than against a round number:
+/// a genuinely restarting peer's msg1 resends fire at roughly t+1, t+3, t+7
+/// and t+15 seconds and its attempt is reaped at `handshake_timeout_secs`
+/// (30), so 15 is the largest value at which a real restart still re-peers
+/// inside its first handshake window with no reconnect backoff. It also sits
+/// below `link_dead_timeout_secs` (30), so the liveness gate can never
+/// outlive the reaper that would have removed the peering anyway.
+///
+/// Raising it lengthens the outage an attacker's accepted replay causes,
+/// because the genuine peer's recovery msg1 hits the same arm. Lowering it
+/// weakens both halves and, below the resend ladder, buys nothing.
+const EPOCH_RESTART_MIN_INTERVAL_SECS: u64 = 15;
+
+/// Why an inbound msg1 got past the `accept_connections` gate, and against
+/// what identity the post-DH confirmation must check it.
+///
+/// Three outcomes, not two: an `Option` would conflate "no waiver was needed"
+/// with "the waiver was used and nobody owns the matched address", and the
+/// second of those is the case that must reject.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::node) enum Msg1Waiver {
+    /// The transport accepts fresh inbound handshakes (or no transport is
+    /// registered), so the address carve-out did not admit this msg1 and
+    /// there is nothing to confirm.
+    NotNeeded,
+    /// The carve-out is what admitted this msg1, and the matched address
+    /// belongs to this identity: either a promoted peer, or a handshake
+    /// already in flight on the matched link whose identity is expected
+    /// (outbound dial) or already learned (inbound msg1).
+    Expect(NodeAddr),
+    /// The carve-out is what admitted this msg1, and no identity can be
+    /// attributed to the matched address. Fail closed: reject after the DH.
+    Unattributed,
+}
 
 impl EstablishView for Node {
     fn establish_snapshot(&self, peer_addr: &NodeAddr) -> EstablishSnapshot {
@@ -169,6 +215,80 @@ impl Node {
         false
     }
 
+    /// Classify the msg1 waiver for a source that `should_admit_msg1`
+    /// admitted, so the post-DH confirmation knows whether it has an
+    /// identity to check against and what to do when it has none.
+    ///
+    /// `established` is the caller's already-computed
+    /// `is_established_link_msg1(...)`, so the O(peers) scan is not repeated
+    /// on the refusal path.
+    ///
+    /// The two attribution limbs are composed the same way
+    /// `is_established_link_msg1` composes its own: as an OR, not as an
+    /// if/else. An `addr_to_link` entry that yields no identity must not
+    /// short-circuit the address scan, because the two keys can be different
+    /// forms of the same peer's address (the hostname-vs-numeric case that
+    /// predicate 2 exists for) and the entry can outlive the link it named.
+    pub(in crate::node) fn msg1_waiver(
+        &self,
+        established: bool,
+        transport_id: crate::transport::TransportId,
+        remote_addr: &crate::transport::TransportAddr,
+    ) -> Msg1Waiver {
+        // The carve-out only admits anything when the gate would otherwise
+        // refuse, so an accepting transport has nothing to confirm.
+        if self
+            .transports
+            .get(&transport_id)
+            .is_none_or(|t| t.accept_connections())
+        {
+            return Msg1Waiver::NotNeeded;
+        }
+        if !established {
+            // `should_admit_msg1` refused this msg1 and the caller returned,
+            // so this arm is unreachable from the one call site. Fail closed
+            // rather than skipping the check, so a second caller cannot
+            // reintroduce the hole this classifier exists to close.
+            return Msg1Waiver::Unattributed;
+        }
+
+        // Predicate 1: the reverse-address lookup.
+        if let Some(&link_id) = self.addr_to_link.get(&(transport_id, remote_addr.clone())) {
+            if let Some(peer) = self.peers.values().find(|p| p.link_id() == link_id) {
+                return Msg1Waiver::Expect(*peer.node_addr());
+            }
+            // A link with no promoted peer: a dial in progress or an inbound
+            // handshake in flight. Both register a connection carrying the
+            // expected (outbound) or learned (inbound) identity.
+            if let Some(id) = self
+                .connections()
+                .find(|(id, _)| **id == link_id)
+                .and_then(|(_, machine)| machine.conn_expected_identity())
+            {
+                return Msg1Waiver::Expect(*id.node_addr());
+            }
+            // Deliberately fall through instead of returning. The entry can
+            // name a link that no longer exists — `remove_link` clears the
+            // reverse lookup only under the key it rebuilds from the link's
+            // own remote address, so an entry inserted under a second
+            // address form for that link survives its removal. Rejecting
+            // here would refuse a peer predicate 2 can still attribute, and
+            // would refuse it permanently: this classifier's caller returns
+            // above the insert that overwrites the stale entry, so nothing
+            // downstream would ever repair the map.
+        }
+
+        // Predicate 2: the address scan over promoted peers, which always
+        // yields an identity when it matches.
+        self.peers
+            .values()
+            .find(|p| {
+                p.transport_id() == Some(transport_id) && p.current_addr() == Some(remote_addr)
+            })
+            .map(|p| Msg1Waiver::Expect(*p.node_addr()))
+            .unwrap_or(Msg1Waiver::Unattributed)
+    }
+
     /// Returns true if an inbound msg1 should be admitted past the
     /// `accept_connections` gate.
     ///
@@ -219,8 +339,8 @@ impl Node {
         // function returns, and that is what releases the pending slot on
         // every exit path. Renaming it to a bare `_` drops the guard right
         // here instead, releasing the slot at acquire time — silently, with
-        // no test and no clippy lint catching the difference. Do not "tidy"
-        // this binding.
+        // no clippy lint catching the difference. Do not "tidy" this
+        // binding; the assertion below is what reds if it is tidied.
         let _slot = match self.msg1_rate_limiter.start_handshake(class) {
             Ok(slot) => slot,
             Err(reason) => {
@@ -233,6 +353,19 @@ impl Node {
                 return;
             }
         };
+
+        // Test-build witness for the paragraph above, and the only thing that
+        // observes it. A guard released at acquire time leaves this msg1
+        // in flight with its slot already back in the pool, which no counter,
+        // log line or lint reports: by the time any test can look, the count
+        // has returned to its baseline either way. Sampling it here, on the
+        // handler's own stack, is what tells the two apart — see
+        // `msg1_handler_holds_its_pending_slot_while_the_handler_runs`.
+        #[cfg(test)]
+        assert!(
+            self.msg1_rate_limiter.pending_count() > 0,
+            "the msg1 pending slot was released before the handler ran"
+        );
 
         // accept_connections gate. Rekey/restart msg1 on an existing link
         // is always admitted; the gate only filters truly-fresh connections
@@ -249,6 +382,12 @@ impl Node {
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;
         }
+
+        // Snapshot which identity, if any, the address carve-out attributed
+        // this source to. Taken here rather than after the DH so the answer
+        // is the one the gate acted on. On an accepting transport this is one
+        // map lookup and a return.
+        let waiver = self.msg1_waiver(established, packet.transport_id, &packet.remote_addr);
 
         // Parse header
         let header = match Msg1Header::parse(&packet.data) {
@@ -334,14 +473,18 @@ impl Node {
         machine.set_conn_source_addr(packet.remote_addr.clone());
         machine.set_leg(HandshakeCrypto::new());
 
-        let our_keypair = self.identity().keypair();
+        // This frame's own copy of the node's long-term private key; the
+        // handshake state keeps its own and clears that on drop.
+        let mut our_keypair = self.identity().keypair();
         let noise_msg1 = &packet.data[header.noise_msg1_offset..];
-        let msg2_response = match machine.receive_handshake_init(
+        let init_result = machine.receive_handshake_init(
             our_keypair,
             self.startup_epoch(),
             noise_msg1,
             packet.timestamp_ms,
-        ) {
+        );
+        our_keypair.non_secure_erase();
+        let msg2_response = match init_result {
             Ok(m) => m,
             Err(e) => {
                 debug!(
@@ -367,6 +510,39 @@ impl Node {
         };
 
         let peer_node_addr = *peer_identity.node_addr();
+
+        // The address carve-out admitted this msg1 past a refusing gate on
+        // the strength of the source address alone. Now that the DH has
+        // revealed the initiator's static, confirm it belongs to the party
+        // that address is attributed to; an off-path party sourcing from an
+        // established peer's address gets no further than here. Cheap
+        // rejection is unchanged: a stranger under accept_connections=false
+        // is still refused above, having paid nothing.
+        match waiver {
+            Msg1Waiver::NotNeeded => {}
+            Msg1Waiver::Expect(expected) if expected == peer_node_addr => {}
+            Msg1Waiver::Expect(expected) => {
+                warn!(
+                    expected = %self.peer_display_name(&expected),
+                    actual = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %packet.transport_id,
+                    "Msg1 admitted by the established-address waiver carries a different identity, dropping"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                return;
+            }
+            Msg1Waiver::Unattributed => {
+                warn!(
+                    actual = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %packet.transport_id,
+                    "Msg1 admitted by the established-address waiver, but no identity owns that address, dropping"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                return;
+            }
+        }
 
         // === PHASE B result ===
         // Bundle the Noise wire-step outputs (identity, remote epoch, sender
@@ -575,6 +751,58 @@ impl Node {
                 // executor's `InvalidateSendState`
                 // (`ambient.verified_identity.node_addr()`) targets the same addr
                 // as the pre-refactor `remove_active_peer(&peer)`.
+                // The epoch travels inside the AEAD, so this msg1 is
+                // authentic — but it stays authentic after capture, and
+                // replaying one destroys a working peering and the FSP session
+                // state it carries, from off the path. Two receiver-local
+                // conditions gate the teardown. The peering's last
+                // authenticated inbound frame is the evidence it is still
+                // alive, and nothing an unauthenticated sender emits can
+                // refresh it, so a peer that genuinely restarted clears this by
+                // having stopped sending. The interval half bounds the churn
+                // one peer can drive on its own.
+                let now_ms = Self::now_ms();
+                let peering_idle_ms = self
+                    .peers
+                    .get(&peer)
+                    .map(|p| p.idle_time(now_ms))
+                    .unwrap_or(u64::MAX);
+                let dampened = self
+                    .restart_dampener
+                    .get(&peer)
+                    .is_some_and(|t| t.elapsed().as_secs() < EPOCH_RESTART_MIN_INTERVAL_SECS);
+                if peering_idle_ms < EPOCH_RESTART_MIN_INTERVAL_SECS * 1000 || dampened {
+                    debug!(
+                        peer = %self.peer_display_name(&peer),
+                        idle_ms = peering_idle_ms,
+                        dampened,
+                        "Epoch mismatch dampened, dropping msg1"
+                    );
+                    // Silent drop: the stored msg2 is bound to the original
+                    // msg1's ephemeral, and answering an address the sender
+                    // chose is free amplification.
+                    //
+                    // No registry cleanup is needed here. On the pre-refactor
+                    // layout this arm removed the pending connection and its
+                    // link, because both were inserted before msg1 was
+                    // classified. The classification now runs against a local
+                    // `machine` that enters `peer_machines` only at the promote
+                    // tails below, and `link_id` is a bare allocation until
+                    // then, so dropping out of the arm is the whole cleanup.
+                    // The fresh leg holds no session index either (it is parked
+                    // at `Handshaking{ReceivedMsg1}` with `our_index == None`),
+                    // so nothing is leaked by returning.
+                    self.stats_mut()
+                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                    return;
+                }
+                // Stamped on acceptance only. A refusal that slid the window
+                // would let a sustained replay starve a genuinely restarting
+                // peer for as long as it kept sending.
+                let cutoff = Duration::from_secs(EPOCH_RESTART_MIN_INTERVAL_SECS);
+                self.restart_dampener.retain(|_, t| t.elapsed() < cutoff);
+                self.restart_dampener.insert(peer, Instant::now());
+
                 debug!(
                     peer = %self.peer_display_name(&peer),
                     "Peer restart detected (epoch mismatch), removing stale session"
@@ -1102,6 +1330,19 @@ impl Node {
             if let Some(idx) = our_index {
                 let _ = self.index_allocator.free(idx);
             }
+            // Put the dial back on the retry schedule. The disposal above takes
+            // this leg out of the stuck-leg sweep — `has_pending_leg` reads false
+            // for it from here on, so the reap that normally reaches
+            // `note_handshake_timeout` never runs — and that reflex is the only
+            // thing that seeds `retry_pending` for a configured peer.
+            // `close_connection` only drops the transport's pool entry; it
+            // schedules nothing.
+            //
+            // `peer_identity` is safe to reschedule against here because this is
+            // an IK dial: the initiator's expected identity is fixed at
+            // `start_handshake` and `complete_handshake` never overwrites it, so
+            // it is still the peer we meant to dial and not whoever answered.
+            self.note_handshake_timeout(*peer_identity.node_addr(), packet.timestamp_ms);
             self.stats_mut()
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;
