@@ -3,7 +3,7 @@
 ![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.5.0-green.svg)](#status--roadmap)
+[![Status](https://img.shields.io/badge/status-v0.6.0--dev-green.svg)](#status--roadmap)
 
 A self-organizing encrypted mesh network built on Nostr identities,
 capable of operating over arbitrary transports without central
@@ -299,29 +299,17 @@ testing/      Docker-based integration test harnesses + chaos simulation
 
 ## Status & roadmap
 
-FIPS is at **v0.5.0** on the `master` branch, the first feature
-release since v0.4.0.
-[v0.4.2](https://github.com/jmcorgan/fips/releases/tag/v0.4.2) was the
-last release on the maintenance line, so how much of this release is
-new to you depends on which version you are upgrading from. The core
-protocol
-works end-to-end over UDP, TCP, Ethernet, Tor, Nym, and Bluetooth on a
-global, public test mesh of thousands of nodes.
-
-v0.5.0 is a platform-and-lifecycle release. It adds FreeBSD as a
-packaged platform (x86_64 only), OpenWrt setup helpers for an 802.11s
-mesh between routers (`fips-mesh-setup`) and for the open `!FIPS` client
-SSID (`fips-ap-setup`), and an Android embedding interface for apps that own
-their own TUN.
-Node health is now determined at start completion and published as
-`Degraded` or `Failed`, a node with **no transport up is a fatal
-start** rather than a silent one, and shutdown runs a bounded drain
-window (`node.drain_timeout_secs`, default 2 seconds) so live traffic
-is not cut mid-flight. The `node.discovery.*` configuration table
-splits into `node.lookup.*` and `node.rendezvous.*`; a deployed
-`node.discovery:` block still loads, folded in with a one-time
-deprecation warning. New wire-format work continues to be staged on the
-`next` branch for the subsequent release line.
+FIPS is at **v0.6.0-dev** on the `master` branch.
+[v0.5.0](https://github.com/jmcorgan/fips/releases/tag/v0.5.0) has
+shipped; this development line continues the testing-and-polishing
+track toward v0.6.0. The core protocol works end-to-end over
+UDP, TCP, Ethernet, Tor, Nym, and Bluetooth on a global, public test
+mesh of thousands of nodes. v0.5.0 added FreeBSD as a packaged platform,
+OpenWrt setup helpers for an 802.11s mesh backhaul and an open client
+SSID, an Android embedding interface, a native datagram API addressed by
+public key, and published node health with a bounded shutdown drain.
+New wire-format work continues to be staged on the `next` branch for the
+subsequent release line.
 
 ### What works today
 
