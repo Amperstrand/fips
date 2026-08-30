@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Nothing yet. Everything previously staged here is folded into
 `[0.5.0]` below.
 
-## [0.5.0] - 2026-08-23
+## [0.5.0] - 2026-08-30
 
 ### Added
 

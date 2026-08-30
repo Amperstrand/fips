@@ -1,7 +1,6 @@
 # FIPS v0.5.0
 
-**Released**: 2026-08-23 (provisional: the date is confirmed when the
-release is tagged)
+**Released**: 2026-08-30
 
 v0.5.0 is a feature release, the first since v0.4.0. It adds two new
 supported platforms, a new way for applications to use the mesh, and a set
@@ -784,4 +783,4 @@ operator meets first.
   tick profiler, the lookup and rendezvous naming split, and the
   integration and review of the contributed work above, plus the
   native datagram API and the `fipsctl probe` diagnostic.
-  171 commits.
+  174 commits.
