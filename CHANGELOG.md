@@ -89,7 +89,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or FreeBSD `ECONNRESET` as end of file alongside the `POLLHUP` and
   zero-byte read that Linux gives. `EAGAIN` is deliberately not in that
   company: it means the socket is empty and the peer alive, so it stays an
-  error and the caller waits again.
+  error and the caller waits again. **A zero-length payload has one known
+  limitation.** A closed peer latches `POLLHUP` while its messages are still
+  queued, so that flag alone cannot say whether a zero-byte read is an empty
+  datagram or the close; the receive path also asks `FIONREAD`, and bytes still
+  queued prove a further message is waiting. That leaves one case unresolved:
+  a zero-length datagram that is the last message before a close is reported as
+  the close, because reading it drains the queue and a zero-length message
+  contributes no bytes to `FIONREAD`. A client should not give a zero-length
+  payload a meaning of its own, and should carry a one-byte discriminator
+  instead.
 
 #### OpenWrt mesh
 
