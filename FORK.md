@@ -91,3 +91,23 @@ One word (`false`) fixed it.
 of them.** The D0WD bin and S3 bin are near-identical files, but the
 fix only went to one. A grep for `peer_sent_first.*true` would have
 found the second instance in seconds.
+
+## 2026-08-31 E2E Mesh Test Results (v0.5.0)
+
+First simultaneous three-chip, three-transport mesh against a single v0.5.0 daemon:
+
+| Node | Chip | Transport | Result |
+|---|---|---|---|
+| STM32 (G·1) | F469I-DISCO | USB CDC → bridge → UDP | Connected, heartbeats sustained, **FSP endpoint** (SIM→STM32 PING passed) |
+| S3 (G·9) | ESP32-S3-WROOM | WiFi → mDNS pinned → UDP | Connected, heartbeats sustained (link-level only, by design) |
+| Atom D0WD (G·12) | ESP32-D0WD | BLE L2CAP (raw-SDU dialect) | Connected, heartbeats sustained |
+
+**MCU-to-MCU FSP forwarding: verified.** The daemon routes FSP SessionSetup
+frames between peers; the SIM initiator reached the STM32's FSP handler
+through the daemon's mesh forwarding. FSP PING succeeded (request → response
+in the same log block).
+
+**RSSI-priority branch analysis (#152):** v0.5.0's rotation in `next_due()`
+already prevents the starvation DoS our old branch fixed. RSSI-based probe
+ordering remains as a small optimization (data already in `ScanAdvert.rssi`,
+just not used in `next_due()`). Branch deleted; port sketch in #152.
