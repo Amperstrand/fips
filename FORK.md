@@ -111,3 +111,33 @@ in the same log block).
 already prevents the starvation DoS our old branch fixed. RSSI-based probe
 ordering remains as a small optimization (data already in `ScanAdvert.rssi`,
 just not used in `next_due()`). Branch deleted; port sketch in #152.
+
+## 2026-09-03 Salvage Pass (#146/#147/#148)
+
+- **#147 (rekey lineage): CLOSED-OUT — subsumed.** The branch's one meat
+  commit (67d1e730, 129 lines) no longer applies to fork/main (target code
+  gone); upstream a3ea2245 covers the abandoned-rekey/ACL-rejected case and
+  is already in our history. Remaining commits were chores/dep bumps.
+  experiment/ble-v2 + experiment/macos-ble had ZERO patch-unique commits
+  (local-only) — deleted. Actions: `fix/ble-rekey-recovery-103` and
+  `feat/tollgate-peer-policy` archived under `archive/` then topic refs
+  deleted (reversible).
+- **#148 (tollgate-peer-policy): re-imagine, don't rebase.** 10 of its
+  commits are the pre-pool Android/macOS BLE stack — architecturally dead
+  against upstream's `enable_app_owned_ble_radio` seam (#144's subject).
+  The per-peer forwarding-policy kernel (1c3eef3a+635963bb) predates
+  upstream's `src/node/dataplane/` split; port it fresh IF a tollgate
+  integration still needs it (upstream's dataplane may grow it natively —
+  re-check then). Branch archived.
+- **#146 (mipsel): rebased kernel pushed as `feature/mipsel-support-rebased`.**
+  Decomposed the 20 "patch-unique" commits: 10 are the #148 BLE stack riding
+  shared lineage (excluded), 10 are the real mipsel work (portable-atomic
+  swap + vendored nostr-relay-pool patch, zigbuild/nightly CI fixes,
+  soft-float ABI). Cherry-picked onto fork/main; d6de652e (mlugg/setup-zig
+  swap) SKIPPED — fork/main's checksum-pinned zig install supersedes it.
+  Cargo.toml conflict resolved (bench section + [patch.crates-io] coexist).
+  Host suite: 2302 passed / 5 failed — the same 5 nostr socket-bind tests
+  fail on clean fork/main (environmental loopback-subnet binds, baseline
+  verified). Zero regressions. NEXT: push-trigger the MIPS cross-compile
+  workflow on the branch (it carries the workflow), then the upstream-PR
+  decision (mipsel/OpenWrt is in upstream's interest).
