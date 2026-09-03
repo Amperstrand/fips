@@ -5,6 +5,7 @@ on:
       - master
       - maint
       - next
+      - feature/mipsel-support-rebased
     tags:
       - "v*"
   pull_request:
@@ -89,10 +90,10 @@ jobs:
           # MIPS disabled: nostr-relay-pool 0.44 uses std::sync::atomic::AtomicU64
           # directly (fips's own atomics already use portable_atomic). Re-enable
           # once an upstream portable-atomic patch lands (or via [patch.crates-io]).
-          # - build_arch: mipsel
-          #   openwrt_arch: mipsel_24kc
-          #   rust_target: mipsel-unknown-linux-musl
-          #   rust_channel: nightly
+          - build_arch: mipsel
+            openwrt_arch: mipsel_24kc
+            rust_target: mipsel-unknown-linux-musl
+            rust_channel: nightly
           # - build_arch: mips
           #   openwrt_arch: mips_24kc
           #   rust_target: mips-unknown-linux-musl
@@ -234,11 +235,18 @@ jobs:
       # these artifacts via --bin-dir, so the Rust build runs a single time
       # per architecture instead of once per package format.
       - name: Cross-compile and strip binaries
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          RUST_CHANNEL: ${{ matrix.rust_channel }}
         run: |
           set -euo pipefail
-          cargo zigbuild --release --target ${{ matrix.rust_target }} \
+          BUILD_STD=""
+          case "$RUST_CHANNEL" in
+            nightly) export RUSTUP_TOOLCHAIN=nightly; BUILD_STD="-Z build-std=core,alloc,std"; export RUSTFLAGS="-C link-arg=-msoft-float -C target-feature=-crt-static" ;;
+          esac
+          cargo zigbuild $BUILD_STD --release --target "$RUST_TARGET" \
             --bin fips --bin fipsctl --bin fipstop --bin fips-gateway
-          RELEASE_DIR="target/${{ matrix.rust_target }}/release"
+          RELEASE_DIR="target/$RUST_TARGET/release"
           mkdir -p out
           for b in fips fipsctl fipstop fips-gateway; do
             llvm-strip "$RELEASE_DIR/$b" 2>/dev/null || true

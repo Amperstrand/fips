@@ -42,7 +42,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use ring::aead::{Aad, LessSafeKey, Nonce};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, trace, warn};
 
