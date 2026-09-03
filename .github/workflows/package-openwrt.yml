@@ -5,6 +5,7 @@ on:
       - master
       - maint
       - next
+      - feature/mipsel-support-rebased
     tags:
       - "v*"
   pull_request:
