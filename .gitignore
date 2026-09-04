@@ -44,3 +44,6 @@ __pycache__/
 /fips.key
 /fips.pub
 /fips.yaml
+
+# local runtime env (real values; testing/sidecar/.env carried a live nsec — rotate)
+testing/*/.env
