@@ -1,0 +1,19 @@
+# Gitleaks allowlist — every entry justified.
+#
+# fips is a public fork carrying one burned credential in history (see
+# Amperstrand/fips#155): testing/sidecar/.env held a real 64-hex FIPS_NSEC,
+# removed at tip in f6c591c (2026-09-06). The identity is under rotation;
+# this prefix-anchored entry dies with the old key. Example .env templates
+# tracked at tip carry placeholders only.
+
+title = "fips gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Burned FIPS_NSEC (raw 64-hex scalar) from testing/sidecar/.env history — removed at tip f6c591c, identity rotation tracked in issue #155"
+regexTarget = "secret"
+regexes = [
+  '''^e752b92a''',
+]
