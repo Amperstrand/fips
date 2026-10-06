@@ -782,7 +782,23 @@ are pumped by two threads doing blocking I/O, so nothing needs the main
 thread's run loop. CoreBluetooth is privacy-gated: the `fips` binary
 embeds an `Info.plist` carrying `NSBluetoothAlwaysUsageDescription`, and
 the process needs Bluetooth permission — which macOS never grants a root
-launchd daemon, so the in-process radio serves a daemon run from a login
+launchd daemon. So when CoreBluetooth refuses the daemon, it listens on
+`/var/run/fips/ble-agent.sock` instead, and a per-user LaunchAgent runs
+`fips-ble-agent --ble-agent` (a hard link to `fips`) in the login
+session: the agent owns the radio and proxies it to the daemon
+(`io_macos/agent*.rs`), carrying the radio commands, the bridge
+callbacks and the channel bytes as length-prefixed frames. The agent
+uses that fixed path, never the control socket's `/tmp` fallback, and
+serves it only when `getpeereid()` says root answered. The daemon
+installs the agent connection into its slot as one more radio, so the
+transport above is unchanged; an agent that disconnects is a radio
+switched off, and an agent whose own radio goes down disconnects. One
+agent at a time: while one is connected, the daemon answers another's
+hello with `Busy`, and that agent backs off. Outbound channel bytes are
+credit-based per channel — the agent grants a window when the channel
+opens and returns credit as its radio takes each packet, and the daemon
+sends only while it holds credit — so a peer that stops granting L2CAP
+credits stalls its own channel at the daemon rather than the agent's
 session. CoreBluetooth also hides link
 addresses; a peer's per-host identifier is hashed into the six bytes of
 a `BleAddr`, so a Mac can dial only scan-discovered peers, not a

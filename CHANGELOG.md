@@ -26,8 +26,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CoreBluetooth requires; the daemon needs Bluetooth permission. Configured
   `hci0/AA:…` peers are not dialable from a Mac, only scan-discovered ones,
   because CoreBluetooth hides link addresses; a BLE peer address naming any
-  adapter but `ble0` is a config error there. macOS has one radio, so more
-  than one `ble` instance is a config error there.
+  adapter but `ble0` is a config error there.
+  macOS never grants Bluetooth to a root launchd daemon — CoreBluetooth answers
+  `Unauthorized` whatever the privacy settings say — so the package also
+  installs a per-user LaunchAgent, `com.fips.ble-agent`, that runs
+  `fips-ble-agent --ble-agent` (a hard link to `fips`, so the two processes
+  are told apart in Activity Monitor) in the login session and lends the
+  radio to the daemon over `/var/run/fips/ble-agent.sock` (group `fips`).
+  The agent uses that path and no fallback, and serves it only if the socket's
+  peer is root. One agent lends the radio at a time: the daemon refuses a
+  second while one is connected, and the refused agent backs off. An agent
+  whose radio goes down hangs up, and says hello again when it is back. Each
+  channel's outbound bytes are credit-limited, so a peer that stops taking
+  bytes stalls only its own channel, not the agent.
+  The daemon uses CoreBluetooth directly when it is allowed to (run from a
+  terminal), and falls back to waiting for the agent when it is refused. BLE
+  works while someone in the `fips` group is logged in; each user's agent
+  logs to `~/Library/Logs/fips/ble-agent.log`, rolled like the daemon's log.
+  macOS has one radio, so more than one `ble` instance is a config error
+  there.
 
 - Dynamic interface binding for the Ethernet transport. An interface-bound
   transport is now a long-lived object that is *sometimes bound*: the interface

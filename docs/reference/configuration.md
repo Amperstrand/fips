@@ -957,8 +957,11 @@ Linux or any other platform, BLE config still parses but the transport
 runtime is absent and config entries become no-ops. On glibc Linux the
 transport communicates with BlueZ via D-Bus through the `bluer` crate;
 on Android the radio is supplied by the embedding application. On macOS
-it uses CoreBluetooth: `adapter` is ignored, and more than one `ble`
-instance is a config error. Linux
+it uses CoreBluetooth: `adapter` is ignored, more than one `ble` instance
+is a config error, and the packaged daemon, which macOS does not let use
+Bluetooth, gets the radio from the `fips-ble-agent` LaunchAgent running in
+a logged-in session of a `fips` group member (see the BLE section of
+[the transport layer design](../design/fips-transport-layer.md)). Linux
 and Android cannot dial a Mac, so a Mac needs `auto_connect: true` to
 peer with them: the link forms only from the Mac's own dial. A Mac can
 dial only scan-discovered peers, so a BLE peer address naming any
