@@ -1697,7 +1697,70 @@ impl Config {
     /// Validate cross-field configuration invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_ethernet_interfaces()?;
+        // Matched to the macOS BLE arm in `Node::create_transports`, which a
+        // test build does not compile either.
+        self.validate_ble_instances(cfg!(all(target_os = "macos", not(test))))?;
+        self.validate_ble_peer_addresses(cfg!(all(target_os = "macos", not(test))))?;
         self.validate_rendezvous()
+    }
+
+    /// Reject more than one BLE instance where the platform has one radio
+    /// for the whole host.
+    ///
+    /// On macOS every instance would drive the same CoreBluetooth radio and
+    /// listen for the BLE agent on the same socket, so a second one can only
+    /// collide with the first. `single_radio` is a parameter so the rule is
+    /// tested on every host.
+    fn validate_ble_instances(&self, single_radio: bool) -> Result<(), ConfigError> {
+        if single_radio && self.transports.ble.len() > 1 {
+            return Err(ConfigError::Validation(format!(
+                "{} BLE transports are configured; this platform has a single \
+                 Bluetooth radio, so configure one",
+                self.transports.ble.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The adapter label CoreBluetooth peers are named under: the radio
+    /// bridge's `RADIO_ADAPTER`, which a test in `io_macos` pins this to.
+    /// Spelled out here because config is compiled where the BLE module is
+    /// not.
+    pub const COREBLUETOOTH_ADAPTER: &'static str = "ble0";
+
+    /// Reject BLE peer addresses a CoreBluetooth radio cannot dial.
+    ///
+    /// CoreBluetooth hides link addresses, so a Mac dials only peers it has
+    /// scanned, which it names under the `ble0` adapter. A configured
+    /// `hci0/AA:…` peer would otherwise fail on every attempt with nothing
+    /// above debug level to say why. `corebluetooth` is a parameter so the
+    /// rule is tested on every host.
+    fn validate_ble_peer_addresses(&self, corebluetooth: bool) -> Result<(), ConfigError> {
+        // With no BLE transport, a BLE address is never dialled; a config
+        // shared with other hosts may list one.
+        if !corebluetooth || self.transports.ble.is_empty() {
+            return Ok(());
+        }
+        for peer in &self.peers {
+            for address in &peer.addresses {
+                if address.spec().kind != "ble" {
+                    continue;
+                }
+                let adapter = address.addr.split_once('/').map(|(a, _)| a);
+                if adapter != Some(Self::COREBLUETOOTH_ADAPTER) {
+                    return Err(ConfigError::Validation(format!(
+                        "BLE peer address \"{}\" for {} cannot be dialled on macOS: \
+                         CoreBluetooth hides link addresses, so only scan-discovered \
+                         peers (adapter \"{}\") are reachable; remove it and enable \
+                         `transports.ble.auto_connect`",
+                        address.addr,
+                        peer.npub,
+                        Self::COREBLUETOOTH_ADAPTER,
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reject interface names no kernel could ever hand back.
@@ -4713,5 +4776,65 @@ node:
             !path.starts_with(bogus),
             "stale/invalid XDG_RUNTIME_DIR leaked into resolver: {path}"
         );
+    }
+
+    /// A Mac dials only scan-discovered peers, so a configured BLE address
+    /// on any other adapter is a config error there, and fine elsewhere.
+    #[test]
+    fn a_ble_peer_address_off_the_radio_adapter_is_rejected_on_macos() {
+        let yaml = |addr: &str| {
+            format!(
+                r#"
+transports:
+  ble:
+    mtu: 2048
+peers:
+  - npub: "npub1sjlh2c3x9w7kjsqg2ay080n2lff2uvt325vpan33ke34rn8l5jcqawh57m"
+    addresses:
+      - transport: ble
+        addr: "{addr}"
+      - transport: udp
+        addr: "192.0.2.1:2121"
+"#
+            )
+        };
+        let hci: Config = serde_yaml::from_str(&yaml("hci0/AA:BB:CC:DD:EE:FF")).unwrap();
+        assert!(matches!(
+            hci.validate_ble_peer_addresses(true),
+            Err(ConfigError::Validation(_))
+        ));
+        assert!(hci.validate_ble_peer_addresses(false).is_ok());
+
+        let radio: Config = serde_yaml::from_str(&yaml("ble0/02:00:00:00:00:01")).unwrap();
+        assert!(radio.validate_ble_peer_addresses(true).is_ok());
+
+        // A Mac with no BLE transport never dials the address, and may share
+        // its config with hosts that do.
+        let mut no_ble = hci;
+        no_ble.transports.ble = Default::default();
+        assert!(no_ble.validate_ble_peer_addresses(true).is_ok());
+    }
+
+    /// One radio per host: a second BLE instance is a config error there,
+    /// and fine where each instance can own an adapter.
+    #[test]
+    fn a_second_ble_instance_is_rejected_on_a_single_radio_platform() {
+        let yaml = r#"
+transports:
+  ble:
+    left:
+      adapter: hci0
+    right:
+      adapter: hci1
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            config.validate_ble_instances(true),
+            Err(ConfigError::Validation(_))
+        ));
+        assert!(config.validate_ble_instances(false).is_ok());
+
+        let one: Config = serde_yaml::from_str("transports:\n  ble:\n    adapter: hci0\n").unwrap();
+        assert!(one.validate_ble_instances(true).is_ok());
     }
 }
