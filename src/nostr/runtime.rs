@@ -53,6 +53,26 @@ fn short_npub(npub: &str) -> String {
         .unwrap_or_else(|| npub.to_string())
 }
 
+/// An offer we sent and are still waiting on, with what is needed to send it
+/// again. `resend` allows at most one successful re-send per offer.
+struct InflightOffer {
+    offer: TraversalOffer,
+    relays: Vec<String>,
+    receiver: PublicKey,
+    resend: Resend,
+}
+
+/// Where the one re-send an in-flight offer is allowed stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resend {
+    /// Not published yet; the next suppression may try.
+    Available,
+    /// A suppression is publishing it now, so a concurrent one must not.
+    Sending,
+    /// Published; the offer gets no further re-send.
+    Done,
+}
+
 /// Whether an inbound-offer rejection belongs to a class that cannot be
 /// explained by ordinary relay delivery lag, and therefore warrants a warning
 /// on a node running at the default log level. A stale offer is benign and is
@@ -216,6 +236,13 @@ pub struct NostrRendezvous {
     advert: AdvertMachine,
     traversal: TraversalMachine,
     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
+    /// Our outbound offer per peer npub while we wait for its answer, kept so
+    /// a dual-init election that suppresses the peer's offer can re-send ours.
+    inflight_offers: Mutex<HashMap<String, InflightOffer>>,
+    /// The payload of every signal `send_signal` published, in order, so unit
+    /// tests can observe what was sent.
+    #[cfg(test)]
+    sent_signals: std::sync::Mutex<Vec<String>>,
     admission: OfferAdmission,
     signal_gate: SignalGate,
     /// Limits the suspicious-offer warning to one a minute.
@@ -360,6 +387,9 @@ impl NostrRendezvous {
             advert,
             traversal,
             pending_answers: Mutex::new(HashMap::new()),
+            inflight_offers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            sent_signals: std::sync::Mutex::new(Vec::new()),
             admission,
             signal_gate: SignalGate::new(Instant::now()),
             refusal_warn: std::sync::Mutex::new(RefusalWarnGate::default()),
@@ -1263,13 +1293,20 @@ impl NostrRendezvous {
             event = %short_id(&offer_event.id.to_string()),
             "traversal: offer sent"
         );
+        self.inflight_offers.lock().await.insert(
+            peer_config.npub.clone(),
+            InflightOffer {
+                offer: offer.clone(),
+                relays: relays.clone(),
+                receiver: target_pubkey,
+                resend: Resend::Available,
+            },
+        );
 
-        let answer = match tokio::time::timeout(
-            Duration::from_secs(self.config.signal_ttl_secs),
-            rx,
-        )
-        .await
-        {
+        let answer =
+            tokio::time::timeout(Duration::from_secs(self.config.signal_ttl_secs), rx).await;
+        self.inflight_offers.lock().await.remove(&peer_config.npub);
+        let answer = match answer {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => {
                 let _ = self.pending_answers.lock().await.remove(&offer.nonce);
@@ -1378,6 +1415,65 @@ impl NostrRendezvous {
         )
     }
 
+    /// Send our in-flight offer to `peer_npub` once more.
+    ///
+    /// Called when the dual-init election suppresses the peer's offer. If the
+    /// peer received our offer, it answers that one and this copy is dropped by
+    /// its replay check. If our offer was lost, or published before the peer
+    /// was listening, the suppression leaves neither side answering, and the
+    /// connect would stall for `signal_ttl_secs`; this copy lets the peer answer
+    /// now.
+    ///
+    /// At most one successful re-send per offer. The re-send is marked done only
+    /// once a publish succeeds, so a failed publish leaves it available to the
+    /// next suppression; while one is publishing, a concurrent suppression
+    /// sends nothing.
+    async fn resend_inflight_offer(&self, peer_npub: &str) {
+        let (offer, relays, receiver) = {
+            let mut inflight = self.inflight_offers.lock().await;
+            let Some(entry) = inflight
+                .get_mut(peer_npub)
+                .filter(|e| e.resend == Resend::Available)
+            else {
+                return;
+            };
+            entry.resend = Resend::Sending;
+            (entry.offer.clone(), entry.relays.clone(), entry.receiver)
+        };
+        let peer_short = short_npub(peer_npub);
+        let result = self.send_signal(&relays, receiver, &offer).await;
+        // The entry may have been removed (answered or timed out) or replaced
+        // by a newer offer while the publish ran; only this offer's entry is
+        // updated.
+        if let Some(entry) = self
+            .inflight_offers
+            .lock()
+            .await
+            .get_mut(peer_npub)
+            .filter(|e| e.offer.session_id == offer.session_id)
+        {
+            entry.resend = if result.is_ok() {
+                Resend::Done
+            } else {
+                Resend::Available
+            };
+        }
+        match result {
+            Ok(event) => debug!(
+                peer = %peer_short,
+                session = %short_id(&offer.session_id),
+                event = %short_id(&event.id.to_string()),
+                "traversal: offer re-sent after suppressing the peer's"
+            ),
+            Err(err) => debug!(
+                peer = %peer_short,
+                session = %short_id(&offer.session_id),
+                error = %err,
+                "traversal: offer re-send failed"
+            ),
+        }
+    }
+
     async fn handle_incoming_offer(
         self: Arc<Self>,
         offer: TraversalOffer,
@@ -1443,6 +1539,7 @@ impl NostrRendezvous {
                             session = %short_id(&offer.session_id),
                             "traversal: responder session suppressed, our outbound initiator wins (smaller addr)"
                         );
+                        self.resend_inflight_offer(&sender_npub).await;
                         return Ok(());
                     }
                     OfferDisposition::Proceed => {}
@@ -1923,6 +2020,11 @@ impl NostrRendezvous {
             .send_event_to(relays.to_vec(), &signal)
             .await
             .map_err(|e| BootstrapError::Nostr(e.to_string()))?;
+        #[cfg(test)]
+        self.sent_signals
+            .lock()
+            .expect("sent_signals lock")
+            .push(serde_json::to_string(payload)?);
         Ok(signal)
     }
 
@@ -2036,6 +2138,8 @@ impl NostrRendezvous {
             advert,
             traversal,
             pending_answers: Mutex::new(HashMap::new()),
+            inflight_offers: Mutex::new(HashMap::new()),
+            sent_signals: std::sync::Mutex::new(Vec::new()),
             admission,
             signal_gate: SignalGate::new(Instant::now()),
             refusal_warn: std::sync::Mutex::new(RefusalWarnGate::default()),
@@ -2052,6 +2156,71 @@ impl NostrRendezvous {
             public_udp_addr_cache: RwLock::new(HashMap::new()),
             outbound_admission: AtomicBool::new(true),
         }
+    }
+
+    /// Register `offer` as our in-flight offer to `peer_npub`, sent to `relays`,
+    /// with an active initiator, as `connect_peer` would after publishing it.
+    pub(crate) async fn insert_inflight_offer_for_test(
+        &self,
+        peer_npub: &str,
+        offer: TraversalOffer,
+        receiver: PublicKey,
+        relays: Vec<String>,
+    ) {
+        self.traversal.begin_initiator(peer_npub);
+        self.inflight_offers.lock().await.insert(
+            peer_npub.to_string(),
+            InflightOffer {
+                offer,
+                relays,
+                receiver,
+                resend: Resend::Available,
+            },
+        );
+    }
+
+    /// Whether our in-flight offer to `peer_npub` has been re-sent, or `None`
+    /// when there is none.
+    pub(crate) async fn inflight_offer_resent_for_test(&self, peer_npub: &str) -> Option<bool> {
+        self.inflight_offers
+            .lock()
+            .await
+            .get(peer_npub)
+            .map(|e| e.resend == Resend::Done)
+    }
+
+    /// The traversal offers `send_signal` has published, in order.
+    pub(crate) fn sent_offers_for_test(&self) -> Vec<TraversalOffer> {
+        self.sent_signals
+            .lock()
+            .expect("sent_signals lock")
+            .iter()
+            .filter_map(|json| serde_json::from_str::<TraversalOffer>(json).ok())
+            .filter(|offer| offer.message_type == "offer")
+            .collect()
+    }
+
+    /// Add `url` to the client pool without connecting to it. A send naming
+    /// only that relay then returns `Ok` from the pool, with the relay listed
+    /// as failed, and touches no network; a send naming a relay outside the
+    /// pool fails.
+    pub(crate) async fn add_unconnected_relay_for_test(&self, url: &str) {
+        self.client.add_relay(url).await.expect("add relay");
+    }
+
+    /// This runtime's own npub.
+    pub(crate) fn npub_for_test(&self) -> &str {
+        &self.npub
+    }
+
+    /// Run the incoming-offer handler.
+    pub(crate) async fn handle_incoming_offer_for_test(
+        self: Arc<Self>,
+        offer: TraversalOffer,
+        sender: PublicKey,
+        sender_npub: String,
+    ) -> Result<(), BootstrapError> {
+        self.handle_incoming_offer(offer, sender, sender_npub).await
     }
 
     /// Install the five background-task handles that `start` would install, so

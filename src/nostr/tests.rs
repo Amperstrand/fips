@@ -2337,3 +2337,191 @@ async fn an_upper_case_configured_npub_resolves_its_cached_advert() {
     .expect("cached advert resolved");
     assert_eq!(endpoints, vec![endpoint]);
 }
+
+/// A peer key whose NodeAddr sorts after (`larger`) or before our own.
+fn peer_keys_ordered(our_npub: &str, larger: bool) -> nostr::Keys {
+    use nostr::ToBech32;
+    let ours = *crate::PeerIdentity::from_npub(our_npub)
+        .unwrap()
+        .node_addr();
+    loop {
+        let keys = nostr::Keys::generate();
+        let npub = keys.public_key().to_bech32().unwrap();
+        let theirs = *crate::PeerIdentity::from_npub(&npub).unwrap().node_addr();
+        if (theirs > ours) == larger {
+            return keys;
+        }
+    }
+}
+
+fn offer_between(session: &str, from: &str, to: &str) -> super::TraversalOffer {
+    create_traversal_offer(
+        session.to_string(),
+        now_ms(),
+        30_000,
+        session.to_string(),
+        from.to_string(),
+        to.to_string(),
+        Some(addr("203.0.113.7", 40000)),
+        Vec::new(),
+        None,
+    )
+}
+
+/// A relay URL the test runtime adds to its pool without connecting. A send
+/// naming it succeeds at the pool and reaches no network.
+const UNCONNECTED_RELAY: &str = "ws://127.0.0.1:1";
+
+/// Dual init where our NodeAddr is smaller: the peer's offer is suppressed in
+/// favour of ours. If the peer never received ours, neither side answers until
+/// `signal_ttl_secs` runs out, so the suppression re-sends ours, once.
+#[tokio::test]
+async fn suppressing_a_peers_offer_resends_ours_once() {
+    use nostr::ToBech32;
+    let runtime = std::sync::Arc::new(NostrRendezvous::new_for_test());
+    runtime
+        .add_unconnected_relay_for_test(UNCONNECTED_RELAY)
+        .await;
+    let our_npub = runtime.npub_for_test().to_string();
+    let peer = peer_keys_ordered(&our_npub, true);
+    let peer_npub = peer.public_key().to_bech32().unwrap();
+
+    let ours = offer_between("our-session", &our_npub, &peer_npub);
+    runtime
+        .insert_inflight_offer_for_test(
+            &peer_npub,
+            ours.clone(),
+            peer.public_key(),
+            vec![UNCONNECTED_RELAY.to_string()],
+        )
+        .await;
+
+    for session in ["their-session-1", "their-session-2"] {
+        let theirs = offer_between(session, &peer_npub, &our_npub);
+        runtime
+            .clone()
+            .handle_incoming_offer_for_test(theirs, peer.public_key(), peer_npub.clone())
+            .await
+            .expect("a suppressed offer is not an error");
+        assert_eq!(
+            runtime.sent_offers_for_test(),
+            vec![ours.clone()],
+            "our offer, with its session id, should be re-sent exactly once ({session})"
+        );
+        assert_eq!(
+            runtime.inflight_offer_resent_for_test(&peer_npub).await,
+            Some(true),
+            "a published re-send should be marked done ({session})"
+        );
+    }
+}
+
+/// A re-send whose publish fails is not marked done, so the next suppression
+/// tries again; once one publish succeeds, no further re-send follows.
+#[tokio::test]
+async fn a_failed_resend_is_tried_again_on_the_next_suppression() {
+    use nostr::ToBech32;
+    let runtime = std::sync::Arc::new(NostrRendezvous::new_for_test());
+    let our_npub = runtime.npub_for_test().to_string();
+    let peer = peer_keys_ordered(&our_npub, true);
+    let peer_npub = peer.public_key().to_bech32().unwrap();
+
+    // The offer names a relay the pool does not hold yet, so publishing fails.
+    let ours = offer_between("our-session", &our_npub, &peer_npub);
+    runtime
+        .insert_inflight_offer_for_test(
+            &peer_npub,
+            ours.clone(),
+            peer.public_key(),
+            vec![UNCONNECTED_RELAY.to_string()],
+        )
+        .await;
+
+    let suppress = |session: &'static str| {
+        let runtime = runtime.clone();
+        let theirs = offer_between(session, &peer_npub, &our_npub);
+        let (sender, sender_npub) = (peer.public_key(), peer_npub.clone());
+        async move {
+            runtime
+                .handle_incoming_offer_for_test(theirs, sender, sender_npub)
+                .await
+                .expect("a suppressed offer is not an error");
+        }
+    };
+
+    suppress("their-session-1").await;
+    assert!(
+        runtime.sent_offers_for_test().is_empty(),
+        "a failed publish sends nothing"
+    );
+    assert_eq!(
+        runtime.inflight_offer_resent_for_test(&peer_npub).await,
+        Some(false),
+        "a failed publish must leave the re-send available"
+    );
+
+    runtime
+        .add_unconnected_relay_for_test(UNCONNECTED_RELAY)
+        .await;
+    for session in ["their-session-2", "their-session-3"] {
+        suppress(session).await;
+        assert_eq!(
+            runtime.sent_offers_for_test(),
+            vec![ours.clone()],
+            "the retried re-send should publish our offer exactly once ({session})"
+        );
+        assert_eq!(
+            runtime.inflight_offer_resent_for_test(&peer_npub).await,
+            Some(true),
+            "the published re-send should be marked done ({session})"
+        );
+    }
+}
+
+/// Dual init where the peer's NodeAddr is smaller: we answer its offer and
+/// leave ours alone.
+#[tokio::test]
+async fn answering_a_peers_offer_does_not_resend_ours() {
+    use nostr::ToBech32;
+    let runtime = std::sync::Arc::new(NostrRendezvous::new_for_test());
+    // Our offer's relay is in the pool, so a wrongful re-send would publish and
+    // be seen below.
+    runtime
+        .add_unconnected_relay_for_test(UNCONNECTED_RELAY)
+        .await;
+    let our_npub = runtime.npub_for_test().to_string();
+    let peer = peer_keys_ordered(&our_npub, false);
+    let peer_npub = peer.public_key().to_bech32().unwrap();
+
+    let ours = offer_between("our-session", &our_npub, &peer_npub);
+    runtime
+        .insert_inflight_offer_for_test(
+            &peer_npub,
+            ours,
+            peer.public_key(),
+            vec![UNCONNECTED_RELAY.to_string()],
+        )
+        .await;
+
+    let theirs = offer_between("their-session", &peer_npub, &our_npub);
+    let r = runtime
+        .clone()
+        .handle_incoming_offer_for_test(theirs, peer.public_key(), peer_npub.clone())
+        .await;
+    // The test runtime shares no signal relay with the peer, so answering fails
+    // after the election. That failure shows the offer got past it rather than
+    // being rejected earlier.
+    assert!(
+        matches!(r, Err(BootstrapError::MissingRelays(_))),
+        "expected to reach the answer step, got {r:?}"
+    );
+    assert!(
+        runtime.sent_offers_for_test().is_empty(),
+        "an offer we answer must not trigger a re-send"
+    );
+    assert_eq!(
+        runtime.inflight_offer_resent_for_test(&peer_npub).await,
+        Some(false),
+        "an offer we answer must not trigger a re-send"
+    );
+}
