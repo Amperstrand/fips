@@ -295,6 +295,272 @@ print(found.pop())
 ' "$@"
 }
 
+# The set of input interfaces on the DNAT rules whose destination lies in pool
+# $1, comma-joined and sorted, from `nft list table inet fips_gateway`. Port
+# forward DNATs, whose destination is the gateway's own address, are not
+# counted. Fails when no such rule exists or one has no iifname match.
+dnat_iifs() {
+    python3 -c '
+import ipaddress, re, sys
+pool = ipaddress.ip_network(sys.argv[1])
+found = set()
+lines = 0
+for line in sys.stdin:
+    if not re.search(r"\bdnat\b", line):
+        continue
+    m = re.search(r"\bip6 daddr ([0-9a-f:]+)\b", line)
+    if not m:
+        continue
+    try:
+        if ipaddress.ip_address(m.group(1)) not in pool:
+            continue
+    except ValueError:
+        sys.exit(1)
+    lines += 1
+    i = re.search(r"\biifname \"([^\"]+)\"", line)
+    if not i:
+        sys.exit(1)
+    found.add(i.group(1))
+if not lines:
+    sys.exit(1)
+print(",".join(sorted(found)))
+' "$@"
+}
+
+# The mesh address the DNAT rule for virtual IP $1 translates to, from
+# `nft list table inet fips_gateway`. Fails when no rule or more than one
+# matches.
+dnat_to() {
+    python3 -c '
+import ipaddress, re, sys
+want = ipaddress.ip_address(sys.argv[1])
+found = []
+for line in sys.stdin:
+    m = re.search(r"\bdaddr ([0-9a-f:]+) .*\bdnat\b.*?\bto \[?([0-9a-f:]+)", line)
+    if not m:
+        continue
+    try:
+        if ipaddress.ip_address(m.group(1)) == want:
+            found.append(ipaddress.ip_address(m.group(2)))
+    except ValueError:
+        sys.exit(1)
+if len(found) != 1:
+    sys.exit(1)
+print(found[0])
+' "$@"
+}
+
+# Prints "ok" when the table holds the two rules that keep other interfaces
+# off the mesh, from `nft -j list table inet fips_gateway`, given the LAN
+# interface $1 and the pool $2: in chain forward, a drop of traffic into
+# fips0 from any interface but the LAN unless it is established or related;
+# in chain raw_prerouting, a drop of traffic to the pool from any interface
+# but the LAN and lo. Fails otherwise. The ct state match is accepted in the
+# form nft 1.0.9 prints for the rule (negation of the established,related
+# set) and as an explicit mask compared with zero.
+lan_drops_json() {
+    python3 -c '
+import ipaddress, json, sys
+lan, pool = sys.argv[1], ipaddress.ip_network(sys.argv[2])
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+rules = [e["rule"] for e in doc.get("nftables", []) if isinstance(e, dict) and "rule" in e]
+
+def matches(rule):
+    return [x["match"] for x in rule.get("expr", []) if isinstance(x, dict) and "match" in x]
+
+def drops(rule):
+    return any(isinstance(x, dict) and "drop" in x for x in rule.get("expr", []))
+
+def meta(m, key, op, value):
+    return m.get("left") == {"meta": {"key": key}} and m.get("op") == op and m.get("right") == value
+
+def flags(v):
+    if isinstance(v, str):
+        return {v}
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return set(v)
+    if isinstance(v, dict) and isinstance(v.get("set"), list):
+        return set(v["set"])
+    return None
+
+def not_est_rel(m):
+    ct = {"ct": {"key": "state"}}
+    want = {"established", "related"}
+    if m.get("op") == "!" and m.get("left") == ct:
+        return flags(m.get("right")) == want
+    left = m.get("left")
+    if m.get("op") == "==" and m.get("right") == 0 and isinstance(left, dict) and isinstance(left.get("&"), list):
+        a = left["&"]
+        return len(a) == 2 and a[0] == ct and flags(a[1]) == want
+    return False
+
+def forward_drop(rule):
+    ms = matches(rule)
+    return (rule.get("chain") == "forward" and drops(rule)
+        and any(meta(m, "oifname", "==", "fips0") for m in ms)
+        and any(meta(m, "iifname", "!=", lan) for m in ms)
+        and any(not_est_rel(m) for m in ms))
+
+def pool_drop(rule):
+    ms = matches(rule)
+    def prefix(m):
+        r = m.get("right")
+        if m.get("op") != "==" or m.get("left") != {"payload": {"protocol": "ip6", "field": "daddr"}}:
+            return False
+        if not isinstance(r, dict) or "prefix" not in r:
+            return False
+        try:
+            net = ipaddress.ip_network("%s/%s" % (r["prefix"]["addr"], r["prefix"]["len"]))
+        except (KeyError, ValueError):
+            return False
+        return net == pool
+    return (rule.get("chain") == "raw_prerouting" and drops(rule)
+        and any(meta(m, "iifname", "!=", lan) for m in ms)
+        and any(meta(m, "iifname", "!=", "lo") for m in ms)
+        and any(prefix(m) for m in ms))
+
+if any(forward_drop(r) for r in rules) and any(pool_drop(r) for r in rules):
+    print("ok")
+else:
+    sys.exit(1)
+' "$@"
+}
+
+# Prints "ok" when chain raw_prerouting holds the drop of packets from a
+# mapped mesh address, from `nft -j list table inet fips_gateway`: a lookup of
+# the source in set fips_mesh_sources, for packets arriving on neither fips0
+# nor lo. Fails otherwise.
+forged_drop_json() {
+    python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+def ok(rule):
+    if rule.get("chain") != "raw_prerouting":
+        return False
+    exprs = rule.get("expr", [])
+    ms = [x["match"] for x in exprs if isinstance(x, dict) and "match" in x]
+    def has(left, op, right):
+        return any(m.get("left") == left and m.get("op") == op and m.get("right") == right for m in ms)
+    return (has({"meta": {"key": "iifname"}}, "!=", "fips0")
+        and has({"meta": {"key": "iifname"}}, "!=", "lo")
+        and has({"payload": {"protocol": "ip6", "field": "saddr"}}, "==", "@fips_mesh_sources")
+        and any(isinstance(x, dict) and "drop" in x for x in exprs))
+rules = [e["rule"] for e in doc.get("nftables", []) if isinstance(e, dict) and "rule" in e]
+if any(ok(r) for r in rules):
+    print("ok")
+else:
+    sys.exit(1)
+'
+}
+
+# Succeeds when the set listing from `nft -j list set inet fips_gateway
+# fips_mesh_sources` holds address $1.
+set_holds() {
+    python3 -c '
+import ipaddress, json, sys
+want = ipaddress.ip_address(sys.argv[1])
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+for e in doc.get("nftables", []):
+    if isinstance(e, dict) and isinstance(e.get("set"), dict):
+        for x in e["set"].get("elem", []):
+            try:
+                if isinstance(x, str) and ipaddress.ip_address(x) == want:
+                    sys.exit(0)
+            except ValueError:
+                pass
+sys.exit(1)
+' "$@"
+}
+
+# The reply-tuple destination port of the conntrack entry for UDP to address
+# $1 port $2, and whether it has seen a reply ("unreplied" or "replied"),
+# from `conntrack -L -f ipv6`. Fails unless exactly one entry matches.
+udp_entry() {
+    python3 -c '
+import ipaddress, sys
+dst, dport = ipaddress.ip_address(sys.argv[1]), sys.argv[2]
+found = []
+for line in sys.stdin:
+    f = line.split()
+    if not f or f[0] != "udp":
+        continue
+    dsts = [t[4:] for t in f if t.startswith("dst=")]
+    dports = [t[6:] for t in f if t.startswith("dport=")]
+    try:
+        if len(dsts) < 2 or len(dports) < 2 or ipaddress.ip_address(dsts[0]) != dst or dports[0] != dport:
+            continue
+    except ValueError:
+        continue
+    found.append((dports[1], "unreplied" if "[UNREPLIED]" in f else "replied"))
+if len(found) != 1:
+    sys.exit(1)
+print(*found[0])
+' "$@"
+}
+
+# The table handle and the packet counters of the gateway's drop rules, from
+# `nft -j list table inet fips_gateway`, as "HANDLE POOL FORWARD FORGED":
+# the raw pool drop, the forward drop and the raw forged-source drop. FORGED
+# is "none" when the table has no forged-source drop. Every rebuild deletes
+# and recreates the table, which resets its counters and changes its handle,
+# so two readings compare only when their handles agree. Fails when the
+# table, the pool drop or the forward drop is missing.
+drop_counters() {
+    python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+entries = [e for e in doc.get("nftables", []) if isinstance(e, dict)]
+tables = [e["table"] for e in entries if "table" in e]
+if len(tables) != 1 or "handle" not in tables[0]:
+    sys.exit(1)
+
+def packets(rule):
+    for x in rule.get("expr", []):
+        if isinstance(x, dict) and isinstance(x.get("counter"), dict):
+            return x["counter"].get("packets")
+    return None
+
+def has(rule, key):
+    return any(isinstance(x, dict) and key in x for x in rule.get("expr", []))
+
+def saddr_lookup(rule):
+    for x in rule.get("expr", []):
+        m = x.get("match") if isinstance(x, dict) else None
+        if isinstance(m, dict) and m.get("left") == {"payload": {"protocol": "ip6", "field": "saddr"}} \
+                and isinstance(m.get("right"), str) and m["right"].startswith("@"):
+            return True
+    return False
+
+pool = forward = None
+forged = "none"
+for e in entries:
+    r = e.get("rule")
+    if not isinstance(r, dict) or not has(r, "drop"):
+        continue
+    if r.get("chain") == "forward":
+        forward = packets(r)
+    elif r.get("chain") == "raw_prerouting" and saddr_lookup(r):
+        forged = packets(r)
+    elif r.get("chain") == "raw_prerouting":
+        pool = packets(r)
+if not isinstance(pool, int) or not isinstance(forward, int) or forged is None:
+    sys.exit(1)
+print(tables[0]["handle"], pool, forward, forged)
+'
+}
+
 # Succeeds when $1 and $2 are the same IPv6 address in any written form.
 same_addr() {
     python3 -c '
@@ -367,13 +633,13 @@ gw_selftest() {
     nft_lan='table inet fips_gateway {
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
-		meta nfproto ipv6 ip6 daddr fd01::1 dnat ip6 to fd3c:9a51:7e02:4b18::2
+		iifname "eth0" meta nfproto ipv6 ip6 daddr fd01::1 dnat ip6 to fd3c:9a51:7e02:4b18::2
 		iifname "fips0" meta nfproto ipv6 meta l4proto tcp tcp dport 18080 dnat ip6 to [fd02::20]:8080
 	}
 
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
-		oifname "fips0" masquerade
+		iifname "eth0" oifname "fips0" masquerade
 		meta nfproto ipv6 ip6 saddr fd3c:9a51:7e02:4b18::2 snat ip6 to fd01::1
 		iifname "fips0" oifname "eth0" meta nfproto ipv6 masquerade
 	}
@@ -406,6 +672,77 @@ gw_selftest() {
     gw_case "snat_to: two rules for one mesh address" 1 "" "$nft_dup" \
         snat_to fd3c:9a51:7e02:4b18::2 || fails=$((fails + 1))
     gw_case "snat_to: empty input" 1 "" "" snat_to fd3c:9a51:7e02:4b18::2 || fails=$((fails + 1))
+
+    # dnat_iifs reads only the mapping DNATs, whose destination is in the
+    # pool; the port-forward DNAT in nft_lan matches iifname "fips0" and is
+    # not counted. nft_noiif holds a mapping DNAT without an iifname match.
+    local nft_noiif nft_two
+    nft_noiif=$(sed 's/iifname "eth0" meta nfproto ipv6 ip6 daddr/meta nfproto ipv6 ip6 daddr/' <<< "$nft_lan")
+    nft_two=$(awk '/daddr fd01::1 dnat/ {print; sub(/fd01::1/, "fd01::2"); sub(/"eth0"/, "\"eth9\"")} {print}' <<< "$nft_lan")
+    gw_case "dnat_iifs: mapping DNAT on eth0 beside a port forward" 0 eth0 "$nft_lan" \
+        dnat_iifs fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_iifs: mapping DNATs on two interfaces" 0 eth0,eth9 "$nft_two" \
+        dnat_iifs fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_iifs: mapping DNAT without iifname" 1 "" "$nft_noiif" \
+        dnat_iifs fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_iifs: no mapping DNAT" 1 "" "$nft_nolan" dnat_iifs fd02::/64 || fails=$((fails + 1))
+    gw_case "dnat_iifs: empty input" 1 "" "" dnat_iifs fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_to: virtual IP" 0 fd3c:9a51:7e02:4b18::2 "$nft_lan" \
+        dnat_to fd01:0:0:0::1 || fails=$((fails + 1))
+    gw_case "dnat_to: no rule" 1 "" "$nft_lan" dnat_to fd01::9 || fails=$((fails + 1))
+
+    # The forward and raw chains as `nft -j` 1.0.9 printed a rebuild of the
+    # gateway's table in a network namespace, trimmed to the two drops.
+    # json_mask names the wrong ct states, and json_nolo lacks the lo
+    # exemption.
+    local json_ok json_mask json_nolo json_alt
+    json_ok='{"nftables": [{"table": {"family": "inet", "name": "fips_gateway", "handle": 8}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "forward", "handle": 6, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv6"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "fips0"}}, {"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "eth0"}}, {"match": {"op": "!", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}}, {"counter": {"packets": 2, "bytes": 160}}, {"drop": null}]}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "raw_prerouting", "handle": 5, "expr": [{"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "eth0"}}, {"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "lo"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": {"prefix": {"addr": "fd01::", "len": 112}}}}, {"counter": {"packets": 3, "bytes": 240}}, {"drop": null}]}}]}'
+    json_mask=$(sed 's/\["established", "related"\]/["new"]/' <<< "$json_ok")
+    json_nolo=$(sed 's/"right": "lo"/"right": "eth9"/' <<< "$json_ok")
+    json_alt=$(sed 's/{"op": "!", "left": {"ct": {"key": "state"}}, "right": \["established", "related"\]}/{"op": "==", "left": {"\&": [{"ct": {"key": "state"}}, ["related", "established"]]}, "right": 0}/' <<< "$json_ok")
+    gw_case "lan_drops_json: both drops" 0 ok "$json_ok" lan_drops_json eth0 fd01::/112 || fails=$((fails + 1))
+    gw_case "lan_drops_json: mask and compare form" 0 ok "$json_alt" lan_drops_json eth0 fd01::/112 || fails=$((fails + 1))
+    gw_case "lan_drops_json: wrong ct state" 1 "" "$json_mask" lan_drops_json eth0 fd01::/112 || fails=$((fails + 1))
+    gw_case "lan_drops_json: no lo exemption" 1 "" "$json_nolo" lan_drops_json eth0 fd01::/112 || fails=$((fails + 1))
+    gw_case "lan_drops_json: another LAN interface" 1 "" "$json_ok" lan_drops_json eth1 fd01::/112 || fails=$((fails + 1))
+    gw_case "lan_drops_json: empty input" 1 "" "" lan_drops_json eth0 fd01::/112 || fails=$((fails + 1))
+    gw_case "drop_counters: table without a forged-source drop" 0 "8 3 2 none" "$json_ok" \
+        drop_counters || fails=$((fails + 1))
+    gw_case "drop_counters: empty input" 1 "" "" drop_counters || fails=$((fails + 1))
+
+    # The forged-source drop and the mesh-source set as `nft -j` 1.0.9
+    # printed them for a rebuild in a network namespace.
+    local json_forged json_forged_nolo json_both set_json
+    json_forged='{"nftables": [{"table": {"family": "inet", "name": "fips_gateway", "handle": 9}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "raw_prerouting", "handle": 7, "expr": [{"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "fips0"}}, {"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "lo"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "@fips_mesh_sources"}}, {"counter": {"packets": 4, "bytes": 320}}, {"drop": null}]}}]}'
+    json_forged_nolo=$(sed 's/"right": "lo"/"right": "eth9"/' <<< "$json_forged")
+    json_both=$(python3 -c '
+import json, sys
+a, b = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+a["nftables"] += [e for e in b["nftables"] if "rule" in e]
+print(json.dumps(a))
+' "$json_ok" "$json_forged")
+    set_json='{"nftables": [{"metainfo": {"version": "1.0.9"}}, {"set": {"family": "inet", "name": "fips_mesh_sources", "table": "fips_gateway", "type": "ipv6_addr", "handle": 5, "elem": ["fd02::63", "fd3c:9a51:7e02:4b18::2"]}}]}'
+    gw_case "forged_drop_json: the drop" 0 ok "$json_forged" forged_drop_json || fails=$((fails + 1))
+    gw_case "forged_drop_json: no lo exemption" 1 "" "$json_forged_nolo" forged_drop_json || fails=$((fails + 1))
+    gw_case "forged_drop_json: empty input" 1 "" "" forged_drop_json || fails=$((fails + 1))
+    gw_case "drop_counters: with a forged-source drop" 0 "8 3 2 4" "$json_both" \
+        drop_counters || fails=$((fails + 1))
+    gw_case "set_holds: a member, long form" 0 "" "$set_json" \
+        set_holds fd3c:9a51:7e02:4b18:0:0:0:2 || fails=$((fails + 1))
+    gw_case "set_holds: not a member" 1 "" "$set_json" set_holds fd02::64 || fails=$((fails + 1))
+    gw_case "set_holds: empty input" 1 "" "" set_holds fd02::63 || fails=$((fails + 1))
+
+    # conntrack -L lines in the kernel's format for a LAN client's UDP flow
+    # to a virtual IP, DNAT'd and masqueraded, before and after a reply.
+    local ct_udp_unreplied ct_udp_replied
+    ct_udp_unreplied='udp      17 29 src=fd02::20 dst=fd01::7 sport=40000 dport=9 [UNREPLIED] src=fd3c:9a51:7e02:4b18::2 dst=fd3c:9a51:7e02:4b18::1 sport=9 dport=61234 mark=0 use=1'
+    ct_udp_replied='udp      17 29 src=fd02::20 dst=fd01::7 sport=40000 dport=9 src=fd3c:9a51:7e02:4b18::2 dst=fd3c:9a51:7e02:4b18::1 sport=9 dport=61234 mark=0 use=1'
+    gw_case "udp_entry: unreplied" 0 "61234 unreplied" "$ct_udp_unreplied" \
+        udp_entry fd01:0:0:0::7 9 || fails=$((fails + 1))
+    gw_case "udp_entry: replied" 0 "61234 replied" "$ct_udp_replied" udp_entry fd01::7 9 || fails=$((fails + 1))
+    gw_case "udp_entry: another port" 1 "" "$ct_udp_replied" udp_entry fd01::7 10 || fails=$((fails + 1))
+    gw_case "udp_entry: two entries" 1 "" "$ct_udp_replied"$'\n'"$ct_udp_unreplied" \
+        udp_entry fd01::7 9 || fails=$((fails + 1))
 
     # Captured lines: one run's entries were on eth0 and a wrong-interface
     # run's on eth1. The mixed inputs join lines from the two captures, since
@@ -839,6 +1176,229 @@ if [ -n "$VIRTUAL_IP" ] && [ -n "$LAN_IF" ] \
 else
     check "Proxy NDP entry for '$VIRTUAL_IP' on the LAN interface '$LAN_IF' (none found once)" 1
 fi
+
+# Only traffic arriving on the LAN interface is translated onto the mesh:
+# every mapping DNAT and the fips0 masquerade match iifname LAN_IF, and the
+# forward and raw chains drop other interfaces' traffic into fips0 and to the
+# pool. The drops are read from `nft -j`, whose fields do not depend on how
+# one nft version renders the ct state match.
+if [ -n "$LAN_IF" ] && P6_IIFS=$(dnat_iifs fd01::/112 <<< "$NFT_RULES"); then
+    if [ "$P6_IIFS" = "$LAN_IF" ]; then
+        check "Mapping DNATs match iifname $LAN_IF only" 0
+    else
+        check "Mapping DNATs match iifname '$P6_IIFS', expected $LAN_IF" 1
+    fi
+else
+    check "Mapping DNATs carry an iifname match (LAN '$LAN_IF', none read)" 1
+fi
+if [ -n "$LAN_IF" ] && grep -qE "^[[:space:]]*iifname \"$LAN_IF\" oifname \"fips0\" masquerade\$" <<< "$NFT_RULES"; then
+    check "fips0 masquerade matches iifname $LAN_IF" 0
+else
+    check "fips0 masquerade matches iifname '$LAN_IF'" 1
+fi
+if [ -n "$LAN_IF" ] && P6_DROPS=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null \
+    | lan_drops_json "$LAN_IF" fd01::/112); then
+    check "Forward drop and raw pool drop for interfaces other than $LAN_IF ($P6_DROPS)" 0
+else
+    check "Forward drop and raw pool drop for interfaces other than '$LAN_IF'" 1
+    docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>&1 | head -c 4000 | sed 's/^/    /' || true
+    echo ""
+fi
+
+# Packets from a mapped mesh address are dropped unless they arrive on fips0
+# or lo, and the set the drop looks up holds the live mappings' addresses.
+if P6_FORGED=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | forged_drop_json); then
+    check "Forged-source drop in raw_prerouting ($P6_FORGED)" 0
+else
+    check "Forged-source drop in raw_prerouting" 1
+fi
+P6_SERVER2=$(docker exec "$SERVER2" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+P6_SET_OK=1
+for _ in $(seq 1 10); do
+    docker exec "$CLIENT2" dig +short AAAA "${NPUB_C}.fips" @${GW_DNS} >/dev/null 2>&1 || true
+    if [ -n "$P6_SERVER2" ] && docker exec "$GATEWAY" nft -j list set inet fips_gateway fips_mesh_sources \
+        2>/dev/null | set_holds "$P6_SERVER2"; then
+        P6_SET_OK=0
+        break
+    fi
+    sleep 0.5
+done
+check "fips_mesh_sources holds $SERVER2 mesh address '$P6_SERVER2'" "$P6_SET_OK"
+
+# Phase 6b: a reply forged from the LAN does not count as the node's
+#
+# gw-client opens a UDP flow to the virtual IP of gw-server's mapping, port
+# 9, where nothing listens, so the entry stays unreplied. It then sends one
+# datagram from gw-server's mesh address to the flow's masqueraded port on
+# the gateway, as a reply would come. The gateway must drop it before
+# connection tracking: the entry stays unreplied (primary), and the
+# forged-source drop's counter rose (control). A rebuild between the two
+# counter reads resets the counter and changes the table handle, so the
+# case is retried.
+echo ""
+echo "Phase 6b: Forged replies from the LAN"
+P6B_MESH=$(docker exec "$SERVER" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+P6B_GW=$(docker exec "$GATEWAY" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+P6B_CLIENT_IF=$(docker exec "$CLIENT" ip -6 -o addr show 2>/dev/null | lan_iface "$GW_CLIENT_LAN" || echo "")
+P6B_DONE=false
+if [ -z "$P6B_MESH" ] || [ -z "$P6B_GW" ] || [ -z "$P6B_CLIENT_IF" ]; then
+    check "Forged reply setup (server mesh '$P6B_MESH', gateway '$P6B_GW', client interface '$P6B_CLIENT_IF')" 1
+else
+    for P6B_TRY in 1 2 3; do
+        P6B_VIP=$(docker exec "$CLIENT" dig +short AAAA "${NPUB_B}.fips" @${GW_DNS} 2>/dev/null \
+            | grep -m1 "^fd01::" || true)
+        [ -n "$P6B_VIP" ] || { echo "  try $P6B_TRY: no virtual IP"; continue; }
+        docker exec "$CLIENT" python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", 40009))
+s.sendto(b"probe", (sys.argv[1], 9))
+' "$P6B_VIP" >/dev/null 2>&1 || true
+        sleep 1
+        P6B_ENTRY=$(docker exec "$GATEWAY" conntrack -L -f ipv6 2>/dev/null | udp_entry "$P6B_VIP" 9 || echo "")
+        read -r P6B_PORT P6B_STATE <<< "$P6B_ENTRY"
+        if [ "$P6B_STATE" != unreplied ]; then
+            echo "  try $P6B_TRY: no unreplied entry for $P6B_VIP port 9 ('$P6B_ENTRY')"
+            continue
+        fi
+        P6B_BEFORE=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | drop_counters || echo "")
+        docker exec "$CLIENT" sh -c "
+            ip -6 addr add $P6B_MESH/128 dev $P6B_CLIENT_IF nodad 2>/dev/null
+            ip -6 route add $P6B_GW/128 via $GW_DNS 2>/dev/null
+            true" >/dev/null 2>&1
+        docker exec "$CLIENT" python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], 9))
+s.sendto(b"forged", (sys.argv[2], int(sys.argv[3])))
+' "$P6B_MESH" "$P6B_GW" "$P6B_PORT" >/dev/null 2>&1 || true
+        sleep 1
+        P6B_AFTER_ENTRY=$(docker exec "$GATEWAY" conntrack -L -f ipv6 2>/dev/null | udp_entry "$P6B_VIP" 9 || echo "")
+        P6B_AFTER=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | drop_counters || echo "")
+        docker exec "$CLIENT" sh -c "
+            ip -6 route del $P6B_GW/128 via $GW_DNS 2>/dev/null
+            ip -6 addr del $P6B_MESH/128 dev $P6B_CLIENT_IF 2>/dev/null
+            true" >/dev/null 2>&1
+        read -r P6B_H0 _ _ P6B_F0 <<< "$P6B_BEFORE"
+        read -r P6B_H1 _ _ P6B_F1 <<< "$P6B_AFTER"
+        if [ -z "$P6B_BEFORE" ] || [ -z "$P6B_AFTER" ] || [ "$P6B_H0" != "$P6B_H1" ]; then
+            echo "  try $P6B_TRY: table rebuilt during the case ('$P6B_BEFORE' then '$P6B_AFTER'), retrying"
+            continue
+        fi
+        P6B_DONE=true
+        break
+    done
+    if [ "$P6B_DONE" = true ]; then
+        read -r _ P6B_STATE_AFTER <<< "$P6B_AFTER_ENTRY"
+        if [ "$P6B_STATE_AFTER" = unreplied ]; then
+            check "A reply forged from the LAN leaves the flow to $P6B_VIP unreplied" 0
+        else
+            check "A reply forged from the LAN reached conntrack (entry '$P6B_AFTER_ENTRY')" 1
+        fi
+        if [ "$P6B_F0" != none ] && [ "$P6B_F1" -gt "$P6B_F0" ]; then
+            check "The forged-source drop counted it ($P6B_F0 -> $P6B_F1)" 0
+        else
+            check "The forged-source drop did not count it ($P6B_F0 -> $P6B_F1)" 1
+        fi
+    else
+        check "Forged reply case (no conclusive try in 3)" 1
+    fi
+fi
+
+# Phase 6c: hosts on the gateway's other interfaces cannot use it
+#
+# A network namespace inside the privileged gateway container stands in for a
+# host on another interface (fips-net carries no IPv6). It connects to the
+# virtual IP of a live mapping and, directly, to that node's mesh address.
+# Both must fail. The controls are the raw pool drop's counter for the first
+# and the forward drop's for the second; every rebuild recreates the table and
+# resets its counters, so a reading counts only when the table handle did not
+# change across the probe, and a changed handle retries the probe.
+echo ""
+echo "Phase 6c: Non-LAN interfaces cannot use the gateway"
+P6C_NS=gwext
+SERVER2_MESH=$(docker exec "$SERVER2" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+P6C_SETUP=false
+if docker exec "$GATEWAY" sh -c "
+    ip netns add $P6C_NS &&
+    ip link add gwext0 type veth peer name gwext1 &&
+    ip link set gwext1 netns $P6C_NS &&
+    ip -6 addr add fd03::1/64 dev gwext0 nodad &&
+    ip link set gwext0 up &&
+    ip netns exec $P6C_NS ip link set lo up &&
+    ip netns exec $P6C_NS ip -6 addr add fd03::2/64 dev gwext1 nodad &&
+    ip netns exec $P6C_NS ip link set gwext1 up &&
+    ip netns exec $P6C_NS ip -6 route add default via fd03::1 dev gwext1
+" >/dev/null 2>&1; then
+    P6C_SETUP=true
+fi
+if [ "$P6C_SETUP" != true ] || [ -z "$SERVER2_MESH" ]; then
+    check "Non-LAN namespace and $SERVER2 mesh address (setup $P6C_SETUP, mesh '$SERVER2_MESH')" 1
+else
+    P6C_VIP_DONE=false
+    P6C_MESH_DONE=false
+    for P6C_TRY in 1 2 3; do
+        # Re-resolve so the probe meets a live mapping, and gate on its rules.
+        P6C_VIP=$(docker exec "$CLIENT2" dig +short AAAA "${NPUB_C}.fips" @${GW_DNS} 2>/dev/null \
+            | grep -m1 "^fd01::" || true)
+        P6C_GATE=false
+        for _ in $(seq 1 10); do
+            P6C_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+            if [ -n "$P6C_VIP" ] && P6C_TO=$(dnat_to "$P6C_VIP" <<< "$P6C_NFT") \
+                && same_addr "$P6C_TO" "$SERVER2_MESH" \
+                && P6C_SNAT=$(snat_to "$SERVER2_MESH" <<< "$P6C_NFT") \
+                && same_addr "$P6C_SNAT" "$P6C_VIP"; then
+                P6C_GATE=true
+                break
+            fi
+            sleep 0.5
+        done
+        if [ "$P6C_GATE" != true ]; then
+            echo "  try $P6C_TRY: no DNAT and SNAT for '$P6C_VIP' to $SERVER2_MESH"
+            continue
+        fi
+        P6C_BEFORE=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | drop_counters || echo "")
+        P6C_OUT_VIP=$(docker exec "$GATEWAY" ip netns exec $P6C_NS \
+            curl -6 -s --max-time 3 "http://[$P6C_VIP]:8000/" 2>&1 || true)
+        P6C_OUT_MESH=$(docker exec "$GATEWAY" ip netns exec $P6C_NS \
+            curl -6 -s --max-time 3 "http://[$SERVER2_MESH]:8000/" 2>&1 || true)
+        P6C_AFTER=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | drop_counters || echo "")
+        read -r P6C_H0 P6C_POOL0 P6C_FWD0 _ <<< "$P6C_BEFORE"
+        read -r P6C_H1 P6C_POOL1 P6C_FWD1 _ <<< "$P6C_AFTER"
+        if [ -z "$P6C_BEFORE" ] || [ -z "$P6C_AFTER" ] || [ "$P6C_H0" != "$P6C_H1" ]; then
+            echo "  try $P6C_TRY: table rebuilt during the probe ('$P6C_BEFORE' then '$P6C_AFTER'), retrying"
+            continue
+        fi
+        P6C_VIP_DONE=true
+        P6C_MESH_DONE=true
+        break
+    done
+    if [ "$P6C_VIP_DONE" = true ]; then
+        if ! grep -q "Fuck IPs" <<< "$P6C_OUT_VIP" && [ "$P6C_POOL1" -gt "$P6C_POOL0" ]; then
+            check "Non-LAN host cannot reach $P6C_VIP (pool drop $P6C_POOL0 -> $P6C_POOL1)" 0
+        else
+            check "Non-LAN host reached $P6C_VIP or the pool drop did not count it (response '${P6C_OUT_VIP:0:40}', pool drop $P6C_POOL0 -> $P6C_POOL1)" 1
+        fi
+        if ! grep -q "Fuck IPs" <<< "$P6C_OUT_MESH" && [ "$P6C_FWD1" -gt "$P6C_FWD0" ]; then
+            check "Non-LAN host cannot reach $SERVER2_MESH through fips0 (forward drop $P6C_FWD0 -> $P6C_FWD1)" 0
+        else
+            check "Non-LAN host reached $SERVER2_MESH or the forward drop did not count it (response '${P6C_OUT_MESH:0:40}', forward drop $P6C_FWD0 -> $P6C_FWD1)" 1
+        fi
+    else
+        check "Non-LAN probe to a virtual IP (no conclusive try in 3)" 1
+        check "Non-LAN probe to a mesh address (no conclusive try in 3)" 1
+    fi
+fi
+docker exec "$GATEWAY" sh -c "ip link del gwext0 2>/dev/null; ip netns del $P6C_NS 2>/dev/null" \
+    >/dev/null 2>&1 || true
 
 # Phase 7: Inbound port-forward rules — UDP and a second simultaneous TCP
 # forward.
@@ -1301,6 +1861,18 @@ PYEOF
         check "$prefix: startup line for rev ${expect_rev} (found $rev_lines)" 1
         return 1
     fi
+    # The container's /var/run is not tmpfs, so the gateway keeps no pool
+    # state: it must say so once at this start and still answer, which the
+    # probe above showed. The cross-restart path itself needs a tmpfs and is
+    # not exercised here.
+    local tmpfs_warn
+    # The level token sits between colour codes in the container's log.
+    tmpfs_warn=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$started_log" | grep -cE " WARN .*Pool state not saved.*not on tmpfs" || true)
+    if [ "$tmpfs_warn" -eq 1 ]; then
+        check "$prefix: one warning that pool state is not kept off tmpfs" 0
+    else
+        check "$prefix: warnings that pool state is not kept off tmpfs (found $tmpfs_warn, expected 1)" 1
+    fi
     GW_BASELINE=$(grep -c "Allocated virtual IP" <<< "$started_log" || true)
     return 0
 }
@@ -1553,13 +2125,13 @@ natbig_phase
 
 # Phase 12: Pool admission limits
 #
-# The pool refuses a new name once it holds MAPPING_CEILING live mappings,
-# and past a burst of MAPPING_BURST admits new names at MAPPING_RATE per
-# second; the constants are read from src/gateway/pool.rs. Restart the gateway
-# with mappings that outlive the phase, fill the pool to the ceiling through
-# the rate limit, then ask once each for 20 more new names: all 20 must be
-# refused at the ceiling while an existing name still resolves. Without the
-# ceiling those 20 are allocated, whatever the creation rate. Reports rebuild
+# The pool holds at most MAPPING_CEILING live mappings, and past a burst of
+# MAPPING_BURST admits new names at MAPPING_RATE per second; the constants are
+# read from src/gateway/pool.rs. Restart the gateway with mappings that
+# outlive the phase, make the readiness probe's mapping carry traffic, fill
+# the pool to the ceiling through the rate limit with names nobody uses, then
+# ask for 20 more new names: each replaces the oldest unused mapping, while
+# the mapping that carries traffic is kept and still resolves. Reports rebuild
 # and tick durations on the way up and the shutdown duration at the ceiling.
 # Runs after phase 11, so the gateway container is stopped when it starts,
 # and it leaves it stopped.
@@ -1620,6 +2192,22 @@ limits_phase() {
         return 0
     fi
 
+    # The probe's mapping carries traffic: one GET through it, then wait for
+    # the tick that sees the reply.
+    docker exec "$CLIENT" curl -6 -s --max-time 5 "http://[$GW_PROBE]:8000/" >/dev/null 2>&1 || true
+    local used_seen=1
+    for _ in $(seq 1 25); do
+        limits_slice
+        # Field names and values are separated by colour codes in the log.
+        if sed 's/\x1b\[[0-9;]*m//g' <<< "$SLICE" | grep "Mapping carried traffic" \
+            | grep -qF "virtual_ip=$GW_PROBE"; then
+            used_seen=0
+            break
+        fi
+        sleep 1
+    done
+    check "Limits: the probe's mapping $GW_PROBE carried traffic" "$used_seen"
+
     # Names: real keys, since the daemon parses each one as a public key.
     local fill=$((ceiling - baseline))
     local total=$((fill + LIMITS_EXTRA))
@@ -1658,7 +2246,8 @@ limits_phase() {
     local rate_refused_fill
     rate_refused_fill=$(grep -c "new-mapping rate limit reached" <<< "$SLICE" || true)
 
-    # Past the ceiling: one query per name, never retried.
+    # Past the ceiling: each name is retried through the rate limit and must
+    # be answered, replacing an unused mapping.
     rc=0
     remaining=$((LIMITS_CAP - ($(limits_now) - t0)))
     if [ "$remaining" -le 0 ]; then
@@ -1667,15 +2256,15 @@ limits_phase() {
         return 0
     fi
     out=$(sed -n "$((fill + 1)),${total}p" "$names_file" | docker exec -i "$CLIENT" \
-        timeout "$remaining" python3 /tmp/gw_driver.py "$GW_DNS" 2>&1) || rc=$?
+        timeout "$remaining" python3 /tmp/gw_driver.py "$GW_DNS" "$retry_bound" 2>&1) || rc=$?
     rm -f "$names_file"
     echo "  [$(($(limits_now) - t0))s] $LIMITS_EXTRA names past the ceiling: $out (rc=$rc)"
-    local post_servfail
-    post_servfail=$(sed -nE 's/.*servfail=([0-9]+).*/\1/p' <<< "$out")
-    if [ "$rc" -eq 0 ] && [ "${post_servfail:-0}" -eq "$LIMITS_EXTRA" ]; then
-        check "Limits: all $LIMITS_EXTRA names past the ceiling got SERVFAIL" 0
+    local post_answered
+    post_answered=$(sed -nE 's/.*answered=([0-9]+).*/\1/p' <<< "$out")
+    if [ "$rc" -eq 0 ] && [ "${post_answered:-0}" -eq "$LIMITS_EXTRA" ]; then
+        check "Limits: all $LIMITS_EXTRA names past the ceiling were answered" 0
     else
-        check "Limits: names past the ceiling (servfail '${post_servfail}', rc $rc)" 1
+        check "Limits: names past the ceiling (answered '${post_answered}', rc $rc)" 1
     fi
 
     local probe
@@ -1688,21 +2277,52 @@ limits_phase() {
 
     sleep 1
     limits_slice
-    local allocated reclaimed ceiling_refused rate_refused nat_fail nat_rm_fail ndp_fail
+    local allocated reclaimed ceiling_refused rate_refused nat_fail nat_rm_fail ndp_fail evicted
     allocated=$(grep -c "Allocated virtual IP" <<< "$SLICE" || true)
+    evicted=$(grep -c "Evicted never-used mapping" <<< "$SLICE" || true)
     reclaimed=$(grep -c "Reclaimed virtual IP" <<< "$SLICE" || true)
     ceiling_refused=$(grep -c "live-mapping ceiling reached" <<< "$SLICE" || true)
     rate_refused=$(grep -c "new-mapping rate limit reached" <<< "$SLICE" || true)
     nat_fail=$(grep -c "Failed to add NAT rules" <<< "$SLICE" || true)
     nat_rm_fail=$(grep -c "Failed to remove NAT rules" <<< "$SLICE" || true)
     ndp_fail=$(grep -c "Failed to add proxy NDP" <<< "$SLICE" || true)
-    echo "  Slice counts: allocated=$allocated reclaimed=$reclaimed" \
+    echo "  Slice counts: allocated=$allocated evicted=$evicted reclaimed=$reclaimed" \
         "ceiling_refused=$ceiling_refused rate_refused=$rate_refused_fill/$rate_refused" \
         "nat_add_fail=$nat_fail nat_remove_fail=$nat_rm_fail ndp_fail=$ndp_fail"
-    if [ "$allocated" -eq "$ceiling" ]; then
-        check "Limits: live mappings stop at the ceiling ($allocated)" 0
+    if [ "$allocated" -eq $((ceiling + LIMITS_EXTRA)) ]; then
+        check "Limits: allocations equal the ceiling plus $LIMITS_EXTRA ($allocated)" 0
     else
-        check "Limits: live mappings $allocated, ceiling $ceiling" 1
+        check "Limits: allocations $allocated, expected $((ceiling + LIMITS_EXTRA))" 1
+    fi
+    if [ "$evicted" -eq "$LIMITS_EXTRA" ]; then
+        check "Limits: $LIMITS_EXTRA unused mappings replaced at the ceiling" 0
+    else
+        check "Limits: unused mappings replaced ($evicted, expected $LIMITS_EXTRA)" 1
+    fi
+    local maps_json live used_probe
+    maps_json=""
+    for _ in $(seq 1 15); do
+        maps_json=$(docker exec "$GATEWAY" bash -c \
+            'echo "{\"command\":\"show_mappings\"}" | nc -U -w1 /run/fips/gateway.sock 2>/dev/null' || echo "")
+        # The response for a full pool is too long for an argument.
+        read -r live used_probe < <(python3 -c '
+import ipaddress, json, sys
+try:
+    r = json.load(sys.stdin)
+    ms = r["data"]["mappings"]
+    probe = ipaddress.ip_address(sys.argv[1])
+    used = [m.get("used") for m in ms if ipaddress.ip_address(m["virtual_ip"]) == probe]
+    print(len(ms), "true" if used == [True] else "false")
+except Exception:
+    print("error error")
+' "$GW_PROBE" <<< "$maps_json")
+        [ "$live" = "$ceiling" ] && [ "$used_probe" = true ] && break
+        sleep 1
+    done
+    if [ "$live" = "$ceiling" ] && [ "$used_probe" = true ]; then
+        check "Limits: $ceiling live mappings with $GW_PROBE marked used" 0
+    else
+        check "Limits: show_mappings reports $live live, $GW_PROBE used '$used_probe' (expected $ceiling, true)" 1
     fi
     if [ "$allocated" -gt 0 ]; then
         if [ "$reclaimed" -eq 0 ]; then
@@ -1713,23 +2333,17 @@ limits_phase() {
     else
         check "Limits: allocations present in the slice (0)" 1
     fi
-    if [ "$ceiling_refused" -ge "$LIMITS_EXTRA" ]; then
-        check "Limits: refusals logged as the ceiling ($ceiling_refused)" 0
+    if [ "$ceiling_refused" -eq 0 ]; then
+        check "Limits: no refusal at the ceiling" 0
     else
-        check "Limits: ceiling refusals logged ($ceiling_refused, expected >= $LIMITS_EXTRA)" 1
+        check "Limits: refusals at the ceiling ($ceiling_refused, expected 0)" 1
     fi
     # The rate limit must have refused during the fill, so its count is a
-    # live signal, and must refuse nothing after it: past the ceiling the
-    # ceiling is checked first.
+    # live signal for the counts above.
     if [ "$rate_refused_fill" -ge 1 ]; then
         check "Limits: the rate limit refused during the fill ($rate_refused_fill)" 0
     else
         check "Limits: rate refusals during the fill (0)" 1
-    fi
-    if [ "$rate_refused" -eq "$rate_refused_fill" ]; then
-        check "Limits: no rate refusal after the fill" 0
-    else
-        check "Limits: rate refusals after the fill ($((rate_refused - rate_refused_fill)))" 1
     fi
     if [ $((nat_fail + nat_rm_fail + ndp_fail)) -eq 0 ]; then
         check "Limits: no NAT or proxy NDP failure lines" 0
@@ -1769,7 +2383,7 @@ print(most)
         check "Limits: timing lines (rebuild $added_timed, tick $tick_timed)" 1
     fi
 
-    echo "  --- Rebuild duration (elapsed_us over the 20 adds ending at each count) ---"
+    echo "  --- Rebuild duration (elapsed_us over the adds in the 20 counts ending at each) ---"
     local targets=("$ceiling") rebuild_report
     [ "$ceiling" -gt 500 ] && targets=(500 "$ceiling")
     rebuild_report=$(grep "Added DNAT/SNAT rules" <<< "$SLICE" | python3 -c "$LIMITS_PY_FIELDS
@@ -1781,19 +2395,19 @@ for l in sys.stdin:
     by_n[int(f['mappings'])] = int(f['elapsed_us'])
 missing = 0
 for t in map(int, sys.argv[1:]):
-    if t not in by_n:
-        missing += 1
-        print(f'  rebuild {t}: no successful add line with mappings={t}')
-        continue
     xs = [by_n[n] for n in range(t - 19, t + 1) if n in by_n]
+    if not xs:
+        missing += 1
+        print(f'  rebuild {t}: no successful add line with mappings in [{t - 19}, {t}]')
+        continue
     print(f'  rebuild {t}: n={len(xs)} median={statistics.median(xs):.0f}us max={max(xs)}us')
 print(f'REBUILD_MISSING={missing}')
 " "${targets[@]}" || true)
     echo "$rebuild_report" | grep -v '^REBUILD_MISSING='
     if echo "$rebuild_report" | grep -q '^REBUILD_MISSING=0$'; then
-        check "Limits: a successful add line at ${targets[*]} mappings" 0
+        check "Limits: a successful add line near ${targets[*]} mappings" 0
     else
-        check "Limits: a successful add line at ${targets[*]} mappings" 1
+        check "Limits: a successful add line near ${targets[*]} mappings" 1
     fi
 
     echo "  --- Ticks as they fell ---"

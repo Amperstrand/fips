@@ -335,7 +335,15 @@ impl Node {
 
         let mut address_changed = false;
         let mut first_frame = false;
+        let mut present = false;
+        let mut prior = None;
         if let Some(peer) = self.peers.get_mut(&node_addr) {
+            present = true;
+            if peer.transport_id() != Some(packet.transport_id)
+                || peer.current_addr() != Some(&packet.remote_addr)
+            {
+                prior = peer.transport_id().zip(peer.current_addr().cloned());
+            }
             if slot == LinkSlot::Current
                 && let Some(mmp) = peer.mmp_mut()
             {
@@ -374,8 +382,14 @@ impl Node {
         if address_changed {
             self.clear_connected_udp_for_peer(&node_addr);
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let _ = address_changed;
+
+        // Tell the transports which link carries the peer: on a roam the old
+        // link loses it, and over BLE every frame marks the link it arrived
+        // on, so a link re-established at the same address is recognised.
+        if present && (address_changed || self.tracks_peers(packet.transport_id)) {
+            let link = (packet.transport_id, packet.remote_addr.clone());
+            self.relink(&node_addr, prior, Some(link)).await;
+        }
 
         // Dispatch to link message handler
         self.dispatch_authentic(&node_addr, slot, link_message, ce_flag)
@@ -496,8 +510,15 @@ impl Node {
         let now_ms = crate::time::mono_ms();
         let mut address_changed = false;
         let mut first_frame = false;
+        let mut present = false;
+        let mut prior = None;
         if let Some(peer) = self.peers.get_mut(node_addr) {
+            present = true;
             peer.reset_decrypt_failures();
+            if peer.transport_id() != Some(transport_id) || peer.current_addr() != Some(remote_addr)
+            {
+                prior = peer.transport_id().zip(peer.current_addr().cloned());
+            }
             address_changed = peer.set_current_addr(transport_id, remote_addr.clone());
             peer.link_stats_mut()
                 .record_recv(packet_len, packet_timestamp_ms);
@@ -527,9 +548,12 @@ impl Node {
         if address_changed {
             self.clear_connected_udp_for_peer(node_addr);
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = address_changed;
+        // As on the inline path. A bounce for a peer already removed (the
+        // decrypt worker can finish after a Disconnect) marks nothing: no
+        // later removal would withdraw it.
+        if present && (address_changed || self.tracks_peers(transport_id)) {
+            let link = (transport_id, remote_addr.clone());
+            self.relink(node_addr, prior, Some(link)).await;
         }
         let link_message = &fmp_plaintext[INNER_TIMESTAMP_LEN..];
         self.dispatch_authentic(node_addr, slot, link_message, ce_flag)

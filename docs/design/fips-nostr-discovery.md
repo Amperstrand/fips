@@ -179,11 +179,17 @@ advert wins; adverts whose `protocol` tag does not match the local
 `app` value are rejected at validation.
 
 Results are kept in an in-memory cache keyed by author npub. Cache
-entries carry the advert's expiration time; a periodic prune drops
-expired entries, and an LRU-by-expiry eviction enforces
-`advert_cache_max_entries`. A parallel long-lived subscription on the
-advert relays populates the cache passively, so open-discovery
-candidates do not require per-dial fetches.
+entries carry the advert's expiration time, and a periodic prune drops
+expired entries. When the cache holds `advert_cache_max_entries` valid
+adverts, an advert from a new author that is neither a configured peer
+nor linked to this node is refused until an entry expires; adverts
+already cached are not evicted for it. Configured and linked authors are
+always cached, taking the slot of the unprotected entry cached most
+recently. A parallel long-lived subscription on the advert relays
+populates the cache passively, so open-discovery candidates do not
+require per-dial fetches. Each open-discovery sweep considers the
+configured authors not yet linked and a fresh random draw of up to 64
+other cached authors that are neither linked nor already queued.
 
 On cache hit, advert endpoints are appended to the peer's static
 address list with lower priority; the static list is tried first.
@@ -254,10 +260,16 @@ builds a candidate-pair plan that tries, in priority order:
    route, or overlapping private address space) will succeed at the
    socket layer in the punch but fail in the FMP handshake when the
    return path doesn't match.
-2. **LAN ↔ LAN.** If both sides share a /24 prefix, same-subnet private
-   addresses are likely reachable directly. Only fires when both peers
-   shared local host candidates (which requires `share_local_candidates`
-   to be enabled — off by default).
+2. **LAN ↔ LAN.** When one of this node's interface prefixes holds
+   both a local candidate of ours and the peer's private IPv4
+   candidate, the two are on one link and likely reachable directly.
+   Only fires when both peers shared local host candidates (which
+   requires `share_local_candidates` to be enabled — off by default).
+   More generally, a peer's private IPv4 candidate, its reflexive
+   address included, is punched only when one of our interface
+   prefixes holds both it and one of our own addresses (a shared local
+   candidate, or our reflexive address when that is private); other
+   private and unique-local candidates are refused.
 3. **Mixed.** Reflexive on one side, local on the other — catches
    hairpin and one-side-public scenarios.
 
@@ -324,7 +336,7 @@ machinery:
 | --- | --- | --- | --- |
 | Offer semaphore (`max_concurrent_incoming_offers`) | 16 | CPU and memory exhaustion from offer spam on DM relays. | Warn log, offer dropped. |
 | Per-npub offer allowance (`max_concurrent_offers_per_npub`) | 4 | One sender identity holding every offer slot and denying traversal onboarding to everyone else. Does not prevent the same denial from several throwaway npubs. | Debug log, offer dropped. |
-| Advert cache (`advert_cache_max_entries`) | 2048 | Memory growth from ambient advert traffic under `policy: open`. | LRU-by-expiry eviction. |
+| Advert cache (`advert_cache_max_entries`) | 2048 | Memory growth from ambient advert traffic under `policy: open`. | New unconfigured authors refused until an entry expires; configured and linked authors kept. |
 | Seen-sessions (`seen_sessions_max_entries`) | 2048 | Replay of stale `sessionId` values. | Oldest entry evicted. |
 | Signal TTL (`signal_ttl_secs`) | 120 s | Indefinite in-flight offers on relays. | Expired offers rejected at validation. |
 | Open discovery queue (`open_discovery_max_pending`) | 64 | Unbounded retry queue under ambient advert load. | New candidates skipped until the queue drains. |
@@ -431,7 +443,24 @@ LAN discovery adds two capabilities, both confined to the local link:
   operator's network bridges mDNS.
 - **Browsing.** The node concurrently browses for the same service
   type, learns the endpoints of other FIPS nodes on the link, and
-  initiates a normal FMP link to each newly-seen peer.
+  initiates a normal FMP link to each newly-seen peer. It dials an
+  advertised address only when it lies on the link its address record
+  arrived on (inside a prefix of the interface that received the
+  record, or IPv6 link-local with a scope); an address outside it, for
+  example one carried in by an mDNS reflector between subnets or one
+  in the prefix of the node's VPN or container interface, is ignored.
+  The advert's service host must also be the advertised node's own
+  `fips-` host name, since the mDNS library looks a host's addresses
+  up on every interface and does not report which interface the
+  advert arrived on; a sender on one link can therefore still name a
+  FIPS node on another of the node's links, at any port and under
+  npubs it mints to share that node's host name, but no other host.
+  New LAN dials are paced: they share the per-tick discovery budget,
+  need room under `max_peers`, and at most 8 handshakes to
+  unconfigured LAN peers are in flight at once, at most 2 of them to
+  any one address. Adverts waiting for a dial are held for up to ten
+  minutes in a set of at most 64, with configured peers dialled
+  first.
 
 The mDNS service type is `_fips._udp.local.`
 (`src/mdns/mod.rs:45`). Per RFC 6763 the `_udp` label denotes

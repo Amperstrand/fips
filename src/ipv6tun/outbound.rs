@@ -26,7 +26,9 @@ pub(crate) trait Mesh {
     fn resolve(&mut self, prefix: &[u8; 15]) -> Option<Route<Self::Dest>>;
 
     /// Send the packet on the destination's session, or hold it while one
-    /// is set up.
+    /// is set up. A packet that cannot be held comes back to be answered,
+    /// when the session table is full or nothing is working to reach the
+    /// destination, or is dropped unanswered for a retransmit to retry.
     fn send(&mut self, dest: Self::Dest, packet: Vec<u8>) -> impl Future<Output = Outcome> + Send;
 
     /// Borrow the sender of ICMPv6 replies to the host.
@@ -49,11 +51,15 @@ pub(crate) enum Outcome {
     /// Handed to the established session. A send error is logged by the
     /// mesh and not answered to the host.
     Sent,
-    /// Held until the destination's session is established.
+    /// Held until the destination's session is established, or dropped
+    /// unanswered where a retransmit can retry it.
     Queued,
     /// Refused because the session table is full; the packet comes back so
     /// the host can be told the destination is unreachable.
     TableFull(Vec<u8>),
+    /// Refused because nothing is working to reach the destination; the
+    /// packet comes back so the host can be told.
+    NoRoute(Vec<u8>),
 }
 
 /// The verdict on a packet read from the TUN, before the mesh is asked.
@@ -105,8 +111,8 @@ pub(crate) fn path_limit(len: usize, path_mtu: u16, ipv6_mtu: u16) -> Option<u32
 ///
 /// Packets that are not IPv6, too large for the node, too large for an
 /// established session's path, to an unknown destination, or refused for a
-/// full session table are answered or dropped here. The rest go to
-/// [`Mesh::send`].
+/// full session table or for want of a route are answered or dropped here.
+/// The rest go to [`Mesh::send`].
 pub(crate) async fn forward<M: Mesh>(mesh: &mut M, packet: Vec<u8>) {
     let ipv6_mtu = mesh.ipv6_mtu();
     let prefix = match admit(&packet, ipv6_mtu) {
@@ -135,8 +141,11 @@ pub(crate) async fn forward<M: Mesh>(mesh: &mut M, packet: Vec<u8>) {
         return;
     }
 
-    if let Outcome::TableFull(packet) = mesh.send(route.dest, packet).await {
-        mesh.icmp().dest_unreachable(&packet);
+    match mesh.send(route.dest, packet).await {
+        Outcome::TableFull(packet) | Outcome::NoRoute(packet) => {
+            mesh.icmp().dest_unreachable(&packet);
+        }
+        Outcome::Sent | Outcome::Queued => {}
     }
 }
 
@@ -154,6 +163,7 @@ mod tests {
         known: [u8; 15],
         path_mtu: Option<u16>,
         refuse: bool,
+        no_route: bool,
         sent: Vec<Vec<u8>>,
         tun_tx: TunTx,
         limiter: IcmpRateLimiter,
@@ -176,6 +186,8 @@ mod tests {
         fn send(&mut self, _dest: (), packet: Vec<u8>) -> impl Future<Output = Outcome> + Send {
             let outcome = if self.refuse {
                 Outcome::TableFull(packet)
+            } else if self.no_route {
+                Outcome::NoRoute(packet)
             } else {
                 self.sent.push(packet);
                 Outcome::Sent
@@ -200,6 +212,7 @@ mod tests {
             known: dest().octets()[1..16].try_into().unwrap(),
             path_mtu: None,
             refuse: false,
+            no_route: false,
             sent: Vec::new(),
             tun_tx,
             limiter: IcmpRateLimiter::new(),
@@ -298,5 +311,15 @@ mod tests {
         mesh.refuse = true;
         forward(&mut mesh, packet(dest(), 60)).await;
         assert_eq!(icmp_type(&rx.try_recv().unwrap()), 1);
+    }
+
+    #[tokio::test]
+    async fn forward_answers_a_destination_nothing_is_working_to_reach_with_unreachable() {
+        let (mut mesh, rx) = fake(1280);
+        mesh.no_route = true;
+        forward(&mut mesh, packet(dest(), 60)).await;
+        assert!(mesh.sent.is_empty());
+        assert_eq!(icmp_type(&rx.try_recv().unwrap()), 1);
+        assert!(rx.try_recv().is_err(), "one packet gets one answer");
     }
 }

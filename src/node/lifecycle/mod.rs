@@ -6,6 +6,9 @@ mod workers;
 use super::{Node, NodeError, NodeState};
 use supervisor::{Action, Child, Event, PeeringDesired, SupervisorFsm};
 
+use super::peering::lan::{
+    LanOffer, MAX_PENDING_LAN_CANDIDATES, PendingLan, PendingPair, lan_target_on_link,
+};
 use super::peering::reconcile::{
     Budget, Candidate, DiscoveryPools, Gate, Observed, PeeringAction, Policy,
 };
@@ -22,6 +25,7 @@ use crate::peer::machine::{HandshakeCrypto, PeerEvent, PeerMachine};
 use crate::proto::fmp::wire::build_msg1;
 use crate::proto::fmp::{Disconnect, DisconnectReason};
 use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId, packet_channel};
+use crate::utils::onlink::OnLinkPrefixes;
 use crate::{NodeAddr, PeerIdentity};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -95,6 +99,18 @@ enum AltDial {
 /// The `detail` a control-API `connect` reports for a held peer whose link
 /// is live.
 const PEER_LIVE_DETAIL: &str = "peer live, not dialled";
+
+/// The one warning a full LAN candidate set produces until it has been below
+/// its bound for a minute, whether the offer that found it full replaced a
+/// held candidate or was refused.
+fn log_lan_set_full(first_at_bound: bool) {
+    if first_at_bound {
+        warn!(
+            bound = MAX_PENDING_LAN_CANDIDATES,
+            "LAN discovery candidate set full; new unconfigured candidates now replace held ones or are refused"
+        );
+    }
+}
 
 impl Node {
     /// Replace the runtime peer list.
@@ -998,6 +1014,12 @@ impl Node {
         // cheap atomic store. One-tick lag is acceptable: the inbound
         // msg1 gate in handshake.rs remains the authoritative cap.
         bootstrap.set_outbound_admission(self.outbound_admission_check());
+        self.push_advert_protection();
+        bootstrap.maintain_advert_cache();
+        let peers = &self.peers;
+        self.supervisor
+            .nostr_rendezvous
+            .note_linked_bootstraps(|addr| peers.contains_key(addr));
 
         if let Err(err) = self.refresh_overlay_advert(&bootstrap).await {
             debug!(error = %err, "Failed to refresh local Nostr overlay advert");
@@ -1233,76 +1255,210 @@ impl Node {
             return;
         };
         let events = runtime.drain_events().await;
-        if events.is_empty() {
+        let now_ms = self.uptime().as_millis() as u64;
+        self.lan_tick(events, now_ms).await;
+    }
+
+    /// One tick of LAN discovery: expire held candidates and release the
+    /// set-full warning on every tick, then, when there are new adverts or
+    /// held candidates, read this node's interface prefixes and dial within
+    /// the budget. `now_ms` is the node's monotonic uptime in milliseconds.
+    pub(in crate::node) async fn lan_tick(
+        &mut self,
+        events: Vec<crate::mdns::LanEvent>,
+        now_ms: u64,
+    ) {
+        if let Some(refused) = self.peering.lan.expire(now_ms) {
+            info!(refused, "LAN discovery candidate set below its bound again");
+        }
+        self.prune_connected_lan();
+        if events.is_empty() && self.peering.lan.is_empty() {
             return;
         }
+        let on_link = OnLinkPrefixes::read_system();
+        if events.is_empty() {
+            self.dial_pending_lan(&on_link).await;
+        } else {
+            self.handle_lan_events(events, &on_link).await;
+        }
+    }
 
-        // Resolve each mDNS beacon to a dialable candidate (the driver I/O: pick a
-        // socket-family-compatible UDP transport, parse the npub). The
-        // connected / connecting skip is the core's decision — LAN growth has no
-        // discovery budget or per-peer cap, only the connected/connecting guard,
-        // applied in event order.
-        //
-        // First-wins per-peer dedup: mdns-sd emits one
-        // `Discovered` event per interface IP of a multi-homed responder, and the
-        // old inline-dial loop dialed the first compatible address then skipped
-        // the rest via `is_connecting_to_peer` (which turned true after that
-        // dial). The frozen-snapshot core cannot see that intra-tick feedback, so
-        // the driver reproduces it here: keep only the first surviving candidate
-        // per peer this tick. (In the ACL-reject case the old loop retried every
-        // address, but each attempt failed `authorize_peer` before touching any
-        // state, so no connection resulted either way — the dedup is neutral on
-        // the dataplane.)
-        let mut lan: Vec<Candidate> = Vec::new();
-        let mut seen: HashSet<NodeAddr> = HashSet::new();
-        for event in events {
-            let crate::mdns::LanEvent::Discovered(peer) = event;
-            let Some((transport_id, _local_addr)) =
-                self.find_udp_transport_for_remote_addr(peer.addr, None)
-            else {
-                debug!(
-                    addr = %peer.addr,
-                    "lan: skip discovered peer with no compatible UDP transport"
-                );
-                continue;
-            };
-            let identity = match crate::PeerIdentity::from_npub(&peer.npub) {
-                Ok(id) => id,
-                Err(err) => {
-                    debug!(npub = %peer.npub, error = %err, "lan: skip bad npub");
+    /// Drop held LAN candidates of nodes that are now connected, whichever
+    /// address or path they connected through.
+    fn prune_connected_lan(&mut self) {
+        let connected: HashSet<NodeAddr> = self.peers.keys().copied().collect();
+        self.peering.lan.prune_connected(&connected);
+    }
+
+    /// The node addresses of the configured peers, read afresh so a
+    /// configuration reload applies on the next call.
+    fn configured_node_addrs(&self) -> HashSet<NodeAddr> {
+        self.config()
+            .peers()
+            .iter()
+            .filter_map(|peer| crate::PeerIdentity::from_npub(&peer.npub).ok())
+            .map(|identity| *identity.node_addr())
+            .collect()
+    }
+
+    /// Hold each mDNS discovery that names an address on this node's links
+    /// as a pending candidate, then dial what the budget allows.
+    pub(in crate::node) async fn handle_lan_events(
+        &mut self,
+        events: Vec<crate::mdns::LanEvent>,
+        on_link: &OnLinkPrefixes,
+    ) {
+        self.prune_connected_lan();
+        let configured = self.configured_node_addrs();
+        let now_ms = self.uptime().as_millis() as u64;
+
+        // No await in this block: the thread-local generator is not `Send`.
+        {
+            let mut rng = rand::rng();
+            for event in events {
+                let crate::mdns::LanEvent::Discovered(peer) = event;
+                let Some((transport_id, _local_addr)) =
+                    self.find_udp_transport_for_remote_addr(peer.addr, None)
+                else {
+                    debug!(
+                        addr = %peer.addr,
+                        "lan: skip discovered peer with no compatible UDP transport"
+                    );
+                    continue;
+                };
+                if !lan_target_on_link(peer.addr, &peer.interfaces, on_link) {
+                    if on_link.read_failed() {
+                        debug!(
+                            npub = %peer.npub,
+                            addr = %peer.addr,
+                            reason = "interface-read-failed",
+                            "lan: ignoring advert; this node's interfaces could not be read"
+                        );
+                    } else {
+                        debug!(
+                            npub = %peer.npub,
+                            addr = %peer.addr,
+                            interfaces = ?peer.interfaces,
+                            reason = "off-link",
+                            "lan: ignoring advert for an address off the link it arrived on"
+                        );
+                    }
                     continue;
                 }
-            };
-            let peer_node_addr = *identity.node_addr();
-            if !seen.insert(peer_node_addr) {
-                continue;
+                let identity = match crate::PeerIdentity::from_npub(&peer.npub) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        debug!(npub = %peer.npub, error = %err, "lan: skip bad npub");
+                        continue;
+                    }
+                };
+                let pair = PendingPair {
+                    node: *identity.node_addr(),
+                    identity,
+                    transport_id,
+                    addr: peer.addr,
+                    interfaces: peer.interfaces,
+                    first_seen_ms: now_ms,
+                };
+                match self.peering.lan.offer(pair, &configured, now_ms, &mut rng) {
+                    LanOffer::Held | LanOffer::Duplicate => {}
+                    LanOffer::RefusedPerNode => debug!(
+                        npub = %identity.short_npub(),
+                        addr = %peer.addr,
+                        reason = "per-node-limit",
+                        "lan: advert refused; node already holds its pending addresses"
+                    ),
+                    LanOffer::Replaced {
+                        displaced,
+                        first_at_bound,
+                    } => {
+                        log_lan_set_full(first_at_bound);
+                        debug!(
+                            npub = %displaced.identity.short_npub(),
+                            addr = %displaced.addr,
+                            reason = "set-full",
+                            "lan: pending candidate displaced by a newer advert"
+                        );
+                    }
+                    LanOffer::Refused { first_at_bound } => {
+                        log_lan_set_full(first_at_bound);
+                        debug!(
+                            npub = %identity.short_npub(),
+                            addr = %peer.addr,
+                            reason = "set-full",
+                            "lan: advert refused; candidate set full of configured peers"
+                        );
+                    }
+                }
             }
-            let remote_addr = crate::transport::TransportAddr::from_string(&peer.addr.to_string());
-            lan.push(Candidate {
-                transport_id,
-                remote_addr,
-                identity: Some(identity),
-                active_refresh: false,
-            });
         }
 
-        if lan.is_empty() {
+        self.dial_pending_lan(on_link).await;
+    }
+
+    /// Dial held LAN candidates within the discovery budget and the in-flight
+    /// cap, after dropping any whose address has left this node's links.
+    ///
+    /// When the interface read failed, nothing is dropped or dialled on this
+    /// tick: an empty read would drop every held candidate, and mDNS reports
+    /// an advert again only when it changes.
+    pub(in crate::node) async fn dial_pending_lan(&mut self, on_link: &OnLinkPrefixes) {
+        self.prune_connected_lan();
+        if on_link.read_failed() {
+            debug!(
+                held = self.peering.lan.len(),
+                "lan: interface read failed; held candidates kept for the next tick"
+            );
+            return;
+        }
+        let dropped = self.peering.lan.retain_on_link(on_link);
+        if dropped > 0 {
+            debug!(
+                dropped,
+                reason = "off-link",
+                "lan: dropped pending candidates no longer on this node's links"
+            );
+        }
+        let connecting = self.observe_peering().connecting;
+        self.peering.lan.prune_dialed(&connecting);
+        if self.peering.lan.is_empty() {
             return;
         }
 
-        let pools = DiscoveryPools {
-            lan,
-            ..DiscoveryPools::default()
-        };
+        let configured = self.configured_node_addrs();
         let policy = self.build_peering_policy(Vec::new());
-        let observed = self.observe_peering();
         let budget = self.build_peering_budget();
-        let now_ms = Self::now_ms();
         let gate = Gate::from_state(self.supervisor.state);
-        let actions = self
-            .peering
-            .reconciler
-            .reconcile_opportunistic(&policy, &observed, &budget, &pools, now_ms, gate);
+        // No await in this block: the thread-local generator is not `Send`.
+        let actions = {
+            let mut rng = rand::rng();
+            let lan: Vec<Candidate> = self
+                .peering
+                .lan
+                .ordered(&configured, &mut rng)
+                .into_iter()
+                .map(|pair| Candidate {
+                    transport_id: pair.transport_id,
+                    remote_addr: TransportAddr::from_string(&pair.addr.to_string()),
+                    identity: Some(pair.identity),
+                    active_refresh: false,
+                })
+                .collect();
+            let pools = DiscoveryPools {
+                lan,
+                lan_configured: configured.clone(),
+                ..DiscoveryPools::default()
+            };
+            let observed = self.observe_peering();
+            self.peering.reconciler.reconcile_opportunistic(
+                &policy,
+                &observed,
+                &budget,
+                &pools,
+                Self::now_ms(),
+                gate,
+            )
+        };
 
         for action in actions {
             let PeeringAction::Connect(candidate) = action else {
@@ -1311,6 +1467,19 @@ impl Node {
             let Some(identity) = candidate.identity else {
                 continue;
             };
+            let node = *identity.node_addr();
+            // Every LAN candidate's address was written from a `SocketAddr`.
+            let Some(addr) = candidate
+                .remote_addr
+                .as_str()
+                .and_then(|text| text.parse::<SocketAddr>().ok())
+            else {
+                continue;
+            };
+            self.peering.lan.take(&node, addr);
+            if !configured.contains(&node) {
+                self.peering.lan.note_dialed(node, addr);
+            }
             let local_addr = self
                 .transports
                 .get(&candidate.transport_id)
@@ -1671,6 +1840,11 @@ impl Node {
                     .await
                     {
                         Ok(runtime) => {
+                            // Before the first await: the engine's relay loops
+                            // are already running and can replay stored
+                            // adverts, which a full cache would refuse for
+                            // configured peers it did not know were protected.
+                            self.install_advert_protection(&runtime);
                             if let Err(err) = self.refresh_overlay_advert(&runtime).await {
                                 warn!(error = %err, "Failed to publish initial Nostr overlay advert");
                             }
@@ -1718,6 +1892,9 @@ impl Node {
                     {
                         Ok(runtime) => {
                             self.supervisor.lan_rendezvous = Some(runtime);
+                            // Held candidates name transports of the previous
+                            // run; start the new one empty.
+                            self.peering.lan = PendingLan::default();
                             info!("LAN mDNS discovery enabled");
                             Event::SubstrateUp { child }
                         }
@@ -2470,7 +2647,7 @@ impl Node {
     /// layer.
     ///
     /// The driver builds the [`DiscoveryPools`] overlay input from
-    /// `bootstrap.cached_open_discovery_candidates(64)` (the I/O), excluding the
+    /// `bootstrap.cached_open_discovery_candidates(64, &skip)` (the I/O), excluding the
     /// node's own advert (the sans-IO core has no self-identity
     /// input), and supplies the configured-npub set, the per-npub cooldown set,
     /// and the startup-sweep max-age. `max_age_secs` is `None` for the per-tick
@@ -2521,7 +2698,23 @@ impl Node {
         // exactly that set (below) — reproducing the old sweep's per-enqueue
         // `peer_aliases` / `register_identity` side effects byte-for-byte.
         let now_secs = now_ms / 1000;
-        let candidates = bootstrap.cached_open_discovery_candidates(64).await;
+        // Authors the sweep is certain to pass over without acting: those with
+        // an established link, and unconfigured authors already queued. Left
+        // out of the cache's window so they cannot take its slots.
+        let skip = self
+            .peers
+            .values()
+            .map(|peer| peer.npub_str().to_string())
+            .chain(
+                self.peering
+                    .reconciler
+                    .retry_pending
+                    .values()
+                    .map(|state| state.peer_config.npub.clone())
+                    .filter(|npub| !configured_npubs.contains(npub)),
+            )
+            .collect::<HashSet<_>>();
+        let candidates = bootstrap.cached_open_discovery_candidates(64, &skip).await;
         // `cached` and the self buckets feed the operator sweep summary below: the
         // raw cache size and the self-advert filter are the driver's to count,
         // since the sans-IO core never sees self (it is excluded from the pool).
@@ -2767,6 +2960,7 @@ impl Node {
             connected,
             connecting,
             in_flight_by_peer,
+            lan_in_flight: self.peering.lan.in_flight(),
             ..Observed::default()
         }
     }
@@ -3379,9 +3573,12 @@ impl Node {
             transport_id,
             crate::transport::TransportHandle::Udp(transport),
         );
-        self.supervisor
-            .nostr_rendezvous
-            .insert_bootstrap_transport(transport_id, traversal.peer_npub.clone());
+        self.supervisor.nostr_rendezvous.insert_bootstrap_transport(
+            transport_id,
+            traversal.peer_npub.clone(),
+            peer_node_addr,
+            traversal.remote_addr,
+        );
         // The adopted transport is bound from here on, so it already counts
         // toward `transport_mtu()`; the SYN clamp has to follow it now.
         self.refresh_tun_mss_ceiling();

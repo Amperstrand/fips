@@ -374,7 +374,7 @@ inert otherwise.
 | `node.rendezvous.nostr.open_discovery_max_pending` | usize | `64` | Max open-discovery peers queued in outbound retry/connection state at once |
 | `node.rendezvous.nostr.max_concurrent_incoming_offers` | usize | `16` | Max concurrent inbound traversal offers processed at once (rate limit against offer spam) |
 | `node.rendezvous.nostr.max_concurrent_offers_per_npub` | usize | `4` | Max concurrent inbound traversal offers accepted from any one sender npub, so a single identity cannot hold the whole pool. Sits inside `max_concurrent_incoming_offers`, which stays the outer bound; a larger value is inert. Zero is rejected, since it refuses every inbound offer rather than disabling the limit |
-| `node.rendezvous.nostr.advert_cache_max_entries` | usize | `2048` | Max cached overlay adverts retained from relay traffic |
+| `node.rendezvous.nostr.advert_cache_max_entries` | usize | `2048` | Max cached overlay adverts retained from relay traffic. When the cache is full, an advert from a new author that is neither a configured peer nor linked to this node is refused until an entry expires; configured and linked authors are always cached |
 | `node.rendezvous.nostr.seen_sessions_max_entries` | usize | `2048` | Max seen-session IDs retained for replay detection |
 | `node.rendezvous.nostr.advertise` | bool | `true` | Publish local endpoint adverts |
 | `node.rendezvous.nostr.advert_relays` | list[string] | `["wss://relay.damus.io", "wss://nos.lol", "wss://offchain.pub"]` | Relays used for service adverts |
@@ -431,6 +431,11 @@ mDNS adverts are unauthenticated, so a LAN advert is treated only as a
 routing hint. Identity is still proven end-to-end by the Noise IK
 handshake the node initiates against the observed endpoint; a spoofed
 advert carrying another peer's npub fails the handshake and is dropped.
+The node dials an advertised address only when it lies on the link the
+advert's address record arrived on, so an advert carried between subnets
+by an mDNS reflector is not dialled. New LAN dials are paced: at most 8
+handshakes to unconfigured LAN peers are in flight at once, and at most
+2 to any one address.
 LAN discovery requires an active UDP transport (peers dial the
 advertised UDP port to begin the handshake).
 
@@ -626,9 +631,9 @@ with the node for routing.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `dns.enabled` | bool | `true` | Enable DNS responder |
-| `dns.bind_addr` | string | `"::1"` | Bind address. Default is IPv6 loopback only; the shipped `fips-dns-setup` configures systemd-resolved to forward `.fips` queries to `[::1]:5354`. To expose the responder to mesh peers (or to the gateway over IPv4), override (e.g., `"::"` for all interfaces). |
+| `dns.bind_addr` | string | `"::1"` | Bind address. Default is IPv6 loopback only; the shipped `fips-dns-setup` configures systemd-resolved to forward `.fips` queries to `[::1]:5354`. A non-loopback address (e.g. `"::"` for all interfaces) answers every host that can reach it: set one only to serve other hosts, such as LAN clients, or a gateway that reaches the daemon over IPv4. On Linux, macOS and FreeBSD, when the daemon creates its own TUN, queries arriving on the mesh interface are dropped, so mesh peers are not served, unless the daemon logs 'Mesh interface index unresolved; DNS mesh filter disabled' at start, in which case they are; on Windows, or with an application-supplied TUN, they are. The reply goes to the query's source address by the routing table, so a host on one of those networks that forges a mesh source address (`fd00::/8`) has the reply sent into the mesh, from this node's mesh address, to the address and port it forged. |
 | `dns.port` | u16 | `5354` | Listen port |
-| `dns.ttl` | u32 | `300` | AAAA record TTL in seconds |
+| `dns.ttl` | u32 | `300` | AAAA record TTL in seconds. Values above 2147483647 are treated as 2147483647. |
 
 The `dns.ttl` value should not exceed `node.cache.coord_ttl_secs` to avoid
 stale address mappings.
@@ -959,7 +964,7 @@ on Android the radio is supplied by the embedding application.
 | `transports.ble.psm` | u16 | `0x0085` (133) | L2CAP Protocol/Service Multiplexer |
 | `transports.ble.mtu` | u16 | `2048` | Default MTU. Actual MTU is negotiated per-link during L2CAP connection setup. |
 | `transports.ble.max_connections` | usize | `7` | Maximum concurrent BLE connections |
-| `transports.ble.connect_timeout_ms` | u64 | `10000` | Outbound connect timeout in milliseconds |
+| `transports.ble.connect_timeout_ms` | u64 | `10000` | Outbound connect timeout in milliseconds; also how long a new link is protected from eviction (never less than 10 s) |
 | `transports.ble.advertise` | bool | `true` | Broadcast BLE beacon advertisements for peer discovery |
 | `transports.ble.scan` | bool | `true` | Listen for BLE beacon advertisements from other nodes |
 | `transports.ble.auto_connect` | bool | `false` | Automatically connect to discovered peers |
@@ -982,15 +987,28 @@ learns each peer's advertised PSM; a peer that advertises none is dialled
 at the configured `psm`. Discovered
 peers are probed immediately (L2CAP connect + pubkey exchange) with a
 cooldown (`probe_cooldown_secs`) to prevent rapid re-probing of the same
-address. A node already linked keeps one link: if two nodes dial each
-other at the same time and both links complete within one
-`connect_timeout_ms` of each other, both keep the link the node with the
-smaller NodeAddr dialled; otherwise the established link is kept and the
-newcomer is declined.
+address. A node whose FIPS session already uses a link keeps that link,
+and a newcomer claiming the same node is declined. Before a link
+verifies, if two nodes dial each other at the same time and both links
+complete within one `connect_timeout_ms` of each other, both keep the
+link the node with the smaller NodeAddr dialled; a newcomer at the
+address of an older unverified link is declined; any other newcomer is
+admitted beside the unverified link.
 
 **Connection pool.** The `max_connections` parameter limits the number of
-concurrent BLE connections. When the pool is full, the least-recently-used
-connection is evicted to make room for new connections.
+concurrent BLE connections. A link counts as a node's once that node's FIPS
+session uses it; until then it is unverified, whatever key the remote
+claimed when it connected. A verified link is never evicted. When the pool
+is full, a new link evicts an unverified link that has had
+`connect_timeout_ms` (never less than 10 s) to complete its handshake,
+preferring a node's duplicate links and then the oldest; when no link may
+be evicted, the new link is refused.
+
+An unverified link is not closed on a timer, and the pool evicts only when
+it is full. Set `max_connections` no higher than the number of connections
+the Bluetooth adapter can hold, less any the host keeps for other devices:
+if the adapter runs out of connections first, links that never complete a
+handshake can hold the rest and no eviction makes room.
 
 ### BLE Example
 
@@ -1068,8 +1086,8 @@ end-to-end design, see
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `gateway.enabled` | bool | `false` | Enable the gateway. Must be `true` for `fips-gateway` to start. |
-| `gateway.pool` | string | *(required)* | Virtual IPv6 pool CIDR (e.g., `"fd01::/112"`). Must not overlap with the FIPS mesh address space (`fd00::/8`) or any address space already in use on the LAN. The `/112` size yields 65 535 usable virtual IPs (address 0 in the pool is skipped), the most the pool uses whatever the CIDR width. The gateway holds at most 1000 live mappings at once and admits new names at up to 10 per second after a burst of 50; an AAAA query for a new name beyond either limit gets `SERVFAIL`. |
-| `gateway.lan_interface` | string | *(required)* | LAN-facing network interface name (e.g., `"enp3s0"`). Used for proxy-NDP entry installation so LAN clients can resolve the link-layer address of allocated virtual IPs. |
+| `gateway.pool` | string | *(required)* | Virtual IPv6 pool CIDR (e.g., `"fd01::/112"`). Must not overlap any address space already in use on the LAN. The gateway routes the whole prefix to itself, so a name whose mesh address (in `fd00::/8`) lies inside it cannot be reached and gets `SERVFAIL`; a `/112` makes that vanishingly unlikely. The `/112` size yields 65 535 usable virtual IPs (address 0 in the pool is skipped), the most the pool uses whatever the CIDR width. The gateway holds at most 1000 live mappings at once and admits new names at up to 10 per second after a burst of 50; at 1000 live mappings, a new name replaces the oldest mapping that has never carried traffic, and gets `SERVFAIL` only when every mapping has carried traffic; a new name beyond the rate limit gets `SERVFAIL`. A pool smaller than `1000 + 10 x (TTL + grace)` addresses (2,200 at the defaults) can be exhausted by one LAN host naming new names; the gateway warns at start when the pool is below this. |
+| `gateway.lan_interface` | string | *(required)* | LAN-facing network interface name (e.g., `"enp3s0"`). Only traffic arriving on this interface is translated onto the mesh; traffic to the pool from other interfaces is dropped, and traffic into `fips0` from other interfaces is dropped unless it is a reply. Also used for proxy-NDP entry installation so LAN clients can resolve the link-layer address of allocated virtual IPs. A VLAN device on a bridge does not work here when bridge netfilter is active with `net.bridge.bridge-nf-pass-vlan-input-dev` 0: the gateway then does not serve the LAN (see the design document's LAN trust boundary). |
 | `gateway.pool_grace_period` | u64 | `60` | Seconds a virtual-IP allocation is retained after its last referencing session ends, before the address is returned to the free pool. Larger values reduce churn for short-lived flows; smaller values reclaim addresses faster. |
 
 ### Gateway DNS (`gateway.dns.*`)
@@ -1084,7 +1102,7 @@ Non-`.fips` queries are answered with `REFUSED`.
 |-----------|------|---------|-------------|
 | `gateway.dns.listen` | string | `"[::1]:5365"` | DNS listen address. The default binds IPv6 loopback on an unprivileged port, not 5353, the mDNS port, matching the canonical deployment where another resolver on the host (dnsmasq, systemd-resolved, BIND) holds port 53 and forwards `.fips` queries to the gateway over loopback. Bind on the LAN-side IP (e.g., `"192.168.1.1:53"`) or wildcard (`"[::]:53"`) only on hosts with no other resolver on 53 and where LAN clients query the gateway directly. See [../how-to/troubleshoot-gateway.md](../how-to/troubleshoot-gateway.md). |
 | `gateway.dns.upstream` | string | `"[::1]:5354"` | Upstream FIPS daemon resolver. **Must match the daemon's `dns.bind_addr` and `dns.port`.** Defaults match the daemon defaults (`::1:5354`). A v4 upstream (`"127.0.0.1:5354"`) cannot reach a daemon bound on `[::1]:5354` — Linux IPv6 sockets bound to explicit `::1` do not accept v4-mapped traffic. If you change the daemon's `dns.bind_addr`, update this field accordingly. |
-| `gateway.dns.ttl` | u32 | `60` | TTL in seconds on AAAA responses returned to LAN clients. Smaller values let the gateway recycle pool addresses faster; larger values reduce LAN-side query traffic. |
+| `gateway.dns.ttl` | u32 | `60` | TTL in seconds on AAAA responses returned to LAN clients. Smaller values let the gateway recycle pool addresses faster; larger values reduce LAN-side query traffic. A name that has never carried traffic is answered with at most the time left until TTL after its creation, and lives TTL plus `pool_grace_period` from creation however often it is queried; a name that has carried traffic is answered with the full TTL and refreshed by each query. Values above 2147483647 are treated as 2147483647. |
 
 ### Conntrack (`gateway.conntrack.*`)
 

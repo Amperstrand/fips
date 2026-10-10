@@ -493,3 +493,570 @@ async fn test_connected_udp_activates_on_an_adopted_traversal_transport_and_on_a
         transport.stop().await.ok();
     }
 }
+
+/// An on-demand configured peer on a placeholder address nothing dials.
+fn on_demand_peer(npub: String) -> crate::config::PeerConfig {
+    crate::config::PeerConfig {
+        npub,
+        alias: None,
+        addresses: vec![crate::config::PeerAddress::new("udp", "127.0.0.1:9")],
+        connect_policy: crate::config::ConnectPolicy::OnDemand,
+        auto_reconnect: false,
+        via_nostr: false,
+    }
+}
+
+/// The node tick tells the advert cache which authors to keep when it is
+/// full: configured peers (in canonical form, whatever case the configuration
+/// wrote) and peers with an established link, following link loss and
+/// configuration reloads.
+#[tokio::test]
+async fn the_peering_tick_pushes_configured_and_linked_npubs_to_the_advert_cache() {
+    let configured = make_peer_identity();
+    let mut config = Config::new();
+    config.peers = vec![on_demand_peer(configured.npub().to_uppercase())];
+    let mut node = make_node_with(config);
+
+    let link_id = LinkId::new(1);
+    let linked = seed_completed_connection(&mut node, link_id, TransportId::new(1), 1000);
+    node.promote_connection(link_id, linked, 2000).unwrap();
+
+    let engine = std::sync::Arc::new(crate::nostr::NostrRendezvous::new_for_test());
+    node.supervisor.nostr_rendezvous.set_engine(engine.clone());
+
+    node.poll_nostr_rendezvous().await;
+    let protected = engine.advert_protection_for_test();
+    assert!(protected.contains(&linked.npub()), "linked peer protected");
+    assert!(
+        protected.contains(&configured.npub()),
+        "configured peer protected under its canonical npub"
+    );
+
+    node.remove_peer(linked.node_addr());
+    node.poll_nostr_rendezvous().await;
+    assert!(
+        !engine.advert_protection_for_test().contains(&linked.npub()),
+        "a dropped link loses protection on the next tick"
+    );
+
+    let added = make_peer_identity();
+    node.update_peers(vec![on_demand_peer(added.npub())])
+        .await
+        .unwrap();
+    node.poll_nostr_rendezvous().await;
+    let protected = engine.advert_protection_for_test();
+    assert!(
+        !protected.contains(&configured.npub()),
+        "removed peer dropped"
+    );
+    assert!(protected.contains(&added.npub()), "added peer protected");
+}
+
+/// A Nostr engine started again on the same node gets the configured authors
+/// at once, before any tick, even though the set has not changed since the
+/// last push to the previous engine.
+#[tokio::test]
+async fn a_restarted_nostr_engine_receives_the_configured_set_before_any_tick() {
+    let configured = make_peer_identity();
+    let mut config = Config::new();
+    config.peers = vec![on_demand_peer(configured.npub())];
+    let mut node = make_node_with(config);
+
+    let engine_a = std::sync::Arc::new(crate::nostr::NostrRendezvous::new_for_test());
+    node.install_advert_protection(&engine_a);
+    node.supervisor
+        .nostr_rendezvous
+        .set_engine(engine_a.clone());
+    node.poll_nostr_rendezvous().await;
+
+    let engine_b = std::sync::Arc::new(crate::nostr::NostrRendezvous::new_for_test());
+    node.install_advert_protection(&engine_b);
+    node.supervisor
+        .nostr_rendezvous
+        .set_engine(engine_b.clone());
+
+    assert!(
+        engine_b
+            .advert_protection_for_test()
+            .contains(&configured.npub())
+    );
+}
+
+/// A running node with one started UDP transport on loopback, for driving
+/// LAN discovery through the real dial path.
+async fn lan_node() -> Node {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+    let (packet_tx, packet_rx) = packet_channel(1024);
+    node.supervisor.packet_tx = Some(packet_tx.clone());
+    node.packet_rx = Some(packet_rx);
+    node.supervisor.state = NodeState::Running;
+    let mut transport = UdpTransport::new(
+        transport_id,
+        None,
+        UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            mtu: Some(1280),
+            ..Default::default()
+        },
+        packet_tx,
+    );
+    transport.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(transport));
+    node
+}
+
+/// The interface index the tests' loopback prefix and adverts use.
+const LAN_TEST_IF: u32 = 1;
+
+/// One mDNS discovery of a fresh npub at `addr`, arriving on
+/// [`LAN_TEST_IF`].
+fn lan_event(addr: &str) -> crate::mdns::LanEvent {
+    lan_event_on(addr, LAN_TEST_IF)
+}
+
+/// One mDNS discovery of a fresh npub at `addr`, arriving on `interface`.
+fn lan_event_on(addr: &str, interface: u32) -> crate::mdns::LanEvent {
+    crate::mdns::LanEvent::Discovered(crate::mdns::LanDiscoveredPeer {
+        npub: make_peer_identity().npub(),
+        scope: None,
+        addr: addr.parse().unwrap(),
+        interfaces: vec![interface],
+        observed_at: std::time::Instant::now(),
+    })
+}
+
+/// 127.0.0.1/32 on interface [`LAN_TEST_IF`].
+fn loopback_prefix() -> crate::utils::onlink::OnLinkPrefixes {
+    crate::utils::onlink::OnLinkPrefixes::from_indexed([(
+        "127.0.0.1".parse().unwrap(),
+        32,
+        Some(LAN_TEST_IF),
+    )])
+}
+
+async fn stop_transports(node: &mut Node) {
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+/// An mDNS advert naming an address off this node's links (one an mDNS
+/// reflector could carry in from another subnet) is not dialled.
+#[tokio::test]
+async fn an_off_link_lan_advert_is_not_dialled() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+
+    node.handle_lan_events(vec![lan_event("127.0.0.2:9")], &loopback_prefix())
+        .await;
+    assert_eq!(node.connection_count(), before, "off-link advert dialled");
+
+    // Control: the same path dials an on-link advert.
+    node.handle_lan_events(vec![lan_event("127.0.0.1:9")], &loopback_prefix())
+        .await;
+    assert_eq!(node.connection_count(), before + 1);
+    stop_transports(&mut node).await;
+}
+
+/// An advert that arrived on one interface naming an address in another
+/// interface's prefix (a VPN or container network on the same node) is not
+/// dialled, though both prefixes are this node's own.
+#[tokio::test]
+async fn a_lan_advert_naming_another_interfaces_prefix_is_not_dialled() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+    let prefixes = crate::utils::onlink::OnLinkPrefixes::from_indexed([
+        ("127.0.0.1".parse().unwrap(), 32, Some(1)),
+        ("127.0.0.2".parse().unwrap(), 32, Some(2)),
+    ]);
+
+    node.handle_lan_events(vec![lan_event_on("127.0.0.2:9", 1)], &prefixes)
+        .await;
+    assert_eq!(
+        node.connection_count(),
+        before,
+        "advert on interface 1 dialled into interface 2's prefix"
+    );
+
+    // Control: the same path dials an address on the arrival interface.
+    node.handle_lan_events(vec![lan_event_on("127.0.0.1:9", 1)], &prefixes)
+        .await;
+    assert_eq!(node.connection_count(), before + 1);
+    stop_transports(&mut node).await;
+}
+
+/// 127.0.0.0/8 on interface [`LAN_TEST_IF`], for tests that dial several
+/// loopback addresses.
+#[cfg(target_os = "linux")]
+fn loopback_net() -> crate::utils::onlink::OnLinkPrefixes {
+    crate::utils::onlink::OnLinkPrefixes::from_indexed([(
+        "127.0.0.0".parse().unwrap(),
+        8,
+        Some(LAN_TEST_IF),
+    )])
+}
+
+/// 100 adverts under fresh keys, two at each of 50 loopback addresses.
+/// Only Linux answers on all of 127.0.0.0/8 without configuration.
+#[cfg(target_os = "linux")]
+fn spread_burst() -> Vec<crate::mdns::LanEvent> {
+    (0..100u16)
+        .map(|i| lan_event(&format!("127.0.0.{}:{}", 1 + i / 2, 10_001 + i)))
+        .collect()
+}
+
+/// A burst of adverts under fresh keys, none of which will ever complete a
+/// handshake, starts no more handshakes than the in-flight cap.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_burst_of_lan_adverts_under_fresh_keys_is_dialled_at_the_in_flight_cap() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+
+    node.handle_lan_events(spread_burst(), &loopback_net())
+        .await;
+    assert_eq!(node.connection_count() - before, 8);
+    stop_transports(&mut node).await;
+}
+
+/// Adverts under any number of fresh npubs that all resolve to one host's
+/// address, at ports the sender chooses (as forged npubs sharing a FIPS
+/// node's host name do), start at most two handshakes to that host, on the
+/// first tick and while those two are still connecting.
+#[tokio::test]
+async fn adverts_under_many_npubs_for_one_address_start_at_most_two_handshakes_to_it() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+    let events = (10_001..=10_100u16)
+        .map(|port| lan_event(&format!("127.0.0.1:{port}")))
+        .collect();
+
+    node.handle_lan_events(events, &loopback_prefix()).await;
+    assert_eq!(node.connection_count() - before, 2);
+    node.dial_pending_lan(&loopback_prefix()).await;
+    assert_eq!(node.connection_count() - before, 2);
+    stop_transports(&mut node).await;
+}
+
+/// The off-link check acts before the pending set, so an off-link advert
+/// never takes a slot there: it neither stays held nor, at a full set,
+/// displaces a held on-link candidate.
+#[tokio::test]
+async fn an_off_link_lan_advert_never_enters_the_pending_set() {
+    let mut node = lan_node().await;
+    node.handle_lan_events(vec![lan_event("127.0.0.2:9")], &loopback_prefix())
+        .await;
+    assert!(node.peering.lan.is_empty());
+
+    // A full set of held on-link candidates, all at one address, then a
+    // burst of off-link adverts: the dial pass takes the two that address
+    // allows, and the other 62 are all still held.
+    let mut rng = rand::rng();
+    let none = std::collections::HashSet::new();
+    for port in 20_001..=20_064u16 {
+        let identity = make_peer_identity();
+        let pair = crate::node::peering::lan::PendingPair {
+            node: *identity.node_addr(),
+            identity,
+            transport_id: TransportId::new(1),
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            interfaces: vec![LAN_TEST_IF],
+            first_seen_ms: 0,
+        };
+        node.peering.lan.offer(pair, &none, 0, &mut rng);
+    }
+    let off_link = (1..=20u16)
+        .map(|i| lan_event(&format!("127.0.0.2:{i}")))
+        .collect();
+    node.handle_lan_events(off_link, &loopback_prefix()).await;
+    assert_eq!(
+        node.peering.lan.len(),
+        64 - crate::node::peering::lan::MAX_LAN_DIALS_PER_ADDR
+    );
+    stop_transports(&mut node).await;
+}
+
+/// Held candidates are not dialled again while the first eight dials are
+/// still connecting.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pending_lan_dials_are_not_repeated_while_the_first_eight_are_connecting() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+    node.handle_lan_events(spread_burst(), &loopback_net())
+        .await;
+    assert_eq!(node.connection_count() - before, 8);
+    assert!(!node.peering.lan.is_empty(), "the rest are held");
+
+    node.dial_pending_lan(&loopback_net()).await;
+    assert_eq!(node.connection_count() - before, 8);
+    stop_transports(&mut node).await;
+}
+
+/// The set-full latch is released by the tick itself, without any further
+/// mDNS event or held candidate.
+#[tokio::test]
+async fn the_lan_set_full_latch_is_released_on_ticks_with_no_mdns_events() {
+    let mut node = lan_node().await;
+    let mut rng = rand::rng();
+    let none = std::collections::HashSet::new();
+    for i in 0..=crate::node::peering::lan::MAX_PENDING_LAN_CANDIDATES {
+        let identity = make_peer_identity();
+        let pair = crate::node::peering::lan::PendingPair {
+            node: *identity.node_addr(),
+            identity,
+            transport_id: TransportId::new(1),
+            addr: format!("192.168.1.{}:2121", 1 + i % 250).parse().unwrap(),
+            interfaces: vec![LAN_TEST_IF],
+            first_seen_ms: 0,
+        };
+        node.peering.lan.offer(pair, &none, 0, &mut rng);
+    }
+    assert!(node.peering.lan.is_latched());
+    node.peering
+        .lan
+        .retain_on_link(&crate::utils::onlink::OnLinkPrefixes::default());
+    assert!(node.peering.lan.is_empty());
+
+    let t = 1_000;
+    node.lan_tick(Vec::new(), t).await;
+    assert!(node.peering.lan.is_latched(), "held for a minute first");
+    node.lan_tick(Vec::new(), t + 60_000).await;
+    assert!(!node.peering.lan.is_latched());
+    stop_transports(&mut node).await;
+}
+
+/// A multi-homed peer's other held addresses go once it connects through
+/// one of them, on a tick with no mDNS events, so the held set does not keep
+/// the per-tick interface read running for nothing.
+#[tokio::test]
+async fn a_connected_peers_other_lan_addresses_are_dropped_on_a_tick_without_adverts() {
+    let mut node = lan_node().await;
+    let link_id = LinkId::new(1);
+    let peer = seed_completed_connection(&mut node, link_id, TransportId::new(1), 1000);
+    node.promote_connection(link_id, peer, 2000).unwrap();
+    let mut rng = rand::rng();
+    let none = std::collections::HashSet::new();
+    for port in [9u16, 10] {
+        let pair = crate::node::peering::lan::PendingPair {
+            node: *peer.node_addr(),
+            identity: peer,
+            transport_id: TransportId::new(1),
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            interfaces: vec![LAN_TEST_IF],
+            first_seen_ms: 0,
+        };
+        node.peering.lan.offer(pair, &none, 0, &mut rng);
+    }
+    assert_eq!(node.peering.lan.len(), 2);
+
+    node.dial_pending_lan(&loopback_prefix()).await;
+    assert!(
+        node.peering.lan.is_empty(),
+        "a connected peer's addresses are still held"
+    );
+    stop_transports(&mut node).await;
+}
+
+/// A failed interface read is not taken for a host with no addresses: the
+/// held candidates are kept, undialled, for the next tick, because mDNS
+/// would not report them again.
+#[tokio::test]
+async fn a_failed_interface_read_keeps_held_lan_candidates_for_the_next_tick() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+    let mut rng = rand::rng();
+    let none = std::collections::HashSet::new();
+    let identity = make_peer_identity();
+    let pair = crate::node::peering::lan::PendingPair {
+        node: *identity.node_addr(),
+        identity,
+        transport_id: TransportId::new(1),
+        addr: "127.0.0.1:9".parse().unwrap(),
+        interfaces: vec![LAN_TEST_IF],
+        first_seen_ms: 0,
+    };
+    node.peering.lan.offer(pair, &none, 0, &mut rng);
+
+    node.dial_pending_lan(&crate::utils::onlink::OnLinkPrefixes::failed())
+        .await;
+    assert_eq!(node.peering.lan.len(), 1, "held candidate discarded");
+    assert_eq!(node.connection_count(), before);
+
+    // The next tick's good read dials it.
+    node.dial_pending_lan(&loopback_prefix()).await;
+    assert_eq!(node.connection_count(), before + 1);
+    stop_transports(&mut node).await;
+}
+
+/// One honest on-link advert is dialled once, and not again on the next
+/// call.
+#[tokio::test]
+async fn one_on_link_lan_advert_is_dialled_once() {
+    let mut node = lan_node().await;
+    let before = node.connection_count();
+    node.handle_lan_events(vec![lan_event("127.0.0.1:9")], &loopback_prefix())
+        .await;
+    assert_eq!(node.connection_count(), before + 1);
+    node.dial_pending_lan(&loopback_prefix()).await;
+    assert_eq!(node.connection_count(), before + 1);
+    stop_transports(&mut node).await;
+}
+
+/// An unknown-version datagram on an adopted traversal transport.
+fn unknown_version_from(transport_id: TransportId, from: &str) -> crate::transport::ReceivedPacket {
+    crate::transport::ReceivedPacket::new(
+        transport_id,
+        TransportAddr::from_string(from),
+        vec![0x40, 0, 0, 0],
+    )
+}
+
+/// A node with a Nostr engine and one adopted traversal transport (id 7)
+/// that reached `peer` at 198.51.100.7:4000.
+fn node_with_traversed_peer(
+    peer: PeerIdentity,
+) -> (Node, std::sync::Arc<crate::nostr::NostrRendezvous>) {
+    let mut node = make_node();
+    let engine = std::sync::Arc::new(crate::nostr::NostrRendezvous::new_for_test());
+    node.supervisor.nostr_rendezvous.set_engine(engine.clone());
+    node.supervisor.nostr_rendezvous.insert_bootstrap_transport(
+        TransportId::new(7),
+        peer.npub(),
+        *peer.node_addr(),
+        "198.51.100.7:4000".parse().unwrap(),
+    );
+    (node, engine)
+}
+
+/// Only the traversed address can set the protocol-mismatch cooldown; a
+/// datagram from anywhere else on the adopted transport cannot.
+#[tokio::test]
+async fn a_foreign_source_on_an_adopted_transport_cannot_set_a_mismatch_cooldown() {
+    let peer = make_peer_identity();
+    let (mut node, engine) = node_with_traversed_peer(peer);
+
+    node.process_packet(unknown_version_from(
+        TransportId::new(7),
+        "203.0.113.99:5000",
+    ))
+    .await;
+    assert_eq!(engine.cooldown_until(&peer.npub(), Node::now_ms()), None);
+
+    // Control: the same datagram from the traversed address sets it.
+    node.process_packet(unknown_version_from(
+        TransportId::new(7),
+        "198.51.100.7:4000",
+    ))
+    .await;
+    assert!(
+        engine
+            .cooldown_until(&peer.npub(), Node::now_ms())
+            .is_some()
+    );
+}
+
+/// Once a link to the traversed peer exists, the version check has already
+/// been passed, so a later unknown-version datagram from its address sets
+/// no cooldown, even after that peer leaves the peer table.
+#[tokio::test]
+async fn a_mismatch_from_the_traversed_address_after_the_link_is_up_sets_no_cooldown() {
+    let mut node = make_node();
+    let link_id = LinkId::new(1);
+    let peer = seed_completed_connection(&mut node, link_id, TransportId::new(7), 1000);
+    node.promote_connection(link_id, peer, 2000).unwrap();
+    let engine = std::sync::Arc::new(crate::nostr::NostrRendezvous::new_for_test());
+    node.supervisor.nostr_rendezvous.set_engine(engine.clone());
+    node.supervisor.nostr_rendezvous.insert_bootstrap_transport(
+        TransportId::new(7),
+        peer.npub(),
+        *peer.node_addr(),
+        "198.51.100.7:4000".parse().unwrap(),
+    );
+
+    node.process_packet(unknown_version_from(
+        TransportId::new(7),
+        "198.51.100.7:4000",
+    ))
+    .await;
+    assert_eq!(engine.cooldown_until(&peer.npub(), Node::now_ms()), None);
+
+    node.poll_nostr_rendezvous().await;
+    node.remove_peer(peer.node_addr());
+    node.process_packet(unknown_version_from(
+        TransportId::new(7),
+        "198.51.100.7:4000",
+    ))
+    .await;
+    assert_eq!(
+        engine.cooldown_until(&peer.npub(), Node::now_ms()),
+        None,
+        "the link was seen, so the window has closed"
+    );
+}
+
+/// The honest case the cooldown exists for: a peer on another FMP version
+/// answers the traversal from the traversed address before any link. The
+/// cooldown is set once and a repeat leaves it where it was.
+#[tokio::test]
+async fn an_unknown_version_from_the_traversed_address_before_any_link_sets_the_cooldown_once() {
+    let peer = make_peer_identity();
+    let (mut node, engine) = node_with_traversed_peer(peer);
+
+    node.process_packet(unknown_version_from(
+        TransportId::new(7),
+        "198.51.100.7:4000",
+    ))
+    .await;
+    let first = engine.cooldown_until(&peer.npub(), Node::now_ms());
+    assert!(first.is_some());
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    node.process_packet(unknown_version_from(
+        TransportId::new(7),
+        "198.51.100.7:4000",
+    ))
+    .await;
+    assert_eq!(engine.cooldown_until(&peer.npub(), Node::now_ms()), first);
+}
+
+/// The address the receive path reports for a datagram on a real adopted
+/// socket matches the one stored at adoption, so an honest mismatch is
+/// still recognised end to end.
+#[tokio::test]
+async fn an_unknown_version_datagram_on_a_real_adopted_socket_sets_the_cooldown() {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+    node.supervisor.state = NodeState::Running;
+    let engine = std::sync::Arc::new(crate::nostr::NostrRendezvous::new_for_test());
+    node.supervisor.nostr_rendezvous.set_engine(engine.clone());
+
+    let peer = make_peer_identity();
+    let peer_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+    let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let adopted_addr = adopted_socket.local_addr().unwrap();
+    let handoff =
+        EstablishedTraversal::new("sess-mismatch", peer.npub(), peer_addr, adopted_socket)
+            .with_transport_name("nostr-punched");
+    node.adopt_established_traversal(handoff).await.unwrap();
+
+    peer_socket.send_to(&[0x40, 0, 0, 0], adopted_addr).unwrap();
+    tokio::select! {
+        result = node.run_rx_loop() => {
+            panic!("rx loop exited unexpectedly: {:?}", result);
+        }
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+
+    assert!(
+        engine
+            .cooldown_until(&peer.npub(), Node::now_ms())
+            .is_some()
+    );
+    stop_transports(&mut node).await;
+}

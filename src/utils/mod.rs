@@ -6,6 +6,7 @@
 
 pub mod index;
 pub mod logfile;
+pub mod onlink;
 pub mod sockbind;
 #[cfg(unix)]
 pub mod sockperm;

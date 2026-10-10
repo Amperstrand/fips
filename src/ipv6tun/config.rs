@@ -20,10 +20,15 @@ const DEFAULT_TUN_MTU: u16 = 1280;
 /// traffic to a TUN address is attributed to the TUN's ifindex —
 /// causing the mesh-interface filter to silently drop every query.
 ///
-/// To expose the responder to mesh peers, set `bind_addr: "::"` in
-/// fips.yaml. The `is_mesh_interface_query` filter in `src/ipv6tun/dns.rs`
-/// is still in place to prevent hosts-file alias enumeration in that
-/// mode. See `packaging/common/fips-dns-setup` for backend selection.
+/// A non-loopback `bind_addr` such as `"::"` answers every host that can
+/// reach it, so set one only to serve other hosts (LAN clients, or a
+/// gateway reaching the daemon over IPv4). On Linux, macOS and FreeBSD,
+/// with the daemon's own TUN, the `is_mesh_interface_query` filter drops
+/// queries arriving on the mesh interface, so mesh peers are not served,
+/// unless the daemon logged "Mesh interface index unresolved; DNS mesh
+/// filter disabled" at start; on Windows, or with an application-supplied
+/// TUN, they are. See `packaging/common/fips-dns-setup` for backend
+/// selection.
 const DEFAULT_DNS_BIND_ADDR: &str = "::1";
 
 /// Default DNS responder port.
@@ -78,9 +83,25 @@ impl DnsConfig {
         self.port.unwrap_or(DEFAULT_DNS_PORT)
     }
 
-    /// Get the TTL in seconds (default: 300).
+    /// Get the TTL in seconds (default: 300), at most 2147483647.
+    ///
+    /// Resolvers read a TTL with the top bit set as zero (RFC 2181 Section
+    /// 8), so a larger configured value is used as 2147483647, with one
+    /// warning per process.
     pub fn ttl(&self) -> u32 {
-        self.ttl.unwrap_or(DEFAULT_DNS_TTL)
+        let configured = self.ttl.unwrap_or(DEFAULT_DNS_TTL);
+        let used = crate::dnsmsg::clamp_ttl(configured);
+        if used != configured {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    configured,
+                    used,
+                    "dns.ttl is above 2147483647, the largest TTL resolvers honour; using 2147483647"
+                );
+            });
+        }
+        used
     }
 }
 
@@ -109,5 +130,31 @@ impl TunConfig {
     /// Get the MTU (default: 1280).
     pub fn mtu(&self) -> u16 {
         self.mtu.unwrap_or(DEFAULT_TUN_MTU)
+    }
+}
+
+/// The `dns.ttl` setting read through its accessor.
+#[cfg(test)]
+mod ttl_tests {
+    use super::*;
+
+    /// A DNS configuration with `ttl` set and every other field default.
+    fn with_ttl(ttl: Option<u32>) -> DnsConfig {
+        DnsConfig {
+            ttl,
+            ..DnsConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_dns_ttl_of_u32_max_is_read_as_2147483647() {
+        assert_eq!(with_ttl(Some(u32::MAX)).ttl(), 2_147_483_647);
+    }
+
+    #[test]
+    fn a_dns_ttl_of_2147483647_or_300_or_unset_is_unchanged() {
+        assert_eq!(with_ttl(Some(2_147_483_647)).ttl(), 2_147_483_647);
+        assert_eq!(with_ttl(Some(300)).ttl(), 300);
+        assert_eq!(with_ttl(None).ttl(), 300);
     }
 }

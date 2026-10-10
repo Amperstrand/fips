@@ -36,8 +36,10 @@ pub struct BleStats {
     pub pool_evictions: AtomicU64,
     pub advertisements_sent: AtomicU64,
     pub scan_results: AtomicU64,
-    /// Connections declined because the peer was already linked (see
-    /// `ConnectionPool::find_by_node`).
+    /// Connections declined beside another link to the same node: a verified
+    /// one at any link address (see `ConnectionPool::find_verified`), or an
+    /// unverified one at the newcomer's own link address or still racing it
+    /// in the opposite direction.
     pub duplicate_node_declines: AtomicU64,
     /// Links dropped because a second link to the same peer raced them and
     /// won the tie-break: the one the smaller node dialled is kept.

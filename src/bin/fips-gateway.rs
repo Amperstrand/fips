@@ -8,15 +8,15 @@ use clap::Parser;
 #[cfg(target_os = "linux")]
 use fips::Config;
 #[cfg(target_os = "linux")]
-use fips::gateway::{control, dns, nat, net, pool};
+use fips::gateway::{control, dns, nat, net, pool, state};
 #[cfg(target_os = "linux")]
 use fips::version;
 #[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 #[cfg(target_os = "linux")]
@@ -107,36 +107,77 @@ fn report_unreadable_conntrack(
     }
 }
 
-/// Log a pending NAT rebuild retry once per change of outcome.
-///
-/// A recovery is reported whether the retry applied the rules itself or a
-/// mapping change applied them in between and left nothing pending.
+/// Log a proxy NDP outcome once per change of outcome: the first failure,
+/// or a changed one, at `error!` for an add and `warn!` for a removal;
+/// repeats at `debug!` with the same text; one line on recovery.
 #[cfg(target_os = "linux")]
-fn report_nat_retry(log: &mut nat::RetryLog, result: &Result<bool, nat::NatError>) {
-    match (log.observe(result.as_ref().err()), result) {
-        (nat::RetryReport::Failed, Err(e)) => {
-            warn!(error = %e, "Failed to retry pending NAT rules")
+fn report_proxy_ndp(
+    report: nat::RetryReport,
+    add: bool,
+    virtual_ip: std::net::Ipv6Addr,
+    result: &Result<(), std::io::Error>,
+) {
+    match (report, result, add) {
+        (nat::RetryReport::Failed, Err(e), true) => {
+            error!(error = %e, virtual_ip = %virtual_ip, "Failed to add proxy NDP")
         }
-        (nat::RetryReport::Repeated, Err(e)) => {
-            debug!(error = %e, "Pending NAT rules still failing to apply")
+        (nat::RetryReport::Repeated, Err(e), true) => {
+            debug!(error = %e, virtual_ip = %virtual_ip, "Failed to add proxy NDP")
         }
-        (nat::RetryReport::Recovered, Ok(true)) => {
-            info!("Applied pending NAT rules; retries recovered")
+        (nat::RetryReport::Failed, Err(e), false) => {
+            warn!(error = %e, virtual_ip = %virtual_ip, "Failed to remove proxy NDP")
         }
-        (nat::RetryReport::Recovered, _) => {
-            info!("Pending NAT rules were applied by a later update; retries recovered")
+        (nat::RetryReport::Repeated, Err(e), false) => {
+            debug!(error = %e, virtual_ip = %virtual_ip, "Failed to remove proxy NDP")
         }
-        (nat::RetryReport::Clean, Ok(true)) => info!("Applied pending NAT rules"),
+        (nat::RetryReport::Recovered, _, true) => info!("Proxy NDP add recovered"),
+        (nat::RetryReport::Recovered, _, false) => info!("Proxy NDP removal recovered"),
         _ => {}
     }
+}
+
+/// Say what the start found of the previous run's pool state.
+#[cfg(target_os = "linux")]
+fn report_loaded_state(loaded: &state::Loaded) {
+    match loaded {
+        state::Loaded::Absent => {
+            info!("No pool state found; the pool starts at a random address")
+        }
+        state::Loaded::Invalid(reason) => warn!(
+            reason = %reason,
+            "Pool state unusable; the pool starts at a random address"
+        ),
+        state::Loaded::Restored(restored) => info!(
+            from = restored.from,
+            stretch = restored.span,
+            held = restored
+                .held
+                .iter()
+                .map(|[a, b]| u64::from(b - a) + 1)
+                .sum::<u64>(),
+            hold_secs = restored.hold_secs,
+            "Pool state restored; holding the previous run's addresses"
+        ),
+    }
+}
+
+/// Write the pool state on a blocking thread.
+#[cfg(target_os = "linux")]
+async fn save_pool_state(request: pool::PoolState) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        state::save(Path::new(state::STATE_DIR), &request, state::is_tmpfs)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 /// Check once at startup which conntrack source the tick will read, and say so.
 ///
 /// Without this, an operator on a kernel with no readable source learns that
 /// session pinning is off only from a warning at the first failed tick.
+/// Returns whether a source was found.
 #[cfg(target_os = "linux")]
-async fn report_conntrack_source() {
+async fn report_conntrack_source() -> bool {
     let probe =
         tokio::task::spawn_blocking(|| pool::probe_conntrack(&pool::SystemConntrack::default()))
             .await
@@ -148,22 +189,31 @@ async fn report_conntrack_source() {
             });
     match probe {
         pool::ConntrackProbe::Found(pool::ConntrackSource::Proc) => {
-            info!("Conntrack source: proc; session pinning is on")
+            info!("Conntrack source: proc; session pinning is on");
+            true
         }
         pool::ConntrackProbe::Found(pool::ConntrackSource::Netlink) => {
-            info!("Conntrack source: netlink; session pinning is on")
+            info!("Conntrack source: netlink; session pinning is on");
+            true
         }
-        pool::ConntrackProbe::Missing(e) => match e.netlink {
-            Some(netlink) => warn!(
-                proc_error = %e.proc,
-                netlink_error = %netlink,
-                "No conntrack source is readable; session pinning is off"
-            ),
-            None => warn!(
-                proc_error = %e.proc,
-                "No conntrack source is readable; session pinning is off"
-            ),
-        },
+        pool::ConntrackProbe::Missing(e) => {
+            // Without conntrack no mapping can be seen to carry traffic, so
+            // re-queries extend no name and any mapping can be replaced at
+            // the ceiling. The tick keeps reading; once enough reads succeed,
+            // mappings created after that count traffic again.
+            match e.netlink {
+                Some(netlink) => warn!(
+                    proc_error = %e.proc,
+                    netlink_error = %netlink,
+                    "No conntrack source is readable; session pinning is off, and no mapping counts as carrying traffic until reads succeed"
+                ),
+                None => warn!(
+                    proc_error = %e.proc,
+                    "No conntrack source is readable; session pinning is off, and no mapping counts as carrying traffic until reads succeed"
+                ),
+            }
+            false
+        }
     }
 }
 
@@ -438,21 +488,55 @@ async fn main() {
 
     // --- Initialize components ---
 
-    // Virtual IP pool
-    let ip_pool = match pool::VirtualIpPool::new(
-        &gw_config.pool,
-        gw_config.dns.ttl() as u64,
-        gw_config.grace_period(),
-    ) {
-        Ok(p) => Arc::new(Mutex::new(p)),
+    // Virtual IP pool, started from the previous run's state when there is
+    // one, so no address a client may still hold an answer for is reissued.
+    let pool_total = match pool::pool_total(&gw_config.pool) {
+        Ok(total) => total,
         Err(e) => {
             error!(error = %e, "Failed to create virtual IP pool");
             std::process::exit(1);
         }
     };
+    // A restored pool's holds are written back before the steps that can
+    // end the start, since loading removed the file.
+    let mut save_log = state::SaveLog::default();
+    let ip_pool = match state::start_pool(
+        Path::new(state::STATE_DIR),
+        &gw_config.pool,
+        pool_total,
+        gw_config.dns.ttl() as u64,
+        gw_config.grace_period(),
+        rand::random::<u32>() % pool_total + 1,
+        Instant::now(),
+        state::is_tmpfs,
+    ) {
+        Ok(started) => {
+            report_loaded_state(&started.loaded);
+            if let Some(result) = &started.carried {
+                save_log.report(result);
+            }
+            started.pool
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to create virtual IP pool");
+            std::process::exit(1);
+        }
+    };
+    let pool_network = ip_pool.network();
+    let small_pool =
+        pool::small_pool_threshold(gw_config.dns.ttl() as u64, gw_config.grace_period());
+    if (pool_total as usize) < small_pool {
+        warn!(
+            addresses = pool_total,
+            threshold = small_pool,
+            "The pool is small enough for one LAN host naming new names to exhaust it"
+        );
+    }
+
+    let ip_pool = Arc::new(Mutex::new(ip_pool));
 
     // NAT manager
-    let mut nat_mgr = match nat::NatManager::new(gw_config.lan_interface.clone()) {
+    let mut nat_mgr = match nat::NatManager::new(gw_config.lan_interface.clone(), pool_network) {
         Ok(n) => n,
         Err(e) => {
             error!(error = %e, "Failed to create nftables table — do you have CAP_NET_ADMIN?");
@@ -480,7 +564,40 @@ async fn main() {
 
     // The NAT table exists by now, so a kernel that provides the proc file
     // has loaded nf_conntrack and the probe sees what the first tick will.
-    report_conntrack_source().await;
+    let mut conntrack_log = pool::ConntrackReadLog::default();
+    if report_conntrack_source().await {
+        // The pool's quota of reads before any name is answered, so the
+        // previous run's conntrack bindings are known before the first
+        // address is issued, and one read that missed an entry is not the
+        // only one. Mappings made before the quota is met never count
+        // traffic.
+        for _ in 0..pool::MAX_ABSENT_READS {
+            let snapshot = read_conntrack(&mut conntrack_log).await;
+            ip_pool.lock().await.tick(Instant::now(), &snapshot);
+        }
+    } else {
+        ip_pool.lock().await.set_evidence(false);
+    }
+
+    // Write the state that covers the first addresses before any is issued.
+    // This is the first write with a stretch, made after the last step that
+    // can end the start, so a start that fails earlier leaves no stretch for
+    // the next one to hold; later writes run off the runtime thread.
+    {
+        let mut pool_guard = ip_pool.lock().await;
+        if let Some(request) = pool_guard.mark_request() {
+            let result = state::save(Path::new(state::STATE_DIR), &request, state::is_tmpfs);
+            save_log.report(&result);
+            match result {
+                Ok(()) => pool_guard.confirm_mark(&request),
+                Err(_) => pool_guard.mark_failed(),
+            }
+        }
+    }
+
+    let (mut nat_driver, nat_reports) = nat::NatDriver::start(Box::new(nat_mgr));
+    let nat_removed = nat_reports.removed;
+    let mut nat_exit = nat_reports.exit;
 
     // --- Channels ---
 
@@ -525,7 +642,7 @@ async fn main() {
 
     // --- NAT mapping counter (shared with tick task for snapshots) ---
 
-    let nat_count = Arc::new(AtomicUsize::new(0));
+    let nat_count = nat_driver.mapping_counter();
 
     // --- Start pool tick task ---
 
@@ -533,7 +650,6 @@ async fn main() {
     let tick_event_tx = event_tx;
     let tick_nat_count = Arc::clone(&nat_count);
     let mut tick_shutdown = shutdown_rx.clone();
-    let mut conntrack_log = pool::ConntrackReadLog::default();
     let snap_config = control::SnapshotConfig {
         pool_cidr: gw_config.pool.clone(),
         lan_interface: gw_config.lan_interface.clone(),
@@ -545,9 +661,14 @@ async fn main() {
 
     let tick_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut save_log = save_log;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Removals the NAT table has applied, taken before the
+                    // conntrack read, so the read follows every removal it
+                    // is counted against.
+                    let removed: Vec<_> = nat_removed.try_iter().flatten().collect();
                     let now = Instant::now();
                     // Read conntrack once, off the runtime thread and before
                     // the pool lock: the runtime is current-thread, so a
@@ -557,6 +678,9 @@ async fn main() {
                     let conntrack = read_conntrack(&mut conntrack_log).await;
                     let read_us = elapsed_us(read_started);
                     let mut pool_guard = tick_pool.lock().await;
+                    for (virtual_ip, mesh_addr) in removed {
+                        pool_guard.nat_removed(virtual_ip, mesh_addr);
+                    }
                     let tick_started = Instant::now();
                     let events = pool_guard.tick(now, &conntrack);
                     let tick_us = elapsed_us(tick_started);
@@ -564,8 +688,22 @@ async fn main() {
                     // Build snapshot for control socket
                     let pool_status = pool_guard.status();
                     let mappings = pool_guard.mapping_info(now);
+                    let request = pool_guard.mark_request();
                     drop(pool_guard);
                     debug!(mappings = mappings.len(), read_us, tick_us, "Pool tick");
+
+                    // Write the pool state off the runtime thread and without
+                    // the pool lock; names issued meanwhile fall in the stretch
+                    // the previous write already covers.
+                    if let Some(request) = request {
+                        let result = save_pool_state(request.clone()).await;
+                        save_log.report(&result);
+                        let mut pool_guard = tick_pool.lock().await;
+                        match result {
+                            Ok(()) => pool_guard.confirm_mark(&request),
+                            Err(_) => pool_guard.mark_failed(),
+                        }
+                    }
 
                     let snapshot = control::build_snapshot(
                         pool_status,
@@ -583,6 +721,7 @@ async fn main() {
                 _ = tick_shutdown.changed() => break,
             }
         }
+        save_log
     });
 
     // --- Event processing loop ---
@@ -590,37 +729,39 @@ async fn main() {
     info!("fips-gateway running");
 
     let mut exit_code = 0;
-    let mut nat_retry = tokio::time::interval(std::time::Duration::from_secs(10));
-    nat_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut nat_retry_log = nat::RetryLog::default();
+    let mut ndp_log = net::NdpLog::default();
     loop {
         tokio::select! {
-            _ = nat_retry.tick() => {
-                report_nat_retry(&mut nat_retry_log, &nat_mgr.retry_pending());
+            // The NAT worker ends only on shutdown, which has not been
+            // signalled while this loop runs. Without it the gateway would
+            // answer .fips queries with addresses that have no rules.
+            _ = &mut nat_exit => {
+                error!("Gateway NAT worker stopped; exiting so the service manager restarts the gateway");
+                exit_code = 1;
+                break;
             }
             Some(event) = event_rx.recv() => {
-                match event {
+                let (command, virtual_ip) = match event {
                     pool::PoolEvent::MappingCreated { virtual_ip, mesh_addr } => {
-                        // Add NAT rules
-                        if let Err(e) = nat_mgr.add_mapping(virtual_ip, mesh_addr) {
-                            error!(error = %e, virtual_ip = %virtual_ip, "Failed to add NAT rules");
-                        }
-                        nat_count.store(nat_mgr.mapping_count(), Ordering::Relaxed);
-                        // Add proxy NDP entry
-                        if let Err(e) = net_setup.add_proxy_ndp(virtual_ip).await {
-                            error!(error = %e, virtual_ip = %virtual_ip, "Failed to add proxy NDP");
-                        }
+                        (nat::NatCommand::Add { virtual_ip, mesh_addr }, virtual_ip)
                     }
-                    pool::PoolEvent::MappingRemoved { virtual_ip, mesh_addr: _ } => {
-                        // Remove NAT rules
-                        if let Err(e) = nat_mgr.remove_mapping(virtual_ip) {
-                            warn!(error = %e, virtual_ip = %virtual_ip, "Failed to remove NAT rules");
-                        }
-                        nat_count.store(nat_mgr.mapping_count(), Ordering::Relaxed);
-                        // Remove proxy NDP entry
-                        if let Err(e) = net_setup.remove_proxy_ndp(virtual_ip).await {
-                            warn!(error = %e, virtual_ip = %virtual_ip, "Failed to remove proxy NDP");
-                        }
+                    pool::PoolEvent::MappingRemoved { virtual_ip, mesh_addr } => {
+                        (nat::NatCommand::Remove { virtual_ip, mesh_addr }, virtual_ip)
+                    }
+                };
+                if nat_driver.submit(command).is_err() {
+                    error!("Gateway NAT worker stopped; exiting so the service manager restarts the gateway");
+                    exit_code = 1;
+                    break;
+                }
+                match command {
+                    nat::NatCommand::Add { .. } => {
+                        let result = net_setup.add_proxy_ndp(virtual_ip).await;
+                        report_proxy_ndp(ndp_log.observe_add(virtual_ip, &result), true, virtual_ip, &result);
+                    }
+                    nat::NatCommand::Remove { .. } => {
+                        let result = net_setup.remove_proxy_ndp(virtual_ip).await;
+                        report_proxy_ndp(ndp_log.observe_remove(virtual_ip, &result), false, virtual_ip, &result);
                     }
                 }
             }
@@ -658,6 +799,11 @@ async fn main() {
 
     info!("fips-gateway shutting down");
 
+    // Close the event channel first. Nothing receives from it any more, and
+    // a resolver or tick blocked sending into a full channel cannot see the
+    // shutdown signal; closing it makes that send fail at once.
+    drop(event_rx);
+
     // Signal all tasks to stop
     let _ = shutdown_tx.send(true);
 
@@ -669,10 +815,12 @@ async fn main() {
     if let Some(task) = dns_task {
         let _ = task.await;
     }
-    let _ = tick_task.await;
+    let mut save_log = tick_task.await.unwrap_or_default();
 
-    // Log final pool status
-    {
+    // Log final pool status, and write the exact set of addresses a client
+    // may still hold an answer for: nothing is issued any more, so the next
+    // start holds only these and resolves new names at once.
+    let final_state = {
         let pool_guard = ip_pool.lock().await;
         let status = pool_guard.status();
         info!(
@@ -683,11 +831,13 @@ async fn main() {
             free = status.free,
             "Final pool status"
         );
-    }
+        pool_guard.shutdown_state()
+    };
+    save_log.report(&save_pool_state(final_state).await);
 
     // Clean up network and NAT
     net_setup.cleanup().await;
-    if let Err(e) = nat_mgr.cleanup() {
+    if let Err(e) = nat_driver.shutdown(nat::NAT_STOP_TIMEOUT) {
         warn!(error = %e, "Failed to clean up nftables table");
     }
 

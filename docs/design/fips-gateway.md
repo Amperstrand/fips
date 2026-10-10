@@ -86,15 +86,25 @@ probe at startup.
 ### nftables Table Layout
 
 All gateway rules live in a single nftables table, `inet
-fips_gateway`, with two chains:
+fips_gateway`, with four chains and one set:
 
 - `prerouting` — `type nat hook prerouting priority dstnat (-100)`,
-  for both LAN→mesh DNAT (per virtual-IP mapping) and mesh→LAN DNAT
-  (per port-forward).
+  for both LAN→mesh DNAT (per virtual-IP mapping, matching
+  `iifname <lan_interface>`) and mesh→LAN DNAT (per port-forward).
 - `postrouting` — `type nat hook postrouting priority srcnat (100)`,
-  for both the always-on `oifname fips0` masquerade, the per-mapping
+  for the `oifname fips0` masquerade of LAN traffic, the per-mapping
   return-path SNAT, and (when any port-forward is configured) the
   LAN-side masquerade for inbound traffic.
+- `forward` — `type filter hook forward priority filter (0)`, which
+  drops traffic into `fips0` from any interface other than the LAN
+  interface unless it belongs to an established or related flow.
+- `raw_prerouting` — `type filter hook prerouting priority raw
+  (-300)`, which runs before connection tracking and drops traffic
+  addressed to the pool that arrives on neither the LAN interface
+  nor loopback, and traffic from a mapped mesh address that arrives
+  on neither `fips0` nor loopback.
+
+The set, `fips_mesh_sources`, holds every mapped mesh address.
 
 The table is rebuilt atomically on every change, in one netlink
 batch that the kernel applies as a single transaction: add the
@@ -104,10 +114,11 @@ table never leaves the packet path; the leading add gives the
 delete a target when no table exists yet, and a batch the kernel
 refuses leaves the previous table in place. Rebuilding the whole
 table avoids reliance on kernel rule-handle tracking, which the
-rustables crate does not expose. The table holds one always-on
-masquerade, two rules per live outbound mapping (at most 1000
-mappings), one rule per inbound forward, and one extra masquerade
-when any forward is present.
+rustables crate does not expose. The table holds the masquerade of
+LAN traffic into `fips0`, the forward drop, the pool drop, the
+forged-source drop and its set, two rules per live outbound mapping
+(at most 1000 mappings), one rule per inbound forward, and one extra
+masquerade when any forward is present.
 
 ### Control Socket
 
@@ -195,11 +206,27 @@ involving the DNS proxy or the pool.
    loopback. Operators on a host without a pre-existing resolver on
    53 can override the listen value to `"[::]:53"` to let LAN clients
    query the gateway directly.
-2. If the question is not for a `.fips` domain, the gateway replies
-   `REFUSED`. The proxy is intentionally narrow — it does not resolve
-   public DNS, and the LAN's primary resolver should hold port 53 on
-   the gateway host (the OpenWrt init script wires dnsmasq to forward
-   `.fips` queries to the loopback listener automatically).
+2. The gateway screens the datagram before it reads the question.
+   It drops, with no answer, a response (QR set); a datagram not
+   shaped like a query (more than one question, any answer or
+   authority record, or more than one additional record); one
+   shorter than a DNS header, or one that fills the 4096-byte
+   receive buffer and so may have been cut short; and anything from
+   source port 0, 7, 13, 17, 19 or 37, the UDP services that answer
+   arbitrary input, so that a reply cannot start an endless exchange
+   with one. A query with an opcode other than `QUERY` gets
+   `NOTIMP`, one with no question or a malformed question name gets
+   `FORMERR`, and one with a class other than IN or ANY gets
+   `REFUSED`. If the question is not for a `.fips` domain, the
+   gateway replies `REFUSED`. Every reply carries the client's ID and
+   its RD and CD bits. The `NOTIMP` and `FORMERR` replies carry
+   nothing else; every other reply carries the client's question
+   byte for byte and only the records the gateway produced, nothing
+   else from the query. The proxy is intentionally narrow — it does
+   not resolve public DNS, and the LAN's primary resolver should hold
+   port 53 on the gateway host (the OpenWrt init script wires dnsmasq
+   to forward `.fips` queries to the loopback listener
+   automatically).
 3. The gateway forwards the query to the daemon resolver
    (`gateway.dns.upstream`, default `[::1]:5354`). The daemon must
    match: an IPv6 socket bound to `[::1]` does not accept v4-mapped
@@ -207,8 +234,11 @@ involving the DNS proxy or the pool.
    bound on `[::1]:5354`.
 4. If the daemon is unreachable or times out (5 s), the gateway
    replies `SERVFAIL`. If the daemon answers with an error such as
-   `NXDOMAIN`, the gateway relays that response code; if it answers
-   without an AAAA record, the gateway replies `SERVFAIL`.
+   `NXDOMAIN`, the gateway relays that response code. A relayed
+   `NXDOMAIN` carries an SOA record, as NODATA does, so the client
+   may cache it for up to `gateway.dns.ttl`; any other relayed error
+   carries the question only. If the daemon answers without an AAAA
+   record, the gateway replies `SERVFAIL`.
 5. The gateway extracts the AAAA (`fd00::/8`) record from the
    daemon's response. This resolution primes the daemon's identity
    cache as a side effect — a prerequisite for `fips0` routing,
@@ -216,14 +246,21 @@ involving the DNS proxy or the pool.
    back to a `NodeAddr` for forwarding.
 6. If the client asked for AAAA or ANY, the gateway allocates a
    virtual IP from the pool for that mesh address (idempotent: an
-   existing mapping is reused and its TTL refreshed). Any other
-   query type refreshes an existing mapping's TTL, creates nothing,
-   and is answered with NODATA.
-7. If a new mapping was created, the pool emits `MappingCreated`,
-   which the main loop turns into `add_mapping` calls on the NAT
-   manager and `add_proxy_ndp` on the network setup.
+   existing mapping is reused, and its TTL refreshed only if it has
+   carried traffic). Any other query type refreshes an existing
+   mapping that has carried traffic, creates nothing, and is answered
+   with NODATA. At the ceiling of 1000 live mappings, a new name
+   replaces the oldest mapping that has never carried traffic.
+7. If a new mapping was created, the pool emits `MappingCreated`
+   (preceded by `MappingRemoved` for a mapping it replaced), which the
+   main loop turns into a command for the NAT worker thread, which
+   applies queued changes in one rebuild, and into `add_proxy_ndp` on
+   the network setup. A NAT rule can land a few milliseconds after the
+   answer.
 8. The gateway returns an `AAAA` response containing the virtual IP,
-   with the configured TTL (default 60 s).
+   with the configured TTL (default 60 s) for a mapping that has
+   carried traffic, and otherwise with at most the time left until
+   TTL after the mapping's creation.
 
 ### Virtual IP Pool
 
@@ -232,7 +269,10 @@ The pool allocates IPv6 addresses from a required CIDR (commonly
 `NodeAddr` rather than by hostname — different `.fips` aliases for
 the same node share a virtual IP. Address 0 (the network-equivalent)
 is reserved; the rest are allocatable. The pool is capped at 2^16
-addresses regardless of prefix length, to bound memory.
+addresses regardless of prefix length, to bound memory. A CIDR
+written with host bits set, such as `fd01::1/112`, is used as its
+prefix, with a warning; a `/128`, which has no address to issue, is
+refused at start.
 
 The pool tracks state per address:
 
@@ -263,10 +303,10 @@ Transitions:
   does not drain.
 - **Draining → Active**: conntrack reports a session again before
   the grace period ends. The next drain starts a fresh grace period.
-- **Draining → Allocated**: a DNS query for the name, with or
-  without an address in the answer. The client may now hold a fresh
-  TTL, so reclamation is cancelled: the mapping gets the full TTL
-  and, if it stays idle, a fresh grace period.
+- **Draining → Allocated**: a DNS query for a name that has carried
+  traffic, with or without an address in the answer. The client may
+  now hold a fresh TTL, so reclamation is cancelled: the mapping gets
+  the full TTL and, if it stays idle, a fresh grace period.
 - **Draining → Free**: the grace period has elapsed since draining
   began with no session seen.
 
@@ -274,13 +314,48 @@ Timing:
 
 - **TTL** (`gateway.dns.ttl`, default 60 s) is both the DNS TTL
   returned to the client and the mapping's idle lifetime. A DNS
-  query for a mapped name refreshes the mapping's idle clock, and
-  so do conntrack sessions at each tick.
+  query for a mapped name that has carried traffic refreshes the
+  mapping's idle clock, and so do conntrack sessions at each tick.
 - **Grace period** (`gateway.pool_grace_period`, default 60 s) is
   the dwell time after the last session ends before the address is
   recycled. It prevents immediate reuse from confusing hosts with
   cached DNS responses.
 - **Tick interval**: the pool re-evaluates state every 10 s.
+
+Addresses are handed out in ring order from a moving cursor that
+starts at a random address, so an address freed in one run is reused
+only after the cursor has gone round the pool.
+
+**Across a restart.** A client may cache an answer for up to the TTL,
+so a restarted gateway must not hand that address to a different node.
+The gateway keeps, in `/var/run/fips-gateway/pool.json`, how far it
+may issue and which addresses a client may still hold an answer for;
+the file holds no names, identities or mappings. It is written only to
+tmpfs, so a reboot, which ends every client's cache with it, starts
+from nothing. The first write with a stretch comes after the start
+steps that can fail and before any name is answered. A start that
+read a file writes what it holds back at once, with no stretch, so a
+start that fails or is killed before its first write leaves the same
+holds for the next one. The pool writes the
+file before issuing past the stretch the last write covered (about 512
+addresses at a time), off the DNS thread, and refuses new names for
+the moment the cursor reaches that point before the next write is
+confirmed. On a clean stop it writes the exact set of live addresses
+with no stretch ahead. The next start reads the file, removes it, and
+holds every address it names, and the stretch, for the TTL plus the
+grace period, then issues from where the stretch ends. A write that
+fails removes the file, and the gateway carries on issuing; the next
+start then begins at a random address. Where `/var/run` is not on
+tmpfs, as in most containers, the gateway warns once and keeps no
+state.
+
+After a crash or a kill, the last written stretch is held, which on a
+pool with fewer than 512 free addresses (a `/119` or narrower, or a
+`/118` with more than about 500 addresses in use) is every free address:
+new names are refused for the TTL plus the grace period, 2 minutes at
+the defaults. A clean stop has no such
+cost. A pool resized with the same base address starts at a random
+address with nothing held.
 
 Active session counts come from `/proc/net/nf_conntrack`, or, on a
 kernel without that file, from a dump of the IPv6 conntrack table over
@@ -290,24 +365,74 @@ way an entry counts once toward each distinct IPv6 destination among
 its original and reply tuples, so an entry counts as a session of a
 virtual IP whose address is its original destination.
 
-A new mapping is refused, and the query answered `SERVFAIL`, when
-the pool is exhausted, when it already holds 1000 live mappings, or
-when the new-mapping rate limit is spent (a bucket of 50 that
-refills at 10 per second). A name that already has a mapping keeps
-resolving while new names are refused. Existing mappings are never
-evicted prematurely — the correctness of in-flight sessions takes
-precedence over fresh allocations.
+**Evidence of use.** A mapping counts as having carried traffic once
+a conntrack entry for a flow to its virtual IP has seen a reply whose
+source is the mapped mesh address. A reply from anywhere else does not
+count: not from the virtual IP itself (an unmapped pool address is a
+local address of the gateway, so it answers), not from an earlier
+holder of the address, and not from a host forging the mesh address,
+since the `raw_prerouting` chain drops packets from any mapped mesh
+address (the `fips_mesh_sources` set) unless they arrive on `fips0`
+or loopback. An ICMPv6 error is not a reply. The gateway routes its
+whole pool prefix to itself, so a name whose mesh address lies inside
+that prefix is refused with `SERVFAIL`: its traffic could never reach
+the mesh, and the gateway's own replies from the address would read as
+the mapping's traffic. Only a mapping that has
+carried traffic is refreshed by re-queries and answered with the full
+TTL; a name nobody has used expires TTL plus grace after it was
+created however often it is queried, and its answers never outlive
+TTL after creation (TTL 0 if unreplied traffic keeps it mapped past
+that). The flag is never cleared.
+
+When the gateway cannot read conntrack at start (it warns that session
+pinning is off), or reads fail for three ticks in a row (it warns
+then), it stops trusting conntrack until three reads in a row succeed.
+Mappings created in between can never count as having carried traffic:
+re-queries do not extend them and they can be replaced at the ceiling.
+Mappings that already counted keep their protection. At start the
+gateway takes three reads before it answers any name, so that the
+conntrack entries the previous run left are known before an address is
+reissued; a mapping created before three reads have succeeded never
+counts as having carried traffic.
+
+**Limits.** A new mapping is refused, and the query answered
+`SERVFAIL`, when the pool is exhausted, when the new-mapping rate limit
+is spent (a bucket of 50 that refills at 10 per second), or when it
+already holds 1000 live mappings that have all carried traffic. At
+the ceiling a new name otherwise replaces the oldest mapping that has
+never carried traffic; a client still holding an answer for the
+replaced address then reaches the gateway host itself, as for any
+unmapped pool address, until that answer expires. A name that already
+has a mapping keeps resolving while new names are refused. The first
+refusal at a bound logs one warning; later ones are counted and
+reported when the pool has refused nothing for 60 s. A pool smaller
+than 1000 + 10 x (TTL + grace) addresses (2,200 at the defaults) can
+be exhausted by one LAN host naming new names; the gateway warns at
+start when it is. A host that can draw real replies from many mesh
+destinations, such as nodes of its own, keeps that many mappings for
+as long as it re-queries them, and with 1000 of them refuses new names
+for everyone.
+
+**Release.** A removed or replaced address returns to the free set
+only once no answer naming it can still be cached (its creation plus
+TTL plus grace, or its last answer plus grace, whichever is later),
+the NAT table has reported its rules gone, and three conntrack reads
+have followed. It is never handed back to the same node while a
+conntrack entry from its old mapping survives, since nothing deletes
+such entries and a forged reply on one would read as the new
+mapping's traffic.
 
 ### NAT Pipeline (Outbound)
 
 Three rule classes in `inet fips_gateway` together implement the
-LAN→mesh path:
+LAN→mesh path, and two filter rules keep every other interface off
+it:
 
-**Prerouting DNAT (per mapping)** rewrites the destination from the
-virtual IP to the corresponding mesh address:
+**Prerouting DNAT (per mapping)** rewrites the destination of LAN
+traffic from the virtual IP to the corresponding mesh address:
 
 ```text
-match:  nfproto ipv6 && ip6 daddr == <virtual_ip>
+match:  iifname == <lan_interface> && nfproto ipv6 && ip6 daddr == <virtual_ip>
 action: dnat to <mesh_addr>
 ```
 
@@ -315,19 +440,48 @@ After DNAT, the kernel routes the packet through `fips0` via the
 standard routing table.
 
 **Postrouting masquerade (`oifname fips0`)** rewrites the source of
-all traffic exiting via `fips0` to the gateway's own `fips0` address:
+LAN traffic exiting via `fips0` to the gateway's own `fips0` address:
 
 ```text
-match:  oifname == "fips0"
+match:  iifname == <lan_interface> && oifname == "fips0"
 action: masquerade
 ```
 
 This rule is critical. Without it, LAN client source addresses (for
-example `fd02::20` from the LAN's RA-advertised prefix, or virtual
-addresses from another forwarding domain) would appear as the source
-on the mesh. Those addresses are meaningless to mesh nodes, so
-return traffic would be black-holed. Masquerade ensures all mesh
-traffic appears to originate from the gateway's own FIPS identity.
+example `fd02::20` from the LAN's RA-advertised prefix) would appear
+as the source on the mesh. Those addresses are meaningless to mesh
+nodes, so return traffic would be black-holed. Masquerade ensures
+LAN traffic appears on the mesh under the gateway's own FIPS
+identity.
+
+**Forward drop** keeps hosts on the gateway's other interfaces from
+sending into the mesh:
+
+```text
+chain:  forward
+match:  nfproto ipv6 && oifname == "fips0" && iifname != <lan_interface>
+        && ct state not in { established, related }
+action: drop
+```
+
+Packets of established or related flows still pass, such as replies
+to flows a mesh peer opened and flows established before the rule was
+installed; new, invalid and untracked packets do not.
+
+**Pool drop** keeps them off the virtual IPs:
+
+```text
+chain:  raw_prerouting (before connection tracking)
+match:  nfproto ipv6 && iifname != <lan_interface> && iifname != "lo"
+        && ip6 daddr in <pool>
+action: drop
+```
+
+It runs before conntrack because conntrack matches a packet to an
+existing flow whatever interface it arrives on: a host that knows a
+LAN flow's addresses and ports could otherwise send in that flow's
+original direction and have it translated and forwarded. Loopback is
+exempt so the gateway host's own connections to pool addresses work.
 
 **Postrouting SNAT (per mapping)** rewrites the source of return
 traffic from the mesh address back to the virtual IP:
@@ -455,7 +609,8 @@ sequence is:
 
 1. Add the table (which succeeds whether or not it exists), delete
    it, and add it again, so the delete always has a target.
-2. Add the `prerouting` and `postrouting` chains; the always-on
+2. Add the four chains and the mesh-source set with its elements; the
+   pool drop, the forged-source drop and the forward drop; the
    `oifname fips0` masquerade; the LAN-side masquerade if any
    port-forwards exist; per-mapping DNAT/SNAT rules for every live
    pool entry; per-port-forward DNAT rules.
@@ -469,6 +624,22 @@ sequence is:
    even when no new mapping event arrives. Each retry rebuilds the latest
    desired state, so a newer change supersedes an earlier failed one.
    Successful rebuilds clear the pending flag; clean tables are not retried.
+
+Rebuilds run on a NAT worker thread that owns the table, never on the
+thread that answers `.fips` queries: a rebuild is a netlink round trip
+that can wait up to five seconds for the kernel. The worker drains every
+queued change into one rebuild. If it stops for any reason the gateway
+exits non-zero so the service manager restarts it, rather than answer
+with addresses that have no rules. Repeated failures to apply NAT rules
+or proxy NDP entries log one warning or error per change of outcome,
+with the repeats at debug level. Each mapping change forks
+`ip -6 neigh` once, and a replaced mapping twice, so proxy NDP forks
+at most 20 times a second at the admission rate. The main loop makes
+these changes one at a time, and the DNS task hands them over through
+a queue of 64, so a burst of new names at the ceiling (up to 50, each
+replacing a mapping) can hold `.fips` answers back while the forks
+drain: 100 forks took 0.26 s on an x86 host, and router hardware is
+slower.
 
 The rustables crate does not expose rule-handle tracking, so
 incremental update of individual rules is not available. Atomic
@@ -509,12 +680,38 @@ half is not in play.
 
 ### Outbound
 
-- **LAN trust boundary.** The DNS listener and the virtual-IP pool
-  are reachable by every host on the LAN. Any LAN host that can
-  resolve `.fips` and route to the pool CIDR can reach mesh
-  destinations. There is no per-client authentication; access
-  restriction is a network-level concern, enforced with firewall
-  rules on the LAN interface or on the gateway host itself.
+- **LAN trust boundary.** The DNS listener and the virtual-IP pool are
+  reachable by every host on the LAN. Any LAN host that can resolve
+  `.fips` and route to the pool CIDR can reach mesh destinations.
+  There is no per-client authentication; access restriction is a
+  network-level concern, enforced with firewall rules on the LAN
+  interface or on the gateway host itself. Only traffic arriving on
+  `lan_interface` is translated onto the mesh. Traffic into `fips0`
+  from any other interface (a WAN port, a VPN interface, a container
+  or VM bridge on the gateway host) is dropped unless it is a reply,
+  and traffic to the pool from any other interface is dropped before
+  connection tracking. The rules assume the TUN interface is named
+  `fips0`. Three forms remain open, as they were before these rules. A
+  host on another interface that knows the addresses and ports of a
+  LAN flow sent straight to a mesh address (with no virtual IP) can
+  inject packets in that flow's original direction, and can forge its
+  replies, which the gateway then forwards to the LAN client. It can
+  also forge the replies of an inbound port-forward flow, sent from
+  the forward's target to the gateway's LAN address and the flow's
+  masqueraded port (usually the mesh peer's own source port):
+  connection tracking matches them as established, and the gateway
+  forwards them to the mesh peer as if from the forwarded service.
+  Dropping those would also break port forwards whose target is not on
+  the LAN interface. Flows from other interfaces that were established
+  before an upgrade to these rules continue until connection tracking
+  expires them (`conntrack -F` or a reboot cuts them at once). A
+  `lan_interface` that is a VLAN device on a bridge (for example
+  `br-lan.1` under bridge VLAN filtering) does not work when bridge
+  netfilter is active (`br_netfilter` loaded) and
+  `net.bridge.bridge-nf-pass-vlan-input-dev` is 0, its default:
+  prerouting then sees the parent bridge as the input interface while
+  forwarding sees the VLAN device, so LAN clients' DNAT never matches
+  and the pool drop discards their traffic to the pool.
 - **Identity masking.** All outbound LAN traffic appears on the
   mesh under the gateway's own FIPS identity. Mesh nodes cannot
   determine which LAN host originated a connection. This provides

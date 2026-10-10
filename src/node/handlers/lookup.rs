@@ -9,7 +9,7 @@ use crate::node::reject::DiscoveryReject;
 use crate::node::{Node, diag};
 use crate::proto::fsp::should_apply_path_mtu;
 use crate::proto::lookup::{
-    LookupAction, LookupRequest, LookupResponse, MAX_RECENT_LOOKUP_REQUESTS,
+    LookupAction, LookupRequest, LookupResponse, MAX_BACKOFF_ENTRIES, MAX_RECENT_LOOKUP_REQUESTS,
 };
 use crate::proto::probe::LookupOutcomeKind;
 use crate::transport::{TransportAddr, TransportId};
@@ -28,9 +28,8 @@ struct NodeRoutingView<'a> {
     node: &'a Node,
 }
 
-/// What [`Node::maybe_initiate_lookup`] did, for callers that report on the
-/// lookup rather than merely triggering it. The three existing data-path call
-/// sites are statement-position and discard it unchanged.
+/// What [`Node::maybe_initiate_lookup`] did, for callers that act on the
+/// lookup rather than merely triggering it.
 pub(in crate::node) struct LookupInitiateOutcome {
     kind: LookupOutcomeKind,
     /// Peers the LookupRequest actually reached; `None` when the gate declined
@@ -832,15 +831,45 @@ impl Node {
             self.metrics().lookup.resp_timed_out.inc();
             let queued = self.pending_tun_packets.remove(&addr);
             let pkt_count = queued.as_ref().map_or(0, |p| p.len());
-            info!(
-                target_node = %self.peer_display_name(&addr),
-                queued_packets = pkt_count,
-                failures = failures,
-                "Discovery lookup timed out, destination unreachable"
-            );
+            // A local application is told only when packets were held, so that
+            // is the case worth `info!`; a timeout with nothing queued is one
+            // an outside sender can drive per name it keeps pending.
+            if pkt_count > 0 {
+                info!(
+                    target_node = %self.peer_display_name(&addr),
+                    queued_packets = pkt_count,
+                    failures = failures,
+                    "Discovery lookup timed out, destination unreachable"
+                );
+            } else {
+                debug!(
+                    target_node = %self.peer_display_name(&addr),
+                    queued_packets = pkt_count,
+                    failures = failures,
+                    "Discovery lookup timed out, destination unreachable"
+                );
+            }
             if let Some(packets) = queued {
                 self.host_icmp().no_route(&packets);
             }
+        }
+
+        let evicted = self.lookup.backoff.take_evicted();
+        if self.backoff_bound_log.refused(evicted) {
+            warn!(
+                bound = MAX_BACKOFF_ENTRIES,
+                "Lookup failure table at its bound; evicting the entries nearest expiry"
+            );
+        }
+        let at_bound = self.lookup.backoff.entry_count() >= MAX_BACKOFF_ENTRIES;
+        if let Some(evicted) = self
+            .backoff_bound_log
+            .tick(at_bound, std::time::Instant::now())
+        {
+            info!(
+                evicted,
+                "Lookup failure table below its bound again; entries evicted while it was full"
+            );
         }
     }
 

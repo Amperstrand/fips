@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::NodeAddr;
 use crate::config::{NostrRendezvousConfig, NostrRendezvousPolicy, PeerAddress, PeerConfig};
 use crate::transport::TransportId;
 
@@ -48,6 +49,60 @@ pub enum AdvertTransportSnapshot {
     },
 }
 
+/// The peer a bootstrap transport was adopted for: who it is and the address
+/// the traversal reached it at.
+#[derive(Debug, Clone)]
+pub struct BootstrapPeer {
+    /// The peer's npub (bech32).
+    pub npub: String,
+    /// The peer's node address, derived from `npub`.
+    pub node_addr: NodeAddr,
+    /// The remote address the traversal punched through to.
+    pub remote_addr: SocketAddr,
+    /// Set once a link to this peer has been seen on any transport.
+    linked: bool,
+}
+
+/// Whether an unknown-version datagram may set the protocol-mismatch
+/// cooldown for the peer a bootstrap transport was adopted for.
+///
+/// The datagram is unauthenticated. The evidence it can carry is only that
+/// it came from the address the traversal reached and arrived before any
+/// link to that peer existed; after a link, the peer has already completed a
+/// handshake in our version. This is not proof of origin: an off-path sender
+/// who can spoof that address and port can still set the cooldown once,
+/// before the first link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchEvidence<'a> {
+    /// The transport is not an adopted bootstrap transport.
+    NotBootstrap,
+    /// The datagram did not come from the traversed address.
+    ForeignSource,
+    /// A link to the traversed peer exists or has existed.
+    AfterLink,
+    /// From the traversed address before any link: the cooldown applies to
+    /// this npub.
+    Traversed(&'a str),
+}
+
+impl MismatchEvidence<'_> {
+    /// The stable field value naming this case in a log record.
+    pub fn label(&self) -> &'static str {
+        match self {
+            MismatchEvidence::NotBootstrap => "not-bootstrap",
+            MismatchEvidence::ForeignSource => "foreign-source",
+            MismatchEvidence::AfterLink => "after-link",
+            MismatchEvidence::Traversed(_) => "traversed",
+        }
+    }
+}
+
+/// A socket address with an IPv4-mapped IPv6 address taken as IPv4, so a
+/// dual-stack socket's view of a source matches the traversal's.
+fn canonical_socket(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// Node-side rendezvous-subsystem state and bootstrap-transport bookkeeping.
 #[derive(Default)]
 pub struct RendezvousDriver {
@@ -64,13 +119,13 @@ pub struct RendezvousDriver {
     startup_sweep_done: bool,
     /// Per-peer UDP transports adopted from NAT traversal handoff.
     bootstrap_transports: HashSet<TransportId>,
-    /// Originating peer npub (bech32) for each adopted bootstrap
-    /// transport, captured at `adopt_established_traversal` time.
-    /// Populated alongside `bootstrap_transports`; cleared in
+    /// The originating peer of each adopted bootstrap transport, captured
+    /// at `adopt_established_traversal` time. Populated alongside
+    /// `bootstrap_transports`; cleared in
     /// `cleanup_bootstrap_transport_if_unused`. Used by the rx loop to
     /// route fatal-protocol-mismatch observations back to the
     /// Nostr-discovery `failure_state` for long cooldown application.
-    bootstrap_transport_npubs: HashMap<TransportId, String>,
+    bootstrap_peers: HashMap<TransportId, BootstrapPeer>,
 }
 
 impl RendezvousDriver {
@@ -121,19 +176,72 @@ impl RendezvousDriver {
 
     /// Originating peer npub for an adopted bootstrap transport, if any.
     pub fn bootstrap_transport_npub(&self, transport_id: &TransportId) -> Option<&String> {
-        self.bootstrap_transport_npubs.get(transport_id)
+        self.bootstrap_peers
+            .get(transport_id)
+            .map(|peer| &peer.npub)
     }
 
-    /// Register an adopted bootstrap transport and its originating npub.
-    pub fn insert_bootstrap_transport(&mut self, transport_id: TransportId, npub: String) {
+    /// The originating peer of an adopted bootstrap transport, if any.
+    pub fn bootstrap_peer(&self, transport_id: &TransportId) -> Option<&BootstrapPeer> {
+        self.bootstrap_peers.get(transport_id)
+    }
+
+    /// Register an adopted bootstrap transport, its originating peer and the
+    /// address the traversal reached that peer at.
+    pub fn insert_bootstrap_transport(
+        &mut self,
+        transport_id: TransportId,
+        npub: String,
+        node_addr: NodeAddr,
+        remote_addr: SocketAddr,
+    ) {
         self.bootstrap_transports.insert(transport_id);
-        self.bootstrap_transport_npubs.insert(transport_id, npub);
+        self.bootstrap_peers.insert(
+            transport_id,
+            BootstrapPeer {
+                npub,
+                node_addr,
+                remote_addr,
+                linked: false,
+            },
+        );
+    }
+
+    /// Judge whether an unknown-version datagram on `transport_id` from
+    /// `source` may set the protocol-mismatch cooldown. `peer_linked` says
+    /// whether a node currently has an established link.
+    pub fn mismatch_evidence(
+        &self,
+        transport_id: &TransportId,
+        source: Option<SocketAddr>,
+        peer_linked: impl Fn(&NodeAddr) -> bool,
+    ) -> MismatchEvidence<'_> {
+        let Some(peer) = self.bootstrap_peers.get(transport_id) else {
+            return MismatchEvidence::NotBootstrap;
+        };
+        if source.map(canonical_socket) != Some(canonical_socket(peer.remote_addr)) {
+            return MismatchEvidence::ForeignSource;
+        }
+        if peer.linked || peer_linked(&peer.node_addr) {
+            return MismatchEvidence::AfterLink;
+        }
+        MismatchEvidence::Traversed(&peer.npub)
+    }
+
+    /// Latch every bootstrap peer that now has an established link, so a
+    /// mismatch from its address stays refused after the link drops.
+    pub fn note_linked_bootstraps(&mut self, peer_linked: impl Fn(&NodeAddr) -> bool) {
+        for peer in self.bootstrap_peers.values_mut() {
+            if peer_linked(&peer.node_addr) {
+                peer.linked = true;
+            }
+        }
     }
 
     /// Drop an adopted bootstrap transport from both bookkeeping maps.
     pub fn remove_bootstrap_transport(&mut self, transport_id: &TransportId) {
         self.bootstrap_transports.remove(transport_id);
-        self.bootstrap_transport_npubs.remove(transport_id);
+        self.bootstrap_peers.remove(transport_id);
     }
 
     /// Convert an advertised overlay endpoint into a `PeerAddress` candidate.

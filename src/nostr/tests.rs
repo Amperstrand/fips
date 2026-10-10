@@ -18,9 +18,9 @@ use super::stun::{parse_stun_binding_success, parse_stun_url};
 #[cfg(target_os = "linux")]
 use super::traversal::run_punch_attempt;
 use super::traversal::{
-    PunchStrategy, SourceRank, build_punch_packet, is_doc_ip, is_never_punchable_ip, is_private_ip,
-    now_ms, parse_punch_packet, plan_punch_targets, planned_remote_endpoints, rank_punch_source,
-    session_hash,
+    PunchStrategy, RefusalWarnGate, SourceRank, build_punch_packet, is_doc_ip,
+    is_never_punchable_ip, is_private_ip, now_ms, parse_punch_packet, plan_punch_targets,
+    planned_remote_endpoints, rank_punch_source, session_hash,
 };
 use super::traversal_machine::suppress_responder_for_own_initiator;
 use super::types::BootstrapError;
@@ -29,6 +29,7 @@ use super::{
     OverlayTransportKind, PunchHint, PunchPacketKind, TraversalAddress,
 };
 use crate::NodeAddr;
+use crate::utils::onlink::OnLinkPrefixes;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NatType {
@@ -511,6 +512,7 @@ fn plans_reflexive_targets_before_lan() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     );
 
     assert_eq!(planned[0].strategy, PunchStrategy::Reflexive);
@@ -524,6 +526,7 @@ fn simulated_lan_scenario_includes_lan_target_and_succeeds() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     );
 
     assert!(
@@ -541,6 +544,7 @@ fn simulated_symmetric_nat_scenario_requires_fallback() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("10.0.1.10", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("10.0.0.0", 24)]),
     );
 
     assert!(
@@ -558,6 +562,7 @@ fn planned_remote_endpoints_include_private_and_reflexive_paths() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     )
     .expect("endpoint planning should succeed");
 
@@ -583,6 +588,7 @@ fn planned_remote_endpoints_reject_never_punchable_remote_candidates() {
             addr("8.8.8.8", 0),
         ],
         Some(&addr("198.51.100.20", 63000)),
+        &OnLinkPrefixes::default(),
     )
     .expect("endpoint planning should succeed");
 
@@ -599,6 +605,7 @@ fn planned_remote_endpoints_drop_private_candidate_outside_our_subnet() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("10.9.9.9", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     )
     .expect("endpoint planning should succeed");
 
@@ -613,6 +620,7 @@ fn planned_remote_endpoints_reject_ipv4_mapped_private_candidate() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("::ffff:10.0.0.1", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &OnLinkPrefixes::default(),
     )
     .expect("endpoint planning should succeed");
 
@@ -637,6 +645,7 @@ fn planned_remote_endpoints_cap_targets_from_an_oversized_candidate_list() {
         Some(&addr("203.0.113.10", 62000)),
         &remotes,
         Some(&addr("198.51.100.20", 63000)),
+        &OnLinkPrefixes::default(),
     )
     .expect("endpoint planning should succeed");
 
@@ -654,10 +663,9 @@ fn planned_remote_endpoints_cap_targets_from_an_oversized_candidate_list() {
 /// elsewhere; this drives it end to end through the planner, which is the
 /// path the reflector attack actually uses.
 ///
-/// The local address is a ULA so `lan_refs` is non-empty and `same_subnet_24`
-/// is genuinely called with two IPv6 strings. It splits on `.` and requires
-/// four parts, so no IPv6 candidate can ever satisfy the /24 gate and
-/// `fd00::1` is refused off-subnet rather than admitted.
+/// The local address is a ULA, so our own addresses are not empty, and
+/// `fd00::1` is still refused off-subnet rather than admitted: the traversal
+/// socket is IPv4, so no unique-local candidate is ever punched.
 #[test]
 fn planned_remote_endpoints_reject_never_punchable_ipv6_candidates() {
     let (endpoints, _tally) = planned_remote_endpoints(
@@ -671,6 +679,7 @@ fn planned_remote_endpoints_reject_never_punchable_ipv6_candidates() {
             addr("fd00::1", 63000),
         ],
         Some(&addr("198.51.100.20", 63000)),
+        &OnLinkPrefixes::default(),
     )
     .expect("endpoint planning should succeed");
 
@@ -698,6 +707,7 @@ fn planned_remote_endpoints_bound_an_oversized_list_of_unroutable_candidates() {
         Some(&addr("203.0.113.10", 62000)),
         &remotes,
         Some(&addr("198.51.100.20", 63000)),
+        &OnLinkPrefixes::default(),
     )
     .expect("endpoint planning should succeed");
 
@@ -715,13 +725,10 @@ fn planned_remote_endpoints_bound_an_oversized_list_of_unroutable_candidates() {
 }
 
 /// Guards the deployment whose STUN server sits inside the private network,
-/// so the observed reflexive address is itself private. Applying the /24 gate
-/// to a peer's reflexive address would drop it and remove the only branch
-/// that works across arbitrary NATs; this test reds if anyone does that.
-///
-/// The exemption is conditional on exactly the vantage point this test sets
-/// up: our own reflexive address is private here, so it still applies. The
-/// two tests below cover the public and absent cases.
+/// so the observed reflexive address is itself private. A peer's private
+/// reflexive address on the same LAN is kept because one of our interface
+/// prefixes holds both it and our own reflexive address; dropping it would
+/// remove the only branch that works across arbitrary NATs.
 #[test]
 fn planned_remote_endpoints_keep_private_reflexive_when_stun_is_on_the_lan() {
     let (endpoints, _tally) = planned_remote_endpoints(
@@ -729,16 +736,18 @@ fn planned_remote_endpoints_keep_private_reflexive_when_stun_is_on_the_lan() {
         Some(&addr("192.168.1.10", 62000)),
         &[],
         Some(&addr("192.168.1.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     )
     .expect("endpoint planning should succeed");
 
     assert!(endpoints.contains(&"192.168.1.20:63000".parse().unwrap()));
 }
 
-/// A node whose own STUN result is public shares no LAN with a private
-/// address, so a peer's private reflexive address is only ever an address of
-/// the peer's choosing. Admitting it made the reflexive branch a way to have
-/// this node punch inside its own private network; the /24 gate now applies.
+/// A node whose own STUN result is public, and which shares no local
+/// candidate, holds no address of its own on any LAN, so a peer's private
+/// reflexive address is only ever an address of the peer's choosing, even
+/// when our interface prefix holds it. Admitting it would have this node
+/// punch inside its own private network.
 #[test]
 fn a_peers_private_reflexive_address_is_refused_when_our_own_stun_result_is_public() {
     let (endpoints, tally) = planned_remote_endpoints(
@@ -746,6 +755,7 @@ fn a_peers_private_reflexive_address_is_refused_when_our_own_stun_result_is_publ
         Some(&addr("203.0.113.10", 62000)),
         &[],
         Some(&addr("192.168.1.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     )
     .expect("endpoint planning should succeed");
 
@@ -753,9 +763,9 @@ fn a_peers_private_reflexive_address_is_refused_when_our_own_stun_result_is_publ
     assert_eq!(tally.reflexive, Some("off-subnet"));
 }
 
-/// The conditional gate keys on our own reflexive address being private, and
-/// a node with no reflexive address at all has to keep behaving as it did:
-/// a failed STUN probe must not cost same-LAN peering.
+/// A node with no reflexive address at all keeps same-LAN peering through
+/// its shared local candidate: one of its interface prefixes holds both that
+/// address and the peer's private reflexive address.
 #[test]
 fn a_peers_private_reflexive_address_is_kept_when_we_have_no_stun_result_at_all() {
     let (endpoints, tally) = planned_remote_endpoints(
@@ -763,6 +773,7 @@ fn a_peers_private_reflexive_address_is_kept_when_we_have_no_stun_result_at_all(
         None,
         &[],
         Some(&addr("192.168.1.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     )
     .expect("endpoint planning should succeed");
 
@@ -780,6 +791,7 @@ fn an_off_subnet_reflexive_refusal_alone_is_not_suspicious() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("203.0.113.5", 63000)],
         Some(&addr("192.168.1.20", 63000)),
+        &OnLinkPrefixes::default(),
     );
 
     assert_eq!(tally.reflexive, Some("off-subnet"));
@@ -809,6 +821,7 @@ fn an_oversized_candidate_list_is_bounded_before_vetting() {
         Some(&addr("203.0.113.10", 62000)),
         &remotes,
         Some(&addr("198.51.100.20", 63000)),
+        &OnLinkPrefixes::default(),
     );
 
     assert_eq!(tally.offered, 1001);
@@ -832,6 +845,7 @@ fn refused_punch_candidates_are_counted_by_class_and_sampled() {
             addr("not-an-ip", 63000),
         ],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     );
 
     assert_eq!(tally.offered, 5);
@@ -852,6 +866,7 @@ fn a_clean_plan_and_an_off_subnet_only_plan_are_not_suspicious() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     );
     assert_eq!(clean.offsubnet, 0);
     assert!(!clean.suspicious());
@@ -861,6 +876,7 @@ fn a_clean_plan_and_an_off_subnet_only_plan_are_not_suspicious() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("10.9.9.9", 63000)],
         Some(&addr("198.51.100.20", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     );
     assert_eq!(off_subnet.offsubnet, 1);
     assert!(off_subnet.admitted > 0);
@@ -874,12 +890,46 @@ fn an_offer_whose_every_candidate_is_refused_is_suspicious() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("127.0.0.1", 63000), addr("224.0.0.1", 63000)],
         None,
+        &OnLinkPrefixes::default(),
     );
 
     assert!(planned.is_empty());
     assert_eq!(tally.admitted, 0);
     assert_eq!(tally.unroutable, 2);
     assert!(tally.suspicious());
+}
+
+/// A suspicious offer whose refusals are hidden behind its planned pairings
+/// logs nothing, so it must not spend the one warning a minute that a later
+/// suspicious offer, which does log, is owed.
+#[test]
+fn a_suspicious_offer_that_logs_nothing_does_not_use_up_the_next_ones_warning() {
+    let (_planned, quiet) = plan_punch_targets(
+        &[addr("203.0.113.5", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("127.0.0.1", 4000), addr("198.51.100.30", 4000)],
+        Some(&addr("198.51.100.20", 4000)),
+        &OnLinkPrefixes::default(),
+    );
+    assert!(quiet.suspicious());
+    assert!(!quiet.has_refusals(), "the shape logs nothing: {quiet:?}");
+    let (_planned, loud) = plan_punch_targets(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("127.0.0.1", 63000)],
+        None,
+        &OnLinkPrefixes::default(),
+    );
+    assert!(loud.suspicious());
+
+    let mut gate = RefusalWarnGate::default();
+    let t = std::time::Instant::now();
+    assert_eq!(gate.decide(&quiet, t), None);
+    assert_eq!(
+        gate.decide(&loud, t + std::time::Duration::from_millis(1)),
+        Some(0),
+        "the warning went to an offer that logged nothing"
+    );
 }
 
 /// A peer's reflexive address is refused on its own terms: losing it removes
@@ -892,12 +942,315 @@ fn a_refused_reflexive_address_is_recorded_apart_from_the_candidates() {
         Some(&addr("203.0.113.10", 62000)),
         &[addr("192.168.1.20", 63000)],
         Some(&addr("127.0.0.1", 63000)),
+        &prefixes(&[("192.168.1.0", 24)]),
     );
 
     assert_eq!(tally.reflexive, Some("never-routable"));
     assert_eq!(tally.unroutable, 0);
     assert_eq!(tally.sample.as_deref(), Some("127.0.0.1:63000"));
     assert!(tally.suspicious());
+}
+
+/// Interface prefixes for a planning test, as `(address, prefix length)`.
+fn prefixes(pairs: &[(&str, u8)]) -> OnLinkPrefixes {
+    OnLinkPrefixes::from_pairs(
+        pairs
+            .iter()
+            .map(|(ip, len)| (ip.parse::<IpAddr>().expect("test prefix"), *len)),
+    )
+}
+
+fn endpoint(text: &str) -> SocketAddr {
+    text.parse().expect("test endpoint")
+}
+
+/// A STUN server inside our LAN gives us a private reflexive address. A
+/// stranger's private reflexive address on another subnet must not be
+/// punched on the strength of that alone.
+#[test]
+fn a_strangers_private_reflexive_address_is_refused_when_our_lan_stun_address_shares_no_prefix_with_it()
+ {
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("192.168.1.5", 62000)),
+        &[addr("198.51.100.30", 4000)],
+        Some(&addr("10.9.8.7", 4000)),
+        &prefixes(&[("192.168.1.0", 24)]),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(
+        endpoints
+            .iter()
+            .all(|e| e.ip() != endpoint("10.9.8.7:1").ip()),
+        "planned {endpoints:?}"
+    );
+    assert_eq!(tally.reflexive, Some("off-subnet"));
+    assert!(endpoints.contains(&endpoint("198.51.100.30:4000")));
+}
+
+/// With no STUN result of our own, a stranger's private reflexive address
+/// is refused unless one of our prefixes holds it and one of our addresses.
+#[test]
+fn a_strangers_private_reflexive_address_is_refused_when_we_have_no_stun_result() {
+    let (planned, tally) = plan_punch_targets(
+        &[addr("192.168.1.10", 62000)],
+        None,
+        &[addr("192.168.1.20", 4000)],
+        Some(&addr("10.9.8.7", 4000)),
+        &prefixes(&[("192.168.1.0", 24)]),
+    );
+
+    assert!(
+        planned.iter().all(|t| t.remote.ip != "10.9.8.7"),
+        "planned {planned:?}"
+    );
+    assert_eq!(tally.reflexive, Some("off-subnet"));
+    assert!(
+        planned
+            .iter()
+            .any(|t| t.strategy == PunchStrategy::Lan && t.remote.ip == "192.168.1.20")
+    );
+}
+
+/// A /24 text match is not a link: on a /25, `.200` is another network.
+#[test]
+fn a_private_candidate_outside_our_interface_prefix_is_refused_even_inside_the_same_slash_24() {
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[addr("192.168.1.10", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("192.168.1.200", 4000), addr("192.168.1.20", 4000)],
+        None,
+        &prefixes(&[("192.168.1.0", 25)]),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(!endpoints.contains(&endpoint("192.168.1.200:4000")));
+    assert_eq!(tally.offsubnet, 1);
+    assert!(endpoints.contains(&endpoint("192.168.1.20:4000")));
+}
+
+/// At the default settings (public STUN, no shared local candidates) we hold
+/// no address of our own on the LAN to vouch for a private candidate, so an
+/// offer cannot aim probes at hosts on our LAN even though our prefix holds
+/// them.
+#[test]
+fn at_default_settings_an_offer_cannot_aim_probes_at_hosts_on_our_lan() {
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("192.168.1.77", 4000)],
+        Some(&addr("198.51.100.20", 4000)),
+        &prefixes(&[("192.168.1.0", 24)]),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert!(!endpoints.contains(&endpoint("192.168.1.77:4000")));
+    assert_eq!(tally.offsubnet, 1);
+    assert_eq!(endpoints, vec![endpoint("198.51.100.20:4000")]);
+}
+
+#[test]
+fn a_private_reflexive_address_on_our_lan_stun_prefix_is_punched() {
+    let (endpoints, tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("192.168.1.5", 62000)),
+        &[],
+        Some(&addr("192.168.1.50", 4000)),
+        &prefixes(&[("192.168.1.0", 24)]),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert_eq!(endpoints, vec![endpoint("192.168.1.50:4000")]);
+    assert_eq!(tally.reflexive, None);
+}
+
+#[test]
+fn a_public_reflexive_address_is_punched_whatever_the_prefixes() {
+    let (endpoints, _tally) = planned_remote_endpoints(
+        &[],
+        Some(&addr("203.0.113.10", 62000)),
+        &[],
+        Some(&addr("198.51.100.20", 4000)),
+        &OnLinkPrefixes::default(),
+    )
+    .expect("endpoint planning should succeed");
+
+    assert_eq!(endpoints, vec![endpoint("198.51.100.20:4000")]);
+}
+
+#[test]
+fn a_peer_in_a_slash_16_lan_is_punched_where_the_slash_24_test_refused_it() {
+    let (planned, tally) = plan_punch_targets(
+        &[addr("10.20.1.1", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("10.20.7.8", 4000)],
+        None,
+        &prefixes(&[("10.20.0.0", 16)]),
+    );
+
+    assert_eq!(tally.offsubnet, 0);
+    assert!(
+        planned
+            .iter()
+            .any(|t| t.strategy == PunchStrategy::Lan && t.remote.ip == "10.20.7.8"),
+        "planned {planned:?}"
+    );
+}
+
+/// Two peers whose STUN servers sit inside their own, different LANs see
+/// each other's private reflexive address refused on every attempt. That is
+/// accepted, and must not warn every time.
+#[test]
+fn a_cross_subnet_lan_stun_offer_refused_as_off_subnet_is_not_suspicious() {
+    let (planned, tally) = plan_punch_targets(
+        &[],
+        Some(&addr("192.168.1.5", 62000)),
+        &[],
+        Some(&addr("10.9.8.7", 4000)),
+        &prefixes(&[("192.168.1.0", 24)]),
+    );
+    assert!(planned.is_empty());
+    assert_eq!(tally.reflexive, Some("off-subnet"));
+    assert!(!tally.suspicious());
+
+    let (_planned, loopback) = plan_punch_targets(
+        &[],
+        Some(&addr("192.168.1.5", 62000)),
+        &[],
+        Some(&addr("127.0.0.1", 4000)),
+        &prefixes(&[("192.168.1.0", 24)]),
+    );
+    assert!(loopback.suspicious());
+}
+
+#[test]
+fn a_unique_local_candidate_is_refused_while_the_traversal_socket_is_ipv4_only() {
+    let (planned, tally) = plan_punch_targets(
+        &[addr("fd00::2", 62000)],
+        Some(&addr("203.0.113.10", 62000)),
+        &[addr("fd00::1", 4000)],
+        None,
+        &prefixes(&[("fd00::", 64)]),
+    );
+
+    assert_eq!(tally.offsubnet, 1);
+    assert!(planned.iter().all(|t| t.strategy != PunchStrategy::Lan));
+    assert!(planned.iter().all(|t| t.remote.ip != "fd00::1"));
+}
+
+/// An honest dual-stack peer offers a private IPv4 address, two unique-local
+/// addresses and a global IPv6 address, as we do. The plan must fit the
+/// eight-target cap so nothing is discarded and nothing warns.
+#[test]
+fn an_honest_dual_stack_offer_fills_no_more_than_the_target_cap() {
+    let (planned, tally) = plan_punch_targets(
+        &[
+            addr("192.168.1.10", 62000),
+            addr("fd00::10", 62000),
+            addr("fd01::10", 62000),
+            addr("2001:db8::1", 62000),
+        ],
+        Some(&addr("203.0.113.10", 62000)),
+        &[
+            addr("192.168.1.20", 4000),
+            addr("fd00::20", 4000),
+            addr("fd01::20", 4000),
+            addr("2001:db8::2", 4000),
+        ],
+        Some(&addr("198.51.100.20", 4000)),
+        &prefixes(&[
+            ("192.168.1.0", 24),
+            ("fd00::", 64),
+            ("fd01::", 64),
+            ("2001:db8::", 64),
+        ]),
+    );
+
+    assert_eq!(tally.capped, 0, "planned {planned:?}");
+    assert_eq!(planned.len(), 8);
+    assert!(!tally.suspicious());
+}
+
+/// A driver holding one adopted bootstrap transport (id 7) that reached
+/// `peer` at 198.51.100.7:4000.
+fn driver_with_bootstrap(peer: &crate::PeerIdentity) -> super::RendezvousDriver {
+    let mut driver = super::RendezvousDriver::default();
+    driver.insert_bootstrap_transport(
+        crate::transport::TransportId::new(7),
+        peer.npub(),
+        *peer.node_addr(),
+        "198.51.100.7:4000".parse().unwrap(),
+    );
+    driver
+}
+
+#[test]
+fn mismatch_evidence_names_the_traversed_peer_only_for_its_own_address_before_a_link() {
+    use super::MismatchEvidence;
+    let peer = crate::PeerIdentity::from_pubkey(crate::Identity::generate().pubkey());
+    let driver = driver_with_bootstrap(&peer);
+    let t7 = crate::transport::TransportId::new(7);
+    let unlinked = |_: &NodeAddr| false;
+    let npub = peer.npub();
+
+    assert_eq!(
+        driver.mismatch_evidence(
+            &crate::transport::TransportId::new(8),
+            Some(endpoint("198.51.100.7:4000")),
+            unlinked
+        ),
+        MismatchEvidence::NotBootstrap
+    );
+    assert_eq!(
+        driver.mismatch_evidence(&t7, Some(endpoint("203.0.113.99:5000")), unlinked),
+        MismatchEvidence::ForeignSource
+    );
+    assert_eq!(
+        driver.mismatch_evidence(&t7, None, unlinked),
+        MismatchEvidence::ForeignSource
+    );
+    assert_eq!(
+        driver.mismatch_evidence(&t7, Some(endpoint("198.51.100.7:4001")), unlinked),
+        MismatchEvidence::ForeignSource
+    );
+    assert_eq!(
+        driver.mismatch_evidence(&t7, Some(endpoint("198.51.100.7:4000")), unlinked),
+        MismatchEvidence::Traversed(&npub)
+    );
+    // A dual-stack socket reports an IPv4 source in its mapped form.
+    assert_eq!(
+        driver.mismatch_evidence(&t7, Some(endpoint("[::ffff:198.51.100.7]:4000")), unlinked),
+        MismatchEvidence::Traversed(&npub)
+    );
+    let linked = |addr: &NodeAddr| addr == peer.node_addr();
+    assert_eq!(
+        driver.mismatch_evidence(&t7, Some(endpoint("198.51.100.7:4000")), linked),
+        MismatchEvidence::AfterLink
+    );
+}
+
+#[test]
+fn note_linked_bootstraps_keeps_refusing_after_the_link_drops() {
+    use super::MismatchEvidence;
+    let peer = crate::PeerIdentity::from_pubkey(crate::Identity::generate().pubkey());
+    let other = crate::PeerIdentity::from_pubkey(crate::Identity::generate().pubkey());
+    let mut driver = driver_with_bootstrap(&peer);
+    let t7 = crate::transport::TransportId::new(7);
+
+    // A link to some other node latches nothing.
+    driver.note_linked_bootstraps(|addr| addr == other.node_addr());
+    assert!(matches!(
+        driver.mismatch_evidence(&t7, Some(endpoint("198.51.100.7:4000")), |_| false),
+        MismatchEvidence::Traversed(_)
+    ));
+
+    driver.note_linked_bootstraps(|addr| addr == peer.node_addr());
+    assert_eq!(
+        driver.mismatch_evidence(&t7, Some(endpoint("198.51.100.7:4000")), |_| false),
+        MismatchEvidence::AfterLink,
+        "the link has gone, but it was seen"
+    );
 }
 
 #[test]
@@ -1950,4 +2303,37 @@ fn short_id_truncates_a_multibyte_session_id_on_a_character_boundary_without_pan
     assert_eq!(short_id("abcdefghij"), "abcdefgh");
     assert_eq!(short_id("abc"), "abc");
     assert_eq!(short_id(""), "");
+}
+
+/// The advert cache holds adverts under the canonical lower-case npub, and
+/// a configured npub may be written in upper case. Resolving that peer's
+/// advert finds the cached entry instead of missing it and going to the
+/// relays.
+#[tokio::test]
+async fn an_upper_case_configured_npub_resolves_its_cached_advert() {
+    let runtime = NostrRendezvous::new_for_test();
+    let npub = crate::encode_npub(&crate::Identity::generate().pubkey());
+    let endpoint = OverlayEndpointAdvert {
+        transport: OverlayTransportKind::Udp,
+        addr: "203.0.113.7:2121".to_string(),
+    };
+    let now_secs = now_ms() / 1_000;
+    let advert = NostrRendezvous::cached_advert_for_test(npub.clone(), endpoint.clone(), now_secs);
+    runtime.insert_advert_for_test(npub.clone(), advert).await;
+
+    // Control: the canonical form resolves from the cache.
+    let endpoints = runtime
+        .advert_endpoints_for_peer(&npub)
+        .await
+        .expect("canonical npub resolved");
+    assert_eq!(endpoints, vec![endpoint.clone()]);
+
+    let endpoints = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        runtime.advert_endpoints_for_peer(&npub.to_uppercase()),
+    )
+    .await
+    .expect("resolution finished")
+    .expect("cached advert resolved");
+    assert_eq!(endpoints, vec![endpoint]);
 }

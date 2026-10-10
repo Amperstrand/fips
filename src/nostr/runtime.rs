@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::advert::{AdvertMachine, PublishPlan};
+use super::advert::{AdvertAdmission, AdvertMachine, PublishPlan};
 use super::failure_state::FailureState;
 use super::handoff::EstablishedTraversal;
 use super::offer_admission::{AdmissionReject, OfferAdmission};
@@ -30,8 +30,8 @@ use super::signal::{
 use super::signal_gate::SignalGate;
 use super::stun::observe_traversal_addresses;
 use super::traversal::{
-    PunchTargetTally, is_doc_ip, is_never_punchable_ip, is_private_ip, nonce, now_ms,
-    planned_remote_endpoints, run_punch_attempt,
+    PunchTargetTally, RefusalWarnGate, is_doc_ip, is_never_punchable_ip, is_private_ip, nonce,
+    now_ms, planned_remote_endpoints, run_punch_attempt,
 };
 use super::traversal_machine::{OfferDisposition, SeenDecision, TraversalMachine};
 use super::types::{
@@ -42,6 +42,7 @@ use super::types::{
 };
 use crate::PeerIdentity;
 use crate::config::{NostrRendezvousConfig, PeerConfig};
+use crate::utils::onlink::OnLinkPrefixes;
 
 const ADVERT_CACHE_STALE_GRACE_MULTIPLIER: u64 = 2;
 
@@ -85,15 +86,20 @@ pub(super) fn short_id(id: &str) -> String {
 /// the shapes no honest peer produces, because `info` is the level a shipped
 /// node collects by default and those refusals are the ones an operator needs
 /// to see; the routine off-subnet case stays at `debug`.
-fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str) {
-    if tally.offered <= tally.admitted && tally.capped == 0 && tally.over_offered == 0 {
+///
+/// `warn` is the refusal-warning gate's decision for a suspicious record:
+/// `Some(suppressed)` when this record is the one warning allowed in the
+/// last minute, `None` otherwise, in which case it is logged at `debug`.
+fn log_refusals(tally: &PunchTargetTally, peer: &str, session: &str, warn: Option<u64>) {
+    if !tally.has_refusals() {
         return;
     }
     let sample = tally.sample.as_deref().unwrap_or("-");
     let reflexive = tally.reflexive.unwrap_or("-");
-    if tally.suspicious() {
+    if let Some(suppressed) = warn.filter(|_| tally.suspicious()) {
         warn!(
             peer = %peer,
+            suppressed,
             session = %session,
             offered = tally.offered,
             admitted = tally.admitted,
@@ -212,6 +218,8 @@ pub struct NostrRendezvous {
     pending_answers: Mutex<HashMap<String, oneshot::Sender<SignalEnvelope<TraversalAnswer>>>>,
     admission: OfferAdmission,
     signal_gate: SignalGate,
+    /// Limits the suspicious-offer warning to one a minute.
+    refusal_warn: std::sync::Mutex<RefusalWarnGate>,
     /// Inbound traversal signals shed before decryption, since process start.
     shed_signals: AtomicU64,
     event_tx: mpsc::UnboundedSender<BootstrapEvent>,
@@ -354,6 +362,7 @@ impl NostrRendezvous {
             pending_answers: Mutex::new(HashMap::new()),
             admission,
             signal_gate: SignalGate::new(Instant::now()),
+            refusal_warn: std::sync::Mutex::new(RefusalWarnGate::default()),
             shed_signals: AtomicU64::new(0),
             event_tx,
             event_rx: Mutex::new(event_rx),
@@ -643,7 +652,19 @@ impl NostrRendezvous {
                     created_at: relay_created_at,
                     valid_until_ms,
                 };
-                self.advert.insert_fetched(peer_npub, updated);
+                if let AdvertAdmission::Refused { first_at_bound } =
+                    self.advert.insert_fetched(peer_npub, updated, now_ms())
+                {
+                    // The cache does not hold this advert, so the streak is
+                    // not reset on the strength of it.
+                    self.log_advert_cache_full(first_at_bound);
+                    debug!(
+                        peer = %short_npub(peer_npub),
+                        reason = "cache-full",
+                        "advert cache full; refetched advert not cached"
+                    );
+                    return NostrRefetchOutcome::Skipped;
+                }
                 self.failure_state.reset_streak_after_refresh(peer_npub);
                 NostrRefetchOutcome::Refreshed
             }
@@ -678,16 +699,48 @@ impl NostrRendezvous {
                 npub: peer_npub.to_string(),
                 reason: e.to_string(),
             })?;
-        let advert = self.fetch_advert(peer_npub, target_pubkey).await?;
+        let advert = self.fetch_advert(target_pubkey).await?;
         Ok(advert.endpoints)
     }
 
+    /// Replace the set of authors whose cached adverts survive a full cache:
+    /// the configured peers and the authors with an established link.
+    pub fn set_advert_protection(&self, npubs: HashSet<String>) {
+        self.advert.set_protected(npubs);
+    }
+
+    /// The cached adverts the open-discovery sweep should consider: the
+    /// protected entries not in `skip`, plus up to `max` unprotected entries
+    /// not in `skip`, drawn at random on each call.
     pub async fn cached_open_discovery_candidates(
         &self,
         max: usize,
+        skip: &HashSet<String>,
     ) -> Vec<(String, Vec<OverlayEndpointAdvert>, u64)> {
         self.prune_advert_cache();
-        self.advert.open_discovery_candidates(max, now_ms())
+        self.advert
+            .open_discovery_candidates(max, now_ms(), skip, &mut rand::rng())
+    }
+
+    /// Expire cached adverts, trim the cache to its cap, and release the
+    /// cache-full warning once the cache has stayed below its cap long
+    /// enough. Called once per node tick.
+    pub fn maintain_advert_cache(&self) {
+        self.prune_advert_cache();
+        if let Some(refused) = self.advert.bound_tick(Instant::now()) {
+            info!(refused, "advert cache below cap again");
+        }
+    }
+
+    /// The one warning a full advert cache produces until it has been below
+    /// its cap for a minute.
+    fn log_advert_cache_full(&self, first_at_bound: bool) {
+        if first_at_bound {
+            warn!(
+                bound = self.config.advert_cache_max_entries,
+                "advert cache full; refusing adverts from new unconfigured authors"
+            );
+        }
     }
 
     pub async fn shutdown(&self) -> Result<(), BootstrapError> {
@@ -766,18 +819,32 @@ impl NostrRendezvous {
                                 event.created_at.as_secs(),
                                 now_ms(),
                             );
-                            if self.advert.observe_advert(
+                            match self.advert.observe_advert(
                                 &author_npub,
                                 advert,
                                 created_at,
                                 valid_until_ms,
+                                now_ms(),
                             ) {
-                                debug!(
-                                    peer = %short_npub(&author_npub),
-                                    endpoints = %endpoints,
-                                    event = %short_id(&event.id.to_string()),
-                                    "advert: peer cached"
-                                );
+                                AdvertAdmission::Admitted | AdvertAdmission::Updated
+                                    if author_npub != self.npub =>
+                                {
+                                    debug!(
+                                        peer = %short_npub(&author_npub),
+                                        endpoints = %endpoints,
+                                        event = %short_id(&event.id.to_string()),
+                                        "advert: peer cached"
+                                    );
+                                }
+                                AdvertAdmission::Refused { first_at_bound } => {
+                                    self.log_advert_cache_full(first_at_bound);
+                                    debug!(
+                                        peer = %short_npub(&author_npub),
+                                        reason = "cache-full",
+                                        "advert cache full; advert not cached"
+                                    );
+                                }
+                                _ => {}
                             }
                         }
                         self.prune_advert_cache();
@@ -1138,7 +1205,7 @@ impl NostrRendezvous {
                 npub: peer_config.npub.clone(),
                 reason: e.to_string(),
             })?;
-        let advert = self.fetch_advert(&peer_config.npub, target_pubkey).await?;
+        let advert = self.fetch_advert(target_pubkey).await?;
         if !advert.has_udp_nat_endpoint() {
             return Err(BootstrapError::MissingNatEndpoint(peer_config.npub.clone()));
         }
@@ -1282,8 +1349,9 @@ impl NostrRendezvous {
             offer.reflexive_address.as_ref(),
             &answer.payload.local_addresses,
             answer.payload.reflexive_address.as_ref(),
+            &OnLinkPrefixes::read_system(),
         )?;
-        log_refusals(&tally, &peer_short, &short_id(&session_id));
+        self.log_punch_refusals(&tally, &peer_short, &short_id(&session_id));
 
         let remote_addr = run_punch_attempt(
             &base_socket,
@@ -1475,8 +1543,9 @@ impl NostrRendezvous {
             answer.reflexive_address.as_ref(),
             &offer.local_addresses,
             offer.reflexive_address.as_ref(),
+            &OnLinkPrefixes::read_system(),
         )?;
-        log_refusals(&tally, &peer_short, &short_id(&offer.session_id));
+        self.log_punch_refusals(&tally, &peer_short, &short_id(&offer.session_id));
 
         let punch = run_punch_attempt(
             &base_socket,
@@ -1519,11 +1588,18 @@ impl NostrRendezvous {
         Ok(())
     }
 
+    /// Resolve `target_pubkey`'s advert from the cache, or else from the
+    /// advert relays, caching what the relays return when there is room.
+    ///
+    /// The cache is keyed by the canonical npub, so it is derived here from
+    /// `target_pubkey` rather than taken from the configured text, which may
+    /// be in upper case.
     async fn fetch_advert(
         &self,
-        peer_npub: &str,
         target_pubkey: PublicKey,
     ) -> Result<OverlayAdvert, BootstrapError> {
+        let canonical = target_pubkey.to_bech32().expect("infallible");
+        let peer_npub = canonical.as_str();
         self.prune_advert_cache();
         if let Some(advert) = self.advert.cached_advert(peer_npub) {
             debug!(
@@ -1582,7 +1658,17 @@ impl NostrRendezvous {
             endpoints = %endpoint_summary(&cached.advert.endpoints),
             "advert: resolved"
         );
-        self.advert.insert_fetched(peer_npub, cached.clone());
+        if let AdvertAdmission::Refused { first_at_bound } =
+            self.advert
+                .insert_fetched(peer_npub, cached.clone(), now_ms())
+        {
+            self.log_advert_cache_full(first_at_bound);
+            debug!(
+                peer = %short_npub(peer_npub),
+                reason = "cache-full",
+                "advert cache full; fetched advert used for this dial only"
+            );
+        }
         self.prune_advert_cache();
         Ok(cached.advert)
     }
@@ -1728,13 +1814,25 @@ impl NostrRendezvous {
         Ok(advert)
     }
 
+    /// Log one planning call's refused punch candidates, giving at most one
+    /// warning a minute for suspicious offers.
+    fn log_punch_refusals(&self, tally: &PunchTargetTally, peer: &str, session: &str) {
+        let warn = self
+            .refusal_warn
+            .lock()
+            .expect("refusal-warn mutex poisoned")
+            .decide(tally, Instant::now());
+        log_refusals(tally, peer, session, warn);
+    }
+
     fn prune_advert_cache(&self) {
-        if let Some((evicted, retained)) = self.advert.prune(now_ms()) {
+        let report = self.advert.prune(now_ms());
+        if report.evicted > 0 {
             debug!(
-                evicted,
-                retained,
+                evicted = report.evicted,
+                retained = report.retained,
                 cap = self.config.advert_cache_max_entries,
-                "advert cache overflow; evicted oldest entries"
+                "advert cache over cap; evicted unprotected entries"
             );
         }
     }
@@ -1940,6 +2038,7 @@ impl NostrRendezvous {
             pending_answers: Mutex::new(HashMap::new()),
             admission,
             signal_gate: SignalGate::new(Instant::now()),
+            refusal_warn: std::sync::Mutex::new(RefusalWarnGate::default()),
             shed_signals: AtomicU64::new(0),
             event_tx,
             event_rx: Mutex::new(event_rx),
@@ -2009,7 +2108,12 @@ impl NostrRendezvous {
     /// Insert a cached advert directly into the in-memory cache. Used by
     /// unit tests to set up consumer-side state without needing live relays.
     pub(crate) async fn insert_advert_for_test(&self, npub: String, advert: CachedOverlayAdvert) {
-        self.advert.insert_fetched(&npub, advert);
+        let _ = self.advert.insert_fetched(&npub, advert, now_ms());
+    }
+
+    /// The authors the advert cache currently protects.
+    pub(crate) fn advert_protection_for_test(&self) -> HashSet<String> {
+        self.advert.protected()
     }
 
     /// The cached `created_at` for `npub`, or `None` when nothing is cached.

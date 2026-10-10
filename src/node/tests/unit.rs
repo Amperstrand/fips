@@ -1333,9 +1333,12 @@ fn a_bootstrap_held_peer_is_never_its_own_configured_candidate() {
     let mut active_peer = ActivePeer::new(peer_identity, LinkId::new(7), Node::now_ms());
     active_peer.set_current_addr(transport_id, current_addr);
     node.peers.insert(peer_node_addr, active_peer);
-    node.supervisor
-        .nostr_rendezvous
-        .insert_bootstrap_transport(transport_id, npub);
+    node.supervisor.nostr_rendezvous.insert_bootstrap_transport(
+        transport_id,
+        npub,
+        peer_node_addr,
+        "203.0.113.5:41234".parse().unwrap(),
+    );
 
     assert!(
         !node.active_peer_matches_candidate(

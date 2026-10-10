@@ -816,21 +816,30 @@ A scan/probe loop dials discovered addresses, keeping the learned PSM
 per address beside a probe-cooldown book and falling back to the
 configured `DEFAULT_PSM` for a peer that advertises none.
 
-Peers are identified by node address, not by link address. A device
-using resolvable private addresses rotates continually, and modern
-phones do so by default, so an address-keyed pool sees every rotation as
-a new device and every already-connected guard fails to fire.
+A peer with a verified link is identified by node address, not by link
+address. A link is verified once the node's FIPS session with that peer
+uses it; the key a remote claims in the pre-handshake exchange proves
+nothing on its own. A device using resolvable private addresses rotates
+continually, and modern phones do so by default, so an address-keyed
+pool sees every rotation as a new device and every already-connected
+guard fails to fire.
 
 A second link to an already-linked node is arbitrated, never simply
 added, at the same address or another. A lone link is always admitted,
-whichever side dialled it. When the second link completes within one
-connect timeout of the first, the two raced — typically both nodes
-dialled each other — and both ends keep the link the node with the
-smaller address dialled. Each end admits the two links in its own order,
-so "keep the first" can leave each side holding the channel the other
-just closed; the node order is the one input both ends share. Outside
-that window the incumbent is kept, so address rotation and late redials
-cannot churn a settled link.
+whichever side dialled it. Beside a verified link a second link is
+declined: the verified one carries the node's session. Unverified links
+still settle an honest simultaneous dial. When the second link completes
+within one connect timeout of the first and runs in the opposite
+direction, the two raced — typically both nodes dialled each other — and
+both ends keep the link the node with the smaller address dialled. Each
+end admits the two links in its own order, so "keep the first" can leave
+each side holding the channel the other just closed; the node order is
+the one input both ends share. A second link at the address of an
+unverified one is declined unless it wins that race, since the pool holds
+one link per address. Any other second link is admitted beside the
+unverified one, because a claim that has not verified proves nothing,
+and the extra link leaves by eviction when the pool needs the slot. So
+address rotation and late redials cannot churn a verified link.
 
 Failing addresses back off by powers of two up to
 `MAX_PROBE_BACKOFF_SHIFT`, and the retry book is capped at
