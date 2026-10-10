@@ -1,0 +1,24 @@
+#!/bin/bash
+# C compiler for testing/cross-check/check.sh: zig cc for the zig target named
+# in $ZTARGET.
+#
+# The cc crate passes its own --target=<rust triple> (and, for Apple targets,
+# -mmacosx-version-min), which zig does not accept in that form; they are
+# dropped and replaced by zig's -target. zig is ${ZIG:-zig}, which check.sh
+# sets to the absolute path it found.
+set -u
+
+if [[ -z "${ZTARGET:-}" ]]; then
+    echo "zig-cc: ZTARGET is not set; this wrapper is meant to be run by testing/cross-check/check.sh" >&2
+    exit 2
+fi
+
+args=()
+for a in "$@"; do
+    case "$a" in
+        --target=*|-mmacosx-version-min=*) continue ;;
+    esac
+    args+=("$a")
+done
+
+exec "${ZIG:-zig}" cc -target "$ZTARGET" "${args[@]}"

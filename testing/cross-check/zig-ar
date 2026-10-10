@@ -1,0 +1,5 @@
+#!/bin/bash
+# Archiver for testing/cross-check/check.sh: zig ar, which writes archives in
+# the format of the target rather than the host's, and needs no host binutils.
+# zig is ${ZIG:-zig}, which check.sh sets to the absolute path it found.
+exec "${ZIG:-zig}" ar "$@"
