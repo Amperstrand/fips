@@ -7,11 +7,19 @@ Linux daemon, an Android app and a microcontroller, with each host
 supplying its own I/O around it.
 
 The crate is a workspace member next to the root `fips` package. Code
-moves in from the root crate one module at a time. It holds the identity
-types so far: `NodeAddr`, `Ipv6Address`, `PeerIdentity`, the npub and
-nsec encodings and `IdentityError`, re-exported by the root crate under
-`fips::identity`. `Identity`, which signs, stays in the root crate until
-randomness can be passed in.
+moves in from the root crate one module at a time. So far it holds:
+
+- the identity types: `NodeAddr`, `Ipv6Address`, `PeerIdentity`, the
+  npub and nsec encodings and `IdentityError`, re-exported by the root
+  crate under `fips::identity`. `Identity`, which signs, stays in the
+  root crate until randomness can be passed in;
+- the transport value types: `TransportId`, `LinkId`, `LinkDirection`,
+  `TransportAddr` and `LinkStats`, re-exported under `fips::transport`.
+  The transports themselves stay in the root crate;
+- `SessionIndex`, re-exported under `fips::utils::index`. Its random
+  allocator stays in the root crate;
+- the Noise handshake message sizes, re-exported under `fips::noise`.
+  The handshake itself stays in the root crate.
 
 ## What belongs here
 

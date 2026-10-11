@@ -69,8 +69,7 @@ pub(crate) mod stream;
 mod stats_common;
 pub(crate) use stats_common::PoolCounters;
 
-mod types;
-pub use types::*;
+pub use fips_core::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 
 // ============================================================================
 // Packet Channel Types

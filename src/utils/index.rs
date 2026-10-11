@@ -23,6 +23,8 @@ use rand::RngExt;
 use std::collections::HashSet;
 use thiserror::Error;
 
+pub use fips_core::utils::index::SessionIndex;
+
 /// Errors related to index allocation.
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -34,40 +36,6 @@ pub enum IndexError {
 
     #[error("index {0} already in use")]
     AlreadyInUse(u32),
-}
-
-/// A 32-bit session index.
-///
-/// Wrapper type for type safety and clarity in APIs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SessionIndex(u32);
-
-impl SessionIndex {
-    /// Create from raw u32.
-    pub fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// Get the raw u32 value.
-    pub fn as_u32(&self) -> u32 {
-        self.0
-    }
-
-    /// Convert to little-endian bytes.
-    pub fn to_le_bytes(&self) -> [u8; 4] {
-        self.0.to_le_bytes()
-    }
-
-    /// Create from little-endian bytes.
-    pub fn from_le_bytes(bytes: [u8; 4]) -> Self {
-        Self(u32::from_le_bytes(bytes))
-    }
-}
-
-impl core::fmt::Display for SessionIndex {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:08x}", self.0)
-    }
 }
 
 /// Allocator for session indices within a single transport.

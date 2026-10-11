@@ -10,6 +10,13 @@ changing anything here.
   brings in `std` for tests only, and lists the crate's modules.
 - `identity/`: node and peer identity types and their encodings. Its own
   README describes it.
+- `noise/`: the fixed sizes of Noise handshake messages and their parts.
+  Its own README describes it.
+- `transport/`: the transport value types (identifiers, address,
+  statistics) that transports and the protocol cores both name. Its own
+  README describes it.
+- `utils/`: small shared value types, so far the session index. Its own
+  README describes it.
 
 ## Rules for this level
 
