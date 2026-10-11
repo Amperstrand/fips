@@ -252,3 +252,50 @@ fn test_peer_identity_pubkey_full_preserved_parity() {
     // pubkey_full should return the exact key provided, preserving parity
     assert_eq!(peer.pubkey_full(), full_pubkey);
 }
+
+// ===== IdentityError conversions =====
+//
+// The four `From` impls are written by hand (see `mod.rs`). Each test makes
+// a real error of the wrapped type, converts it, and checks the variant, the
+// message, and that `source()` is `None`.
+
+#[test]
+fn test_identity_error_from_secp256k1_error() {
+    let inner = SecretKey::from_slice(&[0u8; 32]).unwrap_err();
+    let err = IdentityError::from(inner);
+    assert!(matches!(err, IdentityError::InvalidSecretKey(e) if e == inner));
+    assert_eq!(format!("{err}"), format!("invalid secret key: {inner}"));
+    assert!(core::error::Error::source(&err).is_none());
+}
+
+#[test]
+fn test_identity_error_from_bech32_encode_error() {
+    // A bech32 string is limited to 1023 characters; 1000 data bytes exceed it.
+    let inner =
+        bech32::encode::<bech32::Bech32>(bech32::Hrp::parse_unchecked("npub"), &[0u8; 1000])
+            .unwrap_err();
+    let text = format!("{inner}");
+    let err = IdentityError::from(inner);
+    assert!(matches!(err, IdentityError::Bech32Encode(_)));
+    assert_eq!(format!("{err}"), format!("bech32 encoding error: {text}"));
+    assert!(core::error::Error::source(&err).is_none());
+}
+
+#[test]
+fn test_identity_error_from_bech32_decode_error() {
+    let inner = bech32::decode("not bech32").unwrap_err();
+    let text = format!("{inner}");
+    let err = IdentityError::from(inner);
+    assert!(matches!(err, IdentityError::Bech32Decode(_)));
+    assert_eq!(format!("{err}"), format!("bech32 decoding error: {text}"));
+    assert!(core::error::Error::source(&err).is_none());
+}
+
+#[test]
+fn test_identity_error_from_hex_error() {
+    let inner = hex::decode("zz").unwrap_err();
+    let err = IdentityError::from(inner);
+    assert!(matches!(err, IdentityError::InvalidHex(e) if e == inner));
+    assert_eq!(format!("{err}"), format!("invalid hex encoding: {inner}"));
+    assert!(core::error::Error::source(&err).is_none());
+}

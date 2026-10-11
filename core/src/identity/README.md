@@ -33,9 +33,9 @@ algebraic structure.
 ## Files
 
 - `mod.rs`: declares the submodules and re-exports their public items.
-  It also holds the shared secp256k1 context and its `secp()` accessor,
-  `IPV6_ADDRESS_PREFIX` (`0xfd`), `IdentityError`, the `sha256` helper
-  and the private `hex_encode` helper.
+  It also holds the shared secp256k1 context and its `secp()` accessor;
+  `IPV6_ADDRESS_PREFIX` (`0xfd`); `IdentityError` and its `From` impls;
+  the `sha256` helper and the private `hex_encode` helper.
 - `address.rs`: `Ipv6Address`, the node's 128-bit IPv6 address with the
   `0xfd` prefix, and its conversion to `core::net::Ipv6Addr`.
 - `node_addr.rs`: `NodeAddr`, the 16-byte node identifier taken from the
@@ -62,9 +62,13 @@ algebraic structure.
   `pub(crate)`.
 - **`hex_encode` stays private.** It formats `NodeAddr` for display and
   is not re-exported.
-- **`IdentityError`.** Its `#[from]` fields need `std::error::Error` on
-  the `secp256k1`, `bech32` and `hex` error types, which is why
-  `core/Cargo.toml` enables `std` on those three. Changing a variant or a
+- **`IdentityError`.** The `From` impls for the `secp256k1`, `bech32`
+  and `hex` errors are written by hand, not derived with `#[from]`:
+  `#[from]` also makes the field the error's `source()`, which needs
+  the error trait on the field type, and those crates implement it
+  only with their `std` features. So `source()` returns `None` for
+  `InvalidSecretKey`, `Bech32Encode`, `Bech32Decode` and `InvalidHex`;
+  the inner error's text is in the message. Changing a variant or a
   message changes what the root crate's callers see.
 - **Secret material.** Only `encoding.rs` touches secret keys, to encode
   or decode an nsec, and it clears the raw byte copies it makes

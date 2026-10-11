@@ -48,7 +48,7 @@ pub const IPV6_ADDRESS_PREFIX: u8 = 0xfd;
 #[derive(Debug, Error)]
 pub enum IdentityError {
     #[error("invalid secret key: {0}")]
-    InvalidSecretKey(#[from] secp256k1::Error),
+    InvalidSecretKey(secp256k1::Error),
 
     #[error("signature verification failed")]
     SignatureVerificationFailed,
@@ -63,10 +63,10 @@ pub enum IdentityError {
     InvalidAddressPrefix(u8),
 
     #[error("bech32 encoding error: {0}")]
-    Bech32Encode(#[from] bech32::EncodeError),
+    Bech32Encode(bech32::EncodeError),
 
     #[error("bech32 decoding error: {0}")]
-    Bech32Decode(#[from] bech32::DecodeError),
+    Bech32Decode(bech32::DecodeError),
 
     #[error("invalid npub: expected 'npub' prefix, got '{0}'")]
     InvalidNpubPrefix(String),
@@ -81,7 +81,36 @@ pub enum IdentityError {
     InvalidNsecLength(usize),
 
     #[error("invalid hex encoding: {0}")]
-    InvalidHex(#[from] hex::FromHexError),
+    InvalidHex(hex::FromHexError),
+}
+
+// Written out rather than derived with `#[from]`: that also marks the field
+// as the error's source, which needs `core::error::Error` on the field type,
+// and `secp256k1`, `bech32` and `hex` implement it only with their `std`
+// features. So `source()` returns `None` for these four variants; the inner
+// error's text is in the `Display` output.
+impl From<secp256k1::Error> for IdentityError {
+    fn from(e: secp256k1::Error) -> Self {
+        Self::InvalidSecretKey(e)
+    }
+}
+
+impl From<bech32::EncodeError> for IdentityError {
+    fn from(e: bech32::EncodeError) -> Self {
+        Self::Bech32Encode(e)
+    }
+}
+
+impl From<bech32::DecodeError> for IdentityError {
+    fn from(e: bech32::DecodeError) -> Self {
+        Self::Bech32Decode(e)
+    }
+}
+
+impl From<hex::FromHexError> for IdentityError {
+    fn from(e: hex::FromHexError) -> Self {
+        Self::InvalidHex(e)
+    }
 }
 
 /// Compute SHA-256 hash of data.
