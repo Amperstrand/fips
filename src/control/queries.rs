@@ -1223,7 +1223,7 @@ pub fn show_cache(node: &Node) -> Value {
     let entries: Vec<Value> = cache
         .iter(now)
         .map(|(addr, entry)| {
-            let fips_addr = crate::identity::FipsAddress::from_node_addr(addr);
+            let fips_addr = crate::identity::Ipv6Address::from_node_addr(addr);
             let coord_path: Vec<String> = entry
                 .coords()
                 .entries()
@@ -1272,7 +1272,7 @@ pub(crate) fn show_cache_from_handle(handle: &super::read_handle::ControlReadHan
         .entries
         .iter()
         .map(|entry| {
-            let fips_addr = crate::identity::FipsAddress::from_node_addr(&entry.node_addr);
+            let fips_addr = crate::identity::Ipv6Address::from_node_addr(&entry.node_addr);
             let coord_path: Vec<String> = entry
                 .coord_path
                 .iter()
@@ -1615,7 +1615,7 @@ pub fn show_identity_cache(node: &Node) -> Value {
         .identity_cache_iter()
         .map(|(node_addr, pubkey, last_seen_ms)| {
             let (xonly, _parity) = pubkey.x_only_public_key();
-            let fips_addr = crate::identity::FipsAddress::from_node_addr(node_addr);
+            let fips_addr = crate::identity::Ipv6Address::from_node_addr(node_addr);
             json!({
                 "node_addr": hex::encode(node_addr.as_bytes()),
                 "npub": encode_npub(&xonly),
@@ -2461,7 +2461,7 @@ pub(crate) fn show_listening_sockets_from_handle(
 /// `NodeAddr` it derives the fips0 address, enumerates listening sockets, and
 /// classifies each against the shipped firewall baseline.
 fn render_listening_sockets(node_addr: &NodeAddr) -> Value {
-    let fips0 = crate::FipsAddress::from_node_addr(node_addr).to_ipv6();
+    let fips0 = crate::Ipv6Address::from_node_addr(node_addr).to_ipv6();
     let sockets = super::listening::enumerate(fips0);
     let classifier = super::firewall_state::FilterClassifier::query();
 

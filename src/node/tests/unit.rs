@@ -2240,7 +2240,7 @@ async fn test_transport_mtu_min_with_single_operational() {
 
 // path_mtu_lookup seeding for direct-link (configured) peers — closes the
 // B3 coverage gap where configured/auto-connect peers never go through the
-// discovery Lookup flow and so their FipsAddress was missing from
+// discovery Lookup flow and so their Ipv6Address was missing from
 // path_mtu_lookup, causing the SYN-time TCP MSS clamp to fall back to the
 // global ceiling.
 
@@ -2255,7 +2255,7 @@ async fn test_seed_path_mtu_inserts_when_empty() {
     node.transports.insert(TransportId::new(1), udp);
 
     let peer_addr = make_node_addr(0xAA);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.2:2121");
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
@@ -2295,7 +2295,7 @@ async fn test_seeded_narrow_link_mtu_reaches_the_clamp_as_a_tight_ceiling() {
     node.transports.insert(TransportId::new(1), udp);
 
     let peer_addr = make_node_addr(0xEE);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.6:2121");
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
@@ -2335,7 +2335,7 @@ async fn test_seed_path_mtu_keeps_tighter_existing_value() {
     node.transports.insert(TransportId::new(1), udp);
 
     let peer_addr = make_node_addr(0xBB);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.3:2121");
 
     // Pre-populate with a tighter value, e.g. learned from discovery's
@@ -2375,7 +2375,7 @@ async fn test_seed_path_mtu_tightens_looser_existing_value() {
     node.transports.insert(TransportId::new(1), udp);
 
     let peer_addr = make_node_addr(0xCC);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.4:2121");
 
     // Pre-populate with a looser stale value.
@@ -2407,7 +2407,7 @@ async fn test_seed_path_mtu_tightens_looser_existing_value() {
 async fn test_seed_path_mtu_noop_for_unknown_transport() {
     let node = make_node();
     let peer_addr = make_node_addr(0xDD);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.5:2121");
 
     // No transport registered — call must be a no-op, not panic.
@@ -2440,7 +2440,7 @@ async fn test_seed_path_mtu_reseeds_when_peer_moves_to_wider_transport() {
     node.transports.insert(TransportId::new(2), wide);
 
     let peer_addr = make_node_addr(0xE1);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let narrow_addr = TransportAddr::from_string("10.0.0.6:2121");
     let wide_addr = TransportAddr::from_string("10.0.0.7:2121");
 
@@ -2488,7 +2488,7 @@ async fn test_seed_path_mtu_discards_learned_value_from_abandoned_link() {
     node.transports.insert(TransportId::new(2), wide);
 
     let peer_addr = make_node_addr(0xE2);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let narrow_addr = TransportAddr::from_string("10.0.0.8:2121");
     let wide_addr = TransportAddr::from_string("10.0.0.9:2121");
 
@@ -2529,7 +2529,7 @@ async fn test_seed_path_mtu_keeps_tighter_value_when_reseeding_same_transport() 
     node.transports.insert(TransportId::new(1), udp);
 
     let peer_addr = make_node_addr(0xE3);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.10:2121");
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
@@ -2573,7 +2573,7 @@ async fn test_releasing_a_path_drops_the_seeding_transport_record_with_the_value
     node.transports.insert(TransportId::new(1), udp);
 
     let peer_addr = make_node_addr(0xE4);
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.11:2121");
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
@@ -2628,7 +2628,7 @@ async fn test_releasing_a_path_for_a_still_linked_peer_reseeds_both_stores() {
 
     let identity = make_peer_identity();
     let peer_addr = *identity.node_addr();
-    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let fips_addr = crate::Ipv6Address::from_node_addr(&peer_addr);
     let transport_addr = TransportAddr::from_string("10.0.0.12:2121");
 
     let mut peer = crate::peer::ActivePeer::new(identity, LinkId::new(1), 0);
@@ -4270,7 +4270,7 @@ async fn dns_responder_serves_a_proxying_embedder() {
     assert_eq!(
         std::net::Ipv6Addr::from(aaaa.address),
         peer.address().to_ipv6(),
-        "AAAA must be the peer's FipsAddress",
+        "AAAA must be the peer's Ipv6Address",
     );
 
     // The identity leg. `run_rx_loop` owns the node for its whole life, so the

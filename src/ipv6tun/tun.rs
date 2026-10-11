@@ -11,9 +11,9 @@
 //! - Windows: Uses the `wintun` crate for TUN device support
 
 #[cfg(windows)]
-use crate::FipsAddress;
+use crate::Ipv6Address;
 #[cfg(unix)]
-use crate::{FipsAddress, TunConfig};
+use crate::{Ipv6Address, TunConfig};
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
@@ -112,11 +112,11 @@ pub(crate) fn per_flow_max_mss(
         );
         return empty_lookup_ceiling;
     }
-    let Ok(fips_addr) = FipsAddress::from_slice(addr_bytes) else {
+    let Ok(fips_addr) = Ipv6Address::from_slice(addr_bytes) else {
         trace!(
             global_max_mss,
             empty_lookup_ceiling,
-            "per_flow_max_mss: FipsAddress::from_slice rejected (non-fd::/8 prefix), fall back to conservative ceiling"
+            "per_flow_max_mss: Ipv6Address::from_slice rejected (non-fd::/8 prefix), fall back to conservative ceiling"
         );
         return empty_lookup_ceiling;
     };
@@ -258,7 +258,7 @@ pub struct TunDevice {
     device: tun::Device,
     name: String,
     mtu: u16,
-    address: FipsAddress,
+    address: Ipv6Address,
 }
 
 #[cfg(unix)]
@@ -269,7 +269,7 @@ impl TunDevice {
     /// Otherwise, creates a new TUN device.
     ///
     /// This requires CAP_NET_ADMIN capability (run with sudo or setcap).
-    pub async fn create(config: &TunConfig, address: FipsAddress) -> Result<Self, TunError> {
+    pub async fn create(config: &TunConfig, address: Ipv6Address) -> Result<Self, TunError> {
         // Check if IPv6 is enabled
         if platform::is_ipv6_disabled() {
             return Err(TunError::Ipv6Disabled);
@@ -358,7 +358,7 @@ impl TunDevice {
     }
 
     /// Get the FIPS address assigned to this device.
-    pub fn address(&self) -> &FipsAddress {
+    pub fn address(&self) -> &Ipv6Address {
         &self.address
     }
 
@@ -611,7 +611,7 @@ impl TunWriter {
 pub fn run_tun_reader(
     mut device: TunDevice,
     mtu: u16,
-    our_addr: FipsAddress,
+    our_addr: Ipv6Address,
     tun_tx: TunTx,
     outbound_tx: TunOutboundTx,
     max_mss: MssCeiling,
@@ -674,7 +674,7 @@ impl Drop for ShutdownFd {
 pub fn run_tun_reader(
     mut device: TunDevice,
     mtu: u16,
-    our_addr: FipsAddress,
+    our_addr: Ipv6Address,
     tun_tx: TunTx,
     outbound_tx: TunOutboundTx,
     max_mss: MssCeiling,
@@ -792,7 +792,7 @@ fn handle_tun_packet(
     packet: &mut [u8],
     max_mss: u16,
     name: &str,
-    our_addr: FipsAddress,
+    our_addr: Ipv6Address,
     tun_tx: &TunTx,
     outbound_tx: &TunOutboundTx,
     path_mtu_lookup: &PathMtuLookup,
@@ -946,7 +946,7 @@ mod windows_tun {
         _adapter: Arc<wintun::Adapter>,
         name: String,
         mtu: u16,
-        address: FipsAddress,
+        address: Ipv6Address,
     }
 
     impl TunDevice {
@@ -955,7 +955,7 @@ mod windows_tun {
         /// Loads the wintun DLL, creates (or reopens) a named adapter, starts
         /// a session with a 2 MiB ring buffer, and configures the interface
         /// via netsh. Requires Administrator privileges.
-        pub async fn create(config: &TunConfig, address: FipsAddress) -> Result<Self, TunError> {
+        pub async fn create(config: &TunConfig, address: Ipv6Address) -> Result<Self, TunError> {
             let name = config.name();
             let mtu = config.mtu();
 
@@ -1018,7 +1018,7 @@ mod windows_tun {
         }
 
         /// Get the FIPS address assigned to this device.
-        pub fn address(&self) -> &FipsAddress {
+        pub fn address(&self) -> &Ipv6Address {
             &self.address
         }
 
@@ -1180,7 +1180,7 @@ mod windows_tun {
     pub fn run_tun_reader(
         mut device: TunDevice,
         mtu: u16,
-        our_addr: FipsAddress,
+        our_addr: Ipv6Address,
         tun_tx: TunTx,
         outbound_tx: TunOutboundTx,
         max_mss: MssCeiling,
@@ -1626,11 +1626,11 @@ mod tests {
     // per_flow_max_mss — per-destination MSS clamp regression coverage
     // ========================================================================
 
-    fn fips_addr_with_node_byte(b: u8) -> FipsAddress {
+    fn fips_addr_with_node_byte(b: u8) -> Ipv6Address {
         let mut bytes = [0u8; 16];
         bytes[0] = crate::identity::FIPS_ADDRESS_PREFIX;
         bytes[1] = b;
-        FipsAddress::from_bytes(bytes).unwrap()
+        Ipv6Address::from_bytes(bytes).unwrap()
     }
 
     fn empty_lookup() -> PathMtuLookup {
@@ -1827,7 +1827,7 @@ mod tests {
 
     /// Build a minimal 40-byte IPv6 packet (no upper-layer payload) addressed
     /// to `dst`, sourced from a distinct fips address.
-    fn ipv6_packet_to(dst: &FipsAddress) -> Vec<u8> {
+    fn ipv6_packet_to(dst: &Ipv6Address) -> Vec<u8> {
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x60; // version 6
         pkt[6] = 59; // next header = No Next Header (skips MSS clamp)

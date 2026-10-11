@@ -142,13 +142,13 @@ fn test_fips_address_validation() {
     // Valid address with fd prefix
     let mut valid = [0u8; 16];
     valid[0] = 0xfd;
-    assert!(FipsAddress::from_bytes(valid).is_ok());
+    assert!(Ipv6Address::from_bytes(valid).is_ok());
 
     // Invalid prefix
     let mut invalid = [0u8; 16];
     invalid[0] = 0xfe;
     assert!(matches!(
-        FipsAddress::from_bytes(invalid),
+        Ipv6Address::from_bytes(invalid),
         Err(IdentityError::InvalidAddressPrefix(0xfe))
     ));
 }
@@ -468,7 +468,7 @@ fn test_fips_address_from_slice_success() {
     let mut bytes = [0u8; 16];
     bytes[0] = 0xfd;
     bytes[1] = 0x42;
-    let addr = FipsAddress::from_slice(&bytes).unwrap();
+    let addr = Ipv6Address::from_slice(&bytes).unwrap();
     assert_eq!(addr.as_bytes(), &bytes);
 }
 
@@ -476,13 +476,13 @@ fn test_fips_address_from_slice_success() {
 fn test_fips_address_from_slice_wrong_length() {
     let short = [0xfd; 8];
     assert!(matches!(
-        FipsAddress::from_slice(&short),
+        Ipv6Address::from_slice(&short),
         Err(IdentityError::InvalidAddressLength(8))
     ));
 
     let long = [0xfd; 20];
     assert!(matches!(
-        FipsAddress::from_slice(&long),
+        Ipv6Address::from_slice(&long),
         Err(IdentityError::InvalidAddressLength(20))
     ));
 }
@@ -492,7 +492,7 @@ fn test_fips_address_from_slice_wrong_prefix() {
     let mut bytes = [0u8; 16];
     bytes[0] = 0xfe;
     assert!(matches!(
-        FipsAddress::from_slice(&bytes),
+        Ipv6Address::from_slice(&bytes),
         Err(IdentityError::InvalidAddressPrefix(0xfe))
     ));
 }
@@ -510,9 +510,9 @@ fn test_fips_address_into_ipv6() {
 fn test_fips_address_debug() {
     let mut bytes = [0u8; 16];
     bytes[0] = 0xfd;
-    let addr = FipsAddress::from_bytes(bytes).unwrap();
+    let addr = Ipv6Address::from_bytes(bytes).unwrap();
     let debug = format!("{:?}", addr);
-    assert!(debug.starts_with("FipsAddress("));
+    assert!(debug.starts_with("Ipv6Address("));
     assert!(debug.contains("fd"));
 }
 
@@ -520,7 +520,7 @@ fn test_fips_address_debug() {
 fn test_fips_address_display() {
     let mut bytes = [0u8; 16];
     bytes[0] = 0xfd;
-    let addr = FipsAddress::from_bytes(bytes).unwrap();
+    let addr = Ipv6Address::from_bytes(bytes).unwrap();
     let display = format!("{}", addr);
     // Display is the IPv6 representation
     assert!(display.starts_with("fd"));
@@ -530,7 +530,7 @@ fn test_fips_address_display() {
 fn test_fips_address_eq_hash() {
     let identity = Identity::generate();
     let addr1 = *identity.address();
-    let addr2 = FipsAddress::from_node_addr(identity.node_addr());
+    let addr2 = Ipv6Address::from_node_addr(identity.node_addr());
     assert_eq!(addr1, addr2);
 
     let mut set = HashSet::new();

@@ -17,7 +17,7 @@
 use super::limits::FSP_CUTOVER_DELAY_MS;
 use super::quorum::QuorumVerdict;
 use crate::proto::stp::TreeCoordinate;
-use crate::{FipsAddress, NodeAddr};
+use crate::{Ipv6Address, NodeAddr};
 
 /// FSP session-lifecycle subsystem anchor owned by [`Node`](crate::node::Node).
 ///
@@ -100,10 +100,10 @@ pub(crate) enum FspAction {
     /// keeping the value (`coord_cache.demote`). The entry goes on routing,
     /// but no longer refuses a hint that replaces it.
     DemoteCoords { addr: NodeAddr },
-    /// Write `mtu` into the shared `FipsAddress`-keyed path-MTU lookup, keeping
+    /// Write `mtu` into the shared `Ipv6Address`-keyed path-MTU lookup, keeping
     /// the tighter of existing-or-new (the shell applies the write under the
     /// `path_mtu_lookup` guard).
-    TightenPathMtuLookup { fips_addr: FipsAddress, mtu: u16 },
+    TightenPathMtuLookup { fips_addr: Ipv6Address, mtu: u16 },
     /// Trigger discovery toward `dest` (`maybe_initiate_lookup`). The
     /// `CoordsRequired` decision emits it only when the target's identity is
     /// cached; the `PathBroken` decision emits it always.
@@ -489,7 +489,7 @@ impl Fsp {
     /// under one `path_mtu_lookup` write guard, so the decision stays atomic.
     pub(crate) fn plan_path_mtu_tighten(
         &self,
-        fips_addr: FipsAddress,
+        fips_addr: Ipv6Address,
         existing: Option<u16>,
         candidate: u16,
     ) -> Vec<FspAction> {
@@ -522,7 +522,7 @@ pub(crate) fn initiation_winner(our_node_addr: &NodeAddr, their_node_addr: &Node
 }
 
 /// Decide whether a path-MTU update should be applied to the shared
-/// `FipsAddress`-keyed lookup: keep the tighter of existing-or-candidate, never
+/// `Ipv6Address`-keyed lookup: keep the tighter of existing-or-candidate, never
 /// loosen. Returns `true` when `candidate` should be written (there is no
 /// existing value, or the candidate is strictly tighter). An equal candidate is
 /// not written, so the stored entry, and any learn time it carries, is kept.

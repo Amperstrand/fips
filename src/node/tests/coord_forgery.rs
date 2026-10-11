@@ -474,7 +474,7 @@ async fn a_kept_entry_keeps_its_path_mtu_when_the_release_is_rate_limited() {
     let dest = fx.dest;
     let real = fx.real.clone();
     let p2 = fx.p2;
-    let fips = crate::FipsAddress::from_node_addr(&dest);
+    let fips = crate::Ipv6Address::from_node_addr(&dest);
 
     // The first report spends the release budget for this destination.
     fx.path_broken(make_node_addr(0xB1), p2).await;

@@ -181,7 +181,7 @@ impl ProbeReport {
                 npub: job.npub().to_string(),
                 node_addr: target.to_string(),
                 display_name: node.peer_display_name(&target),
-                ipv6_addr: crate::FipsAddress::from_node_addr(&target).to_string(),
+                ipv6_addr: crate::Ipv6Address::from_node_addr(&target).to_string(),
             },
             overall: snap.overall.name(),
             elapsed_ms: job.probe().elapsed_ms(now_ms),

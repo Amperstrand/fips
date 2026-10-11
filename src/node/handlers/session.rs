@@ -721,9 +721,9 @@ impl Node {
 
                 match dst_port {
                     FSP_PORT_IPV6_SHIM => {
-                        use crate::FipsAddress;
-                        let src_ipv6 = FipsAddress::from_node_addr(src_addr).to_ipv6().octets();
-                        let dst_ipv6 = FipsAddress::from_node_addr(self.node_addr())
+                        use crate::Ipv6Address;
+                        let src_ipv6 = Ipv6Address::from_node_addr(src_addr).to_ipv6().octets();
+                        let dst_ipv6 = Ipv6Address::from_node_addr(self.node_addr())
                             .to_ipv6()
                             .octets();
 
@@ -2002,13 +2002,13 @@ impl Node {
             "Path MTU changed via notification"
         );
 
-        // Mirror the new effective MTU into the FipsAddress-keyed lookup used
+        // Mirror the new effective MTU into the Ipv6Address-keyed lookup used
         // by the TUN reader/writer at TCP MSS clamp time. Without this, new
         // TCP flows opened on a path the proactive end-to-end echo has
         // already tightened keep getting clamped by the staler discovery-
         // time value until a reactive MtuExceeded happens to fire. Keep the
         // tighter of existing-or-new — never loosen the clamp.
-        let fips_addr = crate::FipsAddress::from_node_addr(src_addr);
+        let fips_addr = crate::Ipv6Address::from_node_addr(src_addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => {
                 // Read existing, decide, and apply the write under one guard so
@@ -2489,7 +2489,7 @@ impl Node {
         );
 
         // Both effects below — the session's own path MTU and the
-        // FipsAddress-keyed lookup the TUN MSS clamp reads — are refused from
+        // Ipv6Address-keyed lookup the TUN MSS clamp reads — are refused from
         // here, so one return covers both. The guards sit ahead of the apply
         // rather than between the two effects, which is what makes the floor
         // govern `current_mtu` and not only the lookup table.
@@ -2565,7 +2565,7 @@ impl Node {
             entry.clear_sent_wire_len();
         }
 
-        // Mirror the bottleneck into the FipsAddress-keyed lookup used by
+        // Mirror the bottleneck into the Ipv6Address-keyed lookup used by
         // the TUN reader/writer at TCP MSS clamp time. Discovery's reverse-
         // path response can carry a value too generous for the actual
         // forward path; the reactive signal from a forwarder that actually
@@ -2574,7 +2574,7 @@ impl Node {
         //
         // The admission gate above, not this block, is what restricts which
         // addresses can be written here.
-        let fips_addr = crate::FipsAddress::from_node_addr(&msg.dest_addr);
+        let fips_addr = crate::Ipv6Address::from_node_addr(&msg.dest_addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => {
                 // Read existing, decide, and apply the write under one guard so
@@ -3709,7 +3709,7 @@ impl Node {
     /// Borrow the host-facing ICMPv6 sender: the TUN channel, our address
     /// and the Packet Too Big rate limiter.
     pub(in crate::node) fn host_icmp(&mut self) -> IcmpContext<'_> {
-        let our_ipv6 = crate::FipsAddress::from_node_addr(self.node_addr()).to_ipv6();
+        let our_ipv6 = crate::Ipv6Address::from_node_addr(self.node_addr()).to_ipv6();
         IcmpContext::new(
             self.supervisor.ipv6tun.tun_tx.as_ref(),
             our_ipv6,

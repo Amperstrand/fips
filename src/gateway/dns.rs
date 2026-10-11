@@ -58,8 +58,8 @@ fn extract_aaaa(packet: &Packet) -> Option<Ipv6Addr> {
 /// Derive NodeAddr from a FIPS mesh address (fd00::/8).
 /// Returns None unless the address carries the FIPS prefix.
 fn node_addr_from_mesh(mesh_addr: Ipv6Addr) -> Option<NodeAddr> {
-    // FipsAddress = [0xfd, node_addr[0..15]], so node_addr[0..15] = bytes[1..16].
-    let bytes = *crate::identity::FipsAddress::from_bytes(mesh_addr.octets())
+    // Ipv6Address = [0xfd, node_addr[0..15]], so node_addr[0..15] = bytes[1..16].
+    let bytes = *crate::identity::Ipv6Address::from_bytes(mesh_addr.octets())
         .ok()?
         .as_bytes();
     let mut node_bytes = [0u8; 16];

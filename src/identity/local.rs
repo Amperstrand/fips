@@ -6,7 +6,7 @@ use zeroize::Zeroize;
 
 use super::auth::{AuthResponse, auth_challenge_digest};
 use super::encoding::{decode_secret, encode_npub};
-use super::{FipsAddress, IdentityError, NodeAddr, sha256};
+use super::{IdentityError, Ipv6Address, NodeAddr, sha256};
 
 /// A FIPS node identity consisting of a keypair and derived identifiers.
 ///
@@ -27,7 +27,7 @@ use super::{FipsAddress, IdentityError, NodeAddr, sha256};
 pub struct Identity {
     keypair: Keypair,
     node_addr: NodeAddr,
-    address: FipsAddress,
+    address: Ipv6Address,
 }
 
 impl Identity {
@@ -47,7 +47,7 @@ impl Identity {
     pub fn from_keypair(mut keypair: Keypair) -> Self {
         let (pubkey, _parity) = keypair.x_only_public_key();
         let node_addr = NodeAddr::from_pubkey(&pubkey);
-        let address = FipsAddress::from_node_addr(&node_addr);
+        let address = Ipv6Address::from_node_addr(&node_addr);
         let identity = Self {
             keypair,
             node_addr,
@@ -110,7 +110,7 @@ impl Identity {
     }
 
     /// Return the FIPS address.
-    pub fn address(&self) -> &FipsAddress {
+    pub fn address(&self) -> &Ipv6Address {
         &self.address
     }
 

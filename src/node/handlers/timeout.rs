@@ -723,7 +723,7 @@ impl Node {
 
         // Read-scan first: an ordinary tick expires nothing, and the TUN
         // reader and writer take this lock on every packet.
-        let expired: Vec<crate::FipsAddress> = match self.path_mtu_lookup.read() {
+        let expired: Vec<crate::Ipv6Address> = match self.path_mtu_lookup.read() {
             Ok(map) => map
                 .iter()
                 .filter(|(_, e)| stale(e))
@@ -761,7 +761,7 @@ impl Node {
         // direct peer's link MTU under keep-tighter, so an expired entry may
         // be sitting on top of a seed, and a bare removal would drop that peer
         // to the conservative ceiling until its link re-handshakes.
-        let gone: std::collections::HashSet<crate::FipsAddress> = expired.iter().copied().collect();
+        let gone: std::collections::HashSet<crate::Ipv6Address> = expired.iter().copied().collect();
         let seeds: Vec<(
             crate::NodeAddr,
             crate::transport::TransportId,
@@ -769,7 +769,7 @@ impl Node {
         )> = self
             .peers
             .iter()
-            .filter(|(addr, _)| gone.contains(&crate::FipsAddress::from_node_addr(addr)))
+            .filter(|(addr, _)| gone.contains(&crate::Ipv6Address::from_node_addr(addr)))
             .filter_map(|(addr, p)| Some((*addr, p.transport_id()?, p.current_addr()?.clone())))
             .collect();
         for (addr, tid, taddr) in seeds {

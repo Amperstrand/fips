@@ -17,13 +17,17 @@ use secp256k1::{All, Secp256k1};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub use address::FipsAddress;
+pub use address::Ipv6Address;
 pub use auth::{AuthChallenge, AuthResponse};
 pub use encoding::{decode_npub, decode_nsec, decode_secret, encode_npub, encode_nsec};
 pub(crate) use local::ErasingKeypair;
 pub use local::Identity;
 pub use node_addr::NodeAddr;
 pub use peer::PeerIdentity;
+
+/// Former name of [`Ipv6Address`], kept so code written against it still builds.
+#[deprecated(note = "renamed to Ipv6Address")]
+pub type FipsAddress = Ipv6Address;
 
 /// Shared secp256k1 context reused across all identity operations.
 ///

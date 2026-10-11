@@ -671,8 +671,8 @@ async fn test_session_100_nodes() {
         let src_addr = all_info[src].0;
 
         // Build IPv6 packets with pair index as payload
-        let src_fips = crate::FipsAddress::from_node_addr(&src_addr);
-        let dst_fips = crate::FipsAddress::from_node_addr(&dest_addr);
+        let src_fips = crate::Ipv6Address::from_node_addr(&src_addr);
+        let dst_fips = crate::Ipv6Address::from_node_addr(&dest_addr);
 
         // Forward: initiator → responder
         let fwd_payload = format!("fwd-{}", pair_idx).into_bytes();
@@ -956,8 +956,8 @@ async fn test_session_100_nodes() {
 
 /// Build a minimal valid IPv6 packet with given source and destination addresses.
 fn build_ipv6_packet(
-    src: &crate::FipsAddress,
-    dst: &crate::FipsAddress,
+    src: &crate::Ipv6Address,
+    dst: &crate::Ipv6Address,
     payload: &[u8],
 ) -> Vec<u8> {
     let payload_len = payload.len() as u16;
@@ -1024,8 +1024,8 @@ async fn test_tun_outbound_established_session() {
     let node1_addr = *nodes[1].node.node_addr();
     let node1_pubkey = nodes[1].node.identity().pubkey_full();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     // Establish session (XK: 3 messages — Setup, Ack, Msg3)
     nodes[0]
@@ -1129,8 +1129,8 @@ async fn a_tun_send_on_a_session_that_lost_its_route_looks_the_route_up_again() 
     let (mut nodes, node2_addr) = session_with_its_route_lost(false).await;
     let node0_addr = *nodes[0].node.node_addr();
     let (_tun_outbound, tun_rx) = nodes[2].node.enable_app_owned_tun();
-    let src = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst = crate::FipsAddress::from_node_addr(&node2_addr);
+    let src = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst = crate::Ipv6Address::from_node_addr(&node2_addr);
 
     // This packet finds no route and is lost, but it starts the lookup.
     nodes[0]
@@ -1257,8 +1257,8 @@ async fn rekey_cutover_preserves_data_plane() {
     // node 1's TUN receiver observes decoded plaintext.
     let (tun_tx, tun_rx) = std::sync::mpsc::channel();
     nodes[1].node.install_tun(tun_tx);
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     // Baseline: data decodes on the original session, and this send bumps the
     // counter across the rekey trigger.
@@ -1352,8 +1352,8 @@ pub(super) struct AgedLinkPair {
     pub(super) nodes: Vec<TestNode>,
     pub(super) node0_addr: NodeAddr,
     pub(super) node1_addr: NodeAddr,
-    pub(super) fips0: crate::FipsAddress,
-    pub(super) fips1: crate::FipsAddress,
+    pub(super) fips0: crate::Ipv6Address,
+    pub(super) fips1: crate::Ipv6Address,
     pub(super) tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     pub(super) tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 }
@@ -1405,8 +1405,8 @@ pub(super) async fn aged_link_pair(
     nodes[0].node.install_tun(tun0_tx);
     let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
     nodes[1].node.install_tun(tun1_tx);
-    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
-    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+    let fips0 = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let fips1 = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     // Baseline: both directions decode before the caller's scenario, so a
     // later failure is the scenario's and not the harness's.
@@ -1449,8 +1449,8 @@ pub(super) struct HeldMsg2Pair {
     pub(super) nodes: Vec<TestNode>,
     pub(super) node0_addr: NodeAddr,
     pub(super) node1_addr: NodeAddr,
-    pub(super) fips0: crate::FipsAddress,
-    pub(super) fips1: crate::FipsAddress,
+    pub(super) fips0: crate::Ipv6Address,
+    pub(super) fips1: crate::Ipv6Address,
     pub(super) tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     pub(super) tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     pub(super) node0_idx_before: Option<crate::utils::index::SessionIndex>,
@@ -3018,8 +3018,8 @@ async fn test_tun_outbound_triggers_session_initiation() {
     let node0_addr = *nodes[0].node.node_addr();
     let node1_addr = *nodes[1].node.node_addr();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     // No session yet
     assert_eq!(nodes[0].node.session_count(), 0);
@@ -3081,11 +3081,11 @@ async fn test_tun_outbound_unknown_destination() {
     let (tun_tx, tun_rx) = std::sync::mpsc::channel();
     nodes[0].node.install_tun(tun_tx);
 
-    let src_fips = crate::FipsAddress::from_node_addr(nodes[0].node.node_addr());
+    let src_fips = crate::Ipv6Address::from_node_addr(nodes[0].node.node_addr());
 
     // Build a packet to an unknown FIPS address (not in identity cache)
     let unknown_addr = NodeAddr::from_bytes([0xAA; 16]);
-    let unknown_fips = crate::FipsAddress::from_node_addr(&unknown_addr);
+    let unknown_fips = crate::Ipv6Address::from_node_addr(&unknown_addr);
     let ipv6_packet = build_ipv6_packet(&src_fips, &unknown_fips, b"unknown");
 
     nodes[0].node.handle_tun_outbound(ipv6_packet).await;
@@ -3121,8 +3121,8 @@ async fn test_tun_outbound_3node_forwarded() {
     let node0_addr = *nodes[0].node.node_addr();
     let node2_addr = *nodes[2].node.node_addr();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node2_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node2_addr);
 
     // Register Node 2's identity in Node 0's cache
     // (In production, this would come from the discovery protocol or DNS priming)
@@ -3171,8 +3171,8 @@ async fn test_tun_outbound_pending_queue_flush() {
     let node0_addr = *nodes[0].node.node_addr();
     let node1_addr = *nodes[1].node.node_addr();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     // Install TUN receiver on Node 1
     let (tun_tx, tun_rx) = std::sync::mpsc::channel();
@@ -3254,8 +3254,8 @@ async fn inside_the_hold_a_bloom_miss_packet_is_held_and_a_retransmit_after_the_
     let a = *nodes[0].node.node_addr();
     let b = *nodes[1].node.node_addr();
     let c = *nodes[2].node.node_addr();
-    let src = crate::FipsAddress::from_node_addr(&a);
-    let dst = crate::FipsAddress::from_node_addr(&c);
+    let src = crate::Ipv6Address::from_node_addr(&a);
+    let dst = crate::Ipv6Address::from_node_addr(&c);
 
     // B's filter on A, kept so it can arrive again later; meanwhile A sees an
     // empty one, as before B's filter reached it.
@@ -3344,8 +3344,8 @@ async fn outside_the_hold_a_packet_to_a_destination_a_tree_peer_filter_reaches_i
     let initiated = nodes[0].node.metrics().lookup.req_initiated.get();
 
     let packet = build_ipv6_packet(
-        &crate::FipsAddress::from_node_addr(&a),
-        &crate::FipsAddress::from_node_addr(&c),
+        &crate::Ipv6Address::from_node_addr(&a),
+        &crate::Ipv6Address::from_node_addr(&c),
         b"first",
     );
     nodes[0].node.handle_tun_outbound(packet.clone()).await;
@@ -3387,8 +3387,8 @@ async fn hold_a_bloom_miss_for_c_and_backdate_it(
     );
     let misses = nodes[0].node.metrics().lookup.req_bloom_miss.get();
     let packet = build_ipv6_packet(
-        &crate::FipsAddress::from_node_addr(&a),
-        &crate::FipsAddress::from_node_addr(&c),
+        &crate::Ipv6Address::from_node_addr(&a),
+        &crate::Ipv6Address::from_node_addr(&c),
         b"syn",
     );
     nodes[0].node.handle_tun_outbound(packet).await;
@@ -3418,8 +3418,8 @@ async fn a_destination_held_inside_the_hold_whose_session_starts_on_a_retransmit
     populate_all_coord_caches(&mut nodes);
     let initiated = nodes[0].node.metrics().lookup.req_initiated.get();
     let retransmit = build_ipv6_packet(
-        &crate::FipsAddress::from_node_addr(&a),
-        &crate::FipsAddress::from_node_addr(&c),
+        &crate::Ipv6Address::from_node_addr(&a),
+        &crate::Ipv6Address::from_node_addr(&c),
         b"syn-retransmit",
     );
     nodes[0].node.handle_tun_outbound(retransmit).await;
@@ -3517,8 +3517,8 @@ async fn with_the_held_table_full_a_destination_with_an_initiating_session_gets_
     }
     assert_eq!(nodes[0].node.pending_tun_destinations(), cap);
 
-    let src = crate::FipsAddress::from_node_addr(&node0);
-    let dst = crate::FipsAddress::from_node_addr(&node1);
+    let src = crate::Ipv6Address::from_node_addr(&node0);
+    let dst = crate::Ipv6Address::from_node_addr(&node1);
     nodes[0]
         .node
         .handle_tun_outbound(build_ipv6_packet(&src, &dst, b"first"))
@@ -4114,8 +4114,8 @@ async fn test_tun_outbound_path_mtu_generates_ptb() {
     let node1_addr = *nodes[1].node.node_addr();
     let node1_pubkey = nodes[1].node.identity().pubkey_full();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     // Establish session (XK: 3 messages — Setup, Ack, Msg3)
     nodes[0]
@@ -4258,8 +4258,8 @@ async fn test_multihop_pmtud_heterogeneous_mtu() {
     let node0_addr = *nodes[0].node.node_addr();
     let node2_addr = *nodes[2].node.node_addr();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node2_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node2_addr);
 
     // Register Node 2's identity in Node 0's cache
     let node2_pubkey = nodes[2].node.identity().pubkey_full();
@@ -4493,7 +4493,7 @@ async fn test_handle_mtu_exceeded_writes_path_mtu_lookup_when_empty() {
     install_established_session_with_mmp(&mut tn.node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     assert!(
         tn.node.path_mtu_lookup_get(&dest_fips).is_none(),
@@ -4521,7 +4521,7 @@ async fn test_handle_mtu_exceeded_tightens_existing_path_mtu_lookup() {
     install_established_session_with_mmp(&mut tn.node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     // Pre-seed with a generous value (e.g., from a discovery reverse-path
     // response that didn't reflect the forward-path bottleneck).
@@ -4548,7 +4548,7 @@ async fn test_handle_mtu_exceeded_keeps_tighter_existing_path_mtu_lookup() {
     install_established_session_with_mmp(&mut tn.node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     // Pre-seed with a tighter value than the incoming signal (e.g., from
     // a prior reactive event on a narrower hop). The clamp must never
@@ -4581,7 +4581,7 @@ async fn test_handle_mtu_exceeded_below_floor_leaves_path_mtu_lookup_untouched()
     install_initiating(&mut tn.node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 100);
     tn.node.handle_mtu_exceeded(&reporter, &inner).await;
@@ -4658,7 +4658,7 @@ async fn test_handle_mtu_exceeded_at_the_floor_still_writes_path_mtu_lookup() {
     install_initiating(&mut tn.node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
     let floor = crate::proto::mmp::MIN_REACTIVE_PATH_MTU;
 
     note_sent_wire_len(&mut tn.node, &dest, 1400);
@@ -4689,8 +4689,8 @@ async fn test_forged_mtu_exceeded_of_zero_does_not_blackhole_the_session() {
     let node1_addr = *nodes[1].node.node_addr();
     let node1_pubkey = nodes[1].node.identity().pubkey_full();
 
-    let src_fips = crate::FipsAddress::from_node_addr(&node0_addr);
-    let dst_fips = crate::FipsAddress::from_node_addr(&node1_addr);
+    let src_fips = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let dst_fips = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     nodes[0]
         .node
@@ -4759,7 +4759,7 @@ async fn test_path_broken_releases_path_mtu_lookup_entry() {
     install_initiating(&mut tn.node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     tn.node.path_mtu_lookup_insert(dest_fips, 700);
     assert_eq!(tn.node.path_mtu_lookup_get(&dest_fips), Some(700));
@@ -4856,7 +4856,7 @@ async fn node_with_link_seed(
 ) -> (
     Node,
     crate::NodeAddr,
-    crate::FipsAddress,
+    crate::Ipv6Address,
     TransportId,
     TransportAddr,
 ) {
@@ -4886,7 +4886,7 @@ async fn node_with_link_seed(
 
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
     let transport_addr = TransportAddr::from_string("127.0.0.1:2121");
 
     node.seed_path_mtu_for_link_peer(&remote_addr, transport_id, &transport_addr);
@@ -4986,7 +4986,7 @@ async fn test_mirrored_notification_path_mtu_survives_a_purge() {
     let mut node = make_node();
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
 
     install_established_session_with_mmp(&mut node, &remote);
 
@@ -5023,7 +5023,7 @@ async fn test_mtu_exceeded_naming_a_dest_with_no_session_does_not_touch_path_mtu
 
     let dest = NodeAddr::from_bytes([0xCC; 16]);
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     assert!(
         node.path_mtu_lookup_get(&dest_fips).is_none(),
@@ -5075,7 +5075,7 @@ async fn test_mtu_exceeded_naming_a_dest_whose_entry_is_an_unauthenticated_respo
 
     let dest = NodeAddr::from_bytes([0xCC; 16]);
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     // One forged SessionSetup naming `dest` would leave exactly this entry.
     install_halfopen(&mut node, dest);
@@ -5111,7 +5111,7 @@ async fn test_mtu_exceeded_for_a_session_we_initiated_seeds_path_mtu_lookup_befo
     install_initiating(&mut node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     note_sent_wire_len(&mut node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
@@ -5138,7 +5138,7 @@ async fn test_mtu_exceeded_from_a_third_party_forwarder_still_tightens_an_active
     let dest = *remote.node_addr();
     // A real transit reporter is neither us nor the destination.
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     note_sent_wire_len(&mut node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 1280);
@@ -5370,7 +5370,7 @@ async fn test_mtu_exceeded_whose_claimed_source_is_the_destination_it_names_is_d
     let remote = Identity::generate();
     install_established_session_with_mmp(&mut node, &remote);
     let dest = *remote.node_addr();
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     // The emitter of a routing signal is by construction a transit node for
     // the datagram it is reporting on, so it is never that datagram's own
@@ -5474,7 +5474,7 @@ fn test_handle_path_mtu_notification_writes_path_mtu_lookup_when_empty() {
     let mut node = make_node();
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
 
     install_established_session_with_mmp(&mut node, &remote);
 
@@ -5498,7 +5498,7 @@ fn test_handle_path_mtu_notification_tightens_existing_path_mtu_lookup() {
     let mut node = make_node();
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
 
     install_established_session_with_mmp(&mut node, &remote);
 
@@ -5521,7 +5521,7 @@ fn test_handle_path_mtu_notification_keeps_tighter_existing_path_mtu_lookup() {
     let mut node = make_node();
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
 
     install_established_session_with_mmp(&mut node, &remote);
 
@@ -5545,7 +5545,7 @@ fn test_handle_path_mtu_notification_no_session_no_op() {
     let mut node = make_node();
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
 
     // No session installed. The handler should drop the notification entirely.
     let body = build_path_mtu_notification_body(1280);
@@ -5567,7 +5567,7 @@ fn test_sub_floor_path_mtu_notification_is_ignored_and_counted() {
     let mut node = make_node();
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
 
     install_established_session_with_mmp(&mut node, &remote);
 
@@ -5644,7 +5644,7 @@ async fn test_idle_session_purge_keeps_link_peer_path_mtu_seed() {
     // promotion seeds it, with an end-to-end session on top.
     let remote = Identity::generate();
     let remote_addr = *remote.node_addr();
-    let remote_fips = crate::FipsAddress::from_node_addr(&remote_addr);
+    let remote_fips = crate::Ipv6Address::from_node_addr(&remote_addr);
     let transport_addr = TransportAddr::from_string("127.0.0.1:2121");
 
     let peer_identity = PeerIdentity::from_pubkey_full(remote.pubkey_full());
@@ -7017,8 +7017,8 @@ async fn a_lost_initial_msg3_is_resent_and_the_responder_completes_the_session()
     nodes[0].node.install_tun(tun0_tx);
     let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
     nodes[1].node.install_tun(tun1_tx);
-    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
-    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+    let fips0 = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let fips1 = crate::Ipv6Address::from_node_addr(&node1_addr);
 
     let interval_ms = nodes[0]
         .node
@@ -7070,8 +7070,8 @@ async fn an_initiator_stops_resending_msg3_once_a_responder_frame_authenticates(
     let node1_addr = *nodes[1].node.node_addr();
     let (tun0_tx, tun0_rx) = std::sync::mpsc::channel();
     nodes[0].node.install_tun(tun0_tx);
-    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
-    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+    let fips0 = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let fips1 = crate::Ipv6Address::from_node_addr(&node1_addr);
     let interval_ms = nodes[0]
         .node
         .config()
@@ -7127,8 +7127,8 @@ async fn a_resent_msg3_reaching_an_established_responder_is_refused_and_the_sess
     nodes[0].node.install_tun(tun0_tx);
     let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
     nodes[1].node.install_tun(tun1_tx);
-    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
-    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+    let fips0 = crate::Ipv6Address::from_node_addr(&node0_addr);
+    let fips1 = crate::Ipv6Address::from_node_addr(&node1_addr);
     let interval_ms = nodes[0]
         .node
         .config()
@@ -9272,7 +9272,7 @@ async fn a_reactive_mtu_exceeded_at_the_floor_no_longer_pins_a_session_this_node
     // The defect itself. A report of exactly the floor is a legal value, and
     // the admission gate cannot tell an honest forwarder from anyone else, so
     // one packet drove a bound session's path MTU to the floor and pinned the
-    // FipsAddress-keyed entry the SYN-time MSS clamp reads. Nothing this node
+    // Ipv6Address-keyed entry the SYN-time MSS clamp reads. Nothing this node
     // sent could have overflowed a hop at that size, so no honest report of it
     // exists.
     let mut node = make_node();
@@ -9281,7 +9281,7 @@ async fn a_reactive_mtu_exceeded_at_the_floor_no_longer_pins_a_session_this_node
     install_established_session_with_mmp(&mut node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     let before = node
         .sessions
@@ -9329,7 +9329,7 @@ async fn an_initiating_session_refuses_an_uncorroborated_report_and_accepts_a_co
     install_initiating(&mut node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     let inner = build_mtu_exceeded_inner(&dest, &reporter, 800);
     node.handle_mtu_exceeded(&reporter, &inner).await;
@@ -9410,7 +9410,7 @@ async fn a_corroborated_report_below_the_reactive_floor_is_still_refused() {
     install_established_session_with_mmp(&mut node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     note_sent_wire_len(&mut node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(
@@ -9463,7 +9463,7 @@ async fn a_path_broken_flood_releases_the_stored_path_mtu_only_once_per_interval
     install_initiating(&mut node, &remote);
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
-    let dest_fips = crate::FipsAddress::from_node_addr(&dest);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
 
     let encoded = PathBroken::new(dest, reporter).encode();
     let inner = &encoded[5..];

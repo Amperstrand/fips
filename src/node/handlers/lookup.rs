@@ -421,9 +421,9 @@ impl Node {
                     if path_mtu < crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU {
                         continue;
                     }
-                    // Mirror path_mtu into the FipsAddress-keyed read-only lookup
+                    // Mirror path_mtu into the Ipv6Address-keyed read-only lookup
                     // map used by the TUN reader/writer at TCP MSS clamp time.
-                    let fips_addr = crate::FipsAddress::from_node_addr(&target);
+                    let fips_addr = crate::Ipv6Address::from_node_addr(&target);
                     match self.path_mtu_lookup.write() {
                         Ok(mut map) => match map.get(&fips_addr).copied() {
                             Some(existing)
@@ -934,7 +934,7 @@ impl Node {
     ///
     /// Without this seed, configured/auto-connect peers (which establish
     /// sessions without going through the discovery Lookup flow) leave
-    /// `path_mtu_lookup` empty for their FipsAddress, causing
+    /// `path_mtu_lookup` empty for their Ipv6Address, causing
     /// `per_flow_max_mss` to fall back to the global ceiling and the
     /// SYN-time TCP MSS clamp to over-estimate the effective path.
     ///
@@ -981,7 +981,7 @@ impl Node {
                  will not work until the link or the transport's mtu setting changes"
             );
         }
-        let fips_addr = crate::FipsAddress::from_node_addr(peer_addr);
+        let fips_addr = crate::Ipv6Address::from_node_addr(peer_addr);
         let Ok(mut map) = self.path_mtu_lookup.write() else {
             warn!(
                 peer = %self.peer_display_name(peer_addr),

@@ -4,7 +4,7 @@ use secp256k1::{Parity, PublicKey, XOnlyPublicKey};
 use std::fmt;
 
 use super::encoding::{decode_npub, encode_npub};
-use super::{FipsAddress, IdentityError, NodeAddr, sha256};
+use super::{IdentityError, Ipv6Address, NodeAddr, sha256};
 
 /// A known peer's identity (public key only, no signing capability).
 ///
@@ -16,7 +16,7 @@ pub struct PeerIdentity {
     /// Full public key if known (includes parity for ECDH operations).
     pubkey_full: Option<PublicKey>,
     node_addr: NodeAddr,
-    address: FipsAddress,
+    address: Ipv6Address,
 }
 
 impl PeerIdentity {
@@ -35,7 +35,7 @@ impl PeerIdentity {
     /// paid anyway.
     pub fn from_pubkey(pubkey: XOnlyPublicKey) -> Self {
         let node_addr = NodeAddr::from_pubkey(&pubkey);
-        let address = FipsAddress::from_node_addr(&node_addr);
+        let address = Ipv6Address::from_node_addr(&node_addr);
         let pubkey_full = pubkey.public_key(Parity::Even);
         Self {
             pubkey,
@@ -52,7 +52,7 @@ impl PeerIdentity {
     pub fn from_pubkey_full(pubkey: PublicKey) -> Self {
         let (x_only, _parity) = pubkey.x_only_public_key();
         let node_addr = NodeAddr::from_pubkey(&x_only);
-        let address = FipsAddress::from_node_addr(&node_addr);
+        let address = Ipv6Address::from_node_addr(&node_addr);
         Self {
             pubkey: x_only,
             pubkey_full: Some(pubkey),
@@ -101,7 +101,7 @@ impl PeerIdentity {
     }
 
     /// Return the FIPS address.
-    pub fn address(&self) -> &FipsAddress {
+    pub fn address(&self) -> &Ipv6Address {
         &self.address
     }
 

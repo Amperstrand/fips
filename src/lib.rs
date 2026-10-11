@@ -42,9 +42,12 @@ pub mod version;
 
 // Re-export identity types
 pub use identity::{
-    AuthChallenge, AuthResponse, FipsAddress, Identity, IdentityError, NodeAddr, PeerIdentity,
+    AuthChallenge, AuthResponse, Identity, IdentityError, Ipv6Address, NodeAddr, PeerIdentity,
     decode_npub, decode_nsec, decode_secret, encode_npub, encode_nsec,
 };
+
+#[allow(deprecated)]
+pub use identity::FipsAddress;
 
 // Re-export config types
 pub use config::{Config, ConfigError, IdentityConfig, NymConfig, TorConfig, UdpConfig};

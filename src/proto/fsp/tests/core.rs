@@ -1,6 +1,6 @@
 //! Tests for the pure FSP session-rekey + epoch-reaction decision core.
 
-use crate::FipsAddress;
+use crate::Ipv6Address;
 use crate::proto::fsp::core::{
     DecryptSlot, EpochReaction, Fsp, FspAction, InitialMsg3ResendSnapshot, RekeyCfg,
     RekeyMsg3ResendSnapshot, SessionSnapshot, cutover_timer_elapsed, initiation_winner,
@@ -779,7 +779,7 @@ fn plan_path_broken_demotes_a_verified_entry_at_quorum_then_looks_it_up() {
 #[test]
 fn plan_path_mtu_tighten_emits_only_when_tighter() {
     let fsp = Fsp::new();
-    let fa = FipsAddress::from_node_addr(&make_node_addr(7));
+    let fa = Ipv6Address::from_node_addr(&make_node_addr(7));
     // No existing, or candidate tighter → emit.
     assert_eq!(
         fsp.plan_path_mtu_tighten(fa, None, 1400),

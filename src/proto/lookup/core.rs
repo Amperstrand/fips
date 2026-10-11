@@ -41,7 +41,7 @@ pub(crate) enum LookupAction {
         now_ms: u64,
         path_mtu: u16,
     },
-    /// Mirror path_mtu into the FipsAddress-keyed TUN-shared lookup map.
+    /// Mirror path_mtu into the Ipv6Address-keyed TUN-shared lookup map.
     ///
     /// `now_ms` stamps the entry's expiry deadline. It is the same instant
     /// [`Self::CacheCoords`] carries, because the clamp this write feeds must

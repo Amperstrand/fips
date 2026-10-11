@@ -1,6 +1,6 @@
 //! FIPS DNS Responder
 //!
-//! Resolves `.fips` queries to FipsAddress IPv6 addresses. Two resolution
+//! Resolves `.fips` queries to node IPv6 addresses. Two resolution
 //! paths are supported:
 //!
 //! 1. **Hostname**: `<hostname>.fips` — looked up in the [`HostMap`] to get
@@ -48,7 +48,7 @@ fn extract_fips_label(name: &str) -> Option<&str> {
 /// Resolve a `.fips` domain name to an IPv6 address and identity.
 ///
 /// The name should be `<npub>.fips` (with optional trailing dot).
-/// Returns the FipsAddress IPv6, NodeAddr, and full PublicKey on success.
+/// Returns the node's IPv6 address, NodeAddr, and full PublicKey on success.
 pub fn resolve_fips_query(name: &str) -> Option<(Ipv6Addr, NodeAddr, secp256k1::PublicKey)> {
     let npub = extract_fips_label(name)?;
     let peer = PeerIdentity::from_npub(npub).ok()?;

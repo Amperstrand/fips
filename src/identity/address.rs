@@ -11,10 +11,10 @@ use super::{FIPS_ADDRESS_PREFIX, IdentityError, NodeAddr};
 /// providing 120 bits for the node_addr hash. This format allows applications
 /// designed for IP transports to bind to FIPS addresses via a TUN interface.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FipsAddress([u8; 16]);
+pub struct Ipv6Address([u8; 16]);
 
-impl FipsAddress {
-    /// Create a FipsAddress from a 16-byte array.
+impl Ipv6Address {
+    /// Create an Ipv6Address from a 16-byte array.
     pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, IdentityError> {
         if bytes[0] != FIPS_ADDRESS_PREFIX {
             return Err(IdentityError::InvalidAddressPrefix(bytes[0]));
@@ -22,7 +22,7 @@ impl FipsAddress {
         Ok(Self(bytes))
     }
 
-    /// Create a FipsAddress from a slice.
+    /// Create an Ipv6Address from a slice.
     pub fn from_slice(slice: &[u8]) -> Result<Self, IdentityError> {
         if slice.len() != 16 {
             return Err(IdentityError::InvalidAddressLength(slice.len()));
@@ -32,7 +32,7 @@ impl FipsAddress {
         Self::from_bytes(bytes)
     }
 
-    /// Derive a FipsAddress from a NodeAddr.
+    /// Derive an Ipv6Address from a NodeAddr.
     ///
     /// Takes the first 15 bytes of the node_addr and prepends the 0xfd prefix.
     pub fn from_node_addr(node_addr: &NodeAddr) -> Self {
@@ -53,19 +53,19 @@ impl FipsAddress {
     }
 }
 
-impl From<FipsAddress> for Ipv6Addr {
-    fn from(addr: FipsAddress) -> Self {
+impl From<Ipv6Address> for Ipv6Addr {
+    fn from(addr: Ipv6Address) -> Self {
         Ipv6Addr::from(addr.0)
     }
 }
 
-impl fmt::Debug for FipsAddress {
+impl fmt::Debug for Ipv6Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FipsAddress({})", self.to_ipv6())
+        write!(f, "Ipv6Address({})", self.to_ipv6())
     }
 }
 
-impl fmt::Display for FipsAddress {
+impl fmt::Display for Ipv6Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_ipv6())
     }

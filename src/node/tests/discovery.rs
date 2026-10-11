@@ -1444,7 +1444,7 @@ async fn test_originator_ignores_sub_floor_path_mtu_but_still_caches_coords() {
 
     let target_identity = Identity::generate();
     let target = *target_identity.node_addr();
-    let target_fips = crate::FipsAddress::from_node_addr(&target);
+    let target_fips = crate::Ipv6Address::from_node_addr(&target);
     let root = make_node_addr(0xF0);
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
 
@@ -1513,7 +1513,7 @@ async fn test_actionable_lookup_response_path_mtu_does_not_bump_below_floor_coun
 
     let target_identity = Identity::generate();
     let target = *target_identity.node_addr();
-    let target_fips = crate::FipsAddress::from_node_addr(&target);
+    let target_fips = crate::Ipv6Address::from_node_addr(&target);
     let root = make_node_addr(0xF0);
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
 
@@ -1564,7 +1564,7 @@ async fn test_originator_lookup_response_keeps_tighter_path_mtu_lookup() {
     node.register_identity(target, target_identity.pubkey_full());
 
     // Pre-seed a tighter value, as if a reactive signal already narrowed it.
-    let target_fips = crate::FipsAddress::from_node_addr(&target);
+    let target_fips = crate::Ipv6Address::from_node_addr(&target);
     node.path_mtu_lookup_insert(target_fips, 1280);
 
     seed_pending_lookup(&mut node, target, 800);
@@ -1589,16 +1589,16 @@ async fn test_originator_lookup_response_keeps_tighter_path_mtu_lookup() {
 }
 
 /// Build a verified LookupResponse for a fresh target and hand it to the
-/// handler, returning the target and its FipsAddress. The identity is
+/// handler, returning the target and its Ipv6Address. The identity is
 /// registered so the proof verifies and the originator branch is taken.
 fn make_verified_lookup_response(
     node: &mut Node,
     request_id: u64,
     path_mtu: u16,
-) -> (crate::NodeAddr, crate::FipsAddress, Vec<u8>) {
+) -> (crate::NodeAddr, crate::Ipv6Address, Vec<u8>) {
     let target_identity = Identity::generate();
     let target = *target_identity.node_addr();
-    let target_fips = crate::FipsAddress::from_node_addr(&target);
+    let target_fips = crate::Ipv6Address::from_node_addr(&target);
     let root = make_node_addr(0xF0);
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
 
@@ -1715,7 +1715,7 @@ async fn test_a_later_solicited_response_of_the_same_path_mtu_keeps_the_learn_ti
 
     let target_identity = Identity::generate();
     let target = *target_identity.node_addr();
-    let target_fips = crate::FipsAddress::from_node_addr(&target);
+    let target_fips = crate::Ipv6Address::from_node_addr(&target);
     let root = make_node_addr(0xF0);
     let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
     node.register_identity(target, target_identity.pubkey_full());
@@ -1960,7 +1960,7 @@ async fn test_check_pending_lookups_default_sequence_unreachable() {
     ipv6_pkt[8] = 0xfd;
     ipv6_pkt[23] = 0x01;
     // dst = target's IPv6 representation (not strictly required, just non-multicast)
-    let target_ipv6 = crate::FipsAddress::from_node_addr(&target_addr).to_ipv6();
+    let target_ipv6 = crate::Ipv6Address::from_node_addr(&target_addr).to_ipv6();
     ipv6_pkt[24..40].copy_from_slice(&target_ipv6.octets());
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(ipv6_pkt);
@@ -2607,7 +2607,7 @@ fn tun_packet_to(dest: &NodeAddr) -> Vec<u8> {
     pkt[7] = 64;
     pkt[8] = 0xfd;
     pkt[23] = 0x01;
-    let dest_ipv6 = crate::FipsAddress::from_node_addr(dest).to_ipv6();
+    let dest_ipv6 = crate::Ipv6Address::from_node_addr(dest).to_ipv6();
     pkt[24..40].copy_from_slice(&dest_ipv6.octets());
     pkt
 }

@@ -13,7 +13,7 @@ use crate::proto::mmp::MmpPeerState;
 use crate::proto::stp::{ParentDeclaration, TreeCoordinate};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
-use crate::{FipsAddress, NodeAddr, PeerIdentity};
+use crate::{Ipv6Address, NodeAddr, PeerIdentity};
 use rand::RngExt;
 use secp256k1::XOnlyPublicKey;
 use std::fmt;
@@ -508,7 +508,7 @@ impl ActivePeer {
     }
 
     /// Get the peer's FIPS address.
-    pub fn address(&self) -> &FipsAddress {
+    pub fn address(&self) -> &Ipv6Address {
         self.identity.address()
     }
 

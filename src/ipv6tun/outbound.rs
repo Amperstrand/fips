@@ -86,7 +86,7 @@ pub(crate) fn admit(packet: &[u8], ipv6_mtu: u16) -> Admit {
         return Admit::TooBig(effective_mtu as u32);
     }
 
-    // Extract destination FipsAddress prefix (IPv6 dest bytes 1-15)
+    // Extract destination Ipv6Address prefix (IPv6 dest bytes 1-15)
     // IPv6 header: bytes 24-39 are dest addr, so prefix = bytes 25-39
     let mut prefix = [0u8; 15];
     prefix.copy_from_slice(&packet[25..40]);

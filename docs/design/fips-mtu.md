@@ -196,7 +196,7 @@ consumers:
   outbound `SessionDatagram` envelopes.
 
 - **TCP-clamp mirror** (`path_mtu_lookup`, a
-  `HashMap<FipsAddress, u16>` on the Node). Read by the
+  `HashMap<Ipv6Address, u16>` on the Node). Read by the
   TUN-side TCP MSS clamp (`per_flow_max_mss` in
   `src/ipv6tun/tun.rs`) at first-SYN time so outbound TCP flows
   are clamped to the per-destination MTU rather than a generic

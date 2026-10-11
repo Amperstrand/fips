@@ -17,7 +17,7 @@ use super::dns::{DnsIdentityRx, bind_dns_socket, lookup_mesh_ifindex, run_respon
 use super::tun::{
     MssCeiling, TunDevice, TunError, TunOutboundRx, TunTx, run_tun_reader, shutdown_tun_interface,
 };
-use crate::FipsAddress;
+use crate::Ipv6Address;
 use crate::config::PeerConfig;
 use crate::hosts::{DEFAULT_HOSTS_PATH, HostMap, HostMapReloader};
 use crate::node::lifecycle::supervisor::Child;
@@ -82,7 +82,7 @@ pub(crate) struct TunThreads {
 /// Create the TUN device, logging it, or log the failure and return `None`.
 ///
 /// A failure here is not fatal to the node: it continues without a TUN.
-pub(crate) async fn open_tun(config: &TunConfig, address: FipsAddress) -> Option<TunDevice> {
+pub(crate) async fn open_tun(config: &TunConfig, address: Ipv6Address) -> Option<TunDevice> {
     match TunDevice::create(config, address).await {
         Ok(device) => {
             info!("TUN device active:");

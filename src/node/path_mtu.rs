@@ -3,7 +3,7 @@
 //! Every writer, the release paths and the expiry pass live in the node;
 //! the TUN reader and writer threads only read the map.
 
-use crate::FipsAddress;
+use crate::Ipv6Address;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -48,6 +48,6 @@ impl PathMtuEntry {
 /// Read-only handle to the per-destination path MTU map. Populated by
 /// the discovery handler on `LookupResponse`; read by the TUN reader
 /// (outbound clamp) and writer (inbound clamp) at TCP MSS clamp time.
-/// Keyed by [`FipsAddress`] (16 bytes, the IPv6 form of a fips peer
+/// Keyed by [`Ipv6Address`] (16 bytes, the IPv6 form of a fips peer
 /// address).
-pub type PathMtuLookup = Arc<RwLock<HashMap<FipsAddress, PathMtuEntry>>>;
+pub type PathMtuLookup = Arc<RwLock<HashMap<Ipv6Address, PathMtuEntry>>>;
