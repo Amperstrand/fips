@@ -33,9 +33,10 @@ algebraic structure.
 ## Files
 
 - `mod.rs`: declares the submodules and re-exports their public items.
-  It also holds the shared secp256k1 context and its `secp()` accessor;
-  `IPV6_ADDRESS_PREFIX` (`0xfd`); `IdentityError` and its `From` impls;
-  the `sha256` helper and the private `hex_encode` helper.
+  It also holds the shared secp256k1 context with `init_secp`, which
+  installs it, and its `secp()` accessor; `IPV6_ADDRESS_PREFIX`
+  (`0xfd`); `IdentityError` and its `From` impls; the `sha256` helper
+  and the private `hex_encode` helper.
 - `address.rs`: `Ipv6Address`, the node's 128-bit IPv6 address with the
   `0xfd` prefix, and its conversion to `core::net::Ipv6Addr`.
 - `node_addr.rs`: `NodeAddr`, the 16-byte node identifier taken from the
@@ -49,13 +50,20 @@ algebraic structure.
 
 ## Invariants
 
-- **The shared context.** `secp()` returns one `Secp256k1<All>` built on
-  first use and reused by every caller in a build, the root crate's
-  included. `Secp256k1::new()` blinds it from `rand::thread_rng()`
-  because `core/Cargo.toml` enables `rand` and `std` on `secp256k1`.
-  This is the one exception to the crate's rule that randomness is
-  passed in. Removing `rand` must come with an explicit `randomize` call,
-  or a build of the core alone gets an unblinded context.
+- **The shared context.** `secp()` returns one `Secp256k1<All>`, built
+  once and reused by every caller in a build, the root crate's
+  included. The host installs it first with `init_secp(seed)`, which
+  blinds it with the 32 random bytes it is given; the daemon does so at
+  start-up from the OS random source, and refuses to start if the
+  context was already built. The first install wins and is never
+  replaced; `init_secp` returns `false` if it came too late. Without
+  `init_secp`, `secp()` builds the context with `Secp256k1::new()` on
+  first use, which is blinded only when `secp256k1` is built with its
+  `rand` and `std` features. Any build that includes the root crate
+  has them on through the root's own `secp256k1` dependency, so
+  `fipsctl`, `fipstop`, `fips-gateway` and library users that never
+  call `init_secp` still get a blinded context. Blinding protects
+  secret keys from side channels; it never changes a key or signature.
 - **Public only for the root crate.** `secp` and `sha256` are `pub` so
   the root crate can reach them, and `#[doc(hidden)]` because they are
   not part of the crate's interface. The root crate re-exports them as

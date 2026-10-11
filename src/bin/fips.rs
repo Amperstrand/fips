@@ -109,6 +109,26 @@ fn startup_error(msg: &str) {
     }
 }
 
+/// Install the shared secp256k1 context, blinded with 32 bytes from the
+/// operating system's random source.
+///
+/// Fails if the random source cannot be read, or if the context was already
+/// built, which means something used it before start-up seeded it.
+fn seed_secp() -> Result<(), String> {
+    use rand::TryRng;
+    let mut seed = [0u8; 32];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|e| format!("Cannot read the system random source: {e}"))?;
+    let installed = fips::identity::init_secp(&seed);
+    seed.zeroize();
+    if installed {
+        Ok(())
+    } else {
+        Err("The secp256k1 context was in use before start-up seeded it".to_string())
+    }
+}
+
 /// What to do with `node.log_file`, given whether `--log-file` or the
 /// Windows service already opened a log, which take precedence.
 #[derive(Debug, PartialEq)]
@@ -146,6 +166,13 @@ async fn run_daemon(
         && let Err(e) = open_log(path)
     {
         eprintln!("Cannot open log file {}: {e}", path.display());
+        std::process::exit(1);
+    }
+
+    // Before anything can sign, verify or derive a key: the shared secp256k1
+    // context takes its blinding from this seed, and is never rebuilt.
+    if let Err(msg) = seed_secp() {
+        startup_error(&msg);
         std::process::exit(1);
     }
 

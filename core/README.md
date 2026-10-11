@@ -74,9 +74,10 @@ synthetic timestamps.
 
 **Randomness is an argument.** Never reach for a thread-local or OS
 random source. Code that needs random bytes or a nonce takes an RNG or
-the bytes from its caller. The one known exception is the shared
-secp256k1 context in `identity`, which blinds itself from
-`rand::thread_rng()` when built; it stays until randomness is passed in.
+the bytes from its caller. The shared secp256k1 context in `identity`
+follows this too: the host blinds it by calling
+`identity::init_secp(seed)` at start-up with 32 bytes from its own
+random source, as the daemon does.
 
 **No OS calls and no target `cfg`.** No `cfg(target_os = ...)`,
 `cfg(unix)`, `cfg(windows)` or similar. If behaviour differs by

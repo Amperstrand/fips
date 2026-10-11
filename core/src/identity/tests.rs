@@ -299,3 +299,41 @@ fn test_identity_error_from_hex_error() {
     assert_eq!(format!("{err}"), format!("invalid hex encoding: {inner}"));
     assert!(core::error::Error::source(&err).is_none());
 }
+
+// ===== the shared context =====
+
+#[test]
+fn test_install_sets_an_empty_cell_once_and_never_replaces_it() {
+    let cell = OnceBox::new();
+    assert!(install(&cell, &[1u8; 32]));
+    let first: *const Secp256k1<All> = cell.get().unwrap();
+    assert!(!install(&cell, &[2u8; 32]));
+    assert!(core::ptr::eq(cell.get().unwrap(), first));
+}
+
+#[test]
+fn test_seeded_context_signs_and_verifies_like_the_default_one() {
+    // Blinding changes how the context computes, not what it computes: a
+    // signature without auxiliary randomness is the same from both.
+    let cell = OnceBox::new();
+    assert!(install(&cell, &[3u8; 32]));
+    let seeded = cell.get().unwrap();
+    let plain = Secp256k1::new();
+    let keypair = Keypair::from_seckey_slice(&plain, &[0x11u8; 32]).unwrap();
+    let digest = sha256(b"blinding does not change signatures");
+    let a = seeded.sign_schnorr_no_aux_rand(&digest, &keypair);
+    let b = plain.sign_schnorr_no_aux_rand(&digest, &keypair);
+    assert_eq!(a, b);
+    let peer = PeerIdentity::from_pubkey(keypair.x_only_public_key().0);
+    assert!(peer.verify(b"blinding does not change signatures", &a));
+}
+
+#[test]
+fn test_init_secp_never_replaces_the_installed_context() {
+    // Other tests in this binary may have built the context already, so the
+    // first call's result depends on test order; the second's does not.
+    let _ = init_secp(&[4u8; 32]);
+    let installed: *const Secp256k1<All> = secp();
+    assert!(!init_secp(&[5u8; 32]));
+    assert!(core::ptr::eq(secp(), installed));
+}

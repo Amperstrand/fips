@@ -10,7 +10,7 @@ mod local;
 pub use auth::{AuthChallenge, AuthResponse};
 pub use fips_core::identity::{
     IPV6_ADDRESS_PREFIX, IdentityError, Ipv6Address, NodeAddr, PeerIdentity, decode_npub,
-    decode_nsec, decode_secret, encode_npub, encode_nsec,
+    decode_nsec, decode_secret, encode_npub, encode_nsec, init_secp,
 };
 pub(crate) use fips_core::identity::{secp, sha256};
 pub(crate) use local::ErasingKeypair;

@@ -25,14 +25,44 @@ pub use peer::PeerIdentity;
 
 /// Shared secp256k1 context reused across all identity operations.
 ///
-/// `Secp256k1::new()` allocates a `Secp256k1<All>` and runs randomization /
-/// blinding table setup; it is designed to be created once and reused rather
-/// than rebuilt per sign / verify / key-derive call. This single `All` context
-/// serves both signing and verification across the identity module and still
-/// performs the standard construction-time blinding.
+/// `Secp256k1::new()` allocates a `Secp256k1<All>`; it is designed to be
+/// created once and reused rather than rebuilt per sign / verify /
+/// key-derive call. This single `All` context serves both signing and
+/// verification across the identity module. It is blinded with the seed
+/// passed to [`init_secp`]; see there for what happens without one.
 static SECP: OnceBox<Secp256k1<All>> = OnceBox::new();
 
-/// Return the shared secp256k1 context, building it on first use.
+/// Install the shared secp256k1 context, blinded with `seed`.
+///
+/// Call this once at start-up, before anything signs, verifies or derives a
+/// key, with 32 bytes from the host's cryptographic random source. The seed
+/// randomizes the context's internal blinding, which protects secret keys
+/// against timing and power side channels; it does not change any signature
+/// or key the context produces.
+///
+/// Returns `true` if this call installed the context, and `false` if one was
+/// already installed, by an earlier call or by [`secp`] on first use. The
+/// installed context is never replaced, so a `false` return means `seed` was
+/// not used.
+#[must_use]
+pub fn init_secp(seed: &[u8; 32]) -> bool {
+    install(&SECP, seed)
+}
+
+/// Build a context blinded with `seed` and install it in `cell` if the cell
+/// is empty. Split from [`init_secp`] so tests can use a cell of their own.
+fn install(cell: &OnceBox<Secp256k1<All>>, seed: &[u8; 32]) -> bool {
+    let mut ctx = Secp256k1::new();
+    ctx.seeded_randomize(seed);
+    cell.set(Box::new(ctx)).is_ok()
+}
+
+/// Return the shared secp256k1 context.
+///
+/// If [`init_secp`] has not run, the first call builds the context with
+/// `Secp256k1::new()`. That context is blinded only when the `secp256k1`
+/// crate is built with its `rand` and `std` features; in a build that
+/// includes the root `fips` crate they are on.
 ///
 /// If two threads race on first use, each may build a context; one is kept
 /// and the other dropped, so every caller sees the same context afterwards.
