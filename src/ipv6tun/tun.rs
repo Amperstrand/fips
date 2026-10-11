@@ -1,7 +1,7 @@
 //! FIPS TUN Interface
 //!
 //! Manages the TUN device for sending and receiving IPv6 packets.
-//! The TUN interface presents FIPS addresses to the local system,
+//! The TUN interface presents mesh IPv6 addresses to the local system,
 //! allowing standard socket applications to communicate over the mesh.
 //!
 //! Platform-specific implementations:
@@ -357,7 +357,7 @@ impl TunDevice {
         self.mtu
     }
 
-    /// Get the FIPS address assigned to this device.
+    /// Get the IPv6 address assigned to this device.
     pub fn address(&self) -> &Ipv6Address {
         &self.address
     }
@@ -596,7 +596,7 @@ impl TunWriter {
 
 /// TUN packet reader loop (Linux).
 ///
-/// Reads IPv6 packets from the TUN device. Packets destined for FIPS addresses
+/// Reads IPv6 packets from the TUN device. Packets destined for mesh addresses
 /// (fd::/8) are forwarded to the Node via the outbound channel for session
 /// encapsulation and routing. Non-FIPS packets receive ICMPv6 Destination
 /// Unreachable responses.
@@ -807,8 +807,8 @@ fn handle_tun_packet(
         return true;
     }
 
-    // Check if destination is a FIPS address (fd::/8 prefix)
-    if packet[24] == crate::identity::FIPS_ADDRESS_PREFIX {
+    // Check if destination is a mesh IPv6 address (fd00::/8 prefix)
+    if packet[24] == crate::identity::IPV6_ADDRESS_PREFIX {
         // Loopback: a packet to our own mesh address must be delivered
         // locally, not pushed into the mesh (we have no session/route to
         // ourselves, so it would just be dropped). Hairpin it back to the TUN
@@ -1017,7 +1017,7 @@ mod windows_tun {
             self.mtu
         }
 
-        /// Get the FIPS address assigned to this device.
+        /// Get the IPv6 address assigned to this device.
         pub fn address(&self) -> &Ipv6Address {
             &self.address
         }
@@ -1303,7 +1303,7 @@ mod windows_tun {
             );
         }
 
-        // Add route for fd00::/8 (FIPS address space) via this adapter
+        // Add route for fd00::/8 (mesh IPv6 address space) via this adapter
         let output = tokio::process::Command::new("netsh")
             .args([
                 "interface",
@@ -1429,7 +1429,7 @@ mod platform {
             .execute()
             .await?;
 
-        // Add route for fd00::/8 (FIPS address space) via this interface
+        // Add route for fd00::/8 (mesh IPv6 address space) via this interface
         let fd_prefix: Ipv6Addr = "fd00::".parse().unwrap();
         let route = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(fd_prefix, 8)
@@ -1547,7 +1547,7 @@ mod platform {
         // Bring interface up
         run_cmd("ifconfig", &[name, "up"]).await?;
 
-        // Add route for fd00::/8 (FIPS address space) via this interface
+        // Add route for fd00::/8 (mesh IPv6 address space) via this interface
         #[cfg(target_os = "macos")]
         run_cmd(
             "route",
@@ -1628,7 +1628,7 @@ mod tests {
 
     fn fips_addr_with_node_byte(b: u8) -> Ipv6Address {
         let mut bytes = [0u8; 16];
-        bytes[0] = crate::identity::FIPS_ADDRESS_PREFIX;
+        bytes[0] = crate::identity::IPV6_ADDRESS_PREFIX;
         bytes[1] = b;
         Ipv6Address::from_bytes(bytes).unwrap()
     }
@@ -1826,13 +1826,13 @@ mod tests {
     // ========================================================================
 
     /// Build a minimal 40-byte IPv6 packet (no upper-layer payload) addressed
-    /// to `dst`, sourced from a distinct fips address.
+    /// to `dst`, sourced from a distinct mesh IPv6 address.
     fn ipv6_packet_to(dst: &Ipv6Address) -> Vec<u8> {
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x60; // version 6
         pkt[6] = 59; // next header = No Next Header (skips MSS clamp)
         pkt[7] = 64; // hop limit
-        pkt[8] = crate::identity::FIPS_ADDRESS_PREFIX; // src in fd::/8
+        pkt[8] = crate::identity::IPV6_ADDRESS_PREFIX; // src in fd::/8
         pkt[24..40].copy_from_slice(dst.as_bytes()); // dst
         pkt
     }

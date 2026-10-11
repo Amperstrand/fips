@@ -1,8 +1,8 @@
 //! FIPS Identity System
 //!
 //! Node identity based on Nostr keypairs (secp256k1). The node_addr is derived
-//! from the public key via SHA-256, and the FIPS address uses an IPv6-compatible
-//! format with the 0xfd prefix.
+//! from the public key via SHA-256, and the node's IPv6 address is the 0xfd
+//! prefix followed by the first 15 bytes of the node_addr.
 
 mod address;
 mod auth;
@@ -38,8 +38,12 @@ pub type FipsAddress = Ipv6Address;
 /// performs the standard construction-time blinding.
 pub(crate) static SECP: LazyLock<Secp256k1<All>> = LazyLock::new(Secp256k1::new);
 
-/// FIPS address prefix (IPv6 ULA range).
-pub const FIPS_ADDRESS_PREFIX: u8 = 0xfd;
+/// Prefix byte of every node's IPv6 address (the `fd00::/8` ULA range).
+pub const IPV6_ADDRESS_PREFIX: u8 = 0xfd;
+
+/// Former name of [`IPV6_ADDRESS_PREFIX`].
+#[deprecated(note = "renamed to IPV6_ADDRESS_PREFIX")]
+pub const FIPS_ADDRESS_PREFIX: u8 = IPV6_ADDRESS_PREFIX;
 
 /// Errors that can occur in identity operations.
 #[derive(Debug, Error)]

@@ -1,22 +1,22 @@
-//! 128-bit FIPS address with IPv6-compatible format.
+//! A node's 128-bit IPv6 address, in the `fd00::/8` ULA range.
 
 use std::fmt;
 use std::net::Ipv6Addr;
 
-use super::{FIPS_ADDRESS_PREFIX, IdentityError, NodeAddr};
+use super::{IPV6_ADDRESS_PREFIX, IdentityError, NodeAddr};
 
-/// 128-bit FIPS address with IPv6-compatible format.
+/// A node's 128-bit IPv6 address, in the `fd00::/8` ULA range.
 ///
 /// The address uses the IPv6 Unique Local Address (ULA) prefix `fd00::/8`,
 /// providing 120 bits for the node_addr hash. This format allows applications
-/// designed for IP transports to bind to FIPS addresses via a TUN interface.
+/// designed for IP transports to bind to these addresses via a TUN interface.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ipv6Address([u8; 16]);
 
 impl Ipv6Address {
     /// Create an Ipv6Address from a 16-byte array.
     pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, IdentityError> {
-        if bytes[0] != FIPS_ADDRESS_PREFIX {
+        if bytes[0] != IPV6_ADDRESS_PREFIX {
             return Err(IdentityError::InvalidAddressPrefix(bytes[0]));
         }
         Ok(Self(bytes))
@@ -37,7 +37,7 @@ impl Ipv6Address {
     /// Takes the first 15 bytes of the node_addr and prepends the 0xfd prefix.
     pub fn from_node_addr(node_addr: &NodeAddr) -> Self {
         let mut bytes = [0u8; 16];
-        bytes[0] = FIPS_ADDRESS_PREFIX;
+        bytes[0] = IPV6_ADDRESS_PREFIX;
         bytes[1..16].copy_from_slice(&node_addr.as_bytes()[0..15]);
         Self(bytes)
     }

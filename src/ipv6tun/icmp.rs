@@ -163,7 +163,7 @@ pub fn should_send_icmp_error(packet: &[u8]) -> bool {
 /// Arguments:
 /// - `original_packet`: The packet that couldn't be routed
 /// - `code`: The specific unreachable reason
-/// - `our_addr`: Our FIPS address (source of the error)
+/// - `our_addr`: Our IPv6 address (source of the error)
 ///
 /// Returns None if the original packet is invalid.
 pub fn build_dest_unreachable(

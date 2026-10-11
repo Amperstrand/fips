@@ -3083,7 +3083,7 @@ async fn test_tun_outbound_unknown_destination() {
 
     let src_fips = crate::Ipv6Address::from_node_addr(nodes[0].node.node_addr());
 
-    // Build a packet to an unknown FIPS address (not in identity cache)
+    // Build a packet to an unknown IPv6 address (not in identity cache)
     let unknown_addr = NodeAddr::from_bytes([0xAA; 16]);
     let unknown_fips = crate::Ipv6Address::from_node_addr(&unknown_addr);
     let ipv6_packet = build_ipv6_packet(&src_fips, &unknown_fips, b"unknown");

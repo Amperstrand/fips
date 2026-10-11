@@ -98,7 +98,7 @@ interfaces are unaffected.
 
 ## IPv6 Address Derivation
 
-FIPS addresses use the IPv6 Unique Local Address (ULA) prefix `fd00::/8`:
+Node IPv6 addresses use the IPv6 Unique Local Address (ULA) prefix `fd00::/8`:
 
 ```text
 Public Key (32 bytes)
@@ -110,7 +110,7 @@ SHA-256 → node_addr (16 bytes, truncated)
 fd + node_addr[0..15] → IPv6 address (16 bytes)
 ```
 
-The `fd` prefix places FIPS addresses in the IPv6 Unique Local Address (ULA)
+The `fd` prefix places node addresses in the IPv6 Unique Local Address (ULA)
 space defined by RFC 4193. ULAs are the IPv6 equivalent of RFC 1918 private
 addresses (10.x, 172.16.x, 192.168.x) — they are reserved for local use and
 are not routable over the public Internet. This means FIPS overlay addresses
@@ -126,7 +126,7 @@ The derivation from public key to NodeAddr and IPv6 address is one-way
 (SHA-256 truncation). Given a destination IPv6 address from an outbound packet
 on the TUN interface, the adapter cannot recover the public key or NodeAddr
 needed for FIPS routing. The identity cache provides the reverse lookup:
-it maps the FIPS address prefix (15 bytes — the IPv6 address minus the `fd`
+it maps the address prefix (15 bytes — the IPv6 address minus the `fd`
 prefix) back to `(NodeAddr, PublicKey)`, allowing the adapter to route
 IPv6 traffic into the mesh. This cache is needed only when using the IPv6
 adapter; the native FIPS API provides the public key directly.
@@ -365,7 +365,7 @@ it never came up.
 
 Proxying to the responder rather than resolving in the app is what keeps the
 [identity cache](#identity-cache) warm. Answering a `<npub>.fips` query is what
-registers that peer's public key, and a FIPS address is a truncated hash of a
+registers that peer's public key, and its IPv6 address is a truncated hash of a
 hash of the pubkey — the key cannot be recovered from the IPv6 address alone. An
 app that resolves the AAAA itself leaves the cache empty, and the first packet to
 the resolved name is rejected with ICMPv6 Destination Unreachable. Direct

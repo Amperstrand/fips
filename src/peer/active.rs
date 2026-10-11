@@ -507,7 +507,7 @@ impl ActivePeer {
         self.identity.node_addr()
     }
 
-    /// Get the peer's FIPS address.
+    /// Get the peer's IPv6 address.
     pub fn address(&self) -> &Ipv6Address {
         self.identity.address()
     }

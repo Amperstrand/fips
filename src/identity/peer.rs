@@ -100,7 +100,7 @@ impl PeerIdentity {
         &self.node_addr
     }
 
-    /// Return the FIPS address.
+    /// Return the IPv6 address.
     pub fn address(&self) -> &Ipv6Address {
         &self.address
     }
