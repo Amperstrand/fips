@@ -1,12 +1,13 @@
 //! Shared test helpers for the FMP connection-lifecycle unit tests.
 
+use crate::identity::PeerIdentity;
 use crate::proto::fmp::{
     ConnSnapshot, EstablishSnapshot, Msg1Digest, PeerSnapshot, RekeyResendSnapshot, WireOutcome,
 };
-use crate::testutil::make_node_addr;
+use crate::testutil::{make_keypair, make_node_addr};
 use crate::transport::LinkId;
 use crate::utils::index::SessionIndex;
-use crate::{Identity, PeerIdentity};
+use alloc::vec::Vec;
 
 /// Build a `RekeyResendSnapshot` for the given peer byte, prior retransmission
 /// count, due-flag, and opaque msg1 bytes.
@@ -49,7 +50,7 @@ pub(super) fn peer_snapshot(addr_byte: u8) -> PeerSnapshot {
 pub(super) fn stale_snapshot(
     link: LinkId,
     is_outbound: bool,
-    retry_addr: Option<crate::NodeAddr>,
+    retry_addr: Option<crate::identity::NodeAddr>,
 ) -> ConnSnapshot {
     ConnSnapshot {
         link,
@@ -105,7 +106,7 @@ pub(super) fn establish_snapshot() -> EstablishSnapshot {
 /// for the tie-break.
 pub(super) fn wire_outcome(remote_epoch: Option<[u8; 8]>) -> WireOutcome {
     WireOutcome {
-        peer_identity: PeerIdentity::from_pubkey_full(Identity::generate().pubkey_full()),
+        peer_identity: PeerIdentity::from_pubkey_full(make_keypair().public_key()),
         remote_epoch,
         their_index: SessionIndex::new(0x1234),
         msg2_payload: Vec::new(),

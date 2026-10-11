@@ -4,7 +4,7 @@ use super::util::{
     establish_snapshot, peer_snapshot, rekey_resend_snapshot, resend_snapshot, stale_snapshot,
     wire_outcome,
 };
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::fmp::core::ENDED_MSG1_RECORD;
 use crate::proto::fmp::{
     AnsweredMsg1s, ConnAction, Fmp, InboundDecision, InboundReject, Msg1Digest, OutboundDecision,
@@ -12,6 +12,8 @@ use crate::proto::fmp::{
 };
 use crate::testutil::make_node_addr;
 use crate::transport::LinkId;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Threshold config used across the rekey decision tests: rekey at 100s of
 /// session age or 1000 sent messages.

@@ -3,9 +3,11 @@
 //! set.
 
 use super::util::{MockRoutingView, action_peers, make_request};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::lookup::*;
 use crate::testutil::make_node_addr;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Build the routing view from `(addr, is_tree, may_reach)` entries.
 fn view(peers: Vec<(NodeAddr, bool, bool)>) -> MockRoutingView {

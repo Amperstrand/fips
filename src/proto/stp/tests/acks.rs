@@ -9,9 +9,11 @@
 //! removal with the peer.
 
 use super::util::make_node_addr;
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::mmp::delivery::{FALLBACK_MS, LinkEvidence, ResendReason, RrCounters};
 use crate::proto::stp::TreeState;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// First session.
 const E1: u64 = 0x0e01;

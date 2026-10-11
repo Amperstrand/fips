@@ -2,7 +2,7 @@
 //! minimum-interval limiter and an exponential backoff helper, hoisted out of
 //! the subsystem `limits.rs` files.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use alloc::collections::BTreeMap;
 
 /// Maximum number of addresses one limiter remembers at once.
@@ -13,7 +13,7 @@ use alloc::collections::BTreeMap;
 /// suppression across more simultaneously-active addresses; lowering it makes
 /// [`RecordOutcome::AdmitAtCapacity`] the common case sooner, which weakens the
 /// interval gate but never the caller's own budget.
-pub(crate) const MAX_ENTRIES: usize = 4096;
+pub const MAX_ENTRIES: usize = 4096;
 
 /// Fraction of `max_age_ms` between amortized sweeps.
 ///
@@ -25,7 +25,7 @@ const SWEEPS_PER_MAX_AGE: u64 = 8;
 
 /// What the limiter decided about one candidate event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecordOutcome {
+pub enum RecordOutcome {
     /// Admit it; the address was recorded.
     Admit,
     /// Admit it, but the map was full so the address was not recorded and the
@@ -44,7 +44,7 @@ pub(crate) enum RecordOutcome {
 /// address and enforces a minimum interval, evicting entries older than a max
 /// age. The map is bounded and its sweep is amortized; see [`MAX_ENTRIES`] and
 /// [`SWEEPS_PER_MAX_AGE`].
-pub(crate) struct PerAddrRateLimiter {
+pub struct PerAddrRateLimiter {
     last: BTreeMap<NodeAddr, u64>,
     min_interval_ms: u64,
     max_age_ms: u64,
@@ -56,7 +56,7 @@ pub(crate) struct PerAddrRateLimiter {
 }
 
 impl PerAddrRateLimiter {
-    pub(crate) fn new(min_interval_ms: u64, max_age_ms: u64) -> Self {
+    pub fn new(min_interval_ms: u64, max_age_ms: u64) -> Self {
         Self {
             last: BTreeMap::new(),
             min_interval_ms,
@@ -69,7 +69,7 @@ impl PerAddrRateLimiter {
     /// Decide one event for `addr`, recording `now_ms` when it is admitted and
     /// there is room. See [`RecordOutcome`] for why a full map admits rather
     /// than refuses.
-    pub(crate) fn check_and_record(&mut self, addr: &NodeAddr, now_ms: u64) -> RecordOutcome {
+    pub fn check_and_record(&mut self, addr: &NodeAddr, now_ms: u64) -> RecordOutcome {
         let known = self.last.get(addr).copied();
         if let Some(last) = known
             && now_ms.saturating_sub(last) < self.min_interval_ms
@@ -95,23 +95,24 @@ impl PerAddrRateLimiter {
         self.cleanup(now_ms);
     }
 
-    pub(crate) fn cleanup(&mut self, now_ms: u64) {
+    pub fn cleanup(&mut self, now_ms: u64) {
         self.last
             .retain(|_, &mut last| now_ms.saturating_sub(last) < self.max_age_ms);
     }
 
     #[cfg(test)]
-    pub(crate) fn sweeps(&self) -> u64 {
+    pub fn sweeps(&self) -> u64 {
         self.sweeps
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_interval_ms(&mut self, interval_ms: u64) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_interval_ms(&mut self, interval_ms: u64) {
         self.min_interval_ms = interval_ms;
     }
 
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
         self.last.len()
     }
 }
@@ -119,7 +120,7 @@ impl PerAddrRateLimiter {
 /// Exponential (base-2) backoff: `base_ms * 2^exponent`, saturating, capped at
 /// `cap_ms`. Shared by the discovery originator backoff (exponent = failures-1)
 /// and the FMP retry scheduler (exponent = retry_count).
-pub(crate) fn backoff_ms(exponent: u32, base_ms: u64, cap_ms: u64) -> u64 {
+pub fn backoff_ms(exponent: u32, base_ms: u64, cap_ms: u64) -> u64 {
     let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
     base_ms.saturating_mul(multiplier).min(cap_ms)
 }

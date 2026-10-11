@@ -22,15 +22,15 @@
 //! - `wire.rs` — the FSP session wire codec and message types. Clock-free,
 //!   crypto-free.
 
-pub(crate) mod core;
-pub(crate) mod limits;
-pub(crate) mod quorum;
-pub(crate) mod wire;
+pub mod core;
+pub mod limits;
+pub mod quorum;
+pub mod wire;
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use core::{
+pub use core::{
     DecryptSlot, EpochReaction, Fsp, FspAction, InitialMsg3ResendSnapshot, RekeyCfg,
     RekeyMsg3ResendSnapshot, SessionSnapshot, cutover_timer_elapsed, initiation_winner,
     mark_ipv6_ecn_ce, push_bounded_pending, should_apply_path_mtu,

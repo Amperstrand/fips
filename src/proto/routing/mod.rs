@@ -25,12 +25,12 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use core::{
+pub use core::{
     DropReason, NextHop, RouteAction, RouteClass, RouteOutcome, RoutingView, classify_forward,
     select_best_candidate,
 };
-pub(crate) use limits::{LimitVerdict, RoutingErrorRateLimiter};
-pub(crate) use state::Router;
+pub use limits::{LimitVerdict, RoutingErrorRateLimiter};
+pub use state::Router;
 pub use wire::{
     COORDS_REQUIRED_SIZE, CoordsRequired, MTU_EXCEEDED_SIZE, MtuExceeded, PathBroken,
     RoutingSignalType,

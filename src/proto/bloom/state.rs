@@ -3,8 +3,10 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::BloomFilter;
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::mmp::delivery::{Acks, LinkEvidence, ResendReason};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// State for managing Bloom filter announcements.
 ///
@@ -153,8 +155,8 @@ impl BloomState {
     }
 
     /// Read back the time of the last update sent to a peer, if any.
-    #[cfg(test)]
-    pub(crate) fn last_update_sent(&self, peer_id: &NodeAddr) -> Option<u64> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn last_update_sent(&self, peer_id: &NodeAddr) -> Option<u64> {
         self.last_update_sent.get(peer_id).copied()
     }
 

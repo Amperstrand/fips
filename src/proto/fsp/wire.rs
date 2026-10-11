@@ -36,6 +36,7 @@ use crate::proto::Error;
 use crate::proto::codec::{Reader, Writer};
 use crate::proto::stp::{TreeCoordinate, decode_coords, decode_optional_coords, encode_coords};
 use ::core::fmt;
+use alloc::vec::Vec;
 
 // ============================================================================
 // Constants
@@ -66,7 +67,7 @@ pub const FSP_HEADER_SIZE: usize = 12;
 pub const FSP_INNER_HEADER_SIZE: usize = 6;
 
 /// AEAD authentication tag size (ChaCha20-Poly1305).
-pub(crate) const TAG_SIZE: usize = 16;
+pub const TAG_SIZE: usize = 16;
 
 /// Minimum size for an encrypted FSP message: header + tag (no plaintext).
 pub const FSP_ENCRYPTED_MIN_SIZE: usize = FSP_HEADER_SIZE + TAG_SIZE; // 28 bytes

@@ -33,20 +33,20 @@ mod core;
 mod limits;
 mod silent;
 mod state;
-pub(crate) mod wire;
+pub mod wire;
 
 #[cfg(test)]
 mod tests;
 
-pub(crate) use core::{
+pub use core::{
     AnsweredMsg1s, ConnAction, ConnSnapshot, EstablishSnapshot, EstablishView, InboundDecision,
     InboundReject, LifecycleView, Msg1Arrival, Msg1Digest, OutboundDecision, OutboundSnapshot,
     PeerSnapshot, REKEY_MIN_CUTOVER_AGE_SECS, RekeyAnswer, RekeyCfg, RekeyResendSnapshot,
     RekeyRole, WireOutcome,
 };
 pub use core::{PromotionResult, cross_connection_winner};
-pub(crate) use limits::backoff_ms;
-pub(crate) use silent::SilentSessions;
-pub(crate) use state::{ConnectionState, Fmp};
+pub use limits::backoff_ms;
+pub use silent::SilentSessions;
+pub use state::{ConnectionState, Fmp};
 pub use wire::HandshakeMessageType;
-pub(crate) use wire::{Disconnect, DisconnectReason};
+pub use wire::{Disconnect, DisconnectReason};

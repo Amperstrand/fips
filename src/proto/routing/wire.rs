@@ -10,12 +10,13 @@
 //! `crate::proto::stp`, and [`Error`] from `crate::proto` (both
 //! allowed `proto -> proto` dependencies).
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::Error;
 use crate::proto::codec::{Reader, Writer};
 use crate::proto::stp::{
     TreeCoordinate, decode_optional_coords, encode_coords, encode_empty_coords,
 };
+use alloc::vec::Vec;
 use core::fmt;
 
 /// Plaintext link-layer routing error-signal message types (`0x20`–`0x2F`).

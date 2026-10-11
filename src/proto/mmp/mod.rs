@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 mod algorithms;
 mod core;
-pub(crate) mod delivery;
+pub mod delivery;
 mod limits;
 mod metrics;
 mod path_mtu;
@@ -39,13 +39,13 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use algorithms::DualEwma;
-pub(crate) use core::{
+pub use algorithms::DualEwma;
+pub use core::{
     BackoffUpdate, LinkReportKind, LinkReportSnapshot, MmpAction, PeerLivenessSnapshot, SendResult,
     SessionReportKind, SessionReportSnapshot,
 };
-pub(crate) use metrics::{MmpMetrics, RrLog};
-pub(crate) use state::{Mmp, MmpPeerState, MmpSessionState};
+pub use metrics::{MmpMetrics, RrLog};
+pub use state::{Mmp, MmpPeerState, MmpSessionState};
 pub use wire::{
     PathMtuNotification, ReceiverReport, SenderReport, SessionReceiverReport, SessionSenderReport,
 };

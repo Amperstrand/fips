@@ -7,6 +7,7 @@ use crate::proto::routing::{
     RoutingSignalType,
 };
 use crate::testutil::make_node_addr;
+use alloc::format;
 
 #[test]
 fn test_routing_signal_type_roundtrip() {

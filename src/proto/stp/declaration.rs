@@ -2,7 +2,8 @@
 
 use core::fmt;
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
+use alloc::vec::Vec;
 
 /// A node's declaration of its parent in the spanning tree.
 ///

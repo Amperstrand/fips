@@ -4,6 +4,8 @@ use alloc::collections::BTreeMap;
 
 use crate::proto::bloom::{BloomFilter, BloomState};
 use crate::testutil::make_node_addr;
+use alloc::vec;
+use alloc::vec::Vec;
 
 #[test]
 fn test_bloom_state_new() {
@@ -347,7 +349,7 @@ fn test_bloom_state_mark_changed_peers_excludes_source() {
 // send is recorded with `next_counter = counter + 1`, as the shell reads it
 // straight after the send.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::mmp::delivery::{
     FALLBACK_MS, LOSS_BUDGET, LinkEvidence, QUIET_MS, ResendReason, RrCounters, UNVERIFIED_BUDGET,
 };

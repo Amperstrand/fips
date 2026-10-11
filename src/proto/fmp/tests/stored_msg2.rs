@@ -5,6 +5,9 @@
 use super::offlink::aged_snapshot;
 use super::util::wire_outcome;
 use crate::proto::fmp::{EstablishSnapshot, Fmp, InboundDecision, InboundReject};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// The stored msg2 bytes the snapshots below carry.
 const STORED: [u8; 4] = [0x5E; 4];

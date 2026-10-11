@@ -1,6 +1,6 @@
 //! Tests for the pure FSP session-rekey + epoch-reaction decision core.
 
-use crate::Ipv6Address;
+use crate::identity::Ipv6Address;
 use crate::proto::fsp::core::{
     DecryptSlot, EpochReaction, Fsp, FspAction, InitialMsg3ResendSnapshot, RekeyCfg,
     RekeyMsg3ResendSnapshot, SessionSnapshot, cutover_timer_elapsed, initiation_winner,
@@ -10,6 +10,8 @@ use crate::proto::fsp::limits::FSP_CUTOVER_DELAY_MS;
 use crate::proto::stp::TreeCoordinate;
 use crate::testutil::make_node_addr;
 use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 
 fn coords(byte: u8) -> TreeCoordinate {
     TreeCoordinate::from_addrs(vec![make_node_addr(byte)]).unwrap()

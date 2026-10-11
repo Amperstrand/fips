@@ -13,9 +13,10 @@
 //!
 //! Sans-IO: the caller passes the time in, and nothing here logs or counts.
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
+use alloc::vec::Vec;
 
 /// Distinct links that must deliver a report naming a destination within
 /// [`QUORUM_WINDOW_MS`] before its verified coordinates are demoted.
@@ -29,9 +30,9 @@ use crate::NodeAddr;
 /// A node whose reports all arrive over one link, such as a leaf with a
 /// single peer, never reaches this. A stale verified entry there lasts until
 /// a lookup that a report started answers and replaces it, or at most until
-/// its verification ages out after [`crate::cache::VERIFIED_TTL_MS`]; from
+/// its verification ages out after `cache::VERIFIED_TTL_MS`; from
 /// then on it no longer refuses a hint, and the next report removes it.
-pub(crate) const QUORUM_LINKS: usize = 2;
+pub const QUORUM_LINKS: usize = 2;
 
 /// Window within which distinct links count toward one quorum, in
 /// milliseconds.
@@ -39,11 +40,11 @@ pub(crate) const QUORUM_LINKS: usize = 2;
 /// The sum of the default lookup attempt schedule (1 + 2 + 4 + 8 s), so the
 /// reports that arrive during one re-validation cycle count together. An
 /// anchor, not a measurement.
-pub(crate) const QUORUM_WINDOW_MS: u64 = 15_000;
+pub const QUORUM_WINDOW_MS: u64 = 15_000;
 
 /// What one report did to its destination's quorum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QuorumVerdict {
+pub enum QuorumVerdict {
     /// Not enough distinct links yet; `distinct` counts this one.
     Below { distinct: usize },
     /// This report completed the quorum. The destination's record is cleared,
@@ -54,14 +55,14 @@ pub(crate) enum QuorumVerdict {
 /// Distinct links seen per destination, each with the time it was first seen
 /// inside the current window.
 #[derive(Debug, Default)]
-pub(crate) struct LinkQuorum {
+pub struct LinkQuorum {
     seen: BTreeMap<NodeAddr, Vec<(NodeAddr, u64)>>,
     last_sweep_ms: u64,
 }
 
 impl LinkQuorum {
     /// An empty quorum tracker.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -71,12 +72,7 @@ impl LinkQuorum {
     /// A link already counted for `dest` inside the window does not count
     /// again, and its first-seen time is not refreshed, so one neighbour
     /// repeating itself can neither reach the quorum nor keep a record alive.
-    pub(crate) fn record(
-        &mut self,
-        dest: NodeAddr,
-        link_peer: NodeAddr,
-        now_ms: u64,
-    ) -> QuorumVerdict {
+    pub fn record(&mut self, dest: NodeAddr, link_peer: NodeAddr, now_ms: u64) -> QuorumVerdict {
         self.sweep(now_ms);
         let seen = self.seen.entry(dest).or_default();
         seen.retain(|&(_, at)| live(at, now_ms));
@@ -96,13 +92,14 @@ impl LinkQuorum {
     ///
     /// Called when a lookup verifies `dest` again: reports about the path the
     /// fresh value replaced are not evidence against it.
-    pub(crate) fn clear(&mut self, dest: &NodeAddr) {
+    pub fn clear(&mut self, dest: &NodeAddr) {
         self.seen.remove(dest);
     }
 
     /// Number of destinations with a record.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
         self.seen.len()
     }
 

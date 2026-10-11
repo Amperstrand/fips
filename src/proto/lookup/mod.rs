@@ -20,20 +20,20 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use core::{
+pub use core::{
     ForwardOutcome, InitiateDecision, LookupAction, RequestOutcome, ResponseRoute,
     ResponseRouteDecision, RoutingView, classify_request, classify_response, initiate_failed,
     initiate_gate, on_response_accepted, plan_forward, plan_initiate, plan_response_route,
     poll_pending,
 };
-pub(crate) use limits::{
+pub use limits::{
     LookupBackoff, LookupForwardRateLimiter, MAX_BACKOFF_ENTRIES, MAX_RECENT_LOOKUP_REQUESTS,
 };
-#[cfg(test)]
-pub(crate) use state::RecentRequest;
-pub(crate) use state::{Lookup, PendingLookup};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use state::RecentRequest;
+pub use state::{Lookup, PendingLookup};
 // The eviction policy reads the share floor through `Lookup::peer_share`;
 // only the node-level regression tests name the constant itself.
-#[cfg(test)]
-pub(crate) use state::MIN_RECENT_PER_PEER;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use state::MIN_RECENT_PER_PEER;
 pub use wire::{LookupRequest, LookupResponse};

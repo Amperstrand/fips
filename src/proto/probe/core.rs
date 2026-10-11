@@ -22,23 +22,25 @@ use super::state::{
     Preflight, ProbeSnapshot, ResolveSource, RttCounters, Stage, StageRecord, StageVerdict,
 };
 use crate::proto::stp::TreeCoordinate;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Per-stage budgets, all monotonic milliseconds and all tick-quantized by the
 /// shell before they get here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Budgets {
-    pub(crate) bloom_ms: u64,
-    pub(crate) discovery_ms: u64,
-    pub(crate) session_ms: u64,
-    pub(crate) rtt_ms: u64,
-    pub(crate) tick_ms: u64,
+pub struct Budgets {
+    pub bloom_ms: u64,
+    pub discovery_ms: u64,
+    pub session_ms: u64,
+    pub rtt_ms: u64,
+    pub tick_ms: u64,
 }
 
 impl Budgets {
     /// Derive the stage budgets from the rx-loop tick period and the lookup
     /// attempt ladder. Each stage is `max(floor, N * tick_ms)` so a node with a
     /// long tick does not expire a stage between two observations.
-    pub(crate) fn derive(tick_ms: u64, attempt_timeouts_secs: &[u64]) -> Self {
+    pub fn derive(tick_ms: u64, attempt_timeouts_secs: &[u64]) -> Self {
         let ladder_ms: u64 = attempt_timeouts_secs.iter().sum::<u64>() * 1000;
         Self {
             bloom_ms: BLOOM_MIN_TICKS * tick_ms,
@@ -51,44 +53,44 @@ impl Budgets {
 
     /// Total worst-case budget, which is what the client sizes its own ceiling
     /// from.
-    pub(crate) fn total_ms(&self) -> u64 {
+    pub fn total_ms(&self) -> u64 {
         self.bloom_ms + self.discovery_ms + self.session_ms + self.rtt_ms
     }
 }
 
 /// Live state as of one tick, with every clock read already resolved.
 #[derive(Clone, Debug)]
-pub(crate) struct Observation {
+pub struct Observation {
     /// Monotonic. All budget arithmetic uses this.
     ///
     /// Deliberately the monotonic clock and not the wall clock: an NTP step or
     /// a resume from suspend must not invent a handshake timeout against a
     /// healthy peer. Wall time is read shell-side only, where the surrounding
     /// API requires it (the coord cache's TTLs are keyed to it).
-    pub(crate) now_ms: u64,
-    pub(crate) coords_cached: bool,
-    pub(crate) lookup_pending: bool,
-    pub(crate) lookup_outcome: Option<LookupOutcomeKind>,
-    pub(crate) lookup_fanout: Option<usize>,
-    pub(crate) path: Option<PathFacts>,
-    pub(crate) next_hop: Option<NextHopFacts>,
-    pub(crate) no_hop_reason: Option<NoHopReason>,
-    pub(crate) session_present: bool,
-    pub(crate) session_established: bool,
+    pub now_ms: u64,
+    pub coords_cached: bool,
+    pub lookup_pending: bool,
+    pub lookup_outcome: Option<LookupOutcomeKind>,
+    pub lookup_fanout: Option<usize>,
+    pub path: Option<PathFacts>,
+    pub next_hop: Option<NextHopFacts>,
+    pub no_hop_reason: Option<NoHopReason>,
+    pub session_present: bool,
+    pub session_established: bool,
     /// The identity check passed at drive time: the live entry is the one this
     /// probe created and still exclusively owns.
-    pub(crate) session_is_ours: bool,
-    pub(crate) session_error: Option<String>,
-    pub(crate) target_is_direct_peer: bool,
-    pub(crate) counters: RttCounters,
-    pub(crate) last_rtt_ms: Option<u32>,
-    pub(crate) srtt_ms: Option<f64>,
-    pub(crate) path_mtu: Option<u32>,
+    pub session_is_ours: bool,
+    pub session_error: Option<String>,
+    pub target_is_direct_peer: bool,
+    pub counters: RttCounters,
+    pub last_rtt_ms: Option<u32>,
+    pub srtt_ms: Option<f64>,
+    pub path_mtu: Option<u32>,
 }
 
 /// An effect the async driver performs on the core's behalf.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ProbeAction {
+pub enum ProbeAction {
     /// Call the gated lookup entry point for the target.
     InitiateLookup,
     /// Open an FSP session, after re-checking that no entry exists.
@@ -103,7 +105,7 @@ pub(crate) enum ProbeAction {
 }
 
 /// The probe stage machine.
-pub(crate) struct Probe {
+pub struct Probe {
     started_ms: u64,
     ended_ms: Option<u64>,
     deadline_ms: u64,
@@ -150,7 +152,7 @@ pub(crate) struct Probe {
 impl Probe {
     /// Start a probe. Records the deadline; it does **not** decide ownership,
     /// which is latched at action time (see [`Probe::step`]).
-    pub(crate) fn new(now_ms: u64, budgets: Budgets, preflight: Preflight) -> Self {
+    pub fn new(now_ms: u64, budgets: Budgets, preflight: Preflight) -> Self {
         Self {
             started_ms: now_ms,
             ended_ms: None,
@@ -193,16 +195,16 @@ impl Probe {
 
     /// Whether the probe currently holds exclusive ownership of the session.
     #[cfg(test)]
-    pub(crate) fn owns_session(&self) -> bool {
+    pub fn owns_session(&self) -> bool {
         self.owns_session
     }
 
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.finished
     }
 
     /// Advance the machine by one observation.
-    pub(crate) fn step(&mut self, obs: &Observation) -> Vec<ProbeAction> {
+    pub fn step(&mut self, obs: &Observation) -> Vec<ProbeAction> {
         let mut actions = Vec::new();
         if self.finished {
             return actions;
@@ -266,7 +268,7 @@ impl Probe {
     /// Cancel the probe: mark it cancelled and emit the terminal actions
     /// without waiting out the teardown grace, since the caller wants the job
     /// gone now.
-    pub(crate) fn cancel(&mut self, now_ms: u64) -> Vec<ProbeAction> {
+    pub fn cancel(&mut self, now_ms: u64) -> Vec<ProbeAction> {
         let mut actions = Vec::new();
         if self.finished {
             return actions;
@@ -285,7 +287,7 @@ impl Probe {
     }
 
     /// Project the report the control socket publishes.
-    pub(crate) fn snapshot(&self) -> ProbeSnapshot {
+    pub fn snapshot(&self) -> ProbeSnapshot {
         ProbeSnapshot {
             overall: self.overall,
             tick_ms: self.budgets.tick_ms,
@@ -315,7 +317,7 @@ impl Probe {
     }
 
     /// Elapsed wall of the job so far, for a poll that arrives mid-run.
-    pub(crate) fn elapsed_ms(&self, now_ms: u64) -> u64 {
+    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
         self.ended_ms
             .unwrap_or(now_ms)
             .saturating_sub(self.started_ms)
@@ -770,7 +772,7 @@ fn classify_rtt_failure(delta: RttCounters) -> FailKind {
 /// `None` for different roots. `lca_depth` alone returns `0` there via its
 /// `saturating_sub(1)`, indistinguishable from "the LCA is the root", so the
 /// core never keys off it directly.
-pub(crate) fn describe_path(my: &TreeCoordinate, their: &TreeCoordinate) -> PathFacts {
+pub fn describe_path(my: &TreeCoordinate, their: &TreeCoordinate) -> PathFacts {
     let our_depth = my.depth();
     let their_depth = their.depth();
     let lca = my.lca(their).copied();

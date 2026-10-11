@@ -1,4 +1,4 @@
-//! Mesh lookup subsystem state owned by [`Node`](crate::node::Node).
+//! Mesh lookup subsystem state owned by `Node`.
 //!
 //! Groups the four lookup-related state fields (recent-request dedup
 //! cache, in-flight lookups, originator-side backoff, transit-side forward
@@ -10,7 +10,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use super::limits::{LookupBackoff, LookupForwardRateLimiter};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 
 /// Recent request tracking for dedup and reverse-path forwarding.
 ///
@@ -19,19 +19,19 @@ use crate::NodeAddr;
 /// arrives, it's forwarded back to that peer (reverse-path forwarding).
 /// The `response_forwarded` flag prevents response routing loops.
 #[derive(Clone, Debug)]
-pub(crate) struct RecentRequest {
+pub struct RecentRequest {
     /// The peer who sent this request to us.
-    pub(crate) from_peer: NodeAddr,
+    pub from_peer: NodeAddr,
     /// When we received this request (Unix milliseconds).
-    pub(crate) timestamp_ms: u64,
+    pub timestamp_ms: u64,
     /// Whether we've already forwarded a response for this request.
     /// Prevents response routing loops when convergent request paths
     /// create bidirectional entries in recent_requests.
-    pub(crate) response_forwarded: bool,
+    pub response_forwarded: bool,
 }
 
 impl RecentRequest {
-    pub(crate) fn new(from_peer: NodeAddr, timestamp_ms: u64) -> Self {
+    pub fn new(from_peer: NodeAddr, timestamp_ms: u64) -> Self {
         Self {
             from_peer,
             timestamp_ms,
@@ -40,7 +40,7 @@ impl RecentRequest {
     }
 
     /// Check if this entry has expired (older than expiry_ms).
-    pub(crate) fn is_expired(&self, current_time_ms: u64, expiry_ms: u64) -> bool {
+    pub fn is_expired(&self, current_time_ms: u64, expiry_ms: u64) -> bool {
         current_time_ms.saturating_sub(self.timestamp_ms) > expiry_ms
     }
 }
@@ -107,7 +107,7 @@ impl PendingLookup {
 /// the cache size, in which case the peer holding the most entries pays for
 /// the next admission. Raising it lets one busy neighbour hold more of the
 /// cache; lowering it clips a genuine transit burst.
-pub(crate) const MIN_RECENT_PER_PEER: usize = 64;
+pub const MIN_RECENT_PER_PEER: usize = 64;
 
 /// How many evicted request ids [`Lookup::was_evicted`] remembers.
 ///
@@ -115,13 +115,13 @@ pub(crate) const MIN_RECENT_PER_PEER: usize = 64;
 /// which a flooding peer chooses. A response arriving after more evictions
 /// than this since its own is not recognised as one lost to eviction, so the
 /// diagnostic undercounts under heavy eviction.
-pub(crate) const EVICTED_KEPT: usize = 1024;
+pub const EVICTED_KEPT: usize = 1024;
 
 /// Mesh lookup subsystem state.
-pub(crate) struct Lookup {
+pub struct Lookup {
     /// Recent lookup requests (dedup + reverse-path forwarding).
     /// Maps request_id → RecentRequest.
-    pub(crate) recent_requests: BTreeMap<u64, RecentRequest>,
+    pub recent_requests: BTreeMap<u64, RecentRequest>,
     /// Arrival-order index over `recent_requests`, partitioned by the link
     /// peer each request arrived from. The cache is full-then-evict rather
     /// than full-then-refuse, and this is what lets an eviction be charged
@@ -134,14 +134,14 @@ pub(crate) struct Lookup {
     /// goes through [`Lookup::record_recent`], [`Lookup::evict_oldest_from`]
     /// or [`Lookup::purge_recent`], which keep the two level. A drifted index
     /// evicts the wrong entry, or none at all.
-    pub(crate) recent_by_peer: BTreeMap<NodeAddr, VecDeque<u64>>,
+    pub recent_by_peer: BTreeMap<NodeAddr, VecDeque<u64>>,
     /// Tracks in-flight lookups. Maps target NodeAddr to the
     /// initiation timestamp (Unix ms). Prevents duplicate flood queries.
-    pub(crate) pending_lookups: BTreeMap<NodeAddr, PendingLookup>,
+    pub pending_lookups: BTreeMap<NodeAddr, PendingLookup>,
     /// Backoff for failed lookups (originator-side).
-    pub(crate) backoff: LookupBackoff,
+    pub backoff: LookupBackoff,
     /// Rate limiter for forwarded lookup requests (transit-side).
-    pub(crate) forward_limiter: LookupForwardRateLimiter,
+    pub forward_limiter: LookupForwardRateLimiter,
     /// The most recently evicted request ids, oldest first, at most
     /// [`EVICTED_KEPT`]. Read only by diagnostics.
     evicted: VecDeque<u64>,
@@ -153,7 +153,7 @@ impl Lookup {
     /// The two limiters are constructed by the caller so each `Node`
     /// constructor can supply its own configured/default variant, matching
     /// the pre-refactor initialization exactly.
-    pub(crate) fn new(backoff: LookupBackoff, forward_limiter: LookupForwardRateLimiter) -> Self {
+    pub fn new(backoff: LookupBackoff, forward_limiter: LookupForwardRateLimiter) -> Self {
         Self {
             recent_requests: BTreeMap::new(),
             recent_by_peer: BTreeMap::new(),
@@ -170,12 +170,12 @@ impl Lookup {
     /// a many-peer node outgrows, with [`MIN_RECENT_PER_PEER`] as its floor.
     /// `peer_count` is supplied by the caller: the core is sans-IO and has no
     /// view of the live peer table.
-    pub(crate) fn peer_share(max_recent: usize, peer_count: usize) -> usize {
+    pub fn peer_share(max_recent: usize, peer_count: usize) -> usize {
         (max_recent / peer_count.max(1)).max(MIN_RECENT_PER_PEER)
     }
 
     /// How many cached entries `peer` currently holds.
-    pub(crate) fn peer_entries(&self, peer: &NodeAddr) -> usize {
+    pub fn peer_entries(&self, peer: &NodeAddr) -> usize {
         self.recent_by_peer.get(peer).map_or(0, VecDeque::len)
     }
 
@@ -185,7 +185,7 @@ impl Lookup {
     /// last maximum and the index is ordered. Arbitrary but deterministic:
     /// nothing about the policy depends on which of two equally heavy peers
     /// pays, only that the choice does not vary run to run.
-    pub(crate) fn heaviest_peer(&self) -> Option<NodeAddr> {
+    pub fn heaviest_peer(&self) -> Option<NodeAddr> {
         self.recent_by_peer
             .iter()
             .max_by_key(|(_, ids)| ids.len())
@@ -197,7 +197,7 @@ impl Lookup {
     ///
     /// The caller has already established that `request_id` is not cached; a
     /// duplicate must not reach here, or the index would hold it twice.
-    pub(crate) fn record_recent(&mut self, request_id: u64, from: NodeAddr, now_ms: u64) {
+    pub fn record_recent(&mut self, request_id: u64, from: NodeAddr, now_ms: u64) {
         self.recent_requests
             .insert(request_id, RecentRequest::new(from, now_ms));
         self.recent_by_peer
@@ -212,10 +212,7 @@ impl Lookup {
     ///
     /// Returns `None` when the peer holds nothing, which the eviction policy
     /// treats as "no room could be made" rather than as an error.
-    pub(crate) fn evict_oldest_from(
-        &mut self,
-        peer: &NodeAddr,
-    ) -> Option<(u64, Option<RecentRequest>)> {
+    pub fn evict_oldest_from(&mut self, peer: &NodeAddr) -> Option<(u64, Option<RecentRequest>)> {
         let ids = self.recent_by_peer.get_mut(peer)?;
         let evicted = ids.pop_front()?;
         if ids.is_empty() {
@@ -231,7 +228,7 @@ impl Lookup {
 
     /// Whether `request_id` is among the last [`EVICTED_KEPT`] ids evicted
     /// to make room. Expiry purges are not evictions and are not counted.
-    pub(crate) fn was_evicted(&self, request_id: u64) -> bool {
+    pub fn was_evicted(&self, request_id: u64) -> bool {
         self.evicted.contains(&request_id)
     }
 
@@ -241,7 +238,7 @@ impl Lookup {
     /// clock, so the two cannot drift apart: an id is indexed if and only if
     /// the cache still holds it, and a peer disappears from the index when
     /// its last entry does.
-    pub(crate) fn purge_recent(&mut self, now_ms: u64, expiry_ms: u64) {
+    pub fn purge_recent(&mut self, now_ms: u64, expiry_ms: u64) {
         self.recent_requests
             .retain(|_, entry| !entry.is_expired(now_ms, expiry_ms));
         let recent = &self.recent_requests;
@@ -254,7 +251,7 @@ impl Lookup {
     /// Reset lookup backoff on topology changes. Returns the number of
     /// entries cleared (0 if already empty) so the shell can log the reset —
     /// observability stays out of the pure core.
-    pub(crate) fn reset_backoff(&mut self) -> usize {
+    pub fn reset_backoff(&mut self) -> usize {
         if self.backoff.is_empty() {
             return 0;
         }

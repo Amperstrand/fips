@@ -1,13 +1,16 @@
 //! Stage-machine tests. Each drives `Probe::step` with synthetic `now_ms` and
 //! hand-built `Observation`s and asserts on the returned action list.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::probe::core::{Budgets, Observation, Probe, ProbeAction};
 use crate::proto::probe::state::{
     FailKind, LeftIntact, LookupOutcomeKind, NextHopFacts, Overall, PathFacts, Preflight,
     ResolveSource, RttCounters, StageVerdict,
 };
 use crate::proto::routing::RouteClass;
+use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
 
 const T0: u64 = 1_000_000;
 

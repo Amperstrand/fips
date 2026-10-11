@@ -8,7 +8,7 @@
 /// This is the fixed overhead for a SessionDatagram carrying an FSP DataPacket,
 /// used by the send path's CP-flag guard to check whether piggybacked coords
 /// fit within the transport MTU. For IPv6 effective MTU calculations, use
-/// [`FIPS_IPV6_OVERHEAD`] which accounts for port multiplexing and header
+/// `FIPS_IPV6_OVERHEAD` which accounts for port multiplexing and header
 /// compression.
 ///
 /// Breakdown (traced through the actual send path):
@@ -32,6 +32,4 @@
 /// Note: the FMP inner header msg_type byte IS the SessionDatagram msg_type
 /// byte (shared, not double-counted). The "35 bytes" is the SessionDatagram
 /// body after msg_type is consumed by the dispatch layer.
-///
-/// [`FIPS_IPV6_OVERHEAD`]: crate::ipv6tun::icmp::FIPS_IPV6_OVERHEAD
 pub const FIPS_OVERHEAD: u16 = 16 + 16 + 5 + 35 + 12 + 6 + 16; // 106 bytes

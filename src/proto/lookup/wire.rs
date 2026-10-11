@@ -1,10 +1,11 @@
 //! Mesh lookup messages: LookupRequest and LookupResponse.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::Error;
 use crate::proto::codec::Reader;
 use crate::proto::stp::TreeCoordinate;
 use crate::proto::stp::{decode_coords, encode_coords};
+use alloc::vec::Vec;
 use secp256k1::schnorr::Signature;
 
 /// Request to look up a node's coordinates.

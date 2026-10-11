@@ -32,6 +32,9 @@ pub mod nostr;
 mod packaging_tests;
 pub mod peer;
 pub mod perf_profile;
+// `--all-features` turns on `test-hooks` in a build with no test to call
+// the hooks, which would otherwise fail as dead code and unused imports.
+#[cfg_attr(feature = "test-hooks", allow(dead_code, unused_imports))]
 pub(crate) mod proto;
 #[cfg(test)]
 pub(crate) mod testutil;

@@ -8,8 +8,10 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::util::{add_peer, make_coords, make_node_addr, make_tree_state};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::stp::{ParentDeclaration, ParentEval, Stp, TreeDecision, TreeState};
+use alloc::vec;
+use alloc::vec::Vec;
 
 const X: u8 = 5;
 const P: u8 = 4;

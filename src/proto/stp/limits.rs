@@ -28,7 +28,7 @@ const MAX_FLAP_DAMPENING_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 /// ranking in [`TreeState`](super::TreeState) drives them through a small
 /// method surface, mirroring the routing / discovery limiter idiom. All
 /// timers are monotonic milliseconds; the shell injects `now_ms`.
-pub(crate) struct FlapDampener {
+pub struct FlapDampener {
     /// Hold-down period after a parent switch, in ms (0 = disabled).
     hold_down: u64,
     /// Monotonic ms of last parent switch (for hold-down enforcement).
@@ -49,7 +49,7 @@ pub(crate) struct FlapDampener {
 
 impl FlapDampener {
     /// Create with the default flap parameters (hold-down disabled).
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             hold_down: 0,
             last_parent_switch: None,
@@ -63,17 +63,12 @@ impl FlapDampener {
     }
 
     /// Set the hold-down duration after parent switches (seconds).
-    pub(crate) fn set_hold_down(&mut self, secs: u64) {
+    pub fn set_hold_down(&mut self, secs: u64) {
         self.hold_down = secs.saturating_mul(1000);
     }
 
     /// Configure flap dampening parameters (durations in seconds).
-    pub(crate) fn set_flap_dampening(
-        &mut self,
-        threshold: u32,
-        window_secs: u64,
-        dampening_secs: u64,
-    ) {
+    pub fn set_flap_dampening(&mut self, threshold: u32, window_secs: u64, dampening_secs: u64) {
         self.flap_threshold = threshold;
         self.flap_window = window_secs.saturating_mul(1000);
         self.flap_dampening_duration = dampening_secs
@@ -85,21 +80,21 @@ impl FlapDampener {
     /// switching, in seconds, after the configured value is clamped.
     ///
     /// Feeds the log field on the engagement warning.
-    pub(crate) fn dampening_secs(&self) -> u64 {
+    pub fn dampening_secs(&self) -> u64 {
         self.flap_dampening_duration / 1000
     }
 
     /// Stamp the time of a parent switch (called on every `set_parent`,
     /// whether or not the parent actually changed). `now_ms` is the injected
     /// monotonic time in milliseconds.
-    pub(crate) fn mark_switch(&mut self, now_ms: u64) {
+    pub fn mark_switch(&mut self, now_ms: u64) {
         self.last_parent_switch = Some(now_ms);
     }
 
     /// Record a parent switch for flap detection.
     /// Returns true if dampening was just engaged. `now_ms` is the injected
     /// monotonic time in milliseconds.
-    pub(crate) fn record_parent_switch(&mut self, now_ms: u64) -> bool {
+    pub fn record_parent_switch(&mut self, now_ms: u64) -> bool {
         // Retire a lapsed episode here rather than lazily. Clearing the
         // deadline and the counter together is what makes each episode cost a
         // fresh threshold of switches inside one window: switches taken during
@@ -134,7 +129,7 @@ impl FlapDampener {
 
     /// Check if flap dampening is currently active. `now_ms` is the injected
     /// monotonic time in milliseconds.
-    pub(crate) fn is_flap_dampened(&self, now_ms: u64) -> bool {
+    pub fn is_flap_dampened(&self, now_ms: u64) -> bool {
         match self.flap_dampening_until {
             Some(until) => now_ms < until,
             None => false,
@@ -143,7 +138,7 @@ impl FlapDampener {
 
     /// Whether hold-down currently suppresses a non-mandatory re-evaluation.
     /// `now_ms` is the injected monotonic time in milliseconds.
-    pub(crate) fn is_hold_down_active(&self, now_ms: u64) -> bool {
+    pub fn is_hold_down_active(&self, now_ms: u64) -> bool {
         self.hold_down != 0
             && self
                 .last_parent_switch

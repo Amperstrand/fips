@@ -4,8 +4,10 @@
 
 use core::fmt;
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::Error;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Errors from constructing a `TreeCoordinate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +250,7 @@ impl fmt::Debug for TreeCoordinate {
 // ============================================================================
 
 /// Wire size of a TreeCoordinate in address-only format: 2 + entries × 16.
-pub(crate) fn coords_wire_size(coords: &TreeCoordinate) -> usize {
+pub fn coords_wire_size(coords: &TreeCoordinate) -> usize {
     2 + coords.entries().len() * 16
 }
 
@@ -256,7 +258,7 @@ pub(crate) fn coords_wire_size(coords: &TreeCoordinate) -> usize {
 ///
 /// Session-layer messages serialize coordinates as NodeAddr arrays (16 bytes each),
 /// without the sequence/timestamp metadata used by the tree gossip protocol.
-pub(crate) fn encode_coords(coords: &TreeCoordinate, buf: &mut Vec<u8>) {
+pub fn encode_coords(coords: &TreeCoordinate, buf: &mut Vec<u8>) {
     let addrs: Vec<&NodeAddr> = coords.node_addrs().collect();
     let count = addrs.len() as u16;
     buf.extend_from_slice(&count.to_le_bytes());
@@ -268,7 +270,7 @@ pub(crate) fn encode_coords(coords: &TreeCoordinate, buf: &mut Vec<u8>) {
 /// Decode a TreeCoordinate from address-only wire format.
 ///
 /// Returns the decoded coordinate and the number of bytes consumed.
-pub(crate) fn decode_coords(data: &[u8]) -> Result<(TreeCoordinate, usize), Error> {
+pub fn decode_coords(data: &[u8]) -> Result<(TreeCoordinate, usize), Error> {
     if data.len() < 2 {
         return Err(Error::MessageTooShort {
             expected: 2,
@@ -300,9 +302,7 @@ pub(crate) fn decode_coords(data: &[u8]) -> Result<(TreeCoordinate, usize), Erro
 /// Decode an optional coordinate field (count may be 0).
 ///
 /// Returns None if count is 0, Some(coord) otherwise, plus bytes consumed.
-pub(crate) fn decode_optional_coords(
-    data: &[u8],
-) -> Result<(Option<TreeCoordinate>, usize), Error> {
+pub fn decode_optional_coords(data: &[u8]) -> Result<(Option<TreeCoordinate>, usize), Error> {
     if data.len() < 2 {
         return Err(Error::MessageTooShort {
             expected: 2,
@@ -332,6 +332,6 @@ pub(crate) fn decode_optional_coords(
 }
 
 /// Encode a count of zero (for empty/absent coordinate fields).
-pub(crate) fn encode_empty_coords(buf: &mut Vec<u8>) {
+pub fn encode_empty_coords(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&0u16.to_le_bytes());
 }

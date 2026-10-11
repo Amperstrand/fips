@@ -2,6 +2,7 @@
 
 use super::util::{make_coords, make_node_addr};
 use crate::proto::stp::{CoordEntry, CoordError, TreeCoordinate};
+use alloc::vec;
 
 #[test]
 fn test_tree_coordinate_root() {

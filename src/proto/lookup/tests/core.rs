@@ -4,9 +4,10 @@ use super::util::{
     MockRoutingView, action_peers, distinct_addr, empty_lookup, make_request, make_request_id,
     suppressing_lookup,
 };
-use crate::TreeCoordinate;
+use crate::proto::coord::TreeCoordinate;
 use crate::proto::lookup::*;
 use crate::testutil::make_node_addr;
+use alloc::vec;
 
 #[test]
 fn picks_only_tree_peers_when_a_tree_peer_matches() {

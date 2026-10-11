@@ -1,8 +1,11 @@
 //! Tests for the FSP session wire codec and message types.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::fsp::wire::*;
 use crate::proto::stp::TreeCoordinate;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
 
 fn make_node_addr(val: u8) -> NodeAddr {
     let mut bytes = [0u8; 16];

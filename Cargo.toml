@@ -27,6 +27,12 @@ default = []
 # default build's neutrality a property of the generated code rather than of a
 # runtime check. Build with `--features profiling` for a measurement run.
 profiling = []
+# The protocol modules' test hooks: methods and re-exports that only unit
+# tests use to set up or inspect state. Tests see them through `cfg(test)`;
+# the feature lets a test build of another crate see them too. Only tests
+# need it; `--all-features` enables it as well, which compiles the hooks
+# with no caller, and the protocol module allows that.
+test-hooks = []
 
 [dependencies]
 ratatui = "0.30"

@@ -16,21 +16,21 @@
 
 use super::core::Msg1Digest;
 use super::limits::backoff_ms;
-use crate::NodeAddr;
-use std::collections::{HashMap, VecDeque};
+use crate::identity::NodeAddr;
+use alloc::collections::{BTreeMap, VecDeque};
 
 /// Consecutive silent sessions of one identity at one epoch before its msg1s
 /// are refused. Decided with the cap; a later capture may recalibrate both.
-pub(crate) const SILENT_SESSION_LIMIT: u32 = 3;
+pub const SILENT_SESSION_LIMIT: u32 = 3;
 
 /// The first refusal's length. Equal to the default link-dead timeout, so a
 /// first refusal costs a peer wrongly judged silent no more than one more
 /// silent session would have; a step below the peer's redial interval would
 /// refuse nothing.
-pub(crate) const SILENT_BACKOFF_BASE_MS: u64 = 30_000;
+pub const SILENT_BACKOFF_BASE_MS: u64 = 30_000;
 
 /// The longest refusal, reached after five doublings.
-pub(crate) const SILENT_BACKOFF_CAP_MS: u64 = 600_000;
+pub const SILENT_BACKOFF_CAP_MS: u64 = 600_000;
 
 /// How long a record is kept after its refusal ends, or after its last silent
 /// session when it has not reached the limit. Measured from the refusal's end
@@ -45,7 +45,7 @@ const COUNTED_SETUP_RECORD: usize = 8;
 
 /// A refusal in force for one identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ActiveBackoff {
+pub struct ActiveBackoff {
     /// The startup epoch of the silent sessions counted; msg1s at another
     /// epoch are not refused. `None` when none of them carried one.
     pub epoch: Option<[u8; 8]>,
@@ -57,7 +57,7 @@ pub(crate) struct ActiveBackoff {
 
 /// A refusal started or extended by a silent session's end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RefusalStart {
+pub struct RefusalStart {
     /// The refusal now in force.
     pub backoff: ActiveBackoff,
     /// Msg1s refused while the record's previous refusal was in force, or
@@ -108,19 +108,19 @@ impl SilentRecord {
 /// Whether two startup epochs name different runs of a peer: both present and
 /// unequal. A missing epoch on either side counts as the same, as it does for
 /// a restart.
-pub(crate) fn epochs_differ(a: Option<[u8; 8]>, b: Option<[u8; 8]>) -> bool {
+pub fn epochs_differ(a: Option<[u8; 8]>, b: Option<[u8; 8]>) -> bool {
     matches!((a, b), (Some(x), Some(y)) if x != y)
 }
 
 /// Silent-session records, keyed by peer identity.
 #[derive(Debug, Default)]
-pub(crate) struct SilentSessions {
-    records: HashMap<NodeAddr, SilentRecord>,
+pub struct SilentSessions {
+    records: BTreeMap<NodeAddr, SilentRecord>,
 }
 
 impl SilentSessions {
     /// An empty set of records.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -133,7 +133,7 @@ impl SilentSessions {
     /// at a different epoch from the record's starts the count again. Returns
     /// the refusal this end starts or extends, if any, with the number of
     /// msg1s refused before it; the refused count starts again at zero.
-    pub(crate) fn ended(
+    pub fn ended(
         &mut self,
         peer: NodeAddr,
         epoch: Option<[u8; 8]>,
@@ -174,27 +174,27 @@ impl SilentSessions {
                 silent: record.silent,
                 remaining_ms: length,
             },
-            prior_refused: std::mem::take(&mut record.refused),
+            prior_refused: core::mem::take(&mut record.refused),
         })
     }
 
     /// An authenticated frame arrived from `peer`: forget its silent sessions.
     /// Returns how many msg1s the record had refused since its last refusal
     /// started, 0 with no record.
-    pub(crate) fn heard(&mut self, peer: &NodeAddr) -> u32 {
+    pub fn heard(&mut self, peer: &NodeAddr) -> u32 {
         self.records.remove(peer).map_or(0, |r| r.refused)
     }
 
     /// Count one msg1 of `peer` refused, returning how many its record has
     /// refused since its refusal started, or `None` with no record.
-    pub(crate) fn note_refused(&mut self, peer: &NodeAddr) -> Option<u32> {
+    pub fn note_refused(&mut self, peer: &NodeAddr) -> Option<u32> {
         let record = self.records.get_mut(peer)?;
         record.refused = record.refused.saturating_add(1);
         Some(record.refused)
     }
 
     /// The refusal in force for `peer` at `now_ms`, if one is.
-    pub(crate) fn refusing(&self, peer: &NodeAddr, now_ms: u64) -> Option<ActiveBackoff> {
+    pub fn refusing(&self, peer: &NodeAddr, now_ms: u64) -> Option<ActiveBackoff> {
         let record = self.records.get(peer)?;
         let until = record.until_ms?;
         (until > now_ms).then(|| ActiveBackoff {
@@ -205,14 +205,15 @@ impl SilentSessions {
     }
 
     /// Silent sessions counted for `peer`, or `None` with no record.
-    #[cfg(test)]
-    pub(crate) fn count(&self, peer: &NodeAddr) -> Option<u32> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn count(&self, peer: &NodeAddr) -> Option<u32> {
         self.records.get(peer).map(|r| r.silent)
     }
 
     /// Number of identities with a record.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
         self.records.len()
     }
 }

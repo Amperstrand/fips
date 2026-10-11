@@ -4,6 +4,7 @@ use super::BloomFilter;
 use crate::proto::Error;
 use crate::proto::codec::{Reader, Writer};
 use crate::proto::link::LinkMessageType;
+use alloc::vec::Vec;
 
 /// Bloom filter announcement for reachability propagation.
 ///

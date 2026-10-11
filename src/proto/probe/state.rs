@@ -5,12 +5,14 @@
 //! Every enum carries a `const fn name()` returning the exact string the
 //! control-socket JSON publishes, so the wire vocabulary has one home.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::routing::RouteClass;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// The five stages, in order, plus the terminal drain.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Stage {
+pub enum Stage {
     /// Does any peer's announced filter claim the target, and did a request
     /// therefore go out? Separate from `Discovery` because the two fail for
     /// unrelated reasons: nobody claims the address, against nobody answers
@@ -27,7 +29,7 @@ pub(crate) enum Stage {
 
 /// Per-stage answer. `Pending` means the stage has not been reached.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StageVerdict {
+pub enum StageVerdict {
     Pending,
     Running,
     Ok,
@@ -36,7 +38,7 @@ pub(crate) enum StageVerdict {
 }
 
 impl StageVerdict {
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             StageVerdict::Pending => "pending",
             StageVerdict::Running => "running",
@@ -49,7 +51,7 @@ impl StageVerdict {
 
 /// Machine-stable failure or skip discriminator.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FailKind {
+pub enum FailKind {
     /// bloom and discovery skipped: coordinates already cached.
     Cached,
     /// bloom and discovery skipped: the target is a send-ready direct peer.
@@ -93,7 +95,7 @@ pub(crate) enum FailKind {
 }
 
 impl FailKind {
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             FailKind::Cached => "cached",
             FailKind::DirectPeer => "direct_peer",
@@ -119,14 +121,14 @@ impl FailKind {
 
 /// Where the target's coordinates came from.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolveSource {
+pub enum ResolveSource {
     Cache,
     Lookup,
     DirectPeer,
 }
 
 impl ResolveSource {
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             ResolveSource::Cache => "cache",
             ResolveSource::Lookup => "lookup",
@@ -137,17 +139,17 @@ impl ResolveSource {
 
 /// One stage's record. `elapsed_ms` is filled when the stage leaves `Running`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StageRecord {
-    pub(crate) verdict: StageVerdict,
-    pub(crate) reason: Option<FailKind>,
+pub struct StageRecord {
+    pub verdict: StageVerdict,
+    pub reason: Option<FailKind>,
     /// Free text for the one case carrying a real message: the error string
     /// out of `initiate_session`.
-    pub(crate) detail: Option<String>,
-    pub(crate) elapsed_ms: Option<u64>,
+    pub detail: Option<String>,
+    pub elapsed_ms: Option<u64>,
 }
 
 impl StageRecord {
-    pub(crate) fn pending() -> Self {
+    pub fn pending() -> Self {
         Self {
             verdict: StageVerdict::Pending,
             reason: None,
@@ -156,14 +158,14 @@ impl StageRecord {
         }
     }
 
-    pub(crate) fn is_failed(&self) -> bool {
+    pub fn is_failed(&self) -> bool {
         self.verdict == StageVerdict::Failed
     }
 }
 
 /// The probe's overall answer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Overall {
+pub enum Overall {
     Running,
     Ok,
     Partial,
@@ -172,7 +174,7 @@ pub(crate) enum Overall {
 }
 
 impl Overall {
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             // A job still in flight publishes its stages, not a verdict.
             Overall::Running => "running",
@@ -187,38 +189,38 @@ impl Overall {
 /// Coordinate-derived path facts. Purely local arithmetic over two
 /// coordinates — nothing here was observed on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PathFacts {
+pub struct PathFacts {
     /// Self → root, as `TreeCoordinate` stores them.
-    pub(crate) our_coords: Vec<NodeAddr>,
-    pub(crate) their_coords: Vec<NodeAddr>,
-    pub(crate) our_depth: usize,
-    pub(crate) their_depth: usize,
-    pub(crate) same_root: bool,
-    pub(crate) lca: Option<NodeAddr>,
+    pub our_coords: Vec<NodeAddr>,
+    pub their_coords: Vec<NodeAddr>,
+    pub our_depth: usize,
+    pub their_depth: usize,
+    pub same_root: bool,
+    pub lca: Option<NodeAddr>,
     /// Root-relative: 0 is the root.
-    pub(crate) lca_depth: Option<usize>,
+    pub lca_depth: Option<usize>,
     /// Tree metric, not a predicted hop count.
-    pub(crate) tree_hops_up: Option<usize>,
-    pub(crate) tree_hops_down: Option<usize>,
+    pub tree_hops_up: Option<usize>,
+    pub tree_hops_down: Option<usize>,
     /// Upper bound on the real hop count: selection requires only strict
     /// progress, so a crosslink cut-through routinely delivers in fewer hops.
-    pub(crate) tree_distance: Option<usize>,
+    pub tree_distance: Option<usize>,
 }
 
 /// The first hop this node would select right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NextHopFacts {
-    pub(crate) node_addr: NodeAddr,
-    pub(crate) class: RouteClass,
-    pub(crate) direct_peer: bool,
+pub struct NextHopFacts {
+    pub node_addr: NodeAddr,
+    pub class: RouteClass,
+    pub direct_peer: bool,
     /// True when the class is a crosslink form: the first hop leaves the
     /// up-then-down walk `tree_hops_*` describes.
-    pub(crate) leaves_tree_walk: bool,
+    pub leaves_tree_walk: bool,
 }
 
 /// Why no next hop could be named.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NoHopReason {
+pub enum NoHopReason {
     Local,
     NoCoords,
     DisjointTrees,
@@ -227,7 +229,7 @@ pub(crate) enum NoHopReason {
 }
 
 impl NoHopReason {
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             NoHopReason::Local => "local",
             NoHopReason::NoCoords => "no_coords",
@@ -240,7 +242,7 @@ impl NoHopReason {
 
 /// What the gated lookup entry point decided, flattened for the core.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LookupOutcomeKind {
+pub enum LookupOutcomeKind {
     BloomMiss,
     Suppressed,
     Deduplicated,
@@ -252,27 +254,27 @@ pub(crate) enum LookupOutcomeKind {
 
 /// Live state read once, at `probe_start`, before any stage runs.
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct Preflight {
-    pub(crate) session_present: bool,
-    pub(crate) coords_cached: bool,
-    pub(crate) identity_cached: bool,
+pub struct Preflight {
+    pub session_present: bool,
+    pub coords_cached: bool,
+    pub identity_cached: bool,
     /// Another probe already holds this target's ownership claim.
-    pub(crate) target_claimed: bool,
+    pub target_claimed: bool,
 }
 
 /// The four MMP report counters, sampled together.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RttCounters {
-    pub(crate) reports_seen: u64,
-    pub(crate) samples: u64,
-    pub(crate) zero: u64,
-    pub(crate) arith_fail: u64,
+pub struct RttCounters {
+    pub reports_seen: u64,
+    pub samples: u64,
+    pub zero: u64,
+    pub arith_fail: u64,
 }
 
 impl RttCounters {
     /// Per-field saturating difference, so a rekey or a wrap cannot produce a
     /// negative delta that reads as "nothing happened".
-    pub(crate) fn delta(self, base: RttCounters) -> RttCounters {
+    pub fn delta(self, base: RttCounters) -> RttCounters {
         RttCounters {
             reports_seen: self.reports_seen.saturating_sub(base.reports_seen),
             samples: self.samples.saturating_sub(base.samples),
@@ -284,14 +286,14 @@ impl RttCounters {
 
 /// Why a session the probe touched was left in place.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LeftIntact {
+pub enum LeftIntact {
     Preexisting,
     AdoptedByTraffic,
     Replaced,
 }
 
 impl LeftIntact {
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             LeftIntact::Preexisting => "preexisting",
             LeftIntact::AdoptedByTraffic => "adopted_by_traffic",
@@ -303,29 +305,29 @@ impl LeftIntact {
 /// Everything the control-socket projection needs from the core, as plain
 /// data. The core hands one of these out; it never serializes anything itself.
 #[derive(Clone, Debug)]
-pub(crate) struct ProbeSnapshot {
-    pub(crate) overall: Overall,
-    pub(crate) tick_ms: u64,
-    pub(crate) bloom: StageRecord,
-    pub(crate) discovery: StageRecord,
-    pub(crate) path: StageRecord,
-    pub(crate) session: StageRecord,
-    pub(crate) rtt: StageRecord,
-    pub(crate) resolve_source: Option<ResolveSource>,
-    pub(crate) lookup_fanout: Option<usize>,
-    pub(crate) path_facts: Option<PathFacts>,
-    pub(crate) next_hop: Option<NextHopFacts>,
-    pub(crate) no_hop_reason: Option<NoHopReason>,
-    pub(crate) session_preexisting: bool,
-    pub(crate) session_established: bool,
-    pub(crate) path_mtu: Option<u32>,
-    pub(crate) rtt_ms: Option<u32>,
-    pub(crate) srtt_ms: Option<f64>,
-    pub(crate) counters: RttCounters,
-    pub(crate) torn_down: bool,
-    pub(crate) left_intact: Option<LeftIntact>,
-    pub(crate) lookup_issued: bool,
-    pub(crate) coords_were_cached: bool,
-    pub(crate) identity_was_cached: bool,
-    pub(crate) warmups_sent: u8,
+pub struct ProbeSnapshot {
+    pub overall: Overall,
+    pub tick_ms: u64,
+    pub bloom: StageRecord,
+    pub discovery: StageRecord,
+    pub path: StageRecord,
+    pub session: StageRecord,
+    pub rtt: StageRecord,
+    pub resolve_source: Option<ResolveSource>,
+    pub lookup_fanout: Option<usize>,
+    pub path_facts: Option<PathFacts>,
+    pub next_hop: Option<NextHopFacts>,
+    pub no_hop_reason: Option<NoHopReason>,
+    pub session_preexisting: bool,
+    pub session_established: bool,
+    pub path_mtu: Option<u32>,
+    pub rtt_ms: Option<u32>,
+    pub srtt_ms: Option<f64>,
+    pub counters: RttCounters,
+    pub torn_down: bool,
+    pub left_intact: Option<LeftIntact>,
+    pub lookup_issued: bool,
+    pub coords_were_cached: bool,
+    pub identity_was_cached: bool,
+    pub warmups_sent: u8,
 }

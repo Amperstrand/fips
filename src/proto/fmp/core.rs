@@ -19,10 +19,11 @@
 
 use super::silent::{ActiveBackoff, epochs_differ};
 use super::state::Fmp;
+use crate::identity::{NodeAddr, PeerIdentity};
 use crate::transport::{LinkId, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
-use crate::{NodeAddr, PeerIdentity};
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 /// Determine winner of cross-connection tie-breaker.
 ///
@@ -116,7 +117,7 @@ impl PromotionResult {
 /// Produced by the [`LifecycleView`] read-seam. Each `poll_*` decision only
 /// reads the subset of fields relevant to it; the producing view method leaves
 /// the rest at their defaults.
-pub(crate) struct ConnSnapshot {
+pub struct ConnSnapshot {
     /// The connection's link identifier (teardown/resend target).
     pub link: LinkId,
     /// Teardown path: is this an outbound connection? Drives retry scheduling
@@ -139,7 +140,7 @@ pub(crate) struct ConnSnapshot {
 /// schedule: it holds proof that the peer derived them. The responder
 /// learns that only when a frame sealed on the new epoch authenticates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RekeyRole {
+pub enum RekeyRole {
     /// This node sent the rekey msg1 and read the peer's msg2.
     Initiator,
     /// This node answered the peer's rekey msg1 with a msg2.
@@ -151,17 +152,17 @@ pub(crate) enum RekeyRole {
 /// The initiator's resend ladder retransmits its stored msg1 bytes unchanged,
 /// so a resend digests equal to the original and any other msg1 does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Msg1Digest([u8; 32]);
+pub struct Msg1Digest([u8; 32]);
 
 impl Msg1Digest {
     /// Digest the wire bytes of one msg1.
-    pub(crate) fn of(wire_msg1: &[u8]) -> Self {
+    pub fn of(wire_msg1: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
         Self(Sha256::digest(wire_msg1).into())
     }
 
     /// The first four bytes of the digest, the part the log lines carry.
-    pub(crate) fn prefix(&self) -> [u8; 4] {
+    pub fn prefix(&self) -> [u8; 4] {
         [self.0[0], self.0[1], self.0[2], self.0[3]]
     }
 }
@@ -172,7 +173,7 @@ impl Msg1Digest {
 /// Kept with the pending session that answer armed, so a resend of that msg1
 /// draws the same msg2 again rather than a refusal while the pending is held.
 #[derive(Clone, Debug)]
-pub(crate) struct RekeyAnswer {
+pub struct RekeyAnswer {
     /// The msg1 that armed the pending session.
     pub msg1: Msg1Digest,
     /// The framed msg2 sent in answer, opaque to the core.
@@ -187,7 +188,7 @@ pub(crate) struct RekeyAnswer {
 /// peer whose message-count trigger fires every 10 s, on a busy link, cycles
 /// that fast; at the default 120 s interval it covers eight and a half hours.
 /// 32 bytes each, so 8 KiB per peer at most.
-pub(crate) const ENDED_MSG1_RECORD: usize = 256;
+pub const ENDED_MSG1_RECORD: usize = 256;
 
 /// The rekey msg1s this node answered as the link-rekey responder for one
 /// peer, by digest.
@@ -212,27 +213,27 @@ pub(crate) const ENDED_MSG1_RECORD: usize = 256;
 /// whenever the peering is established again while the peer's epoch stays the
 /// same, as after this node restarts or the link is torn down and re-formed.
 #[derive(Debug, Default)]
-pub(crate) struct AnsweredMsg1s {
+pub struct AnsweredMsg1s {
     held: Option<RekeyAnswer>,
     ended: VecDeque<Msg1Digest>,
 }
 
 impl AnsweredMsg1s {
     /// Record the answer that armed a new responder pending.
-    pub(crate) fn arm(&mut self, answer: RekeyAnswer) {
+    pub fn arm(&mut self, answer: RekeyAnswer) {
         self.end();
         self.held = Some(answer);
     }
 
     /// The pending the held answer armed has left: keep only its digest.
-    pub(crate) fn end(&mut self) {
+    pub fn end(&mut self) {
         if let Some(answer) = self.held.take() {
             self.push_ended(answer.msg1);
         }
     }
 
     /// Record the link-setup msg1 the peering was promoted from as ended.
-    pub(crate) fn end_setup(&mut self, msg1: Msg1Digest) {
+    pub fn end_setup(&mut self, msg1: Msg1Digest) {
         self.push_ended(msg1);
     }
 
@@ -246,12 +247,12 @@ impl AnsweredMsg1s {
 
     /// The answer that armed the pending this node holds, if it holds one it
     /// answered.
-    pub(crate) fn held(&self) -> Option<&RekeyAnswer> {
+    pub fn held(&self) -> Option<&RekeyAnswer> {
         self.held.as_ref()
     }
 
     /// Whether `msg1` armed a cycle that has since ended.
-    pub(crate) fn ended(&self, msg1: &Msg1Digest) -> bool {
+    pub fn ended(&self, msg1: &Msg1Digest) -> bool {
         self.ended.contains(msg1)
     }
 }
@@ -265,7 +266,7 @@ impl AnsweredMsg1s {
 /// deliberate master-side asymmetry with discovery (monotonic ages, not an
 /// absolute `now_ms`), so the rekey timing stays behavior-identical under a
 /// clock step.
-pub(crate) struct PeerSnapshot {
+pub struct PeerSnapshot {
     /// The peer's node address (cutover/drain/rekey target).
     pub addr: NodeAddr,
     /// A pending post-rekey session is held (cut over by the initiator,
@@ -296,7 +297,7 @@ pub(crate) struct PeerSnapshot {
 
 /// A snapshot of one peer with a rekey handshake in flight, taken by the shell
 /// for the rekey-msg1 retransmission decision.
-pub(crate) struct RekeyResendSnapshot {
+pub struct RekeyResendSnapshot {
     /// The peer's node address (abandon/resend target).
     pub peer: NodeAddr,
     /// How many rekey-msg1 retransmissions have already happened. Drives both
@@ -310,7 +311,7 @@ pub(crate) struct RekeyResendSnapshot {
 }
 
 /// The rekey trigger thresholds, read shell-side from node config.
-pub(crate) struct RekeyCfg {
+pub struct RekeyCfg {
     /// Rekey after this many seconds of session age (before jitter).
     pub after_secs: u64,
     /// Rekey after this many sent messages.
@@ -326,7 +327,7 @@ pub(crate) struct RekeyCfg {
 /// remote startup epoch, the sender's session index, and the opaque msg2 noise
 /// payload to frame and send. The core never parses or builds Noise bytes; the
 /// payload is an opaque blob.
-pub(crate) struct WireOutcome {
+pub struct WireOutcome {
     /// Peer identity learned from the handshake (msg1 static key).
     pub peer_identity: PeerIdentity,
     /// The peer's startup epoch captured from msg1, if present.
@@ -350,7 +351,7 @@ pub(crate) struct WireOutcome {
 /// (`existing_session_age_secs`, `existing_link_age_secs`) is resolved
 /// shell-side into a plain `u64`, the same monotonic-ages asymmetry the rekey
 /// snapshot uses.
-pub(crate) struct EstablishSnapshot {
+pub struct EstablishSnapshot {
     /// The peer is already an active peer in the registry.
     pub has_existing_peer: bool,
     /// The existing active peer's captured remote startup epoch, if any.
@@ -417,7 +418,7 @@ pub(crate) struct EstablishSnapshot {
 ///
 /// Reachability is resolved before the snapshot is taken because the
 /// transport pools sit behind async locks, which the snapshot cannot await.
-pub(crate) struct Msg1Arrival<'a> {
+pub struct Msg1Arrival<'a> {
     /// The transport the msg1 arrived on.
     pub transport_id: TransportId,
     /// The address the msg1 arrived from.
@@ -433,7 +434,7 @@ pub(crate) struct Msg1Arrival<'a> {
 /// Both fields are pre-evaluated shell-side (the tie-break is a pure function of
 /// the two node addresses, resolved into a plain `bool` here) so the core never
 /// touches live `Node` state or the `crate::peer` tie-break helper.
-pub(crate) struct OutboundSnapshot {
+pub struct OutboundSnapshot {
     /// The peer identity is already a promoted active peer — i.e. this outbound
     /// completion is a cross-connection (we also processed their msg1).
     pub has_existing_peer: bool,
@@ -448,7 +449,7 @@ pub(crate) struct OutboundSnapshot {
 /// tick-poll half of the lifecycle. The establish-machine subset
 /// (`PromoteToActive`..) is the master-side IK handshake decision; the shell
 /// executes each, resolving the ambient identity/time/wire payload it needs.
-pub(crate) enum ConnAction {
+pub enum ConnAction {
     /// Tear down and free the handshake connection on `link`
     /// (`cleanup_stale_connection`): frees the session index, removes the
     /// `pending_outbound` entry, and cleans up the link + address mapping.
@@ -505,7 +506,7 @@ pub(crate) enum ConnAction {
 /// pure decisions never borrow `Node` and never
 /// read a clock. Keeping it a trait keeps `proto` free of a `node` dependency
 /// and lets the decisions be unit-tested against hand-built snapshots.
-pub(crate) trait LifecycleView {
+pub trait LifecycleView {
     /// Snapshot every handshake connection that is stale (idle past
     /// `timeout_ms`) or failed, as of `now_ms`. The shell resolves the
     /// timeout/failed predicate; the core decides retry-then-teardown.
@@ -534,7 +535,7 @@ pub(crate) trait LifecycleView {
 /// existing peer — so on the inbound path the tie-break never fires. The real
 /// cross-connection resolution lives in `handle_msg2` (outbound completion).
 #[derive(Debug)]
-pub(crate) enum InboundDecision {
+pub enum InboundDecision {
     /// No existing peer for this identity: authorize, allocate our index, send
     /// msg2, and promote. Everything the shell needs (verified identity, their
     /// index, opaque msg2 payload) is in the `WireOutcome` it still holds, so
@@ -585,7 +586,7 @@ pub(crate) enum InboundDecision {
 /// [`SilentBackoff`](InboundReject::SilentBackoff), which records its own
 /// reason.
 #[derive(Debug)]
-pub(crate) enum InboundReject {
+pub enum InboundReject {
     /// At `max_peers` and this is a net-new identity with no pending outbound to
     /// bypass the cap: silent-drop before any msg2 build/send.
     AtMaxPeers,
@@ -624,7 +625,7 @@ pub(crate) enum InboundReject {
 /// completion path is handled by a separate shell driver (it mutates
 /// `ActivePeer`, not a pending handshake) and never reaches this decision.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum OutboundDecision {
+pub enum OutboundDecision {
     /// No existing peer for this identity: promote the completed outbound
     /// connection to an active peer via the normal promotion path.
     Promote,
@@ -653,7 +654,7 @@ const REKEY_MIN_LINK_AGE_SECS: u64 = 30;
 /// be draining: adopting it would overwrite the previous slot that session
 /// holds. Equal to the drain window, so the responder completing a drain as
 /// it arms a pending never retires a previous session early.
-pub(crate) const REKEY_MIN_CUTOVER_AGE_SECS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SECS;
+pub const REKEY_MIN_CUTOVER_AGE_SECS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SECS;
 
 /// Read-only view of the `Node` registry state the inbound establish decision
 /// needs about a peer whose msg1 has just been processed.
@@ -663,7 +664,7 @@ pub(crate) const REKEY_MIN_CUTOVER_AGE_SECS: u64 = crate::proto::fsp::limits::DR
 /// the [`EstablishSnapshot`] reaches the core. Keeping it a trait
 /// keeps `proto` free of a `node` dependency and lets the establish decision be
 /// unit-tested against hand-built snapshots.
-pub(crate) trait EstablishView {
+pub trait EstablishView {
     /// Snapshot the registry state relevant to classifying an inbound msg1 from
     /// `peer_addr`: the existing peer's epoch/session/rekey state (with the
     /// session and link ages resolved shell-side), the max-peers cap, and this
@@ -692,7 +693,7 @@ impl Fmp {
     /// connection is torn down. Pure over the snapshots.
     ///
     /// Preserves the pre-refactor per-connection order (retry before teardown).
-    pub(crate) fn poll_timeouts(&self, stale: Vec<ConnSnapshot>) -> Vec<ConnAction> {
+    pub fn poll_timeouts(&self, stale: Vec<ConnSnapshot>) -> Vec<ConnAction> {
         let mut actions = Vec::new();
         for snap in stale {
             if snap.is_outbound
@@ -714,7 +715,7 @@ impl Fmp {
     /// The shell performs the send and only commits the resend (count++ and
     /// reschedule) when it succeeds, preserving the pre-refactor behavior where
     /// a failed send neither advances the count nor reschedules.
-    pub(crate) fn poll_resends(
+    pub fn poll_resends(
         &self,
         candidates: Vec<ConnSnapshot>,
         now_ms: u64,
@@ -756,7 +757,7 @@ impl Fmp {
     /// execution order across peers, which the shared `index_allocator`
     /// observes: retirements free an index, so they run before initiations
     /// allocate.
-    pub(crate) fn poll_rekey(&self, peers: Vec<PeerSnapshot>, cfg: &RekeyCfg) -> Vec<ConnAction> {
+    pub fn poll_rekey(&self, peers: Vec<PeerSnapshot>, cfg: &RekeyCfg) -> Vec<ConnAction> {
         let mut cutovers = Vec::new();
         let mut drains = Vec::new();
         let mut retires = Vec::new();
@@ -802,7 +803,7 @@ impl Fmp {
     /// Actions are returned abandons-first (matching the pre-refactor
     /// two-pass order), and the shell commits a retransmission's count++ and
     /// reschedule only on a successful send.
-    pub(crate) fn poll_rekey_resends(
+    pub fn poll_rekey_resends(
         &self,
         candidates: Vec<RekeyResendSnapshot>,
         now_ms: u64,
@@ -845,7 +846,7 @@ impl Fmp {
     /// promote. The pre-refactor `possible_restart` flag is folded away: it was
     /// forced true whenever `has_existing_peer` held, so gating the block on
     /// `has_existing_peer` alone is behavior-identical.
-    pub(crate) fn establish_inbound(
+    pub fn establish_inbound(
         &self,
         snap: &EstablishSnapshot,
         wire: &WireOutcome,
@@ -973,7 +974,7 @@ impl Fmp {
     /// Mirrors the pre-refactor branch exactly: an existing same-identity peer
     /// makes this a cross-connection resolved by the (pre-evaluated) tie-break —
     /// swap on a win, keep on a loss — otherwise a net-new promote.
-    pub(crate) fn establish_outbound(&self, snap: &OutboundSnapshot) -> OutboundDecision {
+    pub fn establish_outbound(&self, snap: &OutboundSnapshot) -> OutboundDecision {
         if !snap.has_existing_peer {
             return OutboundDecision::Promote;
         }

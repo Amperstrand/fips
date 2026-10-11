@@ -3,7 +3,11 @@
 use core::fmt;
 
 use super::{BloomError, DEFAULT_FILTER_SIZE_BITS, DEFAULT_HASH_COUNT, ECHO_MIN_BITS};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
+use alloc::format;
+use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// A Bloom filter for probabilistic set membership.
 ///

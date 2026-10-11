@@ -16,13 +16,13 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::TreeState;
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 
 /// Empty namespace anchor for the STP classify ladder (like `Mmp`/`Fmp`).
 ///
 /// The tree state lives on the (soon in-core) [`TreeState`], not here; `Stp`
 /// exists only to namespace the pure classification functions.
-pub(crate) struct Stp;
+pub struct Stp;
 
 /// A structured spanning-tree transition the shell matches and drives.
 ///
@@ -31,7 +31,7 @@ pub(crate) struct Stp;
 /// shell-side while driving the returned variant. The `classify_announce` and
 /// `classify_periodic` ladders produce these variants; the removal (`ParentLost`)
 /// variant arrives with its own stage.
-pub(crate) enum TreeDecision {
+pub enum TreeDecision {
     /// `evaluate_parent` picked a (different) parent: switch to it. Shell:
     /// `set_parent(new_parent, new_seq, ts)` -> flap_dampened; `recompute_coords`;
     /// sign; `invalidate_via_node`; reset_backoff;
@@ -82,7 +82,7 @@ pub(crate) enum TreeDecision {
 /// Outcome of `TreeState::evaluate_parent`: whether a parent switch is warranted
 /// and, if so, whether it is mandatory (bypasses the flap/hold-down veto) or
 /// discretionary (the shell applies the veto before switching).
-pub(crate) enum ParentEval {
+pub enum ParentEval {
     /// Path-breaking / root-correcting switch — always taken, veto bypassed.
     Mandatory(NodeAddr),
     /// Improvement switch — taken only if the shell's veto is not active.
@@ -96,7 +96,7 @@ impl ParentEval {
     /// discretionary candidate as taken). Convenience for tests/paths that do not
     /// engage the veto. Returns `None` only for `ParentEval::None`.
     #[cfg(test)]
-    pub(crate) fn switch_target(&self) -> Option<NodeAddr> {
+    pub fn switch_target(&self) -> Option<NodeAddr> {
         match self {
             ParentEval::Mandatory(a) | ParentEval::Discretionary(a) => Some(*a),
             ParentEval::None => Option::None,
@@ -115,7 +115,7 @@ impl Stp {
     /// while it is true, a mandatory switch ignores it). Mirrors the inline ladder
     /// in `node::tree::handle_tree_announce`: parent-switch, else self-root, else
     /// (same-parent) loop-drop or ancestry-update, else no change.
-    pub(crate) fn classify_announce(
+    pub fn classify_announce(
         tree: &TreeState,
         from: NodeAddr,
         peer_costs: &BTreeMap<NodeAddr, f64>,
@@ -167,7 +167,7 @@ impl Stp {
     /// never arise; the no-change tail is a re-broadcast rather than a true no-op.
     /// The first-RTT re-evaluation in `node::handlers::mmp` is driven by it too,
     /// and ignores `PeriodicRebroadcast`.
-    pub(crate) fn classify_periodic(
+    pub fn classify_periodic(
         tree: &TreeState,
         peer_costs: &BTreeMap<NodeAddr, f64>,
         skip: &BTreeSet<NodeAddr>,
@@ -196,7 +196,7 @@ impl Stp {
     /// Root election is smallest-NodeAddr-wins, so a peer advertising a strictly
     /// worse (higher) root than ours has a stale/pre-attachment view and can attach
     /// through us; only the better-rooted side echoes.
-    pub(crate) fn should_echo(announce_root: &NodeAddr, our_root: &NodeAddr) -> bool {
+    pub fn should_echo(announce_root: &NodeAddr, our_root: &NodeAddr) -> bool {
         announce_root > our_root
     }
 }

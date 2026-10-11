@@ -16,21 +16,30 @@
 
 use super::limits::FSP_CUTOVER_DELAY_MS;
 use super::quorum::QuorumVerdict;
+use crate::identity::{Ipv6Address, NodeAddr};
 use crate::proto::stp::TreeCoordinate;
-use crate::{Ipv6Address, NodeAddr};
+use alloc::vec;
+use alloc::vec::Vec;
 
-/// FSP session-lifecycle subsystem anchor owned by [`Node`](crate::node::Node).
+/// FSP session-lifecycle subsystem anchor owned by `Node`.
 ///
 /// Like [`Fmp`](crate::proto::fmp::Fmp), the FSP core owns **no** mutable state:
 /// every `SessionEntry`/coord-cache/path-MTU mutation stays shell-side, driven
 /// by the [`FspAction`]s (and outcome enums) the pure decisions emit. `Fsp` is a
 /// stateless namespace anchor so the decisions can hang off a `Node` field
 /// (`self.fsp`) in the same shape the other migrated subsystems use.
-pub(crate) struct Fsp;
+pub struct Fsp;
+
+/// The same as `Fsp::new`.
+impl Default for Fsp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Fsp {
     /// Create the (stateless) FSP lifecycle anchor.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -41,7 +50,7 @@ impl Fsp {
 /// defined; the send/decrypt-path effects are added when their emitting arms
 /// migrate (an unconstructed variant would trip `clippy::dead_code`).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum FspAction {
+pub enum FspAction {
     /// Perform the initiator-side K-bit cutover to `addr`'s pending session
     /// (`SessionEntry::cutover_to_new_session`).
     CutOver { addr: NodeAddr },
@@ -111,7 +120,7 @@ pub(crate) enum FspAction {
 }
 
 /// The rekey trigger thresholds, read shell-side from node config.
-pub(crate) struct RekeyCfg {
+pub struct RekeyCfg {
     /// Whether this node starts rekeys of its own (`node.rekey.enabled`).
     ///
     /// Gates the trigger and nothing else. A peer's setup message is answered
@@ -133,7 +142,7 @@ pub(crate) struct RekeyCfg {
 /// `cutover_timer_elapsed`, `drain_expired`, and `is_dampened` are the
 /// pre-evaluated timer predicates; `elapsed_secs` is the monotonic session age.
 /// The core applies the rekey thresholds and jitter with **no** clock read.
-pub(crate) struct SessionSnapshot {
+pub struct SessionSnapshot {
     /// The session's remote node address (cutover/drain/rekey target).
     pub addr: NodeAddr,
     /// A completed rekey session is pending, awaiting the K-bit cutover.
@@ -177,7 +186,7 @@ pub(crate) struct SessionSnapshot {
 
 /// A snapshot of one session with a retained rekey-msg3 payload, taken by the
 /// shell for the msg3 retransmission decision.
-pub(crate) struct RekeyMsg3ResendSnapshot {
+pub struct RekeyMsg3ResendSnapshot {
     /// The session's remote node address (abandon/resend target).
     pub addr: NodeAddr,
     /// How many msg3 retransmissions have already happened. Drives the
@@ -190,7 +199,7 @@ pub(crate) struct RekeyMsg3ResendSnapshot {
 
 /// A snapshot of one established session whose initiator still retains its
 /// initial-handshake msg3, taken by the shell for the resend decision.
-pub(crate) struct InitialMsg3ResendSnapshot {
+pub struct InitialMsg3ResendSnapshot {
     /// The session's remote node address (release/resend target).
     pub addr: NodeAddr,
     /// How many msg3 resends have already happened.
@@ -201,10 +210,10 @@ pub(crate) struct InitialMsg3ResendSnapshot {
 }
 
 /// Which key epoch a just-decrypted frame authenticated against — the shell-side
-/// [`EpochSlot`](crate::node::session::EpochSlot) mapped to a proto-local
+/// `EpochSlot` mapped to a proto-local
 /// plain-data mirror so the core carries no `node` dependency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DecryptSlot {
+pub enum DecryptSlot {
     /// Decrypted against the current (active) session — steady state.
     Current,
     /// Decrypted against the pending (new) session — the peer cut over first.
@@ -217,7 +226,7 @@ pub(crate) enum DecryptSlot {
 /// epoch. Post-decrypt classification (§3): the shell opens the frame, the core
 /// classifies, the shell applies the `SessionEntry` mutation + observability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EpochReaction {
+pub enum EpochReaction {
     /// A `pending` hit while a msg3 retransmission is retained: confirm the peer
     /// on the new epoch (stop retransmitting), then promote (cutover).
     PromoteConfirming,
@@ -256,11 +265,7 @@ impl Fsp {
     /// Actions are returned phase-grouped (all cutovers, then all drains, then
     /// all abandoned or expired handshakes, then all rekey initiations) to
     /// preserve the pre-refactor execution order.
-    pub(crate) fn poll_rekey(
-        &self,
-        sessions: Vec<SessionSnapshot>,
-        cfg: &RekeyCfg,
-    ) -> Vec<FspAction> {
+    pub fn poll_rekey(&self, sessions: Vec<SessionSnapshot>, cfg: &RekeyCfg) -> Vec<FspAction> {
         let mut cutovers = Vec::new();
         let mut drains = Vec::new();
         let mut abandons = Vec::new();
@@ -325,7 +330,7 @@ impl Fsp {
     /// Actions are returned abandons-first (matching the pre-refactor two-pass
     /// order); the shell commits a retransmission's count++ and reschedule only
     /// on a successful send.
-    pub(crate) fn poll_rekey_msg3_resends(
+    pub fn poll_rekey_msg3_resends(
         &self,
         candidates: Vec<RekeyMsg3ResendSnapshot>,
         max_resends: u32,
@@ -352,7 +357,7 @@ impl Fsp {
     /// yet due gets nothing this tick. Releases come first, as abandons do in
     /// [`poll_rekey_msg3_resends`](Self::poll_rekey_msg3_resends); the shell
     /// commits a resend's count and reschedule only on a successful send.
-    pub(crate) fn poll_initial_msg3_resends(
+    pub fn poll_initial_msg3_resends(
         &self,
         candidates: Vec<InitialMsg3ResendSnapshot>,
         max_resends: u32,
@@ -382,7 +387,7 @@ impl Fsp {
     /// payload is retained); a `current` hit confirms the responder only when
     /// the initiator already cut over (msg3 retained, no pending); a `previous`
     /// hit is a no-op (the drain refresh happened during the shell-side open).
-    pub(crate) fn classify_epoch(
+    pub fn classify_epoch(
         &self,
         slot: DecryptSlot,
         has_rekey_msg3_payload: bool,
@@ -412,7 +417,7 @@ impl Fsp {
     /// the source's coords keyed by `src_addr`, then the destination's coords
     /// keyed by `my_addr` (our own address). Mirrors the pre-refactor
     /// `handle_encrypted_session_msg` CP-coords caching order.
-    pub(crate) fn plan_cache_coords(
+    pub fn plan_cache_coords(
         &self,
         src_addr: NodeAddr,
         my_addr: NodeAddr,
@@ -439,7 +444,7 @@ impl Fsp {
     /// lookup toward `dest` only when the target's identity is cached (else the
     /// `LookupResponse` proof cannot be verified). The rate-limited warmup send
     /// and warmup-counter reset stay shell-side.
-    pub(crate) fn plan_coords_required_lookup(
+    pub fn plan_coords_required_lookup(
         &self,
         dest: NodeAddr,
         has_cached_identity: bool,
@@ -468,7 +473,7 @@ impl Fsp {
     ///
     /// The lookup is emitted in every case. The warmup send, path-MTU release
     /// and warmup-counter reset stay shell-side.
-    pub(crate) fn plan_path_broken(
+    pub fn plan_path_broken(
         &self,
         dest: NodeAddr,
         verified: bool,
@@ -487,7 +492,7 @@ impl Fsp {
     /// `candidate` is strictly tighter than it (keep-tighter, never loosen).
     /// The `existing` read and the applied write are performed shell-side
     /// under one `path_mtu_lookup` write guard, so the decision stays atomic.
-    pub(crate) fn plan_path_mtu_tighten(
+    pub fn plan_path_mtu_tighten(
         &self,
         fips_addr: Ipv6Address,
         existing: Option<u16>,
@@ -507,7 +512,7 @@ impl Fsp {
 /// Pre-evaluate the initiator liveness-cutover timer for a session: whether the
 /// `FSP_CUTOVER_DELAY_MS` bound has elapsed since the rekey handshake completed.
 /// Resolved shell-side into [`SessionSnapshot::cutover_timer_elapsed`].
-pub(crate) fn cutover_timer_elapsed(now_ms: u64, rekey_completed_ms: u64) -> bool {
+pub fn cutover_timer_elapsed(now_ms: u64, rekey_completed_ms: u64) -> bool {
     now_ms.saturating_sub(rekey_completed_ms) >= FSP_CUTOVER_DELAY_MS
 }
 
@@ -517,7 +522,7 @@ pub(crate) fn cutover_timer_elapsed(now_ms: u64, rekey_completed_ms: u64) -> boo
 /// setup and dual rekey initiation.
 ///
 /// Returns `true` if *we* win (keep initiating, drop the peer's message).
-pub(crate) fn initiation_winner(our_node_addr: &NodeAddr, their_node_addr: &NodeAddr) -> bool {
+pub fn initiation_winner(our_node_addr: &NodeAddr, their_node_addr: &NodeAddr) -> bool {
     our_node_addr < their_node_addr
 }
 
@@ -526,7 +531,7 @@ pub(crate) fn initiation_winner(our_node_addr: &NodeAddr, their_node_addr: &Node
 /// loosen. Returns `true` when `candidate` should be written (there is no
 /// existing value, or the candidate is strictly tighter). An equal candidate is
 /// not written, so the stored entry, and any learn time it carries, is kept.
-pub(crate) fn should_apply_path_mtu(existing: Option<u16>, candidate: u16) -> bool {
+pub fn should_apply_path_mtu(existing: Option<u16>, candidate: u16) -> bool {
     !matches!(existing, Some(existing) if existing <= candidate)
 }
 
@@ -534,7 +539,7 @@ pub(crate) fn should_apply_path_mtu(existing: Option<u16>, candidate: u16) -> bo
 /// oldest entry first when the queue is at `per_dest` capacity. Pure transform
 /// over a passed-in queue (the max-destinations cap is a shell-side map-level
 /// check).
-pub(crate) fn push_bounded_pending<T>(
+pub fn push_bounded_pending<T>(
     queue: &mut alloc::collections::VecDeque<T>,
     packet: T,
     per_dest: usize,
@@ -555,7 +560,7 @@ pub(crate) fn push_bounded_pending<T>(
 ///
 /// No checksum update needed: IPv6 has no header checksum, and the Traffic Class
 /// field is not part of the TCP/UDP pseudo-header.
-pub(crate) fn mark_ipv6_ecn_ce(packet: &mut [u8]) {
+pub fn mark_ipv6_ecn_ce(packet: &mut [u8]) {
     if packet.len() < 2 {
         return;
     }

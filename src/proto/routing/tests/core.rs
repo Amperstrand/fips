@@ -1,13 +1,16 @@
 //! Tests for the sans-IO routing decision core.
 
 use super::util::{MockPeer, MockRoutingView, make_coords, make_datagram_ref, make_next_hop};
+use crate::identity::NodeAddr;
+use crate::proto::coord::TreeCoordinate;
 use crate::proto::link::{SessionDatagramRef, ttl_after_hop};
 use crate::proto::routing::RoutingSignalType;
 use crate::proto::routing::{
     DropReason, LimitVerdict, RouteAction, RouteOutcome, Router, RoutingView, select_best_candidate,
 };
 use crate::testutil::make_node_addr;
-use crate::{NodeAddr, TreeCoordinate};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Decode a forwarded byte buffer (which carries the leading msg_type byte)
 /// back into a borrowed view so tests can inspect the re-encoded header.

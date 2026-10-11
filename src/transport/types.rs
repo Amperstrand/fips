@@ -2,9 +2,10 @@
 //!
 //! The identifier/address/statistics value types shared across the transport
 //! layer, defined free of any `std` dependency so the sans-IO protocol cores
-//! (e.g. `proto::fmp`) can name them without pulling in `std`. The
-//! `std`-requiring helpers (`TransportAddr::from_socket_addr`, socket-address
-//! resolution, `local_addr`) stay in `transport`. Re-exported from `transport`
+//! (e.g. `proto::fmp`) can name them without pulling in `std`.
+//! `TransportAddr::from_socket_addr` formats through `core::fmt` into a stack
+//! buffer; the `std`-requiring helpers (socket-address resolution,
+//! `local_addr`) stay in `transport`. Re-exported from `transport`
 //! via `pub use types::*`, so existing `crate::transport::{LinkId, ...}`
 //! imports are unaffected.
 
@@ -172,6 +173,39 @@ impl TransportAddr {
 }
 
 impl TransportAddr {
+    /// Create a UDP/TCP transport address directly from a socket address.
+    pub fn from_socket_addr(addr: core::net::SocketAddr) -> Self {
+        use core::fmt::Write;
+        // The longest form is 58 bytes: [39-byte IPv6%10-digit scope]:65535.
+        let mut buf = [0u8; 64];
+        let mut out = SliceWriter {
+            buf: &mut buf,
+            len: 0,
+        };
+        write!(out, "{addr}").expect("64 bytes is enough for any SocketAddr");
+        let len = out.len;
+        Self::from_bytes(&buf[..len])
+    }
+}
+
+/// Formats into a fixed byte buffer, failing once it is full.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl fmt::Write for SliceWriter<'_> {
+    /// Append `s`, or fail without writing if it does not fit.
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len.checked_add(s.len()).ok_or(fmt::Error)?;
+        let dst = self.buf.get_mut(self.len..end).ok_or(fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+impl TransportAddr {
     /// Write the bytes as a colon-separated MAC address.
     fn write_mac(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, byte) in self.bytes.iter().enumerate() {
@@ -229,35 +263,6 @@ impl From<&str> for TransportAddr {
 impl From<String> for TransportAddr {
     fn from(s: String) -> Self {
         Self::from_string(&s)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TransportAddr;
-
-    #[test]
-    fn transport_addr_clone_shares_immutable_bytes() {
-        let addr = TransportAddr::from_string("192.168.1.1:2121");
-        let cloned = addr.clone();
-
-        assert_eq!(addr, cloned);
-        assert_eq!(addr.as_bytes().as_ptr(), cloned.as_bytes().as_ptr());
-    }
-
-    #[test]
-    fn transport_addr_equality_and_hash_use_byte_values() {
-        // Only tests use std; the transport primitives remain alloc-only.
-        use std::collections::HashSet;
-
-        let original = TransportAddr::from_string("192.168.1.1:2121");
-        let same_value = TransportAddr::from_bytes(b"192.168.1.1:2121");
-        let mut addrs = HashSet::new();
-
-        assert_ne!(original.as_bytes().as_ptr(), same_value.as_bytes().as_ptr());
-        assert_eq!(original, same_value);
-        addrs.insert(original);
-        assert!(addrs.contains(&same_value));
     }
 }
 
@@ -341,3 +346,7 @@ impl LinkStats {
         *self = Self::default();
     }
 }
+
+#[cfg(test)]
+#[path = "tests/types.rs"]
+mod tests;

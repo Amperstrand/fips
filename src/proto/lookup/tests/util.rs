@@ -2,12 +2,14 @@
 
 use sha2::Digest;
 
+use crate::identity::NodeAddr;
+use crate::proto::coord::TreeCoordinate;
 use crate::proto::lookup::{
     Lookup, LookupAction, LookupBackoff, LookupForwardRateLimiter, LookupRequest, LookupResponse,
     RoutingView,
 };
 use crate::testutil::make_node_addr;
-use crate::{NodeAddr, TreeCoordinate};
+use alloc::vec::Vec;
 
 /// Mock routing view: each entry is `(addr, is_tree, may_reach)`.
 pub(super) struct MockRoutingView {

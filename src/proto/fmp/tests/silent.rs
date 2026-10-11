@@ -10,6 +10,8 @@ use crate::proto::fmp::{
     EstablishSnapshot, Fmp, InboundDecision, InboundReject, Msg1Digest, SilentSessions,
 };
 use crate::testutil::make_node_addr;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// The epoch the counted sessions ran at.
 const EPOCH: [u8; 8] = [7u8; 8];

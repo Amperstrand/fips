@@ -21,7 +21,7 @@ use super::receiver::ReceiverState;
 use super::sender::SenderState;
 use super::{MmpMode, SESSION_COLD_START_INTERVAL_MS};
 
-/// MMP reporting subsystem anchor owned by [`Node`](crate::node::Node).
+/// MMP reporting subsystem anchor owned by `Node`.
 ///
 /// Like [`Fmp`](crate::proto::fmp::Fmp), the MMP reporting core owns **no**
 /// mutable state: the per-peer/per-session timing and backoff state lives on
@@ -31,11 +31,18 @@ use super::{MmpMode, SESSION_COLD_START_INTERVAL_MS};
 /// decisions emit. `Mmp` is therefore an empty namespace anchor: it exists so
 /// the reporting decisions can hang off a `Node` field (`self.mmp`) in the same
 /// shape the other migrated subsystems use, not to hold data.
-pub(crate) struct Mmp;
+pub struct Mmp;
+
+/// The same as `Mmp::new`.
+impl Default for Mmp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Mmp {
     /// Create the (stateless) MMP reporting anchor.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 }

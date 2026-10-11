@@ -1,4 +1,4 @@
-//! Routing-subsystem state owned by [`Node`](crate::node::Node).
+//! Routing-subsystem state owned by `Node`.
 //!
 //! Groups the routing error-signal rate limiter behind a single struct so
 //! the forwarding handlers can evolve toward a sans-IO core without
@@ -7,15 +7,22 @@
 use super::limits::RoutingErrorRateLimiter;
 
 /// Routing-subsystem state.
-pub(crate) struct Router {
+pub struct Router {
     /// Rate limiter for routing error signals (CoordsRequired / PathBroken).
-    pub(crate) error_limiter: RoutingErrorRateLimiter,
+    pub error_limiter: RoutingErrorRateLimiter,
+}
+
+/// The same as `Router::new`.
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Router {
     /// Create routing state with a default error-signal rate limiter,
     /// matching the pre-refactor initialization exactly.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             error_limiter: RoutingErrorRateLimiter::new(),
         }

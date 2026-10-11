@@ -6,8 +6,9 @@ use core::fmt;
 use super::core::ParentEval;
 use super::limits::FlapDampener;
 use super::{CoordEntry, ParentDeclaration, TreeCoordinate};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::mmp::delivery::{Acks, LinkEvidence, ResendReason};
+use alloc::vec;
 
 /// What a parent-loss recovery did: whether the tree state changed, and
 /// whether the recovery switch was the one that armed a dampening episode.
@@ -16,11 +17,11 @@ use crate::proto::mmp::delivery::{Acks, LinkEvidence, ResendReason};
 /// [`TreeState::handle_parent_lost`], whose `bool` return this type must not
 /// displace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ParentLoss {
+pub struct ParentLoss {
     /// Whether the tree state changed and the caller should re-announce.
-    pub(crate) changed: bool,
+    pub changed: bool,
     /// Whether the recovery switch armed a flap dampening episode.
-    pub(crate) dampened: bool,
+    pub dampened: bool,
 }
 
 /// Local spanning tree state for a node.
@@ -94,8 +95,8 @@ impl TreeState {
     /// Test-only override of this node's coordinates, bypassing the
     /// parent/declaration state machine. Lets routing tests place the node at
     /// an arbitrary tree position to exercise coordinate-based classification.
-    #[cfg(test)]
-    pub(crate) fn set_my_coords_for_test(&mut self, coords: TreeCoordinate) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_my_coords_for_test(&mut self, coords: TreeCoordinate) {
         self.root = *coords.root_id();
         self.my_coords = coords;
     }
@@ -399,7 +400,7 @@ impl TreeState {
     /// after the configured value is clamped.
     ///
     /// Crate-internal: it feeds a log field on the engagement warning.
-    pub(crate) fn dampening_secs(&self) -> u64 {
+    pub fn dampening_secs(&self) -> u64 {
         self.flap.dampening_secs()
     }
 
@@ -437,7 +438,7 @@ impl TreeState {
     ///
     /// `skip_peers` contains peers that should not be considered as parent
     /// candidates (e.g., non-routing and leaf nodes that don't forward transit).
-    pub(crate) fn evaluate_parent(
+    pub fn evaluate_parent(
         &self,
         peer_costs: &BTreeMap<NodeAddr, f64>,
         skip_peers: &BTreeSet<NodeAddr>,
@@ -627,7 +628,7 @@ impl TreeState {
     /// here. A caller holding a metrics handle uses this one so the
     /// engagement can be counted and logged; the published signature stays
     /// `bool`.
-    pub(crate) fn recover(
+    pub fn recover(
         &mut self,
         peer_costs: &BTreeMap<NodeAddr, f64>,
         now_secs: u64,
@@ -667,7 +668,7 @@ impl TreeState {
     /// Exposed so the shell can write back a signature after signing: the
     /// declaration data + `signing_bytes()` live in-core, but the key-crypto
     /// (the schnorr sign) is a shell-driven boundary (§6), mirroring discovery.
-    pub(crate) fn my_declaration_mut(&mut self) -> &mut ParentDeclaration {
+    pub fn my_declaration_mut(&mut self) -> &mut ParentDeclaration {
         &mut self.my_declaration
     }
 

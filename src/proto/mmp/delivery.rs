@@ -24,7 +24,7 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 
 /// How long an announce the receiver reports cannot check waits before its
 /// one unchecked resend, in milliseconds. Equal to the default link dead

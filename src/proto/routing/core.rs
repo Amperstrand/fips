@@ -17,8 +17,10 @@
 use super::limits::LimitVerdict;
 use super::state::Router;
 use super::wire::{CoordsRequired, MtuExceeded, PathBroken};
+use crate::identity::NodeAddr;
+use crate::proto::coord::TreeCoordinate;
 use crate::proto::link::{SessionDatagram, SessionDatagramRef, ttl_after_hop};
-use crate::{NodeAddr, TreeCoordinate};
+use alloc::vec::Vec;
 
 /// Read-only view of routing state the routing core needs.
 ///
@@ -26,7 +28,7 @@ use crate::{NodeAddr, TreeCoordinate};
 /// over the live peer/coord/congestion state. Keeping it a trait keeps
 /// `proto` free of any dependency on `node` and lets the core be unit-tested
 /// with a mock.
-pub(crate) trait RoutingView {
+pub trait RoutingView {
     /// Borrowed peer handle exposed while enumerating this view. The concrete
     /// shell type stays opaque to the routing core.
     type Peer<'a>: Copy
@@ -56,13 +58,13 @@ pub(crate) trait RoutingView {
 
 /// A next hop the shell resolved for a transit forward: the peer address and
 /// the outgoing link's transport MTU (already narrowed to the specific link).
-pub(crate) struct NextHop {
+pub struct NextHop {
     pub addr: NodeAddr,
     pub link_mtu: u16,
 }
 
 /// Why a datagram was dropped without forwarding or delivering.
-pub(crate) enum DropReason {
+pub enum DropReason {
     /// The datagram would leave this node with a TTL of zero, so it is not
     /// transmittable. Covers both the already-exhausted arrival (ttl=0) and
     /// the last-hop arrival (ttl=1). Transit only: delivery to the addressed
@@ -71,7 +73,7 @@ pub(crate) enum DropReason {
 }
 
 /// Outcome of routing an inbound SessionDatagram.
-pub(crate) enum RouteOutcome {
+pub enum RouteOutcome {
     /// Drop the datagram; the shell records the reason-specific metric + log.
     Drop { reason: DropReason },
     /// Deliver to the local session layer. Carries no bytes — the shell
@@ -91,7 +93,7 @@ pub(crate) enum RouteOutcome {
 }
 
 /// An I/O action the async shell performs on the core's behalf.
-pub(crate) enum RouteAction {
+pub enum RouteAction {
     /// Route the encoded error datagram in `bytes` toward `toward` (the failed
     /// datagram's source). The shell resolves the outgoing link hop for
     /// `toward` and performs the encrypted send. `toward` is the routing
@@ -117,7 +119,7 @@ impl Router {
     /// `find_next_hop`'s LRU-touch side effect stays scoped to genuine
     /// forwards. `route` still re-checks local delivery and the TTL
     /// authoritatively.
-    pub(crate) fn route(
+    pub fn route(
         &mut self,
         dg: &SessionDatagramRef<'_>,
         my_addr: &NodeAddr,
@@ -182,7 +184,7 @@ impl Router {
     /// the pre-refactor ordering (rate-limit before `find_next_hop`'s cache
     /// touch) and lets the shell distinguish suppression from no-reverse-route
     /// for logging.
-    pub(crate) fn synth_routing_error(
+    pub fn synth_routing_error(
         &mut self,
         dest: &NodeAddr,
         toward: &NodeAddr,
@@ -232,7 +234,7 @@ impl Router {
     /// preserves the pre-refactor ordering (rate-limit before
     /// `find_next_hop`'s cache touch). No coordinate read is involved; unlike
     /// routing errors, the PDU is unconditional once the gate passes.
-    pub(crate) fn synth_mtu_exceeded(
+    pub fn synth_mtu_exceeded(
         &mut self,
         dest: &NodeAddr,
         toward: &NodeAddr,
@@ -265,7 +267,7 @@ impl Router {
 /// The verdict travels with the action so the shell can count `Suppress` and
 /// `AdmitAtCapacity` separately; a bool return collapsed the two admits
 /// together and left both counters with no writer.
-pub(crate) struct ErrorSynth {
+pub struct ErrorSynth {
     /// What the per-destination interval gate decided.
     pub verdict: LimitVerdict,
     /// The signal to send. `None` exactly when `verdict` is `Suppress`.
@@ -293,7 +295,7 @@ pub(crate) struct ErrorSynth {
 ///   advertisement. Tracked alongside `TreeDownCross` as the lateral
 ///   up-and-over contrast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RouteClass {
+pub enum RouteClass {
     /// Chosen peer is our ancestor (tree-up).
     TreeUp,
     /// Chosen peer is our descendant and dest is in its subtree (canonical
@@ -313,7 +315,7 @@ pub(crate) enum RouteClass {
 
 impl RouteClass {
     /// The stable string form, for diagnostics that publish the class.
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             RouteClass::TreeUp => "tree_up",
             RouteClass::TreeDown => "tree_down",
@@ -336,7 +338,7 @@ impl RouteClass {
 /// Ordering: `(link_cost, distance_to_dest, node_addr)`. Returns the winning
 /// peer's address, or `None` when no candidate is strictly closer to the
 /// destination than us.
-pub(crate) fn select_best_candidate(
+pub fn select_best_candidate(
     rv: &impl RoutingView,
     dest: &NodeAddr,
     dest_coords: &TreeCoordinate,
@@ -399,7 +401,7 @@ pub(crate) fn select_best_candidate(
 /// unavailable that test defaults to "not in subtree", i.e. the up-and-over
 /// variant (`TreeDownCross` for a descendant peer, `CrosslinkAscend` for a
 /// lateral one).
-pub(crate) fn classify_forward(
+pub fn classify_forward(
     dest: &NodeAddr,
     chosen_peer: &NodeAddr,
     my_addr: &NodeAddr,

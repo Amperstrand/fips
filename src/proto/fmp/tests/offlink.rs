@@ -3,11 +3,12 @@
 //! the record of the link-setup msg1 a peering was promoted from.
 
 use super::util::{establish_snapshot, wire_outcome};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::fmp::core::ENDED_MSG1_RECORD;
 use crate::proto::fmp::{
     AnsweredMsg1s, EstablishSnapshot, Fmp, InboundDecision, InboundReject, Msg1Digest, RekeyAnswer,
 };
+use alloc::vec;
 
 /// The epoch the existing peer and the msg1 share.
 const EPOCH: [u8; 8] = [7u8; 8];

@@ -62,7 +62,7 @@ pub const SESSION_COLD_START_INTERVAL_MS: u64 = 1_000;
 /// outside `proof_bytes`, and the `MtuExceeded` and `PathBroken` signals
 /// arrive unencrypted, so any forwarder on the path can lower it. Below this
 /// value the quantities derived from it degenerate: at a transport MTU of 137
-/// or less, [`mss_ceiling`] saturates to a TCP MSS of zero, at 138 it is a
+/// or less, `mss_ceiling` saturates to a TCP MSS of zero, at 138 it is a
 /// single byte, and the derived MSS stays under a hundred all the way to 236.
 /// At the floor itself the derived inner IPv6 MTU is 179 and the TCP MSS is
 /// 119, clear of both the zero cliff and that band.
@@ -78,8 +78,6 @@ pub const SESSION_COLD_START_INTERVAL_MS: u64 = 1_000;
 /// is a protocol policy decision — how little a remote party may claim before
 /// this node stops believing it — and the path-MTU state machine that owns
 /// that rule is in this module.
-///
-/// [`mss_ceiling`]: crate::ipv6tun::icmp::mss_ceiling
 pub const MIN_ACTIONABLE_PATH_MTU: u16 = 256;
 
 /// Smallest path MTU this node will act on when the claim arrives on the

@@ -17,7 +17,7 @@
 //!   interval for forwarded requests. Defense-in-depth against misbehaving
 //!   nodes generating fresh request_ids at high rate.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::rate_limit::{PerAddrRateLimiter, RecordOutcome};
 use alloc::collections::{BTreeMap, BTreeSet};
 
@@ -27,7 +27,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 
 /// Maximum number of recent LookupRequests retained for dedup and
 /// reverse-path routing before the cache is treated as full.
-pub(crate) const MAX_RECENT_LOOKUP_REQUESTS: usize = 4096;
+pub const MAX_RECENT_LOOKUP_REQUESTS: usize = 4096;
 
 // ============================================================================
 // Originator-side: Lookup Backoff
@@ -48,7 +48,7 @@ const DEFAULT_BACKOFF_MAX_SECS: u64 = 0;
 /// its expiry index (estimated) the table stays under about 400 KB. A sender
 /// that fails more targets than this only evicts the entries nearest expiry,
 /// and eviction fails open: an evicted target can only be retried sooner.
-pub(crate) const MAX_BACKOFF_ENTRIES: usize = 4096;
+pub const MAX_BACKOFF_ENTRIES: usize = 4096;
 
 /// Exponential backoff for failed lookups.
 ///
@@ -58,7 +58,7 @@ pub(crate) const MAX_BACKOFF_ENTRIES: usize = 4096;
 /// holds at most [`MAX_BACKOFF_ENTRIES`] targets.
 pub struct LookupBackoff {
     /// Maps target → (suppress_until, consecutive_failures).
-    pub(crate) entries: BTreeMap<NodeAddr, BackoffEntry>,
+    pub entries: BTreeMap<NodeAddr, BackoffEntry>,
     /// The same targets ordered by when their windows end, so the entry
     /// nearest expiry and the forgettable ones are found without scanning
     /// the table. Holds exactly one `(suppress_until_ms, target)` per entry.
@@ -71,9 +71,9 @@ pub struct LookupBackoff {
     evicted: u64,
 }
 
-pub(crate) struct BackoffEntry {
+pub struct BackoffEntry {
     /// Don't re-initiate until this time (injected `now_ms`).
-    pub(crate) suppress_until_ms: u64,
+    pub suppress_until_ms: u64,
     /// Consecutive failures (drives exponential backoff).
     failures: u32,
 }
@@ -271,18 +271,19 @@ impl LookupForwardRateLimiter {
     }
 
     /// Replace the minimum interval in milliseconds (e.g., set to zero to disable).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_interval_ms(&mut self, interval_ms: u64) {
         self.0.set_interval_ms(interval_ms);
     }
 
     /// Remove entries older than max_age.
     #[cfg(test)]
-    pub(crate) fn cleanup(&mut self, now_ms: u64) {
+    pub fn cleanup(&mut self, now_ms: u64) {
         self.0.cleanup(now_ms);
     }
 
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.0.len()
     }

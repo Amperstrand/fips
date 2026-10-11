@@ -18,7 +18,8 @@ use alloc::collections::BTreeMap;
 
 use super::MmpMode;
 use super::state::Mmp;
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
+use alloc::vec::Vec;
 
 /// A snapshot of one active peer's liveness/heartbeat-relevant state, taken by
 /// the shell so the core decides without touching live `Node` state or reading
@@ -30,7 +31,7 @@ use crate::NodeAddr;
 /// `heartbeat_due` is the pre-evaluated heartbeat-interval predicate, and
 /// `rekey_active` is the pre-evaluated FMP rekey-suppression predicate. The
 /// core applies only the reap-vs-heartbeat precedence with **no** clock read.
-pub(crate) struct PeerLivenessSnapshot {
+pub struct PeerLivenessSnapshot {
     /// The peer's node address (reap / heartbeat target).
     pub peer: NodeAddr,
     /// The peer has not sent a frame within the link dead timeout
@@ -59,7 +60,7 @@ pub(crate) struct PeerLivenessSnapshot {
 /// them to the behavior-neutral constant `true` (ANDing a runtime `true` is a
 /// no-op); the forward-merge to `-next` wires them to `peer.send_sr()`/
 /// `peer.send_rr()` (plan §7.3 spot c).
-pub(crate) struct LinkReportSnapshot {
+pub struct LinkReportSnapshot {
     /// The peer's node address (report target).
     pub peer: NodeAddr,
     /// The peer's MMP reporting mode (gates which reports are eligible).
@@ -89,7 +90,7 @@ pub(crate) struct LinkReportSnapshot {
 /// `should_log` gate. Unlike the link path there is **no** `send_sr`/`send_rr`
 /// profile flag — the session handler has never gated on a profile, so no
 /// forward-merge fold applies here.
-pub(crate) struct SessionReportSnapshot {
+pub struct SessionReportSnapshot {
     /// The session peer's node address (report target).
     pub dest: NodeAddr,
     /// The session's MMP reporting mode (gates which reports are eligible).
@@ -107,7 +108,7 @@ pub(crate) struct SessionReportSnapshot {
 
 /// Which link-layer report the shell should build/encode/send for a
 /// [`SendLinkReport`](MmpAction::SendLinkReport) action.
-pub(crate) enum LinkReportKind {
+pub enum LinkReportKind {
     /// A SenderReport (Full mode only): `mmp.sender.build_report(now)`.
     Sender,
     /// A ReceiverReport (Full and Lightweight modes):
@@ -117,7 +118,7 @@ pub(crate) enum LinkReportKind {
 
 /// Which session-layer report the shell should build/encode/send for a
 /// [`SendSessionReport`](MmpAction::SendSessionReport) action.
-pub(crate) enum SessionReportKind {
+pub enum SessionReportKind {
     /// A SessionSenderReport (Full mode only): `mmp.sender.build_report(now)`.
     Sender,
     /// A SessionReceiverReport (Full and Lightweight modes):
@@ -130,7 +131,7 @@ pub(crate) enum SessionReportKind {
 /// The outcome of one session-report send, collected by the shell while driving
 /// the [`SendSessionReport`](MmpAction::SendSessionReport) actions, and fed back
 /// into [`Mmp::plan_backoff`] for the per-destination backoff dedup.
-pub(crate) struct SendResult {
+pub struct SendResult {
     /// The destination the report was sent to.
     pub dest: NodeAddr,
     /// Whether `send_session_msg` succeeded.
@@ -147,7 +148,7 @@ pub(crate) struct SendResult {
 /// So `Success` carries no field — the shell calls `record_send_success`, reads
 /// its returned `prev`, and emits the resume log iff `prev > 3`, exactly as the
 /// original did.
-pub(crate) enum BackoffUpdate {
+pub enum BackoffUpdate {
     /// The destination had at least one successful report this cycle → the shell
     /// runs `record_send_success` (and the `prev > 3` resume log).
     Success { dest: NodeAddr },
@@ -168,7 +169,7 @@ pub(crate) enum BackoffUpdate {
 /// [`LogLink`]: MmpAction::LogLink
 /// [`SendSessionReport`]: MmpAction::SendSessionReport
 /// [`LogSession`]: MmpAction::LogSession
-pub(crate) enum MmpAction {
+pub enum MmpAction {
     /// Reap a dead peer: the shell runs `remove_active_peer` +
     /// `schedule_reconnect` (with its wall-clock `now_ms`).
     ReapPeer { peer: NodeAddr },
@@ -221,7 +222,7 @@ impl Mmp {
     /// preserve the pre-refactor two-loop global execution order (every dead
     /// peer removed + reconnect-scheduled before any heartbeat is sent). Pure
     /// over the snapshots.
-    pub(crate) fn plan_heartbeats(&self, peers: &[PeerLivenessSnapshot]) -> Vec<MmpAction> {
+    pub fn plan_heartbeats(&self, peers: &[PeerLivenessSnapshot]) -> Vec<MmpAction> {
         let mut reaps = Vec::new();
         let mut heartbeats = Vec::new();
         for snap in peers {
@@ -259,7 +260,7 @@ impl Mmp {
     /// other peer's build) reads the same state it did when the original emitted
     /// it inline. Pure over the snapshots; the interval/log mutations happen
     /// shell-side while driving.
-    pub(crate) fn plan_link_reports(&self, peers: &[LinkReportSnapshot]) -> Vec<MmpAction> {
+    pub fn plan_link_reports(&self, peers: &[LinkReportSnapshot]) -> Vec<MmpAction> {
         let mut actions = Vec::new();
         // Logs first: the operator log reads `cumulative_packets_sent`, which the
         // report sends advance (send_encrypted_link_message -> sender.record_sent).
@@ -315,10 +316,7 @@ impl Mmp {
     /// PathMtu, interleaved by session), matching the order reports were pushed
     /// into the collect vector. Pure over the snapshots; every build/log mutation
     /// happens shell-side while driving.
-    pub(crate) fn plan_session_reports(
-        &self,
-        sessions: &[SessionReportSnapshot],
-    ) -> Vec<MmpAction> {
+    pub fn plan_session_reports(&self, sessions: &[SessionReportSnapshot]) -> Vec<MmpAction> {
         let mut actions = Vec::new();
         // Logs first (see the ordering note above): they read the pre-send
         // cumulative_packets_sent the original captured during its collect pass.
@@ -364,7 +362,7 @@ impl Mmp {
     /// is used here for a deterministic (address-sorted) emission order — no test
     /// depends on the old order (the backoff chartest exercises a single dest),
     /// and stage 6's no_std pass requires the ordered map regardless.
-    pub(crate) fn plan_backoff(&self, results: &[SendResult]) -> Vec<BackoffUpdate> {
+    pub fn plan_backoff(&self, results: &[SendResult]) -> Vec<BackoffUpdate> {
         let mut dest_success: BTreeMap<NodeAddr, bool> = BTreeMap::new();
         for res in results {
             let entry = dest_success.entry(res.dest).or_insert(false);

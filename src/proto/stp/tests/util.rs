@@ -2,7 +2,7 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::stp::{ParentDeclaration, TreeCoordinate, TreeState};
 
 pub(super) fn make_node_addr(val: u8) -> NodeAddr {
@@ -41,4 +41,31 @@ pub(super) fn make_costs(entries: &[(u8, f64)]) -> BTreeMap<NodeAddr, f64> {
         .iter()
         .map(|&(addr, cost)| (make_node_addr(addr), cost))
         .collect()
+}
+
+/// A random signing key, standing in for the root crate's `Identity`: the
+/// codec tests need a declaration signed by the node it names.
+pub(super) struct Signer {
+    keypair: secp256k1::Keypair,
+    node_addr: NodeAddr,
+}
+
+impl Signer {
+    /// A signer with a fresh random key.
+    pub(super) fn generate() -> Self {
+        let keypair = crate::testutil::make_keypair();
+        let node_addr = NodeAddr::from_pubkey(&keypair.x_only_public_key().0);
+        Self { keypair, node_addr }
+    }
+
+    /// The node address derived from the signer's public key.
+    pub(super) fn node_addr(&self) -> &NodeAddr {
+        &self.node_addr
+    }
+
+    /// Sign `data` the way `Identity::sign` does: Schnorr over its SHA-256.
+    pub(super) fn sign(&self, data: &[u8]) -> secp256k1::schnorr::Signature {
+        let digest = crate::identity::sha256(data);
+        crate::identity::secp().sign_schnorr(&digest, &self.keypair)
+    }
 }

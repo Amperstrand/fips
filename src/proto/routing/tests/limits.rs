@@ -1,6 +1,6 @@
 //! Tests for routing error-signal rate limiting.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::rate_limit::MAX_ENTRIES;
 use crate::proto::routing::{LimitVerdict, RoutingErrorRateLimiter};
 use crate::testutil::make_node_addr as addr;

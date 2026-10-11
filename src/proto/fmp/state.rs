@@ -5,7 +5,7 @@
 //! index/transport/address tracking, handshake-resend scheduling, and link
 //! statistics — extracted out of the async node shell. The handshake phase
 //! itself lives solely on the per-peer control machine
-//! ([`PeerMachine`](crate::peer::machine::PeerMachine)), not here.
+//! (`PeerMachine`), not here.
 //!
 //! [`ConnectionState`] owns every **pure** field of the handshake-phase
 //! connection. The Noise crypto handles (`noise::HandshakeState`,
@@ -26,12 +26,13 @@
 //! decision [`core`](super::core).
 //!
 //! [`Fmp`] is the separate, stateless lifecycle anchor owned by
-//! [`Node`](crate::node::Node); see its doc below.
+//! `Node`; see its doc below.
 
 use super::core::Msg1Digest;
-use crate::PeerIdentity;
+use crate::identity::PeerIdentity;
 use crate::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
+use alloc::vec::Vec;
 
 /// Pure, runtime-agnostic bookkeeping for a connection in the handshake phase.
 ///
@@ -317,13 +318,13 @@ impl ConnectionState {
     }
 
     /// Record the digest of the msg1 that opened this inbound connection.
-    pub(crate) fn set_msg1_digest(&mut self, digest: Msg1Digest) {
+    pub fn set_msg1_digest(&mut self, digest: Msg1Digest) {
         self.msg1_digest = Some(digest);
     }
 
     /// The digest of the msg1 that opened this inbound connection, if
     /// recorded.
-    pub(crate) fn msg1_digest(&self) -> Option<Msg1Digest> {
+    pub fn msg1_digest(&self) -> Option<Msg1Digest> {
         self.msg1_digest
     }
 
@@ -369,7 +370,7 @@ impl ConnectionState {
 }
 
 /// FMP connection-lifecycle subsystem anchor owned by
-/// [`Node`](crate::node::Node).
+/// `Node`.
 ///
 /// Unlike [`Router`](crate::proto::routing::Router), the FMP lifecycle core
 /// owns **no** mutable state: every registry mutation (index allocation,
@@ -379,11 +380,18 @@ impl ConnectionState {
 /// is therefore an empty namespace anchor: it exists so the maintain/teardown
 /// decisions can hang off a `Node` field (`self.fmp`) in the same shape the
 /// other migrated subsystems use, not to hold data.
-pub(crate) struct Fmp;
+pub struct Fmp;
+
+/// The same as `Fmp::new`.
+impl Default for Fmp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Fmp {
     /// Create the (stateless) FMP lifecycle anchor.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 }

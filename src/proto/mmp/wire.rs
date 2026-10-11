@@ -8,6 +8,7 @@
 
 use crate::proto::Error;
 use crate::proto::codec::{Reader, Writer};
+use alloc::vec::Vec;
 
 // ============================================================================
 // SenderReport (msg_type 0x01, 48-byte body including type byte)

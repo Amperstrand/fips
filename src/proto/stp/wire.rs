@@ -1,10 +1,11 @@
 //! TreeAnnounce message: spanning tree state propagation.
 
 use super::{CoordEntry, ParentDeclaration, TreeCoordinate, TreeError};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::Error;
 use crate::proto::codec::{Reader, Writer};
 use crate::proto::link::LinkMessageType;
+use alloc::vec::Vec;
 use secp256k1::schnorr::Signature;
 
 /// Spanning tree announcement carrying parent declaration and ancestry.

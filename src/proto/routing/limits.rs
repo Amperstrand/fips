@@ -8,7 +8,7 @@
 //! per-destination state lives in an `alloc` `BTreeMap` for `no_std`
 //! portability and deterministic ordering.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::rate_limit::{PerAddrRateLimiter, RecordOutcome};
 
 /// Default minimum interval between error signals: 100 ms (max 10 errors/sec
@@ -77,11 +77,12 @@ impl RoutingErrorRateLimiter {
 
     /// Remove entries older than max_age.
     #[cfg(test)]
-    pub(crate) fn cleanup(&mut self, now_ms: u64) {
+    pub fn cleanup(&mut self, now_ms: u64) {
         self.0.cleanup(now_ms);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -89,7 +90,7 @@ impl RoutingErrorRateLimiter {
     /// Sweeps the inner map has run since construction. Read by the test
     /// holding the amortization property.
     #[cfg(test)]
-    pub(crate) fn sweeps(&self) -> u64 {
+    pub fn sweeps(&self) -> u64 {
         self.0.sweeps()
     }
 }

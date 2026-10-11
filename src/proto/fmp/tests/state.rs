@@ -3,13 +3,16 @@
 //! crypto-driving transition behavior is covered by the shell `peer::connection`
 //! suite, and the handshake phase itself lives on the control machine.
 
+use crate::identity::PeerIdentity;
 use crate::proto::fmp::ConnectionState;
+use crate::testutil::make_keypair;
 use crate::transport::{LinkId, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
-use crate::{Identity, PeerIdentity};
+use alloc::string::ToString;
+use alloc::vec;
 
 fn make_peer_identity() -> PeerIdentity {
-    PeerIdentity::from_pubkey(Identity::generate().pubkey())
+    PeerIdentity::from_pubkey(make_keypair().x_only_public_key().0)
 }
 
 #[test]

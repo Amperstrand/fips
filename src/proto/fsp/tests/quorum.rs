@@ -1,6 +1,6 @@
 //! Unit tests for the `PathBroken` link quorum.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::fsp::quorum::{LinkQuorum, QUORUM_LINKS, QUORUM_WINDOW_MS, QuorumVerdict};
 
 fn addr(v: u8) -> NodeAddr {

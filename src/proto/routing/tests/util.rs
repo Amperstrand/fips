@@ -1,9 +1,11 @@
 //! Shared test helpers for the routing subsystem unit tests.
 
+use crate::identity::NodeAddr;
+use crate::proto::coord::TreeCoordinate;
 use crate::proto::link::SessionDatagramRef;
 use crate::proto::routing::{NextHop, RoutingView};
 use crate::testutil::make_node_addr;
-use crate::{NodeAddr, TreeCoordinate};
+use alloc::vec::Vec;
 
 /// A mock peer for the candidate-assembly seam: the set of destinations its
 /// bloom filter reaches, its link cost, and tree coordinates.

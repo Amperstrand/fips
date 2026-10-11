@@ -28,17 +28,17 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-use crate::{IdentityError, NodeAddr};
+use crate::identity::{IdentityError, NodeAddr};
 
 pub use crate::proto::coord::{CoordEntry, CoordError, TreeCoordinate};
-pub(crate) use crate::proto::coord::{
+pub use crate::proto::coord::{
     coords_wire_size, decode_coords, decode_optional_coords, encode_coords, encode_empty_coords,
 };
 // Callers outside this module take the decision from `Stp`; only the tests
 // name the parent evaluation itself.
 #[cfg(test)]
-pub(crate) use core::ParentEval;
-pub(crate) use core::{Stp, TreeDecision};
+pub use core::ParentEval;
+pub use core::{Stp, TreeDecision};
 pub use declaration::ParentDeclaration;
 pub use state::TreeState;
 pub use wire::TreeAnnounce;

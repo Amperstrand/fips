@@ -2,10 +2,13 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::bloom::state::BloomState;
 use crate::proto::bloom::{BloomError, BloomFilter, DEFAULT_FILTER_SIZE_BITS, DEFAULT_HASH_COUNT};
 use crate::testutil::make_node_addr;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
 
 #[test]
 fn test_bloom_filter_new() {

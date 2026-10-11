@@ -3,7 +3,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::util::{make_coords, make_costs, make_node_addr};
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::stp::{ParentDeclaration, ParentEval, TreeState};
 
 #[test]

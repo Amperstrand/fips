@@ -4,6 +4,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::util::{add_peer, make_coords, make_costs, make_node_addr, make_tree_state};
 use crate::proto::stp::{ParentDeclaration, ParentEval, TreeCoordinate, TreeState};
+use alloc::vec::Vec;
 
 // ===== ParentDeclaration Tests =====
 

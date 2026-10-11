@@ -2,7 +2,7 @@
 //! `TreeCoordinate::depth()`, which is `entries - 1`, and worked out in each
 //! test's comment — never read off a rendered example.
 
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::probe::core::describe_path;
 use crate::proto::stp::TreeCoordinate;
 

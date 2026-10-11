@@ -1,15 +1,15 @@
 //! TreeAnnounce wire codec unit tests.
 
-use super::util::{make_coords, make_node_addr};
-use crate::identity::Identity;
+use super::util::{Signer, make_coords, make_node_addr};
 use crate::proto::Error;
 use crate::proto::stp::wire::TreeAnnounce;
 use crate::proto::stp::{CoordEntry, ParentDeclaration, TreeCoordinate, TreeError};
+use alloc::vec;
 
 /// Sign a declaration in place. In production the shell owns the key-crypto
 /// (§6); this test-local helper keeps the sign/verify boundary out of the
 /// in-core `state.rs` while letting the codec tests build signed messages.
-fn sign_decl(decl: &mut ParentDeclaration, identity: &Identity) {
+fn sign_decl(decl: &mut ParentDeclaration, identity: &Signer) {
     let sig = identity.sign(&decl.signing_bytes());
     decl.set_signature(sig.to_byte_array());
 }
@@ -29,9 +29,7 @@ fn test_tree_announce() {
 
 #[test]
 fn test_tree_announce_encode_decode_root() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
 
     // Root declaration: parent == self
@@ -66,9 +64,7 @@ fn test_tree_announce_encode_decode_root() {
 
 #[test]
 fn test_tree_announce_encode_decode_depth3() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
     let parent = make_node_addr(2);
     let grandparent = make_node_addr(3);
@@ -118,9 +114,7 @@ fn test_tree_announce_encode_decode_depth3() {
 
 #[test]
 fn test_tree_announce_decode_unsupported_version() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
 
     let mut decl = ParentDeclaration::new(node_addr, node_addr, 1, 1000);
@@ -157,9 +151,7 @@ fn test_tree_announce_decode_truncated() {
 
 #[test]
 fn test_tree_announce_decode_ancestry_count_mismatch() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
 
     let mut decl = ParentDeclaration::new(node_addr, node_addr, 1, 1000);
@@ -192,13 +184,11 @@ fn test_tree_announce_encode_unsigned_fails() {
 /// Tests that a well-formed non-root ancestry is accepted.
 #[test]
 fn test_tree_announce_validate_semantics_accepts_valid_non_root() {
-    use crate::identity::Identity;
-
     // Regenerate until the random identity's node_addr is numerically
     // larger than both fixed parent (02:..) and root (01:..), so the
     // root-minimum invariant holds deterministically.
     let identity = loop {
-        let id = Identity::generate();
+        let id = Signer::generate();
         if id.node_addr().as_bytes()[0] > 1 {
             break id;
         }
@@ -224,9 +214,7 @@ fn test_tree_announce_validate_semantics_accepts_valid_non_root() {
 /// Tests that an ancestry is rejected if the final node_addr is not the smallest entry in the path.
 #[test]
 fn test_tree_announce_validate_semantics_rejects_non_minimal_root() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
     let smaller = make_node_addr(0);
     let advertised_root = make_node_addr(1);
@@ -254,9 +242,7 @@ fn test_tree_announce_validate_semantics_rejects_non_minimal_root() {
 /// Tests that an ancestry is rejected if the first ancestry hop does not match the signed parent_id.
 #[test]
 fn test_tree_announce_validate_semantics_rejects_parent_mismatch() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
     let declared_parent = make_node_addr(2);
     let ancestry_parent = make_node_addr(3);
@@ -284,9 +270,7 @@ fn test_tree_announce_validate_semantics_rejects_parent_mismatch() {
 /// Tests that an ancestry is rejected if the first path entry does not match the signed sender node_addr.
 #[test]
 fn test_tree_announce_validate_semantics_rejects_sender_mismatch() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
     let ancestry_sender = make_node_addr(9);
     let parent = make_node_addr(2);
@@ -314,9 +298,7 @@ fn test_tree_announce_validate_semantics_rejects_sender_mismatch() {
 /// Tests that a self-root declaration is rejected if its ancestry contains extra ancestors.
 #[test]
 fn test_tree_announce_validate_semantics_rejects_root_with_ancestors() {
-    use crate::identity::Identity;
-
-    let identity = Identity::generate();
+    let identity = Signer::generate();
     let node_addr = *identity.node_addr();
 
     let mut decl = ParentDeclaration::self_root(node_addr, 5, 1000);

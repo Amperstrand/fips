@@ -18,11 +18,11 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use core::{Budgets, Observation, Probe, ProbeAction, describe_path};
-pub(crate) use limits::{MAX_CONCURRENT_PROBES, REAP_MS};
-#[cfg(test)]
-pub(crate) use state::StageVerdict;
-pub(crate) use state::{
+pub use core::{Budgets, Observation, Probe, ProbeAction, describe_path};
+pub use limits::{MAX_CONCURRENT_PROBES, REAP_MS};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use state::StageVerdict;
+pub use state::{
     LeftIntact, LookupOutcomeKind, NextHopFacts, NoHopReason, Preflight, ProbeSnapshot,
     RttCounters, StageRecord,
 };
