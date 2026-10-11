@@ -553,9 +553,9 @@ pub fn push_bounded_pending<T>(
 /// Mark ECN-CE in an IPv6 packet's Traffic Class field.
 ///
 /// IPv6 Traffic Class occupies bits across bytes 0 and 1:
-///   byte[0] bits[3:0] = TC[7:4]
-///   byte[1] bits[7:4] = TC[3:0]
-/// ECN is TC[1:0]. Only marks CE (0b11) if the packet is ECN-capable (ECT(0) or
+///   byte\[0\] bits\[3:0\] = TC\[7:4\]
+///   byte\[1\] bits\[7:4\] = TC\[3:0\]
+/// ECN is TC\[1:0\]. Only marks CE (0b11) if the packet is ECN-capable (ECT(0) or
 /// ECT(1)). Packets with ECN=0b00 (Not-ECT) are never marked per RFC 3168.
 ///
 /// No checksum update needed: IPv6 has no header checksum, and the Traffic Class

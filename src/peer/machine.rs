@@ -3570,7 +3570,7 @@ mod tests {
     /// A rekey cutover arms the drain timer for the drain window FSP uses.
     ///
     /// The expected offset is the literal `10_000`: `DRAIN_WINDOW_SECS` in
-    /// `src/proto/fsp/limits.rs` is 10 seconds, and that is the value this
+    /// `core/src/proto/fsp/limits.rs` is 10 seconds, and that is the value this
     /// deadline is meant to carry. Writing it out rather than reusing
     /// `DRAIN_WINDOW_MS` is what keeps the assertion able to fail; expressed
     /// in terms of the constant under test it would move with any re-pointing

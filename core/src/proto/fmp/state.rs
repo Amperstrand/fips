@@ -16,14 +16,11 @@
 //! (`set_expected_identity`,
 //! `set_remote_epoch`, `touch`).
 //!
-//! This state is `no_std`+`alloc`-clean with respect to transport: the
-//! identifier/address/statistics value types are the plain-data `transport`
-//! primitives (defined in the `no_std` `transport::types` module, named here
-//! via their `crate::transport` re-export). Two `std`-tethers remain —
-//! [`PeerIdentity`] and [`SessionIndex`] — plain-data types whose defining
-//! modules are not yet `no_std`. They are named here as data only (never
-//! driving crypto) and mirror the tether already carried by the sibling
-//! decision [`core`](super::core).
+//! This state is `no_std`+`alloc`-clean: the identifier/address/statistics
+//! value types are the plain-data `transport` primitives, and
+//! [`PeerIdentity`] and [`SessionIndex`] are this crate's `identity` and
+//! `utils::index` types. They are named here as data only (never driving
+//! crypto).
 //!
 //! [`Fmp`] is the separate, stateless lifecycle anchor owned by
 //! `Node`; see its doc below.

@@ -17,8 +17,8 @@
 //!   and the spin-bit state (`no_std`+`alloc`).
 //! - `wire.rs` — the link-layer and session-layer report codecs.
 //!
-//! `MmpConfig` (serde node config) stays shell-side in `crate::mmp`; only the
-//! plain values it carries reach the owned state constructors.
+//! `MmpConfig` (serde node config) stays shell-side in the root crate's `mmp`
+//! module; only the plain values it carries reach the owned state constructors.
 
 // Leading `::` disambiguates the extern `core` crate from the child `mod core`.
 use ::core::fmt;

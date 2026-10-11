@@ -424,7 +424,7 @@ impl TreeState {
     /// `peer_costs` maps each peer's NodeAddr to its link cost (from local
     /// MMP measurements). Missing entries default to 1.0 (optimistic).
     ///
-    /// Returns a [`ParentEval`] describing whether a parent switch is warranted:
+    /// Returns a `ParentEval` describing whether a parent switch is warranted:
     /// `Mandatory` (path-breaking / root-correcting — always taken), `Discretionary`
     /// (an improvement the caller applies only if its veto is inactive), or `None`.
     /// The root-correcting case fires when the best candidate advertises a smaller

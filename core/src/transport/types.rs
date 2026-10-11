@@ -5,9 +5,10 @@
 //! (e.g. `proto::fmp`) can name them without pulling in `std`.
 //! `TransportAddr::from_socket_addr` formats through `core::fmt` into a stack
 //! buffer; the `std`-requiring helpers (socket-address resolution,
-//! `local_addr`) stay in `transport`. Re-exported from `transport`
-//! via `pub use types::*`, so existing `crate::transport::{LinkId, ...}`
-//! imports are unaffected.
+//! `local_addr`) stay in the root crate's `transport` module. Re-exported by
+//! name from this crate's `transport` module and from the root crate's
+//! `fips::transport`, so `crate::transport::{LinkId, ...}` imports resolve in
+//! both crates.
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt;

@@ -265,7 +265,7 @@ fn make_room(
 /// peer emitting fresh `request_id`s could stop the node answering lookups
 /// for itself and stop it carrying anyone else's for as long as it kept the
 /// cache full — a denial of exactly the service the cache exists to protect.
-/// [`make_room`] charges the eviction to the peer that filled the cache.
+/// `make_room` charges the eviction to the peer that filled the cache.
 ///
 /// The loosening this accepts: an evicted `request_id` arriving again inside
 /// the dedup window is forwarded a second time rather than recognised as a

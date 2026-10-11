@@ -78,8 +78,8 @@
 #                    Retired from CI 2026-07-24 as redundant, not unrunnable.
 #                    The rekey timing/choreography decision (trigger, K-bit
 #                    cutover, drain, jitter, guards) is covered by the sans-IO
-#                    poll_rekey tests (src/proto/fsp/tests/core.rs,
-#                    src/proto/fmp/tests/core.rs); the data-plane continuity
+#                    poll_rekey tests (core/src/proto/fsp/tests/core.rs,
+#                    core/src/proto/fmp/tests/core.rs); the data-plane continuity
 #                    across a real cutover by rekey_cutover_preserves_data_plane
 #                    (src/node/tests/session.rs, a real IK rekey over loopback);
 #                    the accept-off dual-init regression and the

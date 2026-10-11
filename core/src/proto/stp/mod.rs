@@ -16,8 +16,7 @@
 //! - `TreeCoordinate` / `CoordEntry` now live in the shared
 //!   [`crate::proto::coord`] primitive and are re-exported here for continuity.
 //! - `limits.rs` — the flap-dampening / hold-down state machine.
-//! - `wire.rs` — `TreeAnnounce` + `validate_semantics` (the one std-tethered
-//!   file).
+//! - `wire.rs` — `TreeAnnounce` + `validate_semantics`.
 
 mod core;
 mod declaration;

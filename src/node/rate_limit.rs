@@ -1035,7 +1035,7 @@ mod sign_limiter_tests {
     // accompanied this limiter in `src/node/discovery_rate_limit.rs` are not
     // repeated here: both types moved into `crate::proto::lookup::limits` as
     // `LookupBackoff` and `LookupForwardRateLimiter`, and all thirteen of those
-    // cases live there, name for name, in `src/proto/lookup/tests/limits.rs`,
+    // cases live there, name for name, in `core/src/proto/lookup/tests/limits.rs`,
     // ported to the clockless millisecond API. Only the signing budget, which
     // is `Instant`-based and so stays in the shell, is exercised below.
 

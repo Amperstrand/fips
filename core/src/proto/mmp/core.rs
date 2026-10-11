@@ -361,7 +361,7 @@ impl Mmp {
     /// initialized `false`) with nondeterministic iteration order; a `BTreeMap`
     /// is used here for a deterministic (address-sorted) emission order — no test
     /// depends on the old order (the backoff chartest exercises a single dest),
-    /// and stage 6's no_std pass requires the ordered map regardless.
+    /// and the crate's `no_std` rule requires an ordered map regardless.
     pub fn plan_backoff(&self, results: &[SendResult]) -> Vec<BackoffUpdate> {
         let mut dest_success: BTreeMap<NodeAddr, bool> = BTreeMap::new();
         for res in results {

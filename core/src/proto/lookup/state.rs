@@ -66,7 +66,7 @@ pub struct PendingLookup {
     /// Current attempt number (1 = initial, 2 = first retry, ...).
     pub attempt: u8,
     /// `request_id`s issued for this target, oldest first, capped at
-    /// [`MAX_RECORDED_IDS`]. A response is only acted on when it carries one
+    /// `MAX_RECORDED_IDS`. A response is only acted on when it carries one
     /// of these, which is what makes the accept path solicited. The entry
     /// itself is dropped at ladder timeout, so this set needs no expiry.
     pub ids: Vec<u64>,
@@ -167,7 +167,7 @@ impl Lookup {
     /// One link peer's share of the dedup cache at the current peer count.
     ///
     /// The share tracks the peer count rather than being pinned to a number
-    /// a many-peer node outgrows, with [`MIN_RECENT_PER_PEER`] as its floor.
+    /// a many-peer node outgrows, with `MIN_RECENT_PER_PEER` as its floor.
     /// `peer_count` is supplied by the caller: the core is sans-IO and has no
     /// view of the live peer table.
     pub fn peer_share(max_recent: usize, peer_count: usize) -> usize {
@@ -226,7 +226,7 @@ impl Lookup {
         Some((evicted, entry))
     }
 
-    /// Whether `request_id` is among the last [`EVICTED_KEPT`] ids evicted
+    /// Whether `request_id` is among the last `EVICTED_KEPT` ids evicted
     /// to make room. Expiry purges are not evictions and are not counted.
     pub fn was_evicted(&self, request_id: u64) -> bool {
         self.evicted.contains(&request_id)

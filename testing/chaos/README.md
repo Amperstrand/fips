@@ -88,7 +88,7 @@ timing all confound the outcome (a deterministic `link_swap` attempt still
 produced zero periodic switches in a full run).
 
 That logic is now covered by deterministic sans-IO unit tests in
-`src/proto/stp/tests/state.rs` (`test_effective_depth_*`, `test_hysteresis_*`,
+`core/src/proto/stp/tests/state.rs` (`test_effective_depth_*`, `test_hysteresis_*`,
 `test_cost_*`), which run in the cargo quartet on every commit and can each be
 shown to fail by breaking the cost or hysteresis logic.
 

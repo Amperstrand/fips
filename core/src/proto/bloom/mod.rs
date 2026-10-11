@@ -14,7 +14,7 @@
 //! - `state.rs` — `BloomState` (per-peer inbound store + outgoing filter
 //!   computation + the send-debounce decision).
 //! - `limits.rs` — the v1 sizing constants.
-//! - `wire.rs` — `FilterAnnounce` + `encode`/`decode` (the std-tethered file).
+//! - `wire.rs` — `FilterAnnounce` + `encode`/`decode`.
 //!   It imports the shared [`crate::proto::Error`] and
 //!   [`crate::proto::link::LinkMessageType`] downward.
 

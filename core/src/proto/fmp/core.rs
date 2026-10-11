@@ -208,7 +208,7 @@ pub const ENDED_MSG1_RECORD: usize = 256;
 /// a pending.
 ///
 /// Retention is bounded: the ended list keeps the last
-/// [`ENDED_MSG1_RECORD`] digests, so a msg1 from an older cycle of the same
+/// `ENDED_MSG1_RECORD` digests, so a msg1 from an older cycle of the same
 /// epoch is not recognized. The record lives with the peer, so it starts empty
 /// whenever the peering is established again while the peer's epoch stays the
 /// same, as after this node restarts or the link is torn down and re-formed.
@@ -433,7 +433,7 @@ pub struct Msg1Arrival<'a> {
 ///
 /// Both fields are pre-evaluated shell-side (the tie-break is a pure function of
 /// the two node addresses, resolved into a plain `bool` here) so the core never
-/// touches live `Node` state or the `crate::peer` tie-break helper.
+/// touches live `Node` state or the root crate's `peer` tie-break helper.
 pub struct OutboundSnapshot {
     /// The peer identity is already a promoted active peer — i.e. this outbound
     /// completion is a cross-connection (we also processed their msg1).
@@ -607,7 +607,7 @@ pub enum InboundReject {
     /// a rekey of this link.
     OffLink,
     /// The identity's last sessions at this msg1's epoch, at least
-    /// [`SILENT_SESSION_LIMIT`](super::silent::SILENT_SESSION_LIMIT) in a
+    /// `SILENT_SESSION_LIMIT` in a
     /// row, ended without one authenticated frame, and the back-off they
     /// started is still running. Checked only where the msg1 would promote a
     /// new session.

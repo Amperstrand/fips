@@ -1402,7 +1402,7 @@ mod overlapping_epoch_tests {
     // characterization tests that sat here on `maint` are not carried: they
     // pinned `check_session_rekey`'s boundaries before the `Fsp::poll_rekey`
     // hoist, and the hoisted predicate has its own tests in
-    // `src/proto/fsp/tests/core.rs`.
+    // `core/src/proto/fsp/tests/core.rs`.
 
     // 12. A peer that keeps exercising the old epoch delays erasure by a
     //     bounded amount rather than preventing it. The refreshes must

@@ -43,7 +43,7 @@ pub enum RecordOutcome {
 /// Per-address minimum-interval rate limiter. Tracks the last event time per
 /// address and enforces a minimum interval, evicting entries older than a max
 /// age. The map is bounded and its sweep is amortized; see [`MAX_ENTRIES`] and
-/// [`SWEEPS_PER_MAX_AGE`].
+/// `SWEEPS_PER_MAX_AGE`.
 pub struct PerAddrRateLimiter {
     last: BTreeMap<NodeAddr, u64>,
     min_interval_ms: u64,

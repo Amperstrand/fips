@@ -172,7 +172,7 @@ impl Router {
     /// CoordsRequired. The chosen PDU is wrapped in a fresh SessionDatagram
     /// addressed back to `toward` (the failed datagram's source) and encoded.
     ///
-    /// The returned [`ErrorSynth`] carries the gate's verdict alongside the
+    /// The returned `ErrorSynth` carries the gate's verdict alongside the
     /// action, rather than collapsing it to a bool. The shell counts the three
     /// verdicts separately: suppression and a full destination map say
     /// different things about the node, and an operator cannot tell a genuine
@@ -224,11 +224,11 @@ impl Router {
 
     /// Synthesize an MtuExceeded error signal after a forward send failed with
     /// a bottleneck MTU. Applies the per-destination rate-limit gate (the same
-    /// limiter as [`synth_routing_error`]), then builds the MtuExceeded PDU
+    /// limiter as [`Self::synth_routing_error`]), then builds the MtuExceeded PDU
     /// carrying `bottleneck_mtu`, wraps it in a fresh SessionDatagram addressed
     /// back to `toward` (the failed datagram's source), and encodes it.
     ///
-    /// The returned [`ErrorSynth`]'s `action` is `None` exactly when the
+    /// The returned `ErrorSynth`'s `action` is `None` exactly when the
     /// verdict is `Suppress`. Otherwise the shell resolves the reverse link hop
     /// for `toward` and sends — resolving the hop only after this gate
     /// preserves the pre-refactor ordering (rate-limit before

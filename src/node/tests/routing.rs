@@ -1474,7 +1474,7 @@ fn test_parent_loss_selfroot_invalidates_coord_cache() {
 // The tests above exercise the routing *decision*; the ones below exercise the
 // *adapter* that feeds it. `NodeRoutingView` (src/node/mod.rs) is the only
 // thing connecting the node's live peer map to the sans-IO routing core, and
-// the core's own tests in src/proto/routing/tests/ drive a mock view, so
+// the core's own tests in core/src/proto/routing/tests/ drive a mock view, so
 // nothing else in the suite observes the real adapter.
 //
 // Why no pre-existing test discriminates it: in every other fixture in this
