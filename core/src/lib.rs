@@ -12,3 +12,5 @@ extern crate alloc;
 // Tests run on the host, where the standard library is available.
 #[cfg(test)]
 extern crate std;
+
+pub mod identity;

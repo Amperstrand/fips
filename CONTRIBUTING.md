@@ -133,11 +133,18 @@ cargo build
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy -p fips-core --all-targets -- -D warnings
+cargo test -p fips-core
 ```
 
 CI runs clippy twice, once with `--all-features` and once with the
 default feature set, because an optional feature means two source
 trees and each pass lints only one of them. Run both locally.
+
+The last two commands build the `fips-core` crate under its own feature
+resolution. The workspace-wide commands unify features across the root
+crate and the core, so they can pass while the core depends on a feature
+only the root turns on; see `core/README.md`.
 
 `fmt` and `clippy -D warnings` are CI gates — PRs with formatting
 drift or new clippy warnings will fail CI and be sent back.

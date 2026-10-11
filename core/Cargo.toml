@@ -9,3 +9,20 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# Debt to clear before the crate can build for a target without `std`:
+# - `std` on secp256k1, bech32 and hex provides the `std::error::Error` impls
+#   that thiserror's `#[from]` needs on IdentityError's fields.
+# - `rand` (with `std`) on secp256k1 makes `Secp256k1::new()` blind the shared
+#   context from `rand::thread_rng()`, an exception to the rule that randomness
+#   is passed in. Removing it must come with an explicit `randomize` call.
+secp256k1 = { version = "0.30", default-features = false, features = ["alloc", "std", "rand"] }
+bech32 = { version = "0.12", default-features = false, features = ["std"] }
+hex = { version = "0.4", default-features = false, features = ["std"] }
+
+# Left without `zeroize`: only public keys and data to be signed or verified
+# pass through the hasher here.
+sha2 = { version = "0.11", default-features = false }
+# `alloc` for the `Zeroizing<Vec<u8>>` guards in the secret key decoding.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+thiserror = { version = "2.0", default-features = false }
+once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }

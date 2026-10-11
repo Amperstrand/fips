@@ -6,8 +6,12 @@ The goal is one implementation of the protocol that runs unchanged on a
 Linux daemon, an Android app and a microcontroller, with each host
 supplying its own I/O around it.
 
-The crate is a workspace member next to the root `fips` package. It is
-empty for now; code moves in from the root crate one module at a time.
+The crate is a workspace member next to the root `fips` package. Code
+moves in from the root crate one module at a time. It holds the identity
+types so far: `NodeAddr`, `Ipv6Address`, `PeerIdentity`, the npub and
+nsec encodings and `IdentityError`, re-exported by the root crate under
+`fips::identity`. `Identity`, which signs, stays in the root crate until
+randomness can be passed in.
 
 ## What belongs here
 
@@ -58,7 +62,9 @@ synthetic timestamps.
 
 **Randomness is an argument.** Never reach for a thread-local or OS
 random source. Code that needs random bytes or a nonce takes an RNG or
-the bytes from its caller.
+the bytes from its caller. The one known exception is the shared
+secp256k1 context in `identity`, which blinds itself from
+`rand::thread_rng()` when built; it stays until randomness is passed in.
 
 **No OS calls and no target `cfg`.** No `cfg(target_os = ...)`,
 `cfg(unix)`, `cfg(windows)` or similar. If behaviour differs by
@@ -115,6 +121,11 @@ Tests run on the host and may use `std`: `lib.rs` declares
 macros into scope, so a test module that uses `format!` or `vec!` needs
 `use alloc::format;` or `use alloc::vec;`.
 
+Unit tests go in their own file, never in an inline `mod tests { ... }`
+block. The source file carries only `#[cfg(test)] mod tests;`, and the
+tests sit beside it in `tests.rs` (`<name>/tests.rs` for a file module,
+or a `tests/` directory when they are large).
+
 Test the state machines the way the host drives them: build the state,
 feed it inputs with synthetic timestamps and fixed random bytes, and
 assert on the actions it returns. No sockets, no sleeps and no real
@@ -138,6 +149,14 @@ clock.
 - Split the tests the same way: tests that use only moved items move
   with them, and the rest stay. Compare the test names before and after
   so none is lost.
+- A module whose tests are inline has them extracted to their own file,
+  as described under Tests, in a commit before the move.
+- Every directory in this crate has a `README.md`: what the directory is
+  for, what each file or subdirectory holds, how it relates to the
+  levels above and below, and the rules or invariants someone changing
+  it must know. Write it for a human reader and a coding agent alike.
+  When code moves into a new directory, or a directory's contents
+  change, add or update its README in the same change.
 - A move changes no behaviour. Code that needs changing to meet the
   rules above (a clock read, a log line, a target `cfg`) is changed in a
   separate commit first, while it is still in the root crate.
