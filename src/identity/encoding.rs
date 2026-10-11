@@ -1,5 +1,7 @@
 //! NIP-19 bech32 encoding for Nostr keys.
 
+use alloc::string::{String, ToString};
+
 use bech32::{Bech32, Hrp};
 use secp256k1::{SecretKey, XOnlyPublicKey};
 use zeroize::{Zeroize, Zeroizing};

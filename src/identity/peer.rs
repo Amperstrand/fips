@@ -1,7 +1,10 @@
 //! Remote peer identity (public key only, no signing capability).
 
+use alloc::format;
+use alloc::string::String;
+use core::fmt;
+
 use secp256k1::{Parity, PublicKey, XOnlyPublicKey};
-use std::fmt;
 
 use super::encoding::{decode_npub, encode_npub};
 use super::{IdentityError, Ipv6Address, NodeAddr, sha256};
@@ -9,7 +12,7 @@ use super::{IdentityError, Ipv6Address, NodeAddr, sha256};
 /// A known peer's identity (public key only, no signing capability).
 ///
 /// Use this to represent remote peers whose npub you know. For a local
-/// identity with signing capability, use [`Identity`] instead.
+/// identity with signing capability, use `Identity` instead.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PeerIdentity {
     pubkey: XOnlyPublicKey,

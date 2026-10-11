@@ -5,8 +5,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 use super::auth::{AuthResponse, auth_challenge_digest};
-use super::encoding::{decode_secret, encode_npub};
-use super::{IdentityError, Ipv6Address, NodeAddr, sha256};
+use super::{IdentityError, Ipv6Address, NodeAddr, decode_secret, encode_npub, sha256};
 
 /// A FIPS node identity consisting of a keypair and derived identifiers.
 ///

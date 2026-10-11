@@ -1,8 +1,11 @@
 //! 16-byte node identifier derived from truncated SHA-256(pubkey).
 
+use alloc::format;
+use alloc::string::String;
+use core::fmt;
+
 use secp256k1::XOnlyPublicKey;
 use sha2::{Digest, Sha256};
-use std::fmt;
 
 use super::{IdentityError, hex_encode};
 

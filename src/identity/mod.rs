@@ -11,6 +11,8 @@ mod local;
 mod node_addr;
 mod peer;
 
+use alloc::format;
+use alloc::string::String;
 use std::sync::LazyLock;
 
 use secp256k1::{All, Secp256k1};

@@ -1,7 +1,7 @@
 //! A node's 128-bit IPv6 address, in the `fd00::/8` ULA range.
 
-use std::fmt;
-use std::net::Ipv6Addr;
+use core::fmt;
+use core::net::Ipv6Addr;
 
 use super::{IPV6_ADDRESS_PREFIX, IdentityError, NodeAddr};
 
