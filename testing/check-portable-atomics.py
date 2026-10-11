@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when non-test code under src/ uses the std 64-bit atomics.
+"""Fail when non-test code under src/ or core/src/ uses the std 64-bit atomics.
 
 `std::sync::atomic::AtomicU64` and `AtomicI64` exist only on targets with
 64-bit atomics. The 32-bit MIPS targets the OpenWrt packages are meant to
@@ -24,11 +24,12 @@ What is flagged, read from the files committed at HEAD:
   * `sa::AtomicU64` where the file renames the module with
     `use std::sync::atomic as sa;` or `use std::sync::{atomic::{self as sa}}`.
 
-Scope is src/, minus files under a `tests/` directory and files named
-`tests.rs` or `*_tests.rs`, which are only ever built for the host. A
-`#[cfg(test)]` module inside an ordinary file is NOT exempt: telling it apart
-needs a Rust parser, and holding test code in those files to the same rule
-costs nothing today (no such module uses the std types).
+Scope is the crate sources, src/ and core/src/, minus files under a `tests/`
+directory and files named `tests.rs` or `*_tests.rs`, which are only ever
+built for the host. A `#[cfg(test)]` module inside an ordinary file is NOT
+exempt: telling it apart needs a Rust parser, and holding test code in those
+files to the same rule costs nothing today (no such module uses the std
+types).
 
 One file is exempt by name, with its reason: src/transport/ble/io_android.rs
 is compiled only for Android, and every Android target Rust supports has
@@ -36,14 +37,14 @@ is compiled only for Android, and every Android target Rust supports has
 
 Known gaps, recorded rather than discovered: a std 64-bit atomic reached
 through a re-export from another crate, or through a type alias defined
-outside src/, is not seen; nor is one written with a macro that assembles the
-path from pieces.
+outside the crate sources, is not seen; nor is one written with a macro that
+assembles the path from pieces.
 
 Exit codes:
-    0 - no non-test file under src/ uses a std 64-bit atomic
+    0 - no non-test file under src/ or core/src/ uses a std 64-bit atomic
     1 - at least one does; every hit is printed
     2 - the check could not look (not a git work tree, git failed, or src/
-        matched no Rust files); never a pass
+        and core/src/ matched no Rust files); never a pass
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ EXEMPT = {
 }
 
 WIDE = ("AtomicU64", "AtomicI64")
+
+SRC_DIRS = ("src/", "core/src/")
 
 USE_RE = re.compile(r"\buse\s+([^;]+);", re.S)
 # Any `atomic::AtomicU64` whose `atomic` is not the tail of a longer name, so
@@ -160,17 +163,18 @@ def path_hits(text: str) -> list[tuple[int, str]]:
 
 
 def main() -> int:
-    """Scan the committed src/ tree and report every std wide-atomic use."""
+    """Scan the committed crate sources and report every std wide-atomic use."""
     root = git("rev-parse", "--show-toplevel").strip()
     if not root:
         print("check-portable-atomics: empty work-tree root", file=sys.stderr)
         return 2
     files = [
-        f for f in git("-C", root, "ls-tree", "-r", "--name-only", "HEAD", "--", "src/").splitlines()
+        f for f in git("-C", root, "ls-tree", "-r", "--name-only", "HEAD", "--", *SRC_DIRS).splitlines()
         if f.endswith(".rs")
     ]
     if not files:
-        print("check-portable-atomics: src/ matched no Rust files at HEAD", file=sys.stderr)
+        print("check-portable-atomics: src/ and core/src/ matched no Rust files at HEAD",
+              file=sys.stderr)
         return 2
 
     scanned = 0
@@ -187,7 +191,7 @@ def main() -> int:
                 findings.append(f"{path}:{line}: {what}")
 
     if scanned == 0:
-        print("check-portable-atomics: every file under src/ was excluded", file=sys.stderr)
+        print("check-portable-atomics: every file under src/ and core/src/ was excluded", file=sys.stderr)
         return 2
 
     if findings:

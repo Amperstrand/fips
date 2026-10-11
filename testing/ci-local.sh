@@ -629,6 +629,21 @@ run_build() {
         return 1
     fi
 
+    # The no_std core fence. A workspace build unifies dependency features
+    # across members, so a feature the root crate enables can hide one the core
+    # needs and does not ask for. Linting the core alone resolves only its own
+    # features. --all-targets type-checks the core's tests under that
+    # resolution too; a plain build would cover the lib only. Mirrored in
+    # .github/workflows/ci.yml; check-ci-parity.sh compares integration suites
+    # only and would not catch a stage added to one runner and not the other.
+    info "cargo clippy -p fips-core --all-targets -- -D warnings"
+    if cargo clippy -p fips-core --all-targets -- -D warnings 2>&1; then
+        record "core-fence" 0
+    else
+        record "core-fence" 1
+        return 1
+    fi
+
     # Tick-body profiler: the feature-on tree must build too. Added alongside
     # the default-feature stages rather than replacing them. Mirrored in
     # .github/workflows/ci.yml — check-ci-parity.sh compares integration suites
@@ -679,6 +694,16 @@ run_tests() {
         else
             record "unit-tests" 1
         fi
+    fi
+
+    # The no_std core's tests under the core's own feature resolution, so a
+    # test whose result depends on a feature only the root crate enables runs
+    # at least once without it. Mirrored in .github/workflows/ci.yml.
+    info "cargo test -p fips-core"
+    if cargo test -p fips-core 2>&1; then
+        record "core-fence-tests" 0
+    else
+        record "core-fence-tests" 1
     fi
 
     # The `profiling` feature adds a module, a recorder and a writer thread that
@@ -1841,7 +1866,7 @@ run_shellcheck() {
 # built on it then passes for the wrong reason.
 run_log_strings() {
     local rc=0
-    info "[log-strings] Checking test log matchers against the strings src/ emits"
+    info "[log-strings] Checking test log matchers against the strings the crate sources emit"
     python3 "$SCRIPT_DIR/check-log-strings.py" || rc=$?
     record "log-strings" $rc
 }

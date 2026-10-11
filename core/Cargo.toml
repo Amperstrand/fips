@@ -1,0 +1,11 @@
+[package]
+name = "fips-core"
+# Versioned with the workspace's root package: this crate is not published on
+# its own, and its version here is never bumped. Release version bumps edit the
+# root Cargo.toml only.
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]

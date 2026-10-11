@@ -16,21 +16,22 @@
 #   1. identifiers, repo-wide. A local item identifier anywhere in the tree.
 #      Repo-wide because packaging/, testing/ and the workflow files are as
 #      public as src/ — more so in the packaging case, which ships to users.
-#   2. document paths, scoped to src/. A comment under src/ citing an *.md
-#      path that does not exist in the tree at the checked commit. This is a
-#      resolvability rule rather than a denylist, so it catches private
-#      documents nobody has thought of. Scoped to src/ because resolving the
-#      whole tree's relative documentation links against the repository root
-#      is a different checker with its own population to triage first.
+#   2. document paths, scoped to the crate sources (src/ and core/src/). A
+#      comment there citing an *.md path that does not exist in the tree at
+#      the checked commit. This is a resolvability rule rather than a
+#      denylist, so it catches private documents nobody has thought of.
+#      Scoped to the crate sources because resolving the whole tree's
+#      relative documentation links against the repository root is a
+#      different checker with its own population to triage first.
 #   3. programme vocabulary, repo-wide in two scopes. Phase, rung,
 #      milestone and step labels, and phrases such as "architectural plan",
 #      that name a plan a reader cannot open. VOCAB_PAT runs over the whole
 #      tree except this file, which would match itself. SRC_VOCAB_PAT adds
-#      two alternatives that run over src/ only, because outside src/ they
-#      are legitimate prose: "in Step N" is the documentation's own step
-#      cross-referencing, and "this PR" is how CONTRIBUTING.md and
-#      PR-REVIEW.md talk about the PR under review. This file is the only
-#      copy of both patterns.
+#      two alternatives that run over the crate sources (src/ and core/src/)
+#      only, because outside them they are legitimate prose: "in Step N" is
+#      the documentation's own step cross-referencing, and "this PR" is how
+#      CONTRIBUTING.md and PR-REVIEW.md talk about the PR under review. This
+#      file is the only copy of both patterns.
 #
 #      The tree-wide alternatives had no hit outside src/ when the scope was
 #      widened. The one most likely to catch legitimate prose later is
@@ -44,10 +45,10 @@
 #     the Tor bootstrap loop in src/transport/tor/mod.rs out of check 3);
 #   - the CATEGORY_D / CATEGORY_E code identifiers and test names, which
 #     check 3's case-sensitive Category-[A-Z] deliberately does not match;
-#   - a document path outside src/. Check 2 resolves a token against the
-#     repository root, but documentation links outside src/ are relative to
-#     the citing file, so widening it means a different resolver and a
-#     triage of the links that fail it;
+#   - a document path outside the crate sources. Check 2 resolves a token
+#     against the repository root, but documentation links elsewhere are
+#     relative to the citing file, so widening it means a different resolver
+#     and a triage of the links that fail it;
 #   - a private-workspace directory cited in lowercase (an issues/... or
 #     tasks/... path with no .md token). Check 1's identifier prefix is
 #     case-sensitive and check 2 only resolves *.md tokens;
@@ -63,7 +64,7 @@
 #   - a pathspec typo introduced after this file lands. git grep returns 1
 #     with empty output for a pathspec that matches nothing, which is
 #     indistinguishable from health. The non-empty-population assertion below
-#     narrows that for the src/-scoped checks and closes nothing for check 1.
+#     narrows that for the crate-source checks and closes nothing for check 1.
 #
 # Exit 0 = every reference resolves. Exit 1 = one or more do not; every hit is
 # printed, not just the first. Exit 2 = the check could not look (not in a work
@@ -86,16 +87,19 @@ cd "$ROOT" || exit 2
 [[ -z "$(git rev-parse --show-prefix)" ]] \
     || { echo "check-comment-refs: not at the work-tree root" >&2; exit 2; }
 
-# The src/ pathspec must select something. wc -l is deliberate where the rest
-# of this script preserves exit statuses: it always exits 0, so the decision is
-# made on n and never on a status, and a failing git ls-tree yields n=0 and
-# fires the assertion. This covers checks 2 and 3 only; check 1's pathspec is
-# "." and stays non-empty from anywhere, so its wrong-directory case is covered
-# by the --show-prefix assertion above and its mistyped-pathspec case by
-# nothing. Check 3's tree-wide half uses "." with exclusions and is in the
-# same position as check 1.
-n=$(git ls-tree -r --name-only HEAD -- src/ | wc -l)
-(( n > 0 )) || { echo "check-comment-refs: pathspec src/ matched no files" >&2; exit 2; }
+# Each crate-source pathspec must select something. wc -l is deliberate where
+# the rest of this script preserves exit statuses: it always exits 0, so the
+# decision is made on n and never on a status, and a failing git ls-tree yields
+# n=0 and fires the assertion. This covers checks 2 and 3 only; check 1's
+# pathspec is "." and stays non-empty from anywhere, so its wrong-directory
+# case is covered by the --show-prefix assertion above and its
+# mistyped-pathspec case by nothing. Check 3's tree-wide half uses "." with
+# exclusions and is in the same position as check 1.
+SRC_DIRS=(src/ core/src/)
+for dir in "${SRC_DIRS[@]}"; do
+    n=$(git ls-tree -r --name-only HEAD -- "$dir" | wc -l)
+    (( n > 0 )) || { echo "check-comment-refs: pathspec $dir matched no files" >&2; exit 2; }
+done
 
 # Deliberately broad: the year group is optional, so the three-digit form is
 # caught as well, and the separator is optional so underscores and spaces are
@@ -106,7 +110,7 @@ ID_PAT='(TASK|ISSUE|IDEA|QUICK|RECUR)[-_ ]?(20[0-9]{2}[-_ ])?[0-9]{3,4}'
 # VOCAB_PAT runs tree-wide. This text matches itself, so the tree-wide run
 # excludes this one file by name; never exclude testing/, which holds real
 # hits a directory-wide exclusion would drop. SRC_VOCAB_PAT is VOCAB_PAT
-# plus the alternatives that are legitimate prose outside src/.
+# plus the alternatives that are legitimate prose outside the crate sources.
 VOCAB_PAT='\b[RQ][0-9]\b|Category-[A-Z]|\bumbrella\b|refactor steps?|\bpre-scopes\b|R0 stub|read-isolation|cut over yet|Cutover begins|(the|this) milestone|Milestone-|[Aa]rchitectural plan|[Ff]ollow-up wiring'
 SRC_VOCAB_PAT="$VOCAB_PAT"'|in Step [0-9]|\b[Tt]his PR\b'
 
@@ -133,9 +137,9 @@ if [[ -n "$out" ]]; then
     FAILED=1
 fi
 
-# ── Check 2: document paths under src/ must resolve in-repo ─────────────────
+# ── Check 2: document paths in the crate sources must resolve in-repo ───────
 rc=0
-md_lines=$(git grep -nI '\.md' HEAD -- src/) || rc=$?
+md_lines=$(git grep -nI '\.md' HEAD -- "${SRC_DIRS[@]}") || rc=$?
 if (( rc > 1 )); then
     echo "check-comment-refs: check 2 grep failed (rc=$rc)" >&2
     exit 2
@@ -182,7 +186,7 @@ if (( ${#CITES[@]} > 0 )); then
     done < <(printf '%s\n' "${!CITES[@]}" | sort)
 fi
 
-# ── Check 3: programme vocabulary, src/ and the rest of the tree ────────────
+# ── Check 3: programme vocabulary, crate sources and the rest of the tree ───
 vocab_check() {
     local pat=$1
     shift
@@ -199,8 +203,9 @@ vocab_check() {
     fi
     return 0
 }
-vocab_check "$SRC_VOCAB_PAT" src/
-vocab_check "$VOCAB_PAT" . ':(exclude)src/' ':(exclude)testing/check-comment-refs.sh'
+vocab_check "$SRC_VOCAB_PAT" "${SRC_DIRS[@]}"
+vocab_check "$VOCAB_PAT" . ':(exclude)src/' ':(exclude)core/src/' \
+    ':(exclude)testing/check-comment-refs.sh'
 
 if (( FAILED != 0 )); then
     echo "" >&2

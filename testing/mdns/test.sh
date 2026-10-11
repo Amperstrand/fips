@@ -83,7 +83,7 @@ resolve_image() {
     fi
     # A stale daemon would give a verdict about code that is not the tree's.
     local newer
-    newer="$(find "$REPO_ROOT/src" "$REPO_ROOT/Cargo.toml" -newer "$bin/fips" -print -quit 2>/dev/null)"
+    newer="$(find "$REPO_ROOT/src" "$REPO_ROOT/core" "$REPO_ROOT/Cargo.toml" -newer "$bin/fips" -print -quit 2>/dev/null)"
     if [[ -n "$newer" ]]; then
         echo "target/release/fips is older than $newer; rebuild: cargo build --release" >&2
         return 1

@@ -67,7 +67,7 @@ jobs:
         run: pip3 install --quiet pyyaml
       - name: Check local and GitHub runners cover the same work
         run: bash testing/check-ci-parity.sh
-      - name: Check test log matchers against the strings src/ emits
+      - name: Check test log matchers against the strings the crate sources emit
         run: python3 testing/check-log-strings.py
       - name: Check no tested function's exit status is a log call's
         run: python3 testing/check-trailing-log.py
@@ -163,6 +163,15 @@ jobs:
       # and not the other.
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
+      # The no_std core fence. A workspace build unifies dependency features
+      # across members, so a feature the root crate enables can hide one the
+      # core needs and does not ask for. Linting the core alone resolves only
+      # its own features. --all-targets type-checks the core's tests under that
+      # resolution too; a plain build would cover the lib only. Mirrored in
+      # testing/ci-local.sh; check-ci-parity.sh compares integration suites
+      # only and would not catch a step added to one runner and not the other.
+      - name: Clippy the no_std core on its own
+        run: cargo clippy -p fips-core --all-targets -- -D warnings
       - name: Build with the tick-body profiler enabled
         run: cargo build --workspace --features profiling
 
@@ -389,6 +398,12 @@ jobs:
         shell: bash
         run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
+      # The no_std core's tests under the core's own feature resolution, so a
+      # test whose result depends on a feature only the root crate enables
+      # runs at least once without it. Mirrored in testing/ci-local.sh.
+      - name: Run the no_std core's tests on their own
+        run: cargo test -p fips-core
+
       # The bind-success half. Every other unit-test leg runs unprivileged, so
       # `PacketSocket::open` cannot succeed on any of them and everything past
       # a successful bind — the post-store shutdown check, the `Present` arm of
@@ -402,13 +417,21 @@ jobs:
       # a raw socket skips quietly without it; with it set, a test that cannot
       # open one fails and says so, so a runner that stops granting the
       # capability shows up as a red leg rather than as silence.
+      #
+      # The workspace has more than one lib test executable, so the build and
+      # the selector name the `fips` package: otherwise the order cargo lists
+      # them in decides which one runs, and the core's, which has no ethernet
+      # tests, passes having run nothing. The grep fails the step unless at
+      # least one test passed, since a name filter that matches nothing passes.
       - name: Run interface-binding tests with privilege
+        shell: bash
         run: |
-          cargo test --lib --no-run
-          BIN=$(cargo test --lib --no-run --message-format=json \
+          cargo test -p fips --lib --no-run
+          BIN=$(cargo test -p fips --lib --no-run --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact")
                      | select(.executable != null)
                      | select(.target.kind[0] == "lib")
+                     | select(.target.name == "fips")
                      | .executable' \
             | tail -1)
           if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
@@ -416,7 +439,9 @@ jobs:
             exit 1
           fi
           echo "running $BIN as root"
-          sudo -E env FIPS_TEST_PRIVILEGED=1 "$BIN" transport::ethernet --test-threads=1
+          sudo -E env FIPS_TEST_PRIVILEGED=1 "$BIN" transport::ethernet --test-threads=1 \
+            | tee "$RUNNER_TEMP/privileged-tests.log"
+          grep -qE '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/privileged-tests.log"
 
       - name: Publish test report (Checks tab)
         uses: dorny/test-reporter@4a2e97665d5fa767581ef38eca97b9694bd4eef4 # v2

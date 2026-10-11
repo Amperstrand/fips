@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that every daemon log string a test matches on still exists in src/.
+"""Verify that every daemon log string a test matches on still exists in the source.
 
 A test that greps the daemon's log for a message the daemon no longer emits
 does not fail — it quietly stops observing anything, and an assertion built on
@@ -9,10 +9,10 @@ rather than re-discovered by reading.
 
 The check extracts the string literals that test code matches against daemon
 log lines, reduces each to its longest literal run (patterns carry regex
-syntax), and requires that run to appear somewhere under src/. Anything that
-legitimately does not originate in src/ — runtime panic text, tracing's own
-level tokens — must be named in ALLOWED with a reason, so the exceptions are
-reviewable instead of invisible.
+syntax), and requires that run to appear somewhere under the crate sources,
+src/ or core/src/. Anything that legitimately does not originate there —
+runtime panic text, tracing's own level tokens — must be named in ALLOWED
+with a reason, so the exceptions are reviewable instead of invisible.
 
 Usage: testing/check-log-strings.py [--verbose]
 Exit:  0 all matched strings are live, 1 otherwise.
@@ -25,12 +25,14 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SRC = REPO / "src"
+# The crate sources a logged string may live in: the root crate and the no_std
+# core crate.
+SRC = [REPO / "src", REPO / "core" / "src"]
 TESTING = REPO / "testing"
 
-# Strings matched against log text that do not come from src/, each with the
-# reason it is legitimately absent. Anything here is exempt from the src/
-# existence requirement — keep the list short and the reasons specific.
+# Strings matched against log text that do not come from the crate sources,
+# each with the reason it is legitimately absent. Anything here is exempt from
+# the existence requirement — keep the list short and the reasons specific.
 ALLOWED = {
     "panicked": "emitted by the Rust runtime's panic hook, not by our code",
     "PANIC": "panic-adjacent marker matched defensively alongside 'panicked'",
@@ -168,7 +170,7 @@ def grep_candidates() -> list[tuple[Path, int, str]]:
     Scoped by what the grep READS, not by what the file mentions. A suite
     greps several unrelated sources — its own analyzer output, fipsctl JSON,
     Tor's log, ping output — and only the daemon's log has to correspond to a
-    string in src/. Two shapes qualify: a grep piped directly from
+    string in the crate sources. Two shapes qualify: a grep piped directly from
     `docker logs`, and a grep fed a variable that was assigned from it.
     """
     grep_lit = r"\bgrep\b[^|;]*?\s(\"[^\"$]+\"|'[^'$]+')"
@@ -196,7 +198,8 @@ def main() -> int:
     verbose = "--verbose" in sys.argv
     src_text = "\n".join(
         p.read_text(encoding="utf-8", errors="replace")
-        for p in SRC.rglob("*.rs")
+        for d in SRC
+        for p in d.rglob("*.rs")
     )
 
     candidates = (
@@ -247,14 +250,15 @@ def main() -> int:
         f"{unscannable} unscannable, {len(dead)} dead"
     )
     if dead:
-        print("\nStrings matched against daemon logs that src/ never emits:\n")
+        print("\nStrings matched against daemon logs that src/ and core/src/ never emit:\n")
         for rel, lineno, raw, anchor in dead:
             print(f"  {rel}:{lineno}")
             print(f"      pattern: {raw!r}")
             print(f"      missing: {anchor!r}")
         print(
             "\nEither correct the string to what the daemon emits, or add it to "
-            "ALLOWED\nin this script with the reason it does not come from src/."
+            "ALLOWED\nin this script with the reason it does not come from the crate "
+            "sources."
         )
         return 1
     return 0

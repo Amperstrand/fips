@@ -9,6 +9,7 @@ RUN apt-get update && \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
+COPY core ./core
 
 RUN cargo build --release && \
     cp target/release/fips target/release/fipsctl target/release/fipstop /usr/local/bin/

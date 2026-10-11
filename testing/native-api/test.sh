@@ -116,8 +116,8 @@ trap cleanup EXIT
 # Print a source file newer than `built`, and nothing when none is. The second
 # argument, when given, is the example source `built` was compiled from.
 #
-# Every binary this run depends on is built from src/ and Cargo.toml, and is
-# read alongside the harness client in this directory. The Python is
+# Every binary this run depends on is built from src/, core/ and Cargo.toml,
+# and is read alongside the harness client in this directory. The Python is
 # bind-mounted live rather than built into the image, so a redesigned harness
 # would otherwise run against a stale daemon without complaint, which is
 # exactly the verdict this guard exists to prevent.
@@ -132,7 +132,7 @@ trap cleanup EXIT
 # iteration.
 stale_source() {
     local built="$1" own="${2:-}"
-    find "$REPO_ROOT/src" "$REPO_ROOT/Cargo.toml" -newer "$built" -print -quit 2>/dev/null
+    find "$REPO_ROOT/src" "$REPO_ROOT/core" "$REPO_ROOT/Cargo.toml" -newer "$built" -print -quit 2>/dev/null
     find "$SCRIPT_DIR" -name '*.py' -newer "$built" -print -quit 2>/dev/null
     [[ -n "$own" && "$own" -nt "$built" ]] && echo "$own"
     return 0

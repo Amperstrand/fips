@@ -121,7 +121,7 @@ build_deb() {
 
     if [ -n "$cached_deb" ] && [ -f "$cached_deb" ]; then
         local newest_src
-        newest_src=$(find "$REPO_ROOT/src" "$REPO_ROOT/Cargo.toml" \
+        newest_src=$(find "$REPO_ROOT/src" "$REPO_ROOT/core" "$REPO_ROOT/Cargo.toml" \
             "$REPO_ROOT/Cargo.lock" "$REPO_ROOT/packaging" \
             -type f -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
         local cached_age

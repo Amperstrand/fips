@@ -11,6 +11,15 @@ readme = "README.md"
 keywords = ["mesh", "p2p", "decentralized", "overlay-network", "nostr"]
 categories = ["network-programming", "command-line-utilities", "cryptography"]
 
+# The root package stays first, and its version line stays the first `version`
+# key in this file: the packaging scripts and workflows read the release
+# version from it. `default-members` makes the bare `cargo build`, `cargo
+# clippy` and `cargo test` cover the core crate too; without it they cover the
+# root package only.
+[workspace]
+members = [".", "core"]
+default-members = [".", "core"]
+
 [features]
 default = []
 # Tick-body profiler (`src/instr`). Off by default: enabling it edits 26 call

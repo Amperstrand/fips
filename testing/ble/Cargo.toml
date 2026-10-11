@@ -12,3 +12,7 @@ path = "ble_spike.rs"
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures = "0.3"
+
+# A workspace of its own, so cargo does not take this standalone spike for an
+# unlisted member of the repository root's workspace and refuse to load it.
+[workspace]
