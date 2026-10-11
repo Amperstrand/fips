@@ -27,12 +27,6 @@ default = []
 # default build's neutrality a property of the generated code rather than of a
 # runtime check. Build with `--features profiling` for a measurement run.
 profiling = []
-# The protocol modules' test hooks: methods and re-exports that only unit
-# tests use to set up or inspect state. Tests see them through `cfg(test)`;
-# the feature lets a test build of another crate see them too. Only tests
-# need it; `--all-features` enables it as well, which compiles the hooks
-# with no caller, and the protocol module allows that.
-test-hooks = []
 
 [dependencies]
 ratatui = "0.30"
@@ -44,7 +38,6 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 hkdf = "0.13"
 hmac = { version = "0.13", features = ["zeroize"] }
 ring = "0.17"
-libm = "0.2"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 rand = "0.10.1"
 crossbeam-channel = "0.5"
@@ -150,6 +143,10 @@ assets = [
 conf-files = ["/etc/fips/hosts", "/etc/fips/fips.nft"]
 
 [dev-dependencies]
+# The protocol modules' test hooks, which this crate's tests call. Enabled
+# here only, so they are compiled into a build that includes tests, examples
+# or benches, where dev-dependency features apply, and into no other build.
+fips-core = { path = "core", features = ["test-hooks"] }
 tempfile = "3.15"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tokio = { version = "1", features = ["test-util"] }

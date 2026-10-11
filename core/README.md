@@ -19,7 +19,11 @@ moves in from the root crate one module at a time. So far it holds:
 - `SessionIndex`, re-exported under `fips::utils::index`. Its random
   allocator stays in the root crate;
 - the Noise handshake message sizes, re-exported under `fips::noise`.
-  The handshake itself stays in the root crate.
+  The handshake itself stays in the root crate;
+- the protocol itself, `proto`: the wire codecs and sans-IO state
+  machines of every layer (link, session, spanning tree, bloom filters,
+  routing, lookups, metrics, probes). The root crate reaches it as
+  `crate::proto` and re-exports its public types at its crate root.
 
 ## What belongs here
 
@@ -106,6 +110,11 @@ Add a dependency with `default-features = false`, then enable `alloc`
 (or the crate's equivalent) and nothing else it does not need. A new
 dependency must build without `std`.
 
+`libm` is the one dependency left on its default features, and it is
+not a precedent: its only default is `arch`, kept so the bloom
+false-positive estimate uses the implementation the root crate used
+before the move.
+
 The workspace build unifies features across members, so a feature the
 root crate turns on for its own use also applies to the core in a
 normal `cargo build`. That can hide a feature the core needs but never
@@ -130,9 +139,19 @@ macros into scope, so a test module that uses `format!` or `vec!` needs
 `use alloc::format;` or `use alloc::vec;`.
 
 Unit tests go in their own file, never in an inline `mod tests { ... }`
-block. The source file carries only `#[cfg(test)] mod tests;`, and the
-tests sit beside it in `tests.rs` (`<name>/tests.rs` for a file module,
-or a `tests/` directory when they are large).
+block, and they are kept per directory: a directory's tests are in its
+`tests.rs` or its `tests/` directory, never both, declared from
+`mod.rs` with `#[cfg(test)] mod tests;`. A file module's tests are
+`tests/<file>.rs` in the same directory, attached from the source file
+with `#[cfg(test)] #[path = "tests/<file>.rs"] mod tests;`, so they stay
+a child module of that file, see its private items and keep their test
+names. A single file's tests never get a directory of their own. If
+`tests/<file>.rs` is already taken by the directory's own test module,
+use another name, such as `tests/<file>_private.rs`.
+
+`testutil.rs` holds fixtures several test modules share, and is compiled
+for tests only. Dev-dependencies in `core/Cargo.toml` are built only for
+the tests, which run on the host, so they may use `std`.
 
 Test the state machines the way the host drives them: build the state,
 feed it inputs with synthetic timestamps and fixed random bytes, and
@@ -141,12 +160,26 @@ clock.
 
 ## Moving code in from the root crate
 
-- Move whole files with `git mv` so history follows them.
+- Move whole files with `git mv` so history follows them. When only
+  part of a file belongs here, cut it in a commit of its own, as
+  `SessionIndex` and the Noise sizes were, and keep the file moves pure
+  renames.
 - Leave a re-export at the old path in the root crate
   (`pub use fips_core::...;`), so existing `crate::...` imports keep
   resolving and the move changes no caller.
-- Items the root crate still reaches become `pub`. Mark internals that
-  are public only for that reason `#[doc(hidden)]`.
+- Items the root crate still reaches become `pub`. A module whose whole
+  surface the root drives, such as `proto`, stays documented, and
+  trimming that surface is later work: hiding a module the root drives
+  end to end would hide most of the crate from its own docs. Mark
+  individual internals that are public only for the root
+  `#[doc(hidden)]`, as `identity::secp` and `identity::sha256` are.
+- An item only the root crate's tests reach is gated
+  `#[cfg(any(test, feature = "test-hooks"))]`, because `cfg(test)` does
+  not cross crates. The root enables `test-hooks` from its
+  `[dev-dependencies]` only, so hooks reach only a build that compiles
+  tests, examples or benches; a plain `cargo build`, release or not,
+  leaves them out. Make the `cfg` change while the item is still in the
+  root, so the move stays a pure rename.
 - An inherent `impl` must live in the type's crate. Methods the root
   crate adds to a moved type move with it, or become a free function or
   an extension trait.

@@ -26,3 +26,25 @@ sha2 = { version = "0.11", default-features = false }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
 once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
+# `MmpMode` derives Serialize and Deserialize for the node configuration.
+# Builds without `std` or `alloc`.
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+# `log` for the bloom false-positive estimate: `core` has no float logarithm.
+# Default features (`arch`) as the root crate had them, so the implementation
+# the estimate uses does not change.
+libm = "0.2"
+
+[features]
+# Test hooks in `proto`: methods and re-exports that only unit tests use to
+# set up or inspect state. This crate's tests see them through `cfg(test)`;
+# the root crate's tests see them because the root enables this feature from
+# its `[dev-dependencies]` only. Never enable it outside tests.
+test-hooks = []
+
+[dev-dependencies]
+# Host-only test dependencies; tests may use `std`.
+# Random keys for the test fixtures (`testutil::make_keypair`, the lookup tests).
+rand = "0.10.1"
+# `MmpMode`'s configuration spelling, checked with the parser the node
+# configuration uses.
+serde_yaml = "0.9"

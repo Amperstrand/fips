@@ -15,5 +15,9 @@ extern crate std;
 
 pub mod identity;
 pub mod noise;
+pub mod proto;
 pub mod transport;
 pub mod utils;
+
+#[cfg(test)]
+mod testutil;

@@ -9,15 +9,6 @@ pub(crate) fn make_node_addr(val: u8) -> NodeAddr {
     NodeAddr::from_bytes(bytes)
 }
 
-/// A random secp256k1 keypair, built the way `Identity::generate` builds one.
-pub(crate) fn make_keypair() -> secp256k1::Keypair {
-    let mut secret = [0u8; 32];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut secret);
-    let key =
-        secp256k1::SecretKey::from_slice(&secret).expect("32 random bytes is a valid secret key");
-    secp256k1::Keypair::from_secret_key(crate::identity::secp(), &key)
-}
-
 /// Collects emitted tracing events so a test can assert on a log line.
 ///
 /// Some behaviour is reported only in the log: a structured field an operator
