@@ -163,7 +163,7 @@ fn test_identity_sign() {
     // Verify the signature manually
     let digest = super::sha256(data);
     assert!(
-        super::SECP
+        super::secp()
             .verify_schnorr(&sig, &digest, &identity.pubkey())
             .is_ok()
     );
@@ -585,7 +585,7 @@ fn test_peer_identity_pubkey_full_preserved_parity() {
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
         0x1f, 0x20,
     ];
-    let keypair = Keypair::from_seckey_slice(&super::SECP, &secret_bytes).unwrap();
+    let keypair = Keypair::from_seckey_slice(super::secp(), &secret_bytes).unwrap();
     let full_pubkey = keypair.public_key();
 
     let peer = PeerIdentity::from_pubkey_full(full_pubkey);

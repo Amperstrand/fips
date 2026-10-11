@@ -111,7 +111,7 @@ impl PeerIdentity {
     /// Verify a signature from this peer.
     pub fn verify(&self, data: &[u8], signature: &secp256k1::schnorr::Signature) -> bool {
         let digest = sha256(data);
-        super::SECP
+        super::secp()
             .verify_schnorr(signature, &digest, &self.pubkey)
             .is_ok()
     }

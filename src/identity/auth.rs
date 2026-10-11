@@ -35,7 +35,7 @@ impl AuthChallenge {
     pub fn verify(&self, response: &AuthResponse) -> Result<NodeAddr, IdentityError> {
         let digest = auth_challenge_digest(&self.0, response.timestamp);
 
-        super::SECP
+        super::secp()
             .verify_schnorr(&response.signature, &digest, &response.pubkey)
             .map_err(|_| IdentityError::SignatureVerificationFailed)?;
 

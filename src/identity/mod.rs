@@ -11,10 +11,11 @@ mod local;
 mod node_addr;
 mod peer;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
-use std::sync::LazyLock;
 
+use once_cell::race::OnceBox;
 use secp256k1::{All, Secp256k1};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -38,7 +39,15 @@ pub type FipsAddress = Ipv6Address;
 /// than rebuilt per sign / verify / key-derive call. This single `All` context
 /// serves both signing and verification across the identity module and still
 /// performs the standard construction-time blinding.
-pub(crate) static SECP: LazyLock<Secp256k1<All>> = LazyLock::new(Secp256k1::new);
+static SECP: OnceBox<Secp256k1<All>> = OnceBox::new();
+
+/// Return the shared secp256k1 context, building it on first use.
+///
+/// If two threads race on first use, each may build a context; one is kept
+/// and the other dropped, so every caller sees the same context afterwards.
+pub(crate) fn secp() -> &'static Secp256k1<All> {
+    SECP.get_or_init(|| Box::new(Secp256k1::new()))
+}
 
 /// Prefix byte of every node's IPv6 address (the `fd00::/8` ULA range).
 pub const IPV6_ADDRESS_PREFIX: u8 = 0xfd;

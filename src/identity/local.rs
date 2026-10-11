@@ -58,7 +58,7 @@ impl Identity {
 
     /// Create an identity from a secret key.
     pub fn from_secret_key(mut secret_key: SecretKey) -> Self {
-        let mut keypair = Keypair::from_secret_key(&super::SECP, &secret_key);
+        let mut keypair = Keypair::from_secret_key(super::secp(), &secret_key);
         let identity = Self::from_keypair(keypair);
         keypair.non_secure_erase();
         secret_key.non_secure_erase();
@@ -116,7 +116,7 @@ impl Identity {
     /// Sign arbitrary data with this identity's secret key.
     pub fn sign(&self, data: &[u8]) -> secp256k1::schnorr::Signature {
         let digest = sha256(data);
-        super::SECP.sign_schnorr(&digest, &self.keypair)
+        super::secp().sign_schnorr(&digest, &self.keypair)
     }
 
     /// Create an authentication response for a challenge.
@@ -124,7 +124,7 @@ impl Identity {
     /// The response signs: SHA256("fips-auth-v1" || challenge || timestamp)
     pub fn sign_challenge(&self, challenge: &[u8; 32], timestamp: u64) -> AuthResponse {
         let digest = auth_challenge_digest(challenge, timestamp);
-        let signature = super::SECP.sign_schnorr(&digest, &self.keypair);
+        let signature = super::secp().sign_schnorr(&digest, &self.keypair);
         AuthResponse {
             pubkey: self.pubkey(),
             timestamp,
