@@ -2325,6 +2325,9 @@ node:
 
     #[test]
     fn test_load_from_paths_reaches_every_node_key_the_same_as_load_file() {
+        // `native_api` is serialized only when it differs from a default whose
+        // socket path follows `XDG_RUNTIME_DIR`, so hold the env still.
+        let _g = ENV_MUTEX.lock().unwrap();
         let mut node = serde_yaml::to_value(NodeConfig::default()).unwrap();
         bump(&mut node);
         let serde_yaml::Value::Mapping(map) = &mut node else {
@@ -4411,10 +4414,11 @@ node:
         ));
     }
 
-    /// Mutex serializing tests that mutate `XDG_RUNTIME_DIR`. `cargo test`
-    /// runs tests on multiple threads in the same process, and env mutation
-    /// is process-global, so concurrent env-touching tests would race.
-    #[cfg(unix)]
+    /// Mutex serializing tests that mutate `XDG_RUNTIME_DIR`, or that read a
+    /// default socket path derived from it more than once and compare the
+    /// results. `cargo test` runs tests on multiple threads in the same
+    /// process, and env mutation is process-global, so concurrent
+    /// env-touching tests would race.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(unix)]
