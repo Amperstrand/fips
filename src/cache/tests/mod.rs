@@ -1,4 +1,5 @@
 use super::*;
+use alloc::string::ToString;
 
 #[test]
 fn test_cache_stats_fill_ratio() {

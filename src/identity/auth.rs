@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use fips_core::entropy::EntropySource;
+use crate::entropy::EntropySource;
 use secp256k1::XOnlyPublicKey;
 use sha2::{Digest, Sha256};
 

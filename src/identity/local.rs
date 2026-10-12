@@ -1,10 +1,11 @@
 //! Local node identity with signing capability.
 
+use alloc::string::String;
+use core::fmt;
 use core::marker::PhantomData;
 
-use fips_core::entropy::EntropySource;
+use crate::entropy::EntropySource;
 use secp256k1::{Keypair, PublicKey, SecretKey, XOnlyPublicKey};
-use std::fmt;
 use zeroize::Zeroize;
 
 use super::auth::{AuthResponse, auth_challenge_digest};
@@ -172,16 +173,16 @@ impl<E> Drop for Identity<E> {
 /// existed. The erase is a volatile write, so the optimiser keeps it, but a
 /// copy made before the guard existed, or taken out through
 /// [`ErasingKeypair::get`], is not cleared by it.
-pub(crate) struct ErasingKeypair<'a>(&'a mut Keypair);
+pub struct ErasingKeypair<'a>(&'a mut Keypair);
 
 impl<'a> ErasingKeypair<'a> {
     /// Guard `source` so it is erased where it lies when the guard drops.
-    pub(crate) fn new(source: &'a mut Keypair) -> Self {
+    pub fn new(source: &'a mut Keypair) -> Self {
         Self(source)
     }
 
     /// Borrow the guarded keypair.
-    pub(crate) fn get(&self) -> &Keypair {
+    pub fn get(&self) -> &Keypair {
         self.0
     }
 }

@@ -6,8 +6,8 @@
 
 use core::marker::PhantomData;
 
-use fips_core::entropy::EntropySource;
-use fips_core::utils::hash::{HashMap, KeyedHasher};
+use crate::entropy::EntropySource;
+use crate::utils::hash::{HashMap, KeyedHasher};
 
 use super::CacheStats;
 use super::entry::CacheEntry;
