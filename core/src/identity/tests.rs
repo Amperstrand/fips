@@ -6,7 +6,7 @@ use std::net::Ipv6Addr;
 use secp256k1::{Keypair, SecretKey};
 
 use super::*;
-use crate::testutil::TestEntropy;
+use crate::testutil::{FixedEntropy, TestEntropy};
 
 type Identity = super::Identity<TestEntropy>;
 type AuthChallenge = super::AuthChallenge<TestEntropy>;
@@ -758,4 +758,27 @@ fn test_erasing_keypair_erases_the_callers_binding_in_place_on_every_exit() {
     let mut keypair = identity.keypair();
     assert_eq!(guarded_secret(&mut keypair, true), Err(()));
     assert_eq!(keypair.secret_bytes(), erased);
+}
+
+#[test]
+fn test_signatures_draw_their_auxiliary_bytes_from_the_entropy_source() {
+    let secret = SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let one = super::Identity::<FixedEntropy<1>>::from_secret_key(secret);
+    let one_again = super::Identity::<FixedEntropy<1>>::from_secret_key(secret);
+    let two = super::Identity::<FixedEntropy<2>>::from_secret_key(secret);
+
+    let data = b"test message";
+    assert_eq!(one.sign(data), one_again.sign(data));
+    assert_ne!(one.sign(data), two.sign(data));
+
+    let challenge = [0x22; 32];
+    let timestamp = 1234567890u64;
+    assert_eq!(
+        one.sign_challenge(&challenge, timestamp).signature,
+        one_again.sign_challenge(&challenge, timestamp).signature
+    );
+    assert_ne!(
+        one.sign_challenge(&challenge, timestamp).signature,
+        two.sign_challenge(&challenge, timestamp).signature
+    );
 }
