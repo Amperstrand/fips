@@ -172,3 +172,8 @@ harness = false
 name = "transport_addr_clone"
 path = "benches/transport_addr_clone.rs"
 harness = false
+
+[[bench]]
+name = "coord_cache"
+path = "benches/coord_cache.rs"
+harness = false
