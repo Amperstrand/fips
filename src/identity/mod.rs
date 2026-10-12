@@ -7,14 +7,30 @@
 mod auth;
 mod local;
 
-pub use auth::{AuthChallenge, AuthResponse};
+pub use auth::AuthResponse;
 pub use fips_core::identity::{
     IPV6_ADDRESS_PREFIX, IdentityError, Ipv6Address, NodeAddr, PeerIdentity, decode_npub,
     decode_nsec, decode_secret, encode_npub, encode_nsec, init_secp,
 };
 pub(crate) use fips_core::identity::{secp, sha256};
 pub(crate) use local::ErasingKeypair;
-pub use local::Identity;
+
+/// The local node's identity, drawing its random bytes from [`OsEntropy`].
+pub type Identity = local::Identity<OsEntropy>;
+
+/// A random authentication challenge, drawn from [`OsEntropy`].
+pub type AuthChallenge = auth::AuthChallenge<OsEntropy>;
+
+/// The host's random source for the core's randomized types: `rand`'s
+/// thread-local generator, seeded from the operating system.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsEntropy;
+
+impl fips_core::entropy::EntropySource for OsEntropy {
+    fn fill(dest: &mut [u8]) {
+        rand::Rng::fill_bytes(&mut rand::rng(), dest);
+    }
+}
 
 /// Former name of [`Ipv6Address`], kept so code written against it still builds.
 #[deprecated(note = "renamed to Ipv6Address")]

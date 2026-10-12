@@ -13,6 +13,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod entropy;
 pub mod identity;
 pub mod noise;
 pub mod proto;

@@ -8,6 +8,9 @@ changing anything here.
 
 - `lib.rs`: the crate root. It declares `#![no_std]`, brings in `alloc`,
   brings in `std` for tests only, and lists the crate's modules.
+- `entropy.rs`: the `EntropySource` trait, through which the host supplies
+  random bytes. A type that needs them takes the source as a type
+  parameter; the core never reads a random source of its own.
 - `identity/`: node and peer identity types and their encodings. Its own
   README describes it.
 - `noise/`: the fixed sizes of Noise handshake messages and their parts.

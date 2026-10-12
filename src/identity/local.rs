@@ -1,5 +1,8 @@
 //! Local node identity with signing capability.
 
+use core::marker::PhantomData;
+
+use fips_core::entropy::EntropySource;
 use secp256k1::{Keypair, PublicKey, SecretKey, XOnlyPublicKey};
 use std::fmt;
 use zeroize::Zeroize;
@@ -22,18 +25,21 @@ use super::{IdentityError, Ipv6Address, NodeAddr, decode_secret, encode_npub, sh
 /// the frame of the constructor that built it. `from_secret_str` is a known
 /// case: it leaves copies of the private key, a whole intermediate
 /// `Identity` among them, in its own frame.
+///
+/// `E` is the host's random source, used by `generate` and by signing.
 #[derive(Clone)]
-pub struct Identity {
+pub struct Identity<E> {
     keypair: Keypair,
     node_addr: NodeAddr,
     address: Ipv6Address,
+    entropy: PhantomData<fn() -> E>,
 }
 
-impl Identity {
+impl<E: EntropySource> Identity<E> {
     /// Create a new random identity.
     pub fn generate() -> Self {
         let mut secret_bytes = [0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut secret_bytes);
+        E::fill(&mut secret_bytes);
         let mut secret_key =
             SecretKey::from_slice(&secret_bytes).expect("32 random bytes is a valid secret key");
         let identity = Self::from_secret_key(secret_key);
@@ -51,6 +57,7 @@ impl Identity {
             keypair,
             node_addr,
             address,
+            entropy: PhantomData,
         };
         keypair.non_secure_erase();
         identity
@@ -114,9 +121,13 @@ impl Identity {
     }
 
     /// Sign arbitrary data with this identity's secret key.
+    ///
+    /// BIP-340 auxiliary randomness: 32 bytes from `E`.
     pub fn sign(&self, data: &[u8]) -> secp256k1::schnorr::Signature {
         let digest = sha256(data);
-        super::secp().sign_schnorr(&digest, &self.keypair)
+        let mut aux = [0u8; 32];
+        E::fill(&mut aux);
+        super::secp().sign_schnorr_with_aux_rand(&digest, &self.keypair, &aux)
     }
 
     /// Create an authentication response for a challenge.
@@ -124,7 +135,9 @@ impl Identity {
     /// The response signs: SHA256("fips-auth-v1" || challenge || timestamp)
     pub fn sign_challenge(&self, challenge: &[u8; 32], timestamp: u64) -> AuthResponse {
         let digest = auth_challenge_digest(challenge, timestamp);
-        let signature = super::secp().sign_schnorr(&digest, &self.keypair);
+        let mut aux = [0u8; 32];
+        E::fill(&mut aux);
+        let signature = super::secp().sign_schnorr_with_aux_rand(&digest, &self.keypair, &aux);
         AuthResponse {
             pubkey: self.pubkey(),
             timestamp,
@@ -133,7 +146,7 @@ impl Identity {
     }
 }
 
-impl Drop for Identity {
+impl<E> Drop for Identity<E> {
     /// Erase the long-term private key this identity owns.
     ///
     /// `Keypair` is `Copy` and so cannot clear itself on drop; `Identity` is
@@ -179,7 +192,7 @@ impl Drop for ErasingKeypair<'_> {
     }
 }
 
-impl fmt::Debug for Identity {
+impl<E> fmt::Debug for Identity<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Identity")
             .field("node_addr", &self.node_addr)

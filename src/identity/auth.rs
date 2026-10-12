@@ -1,6 +1,8 @@
 //! Authentication challenge-response protocol.
 
-use rand::Rng;
+use core::marker::PhantomData;
+
+use fips_core::entropy::EntropySource;
 use secp256k1::XOnlyPublicKey;
 use sha2::{Digest, Sha256};
 
@@ -10,20 +12,22 @@ use super::{IdentityError, NodeAddr};
 const AUTH_DOMAIN: &[u8] = b"fips-auth-v1";
 
 /// A 32-byte random authentication challenge.
+///
+/// `E` is the host's random source, used by `generate`.
 #[derive(Clone, Copy, Debug)]
-pub struct AuthChallenge([u8; 32]);
+pub struct AuthChallenge<E>([u8; 32], PhantomData<fn() -> E>);
 
-impl AuthChallenge {
+impl<E: EntropySource> AuthChallenge<E> {
     /// Generate a new random challenge.
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        Self(bytes)
+        E::fill(&mut bytes);
+        Self(bytes, PhantomData)
     }
 
     /// Create a challenge from bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        Self(bytes, PhantomData)
     }
 
     /// Return the challenge bytes.
