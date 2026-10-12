@@ -1,8 +1,9 @@
 #!/bin/bash
 # ── OpenWrt shell-script lint guard ─────────────────────────────────────────
-# Runs shellcheck over the shell scripts the OpenWrt packages ship, and over
+# Runs shellcheck over the shell scripts the OpenWrt packages ship, over
 # .github/scripts/install-nak.sh, which the OpenWrt Package workflow runs to
-# fetch its publishing tool.
+# fetch its publishing tool, and over testing/build-core-baremetal.sh, which
+# both CI runners run.
 #
 # This is the one copy of that lint. The OpenWrt Package workflow calls it
 # after building each .ipk, and ci.yml and ci-local.sh call it too, because
@@ -17,8 +18,9 @@
 #     two directories (build-apk.sh wraps the maintainer scripts with one
 #     header line, which is not linted separately); the SDK feed Makefile ships
 #     preinst as well. On a router they run under busybox ash.
-#   * install-nak.sh as bash, with no exclusions. It is a CI script, not a
-#     shipped one, and the sh exclusion set below misfires on bash.
+#   * install-nak.sh and build-core-baremetal.sh as bash, with no exclusions.
+#     They are CI scripts, not shipped ones, and the sh exclusion set below
+#     misfires on bash.
 #
 # The sh exclusions, with reason:
 #   SC1008  the init scripts' `#!/bin/sh /etc/rc.common` shebang, an
@@ -58,6 +60,7 @@ SH_TARGETS=(
 )
 BASH_TARGETS=(
     ".github/scripts/install-nak.sh"
+    "testing/build-core-baremetal.sh"
 )
 
 if ! command -v shellcheck >/dev/null 2>&1; then

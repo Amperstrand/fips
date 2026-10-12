@@ -357,7 +357,8 @@ jobs:
           fi
           shellcheck --version
 
-      # The scripts this package ships, as sh, and install-nak.sh, as bash.
+      # The scripts this package ships, as sh, and install-nak.sh and
+      # build-core-baremetal.sh, as bash.
       # The guard is the one copy of the lint; ci.yml and ci-local.sh run it
       # too, so a branch push sees a finding before it reaches a trunk.
       - name: Lint shell scripts

@@ -59,8 +59,10 @@ algebraic structure.
   replaced; `init_secp` returns `false` if it came too late. Without
   `init_secp`, `secp()` builds the context with `Secp256k1::new()` on
   first use, which is blinded only when `secp256k1` is built with its
-  `rand` and `std` features. Any build that includes the root crate
-  has them on through the root's own `secp256k1` dependency, so
+  `rand` and `std` features. This crate does not enable them, so a
+  build of the core alone (firmware, for example) gets an unblinded
+  context unless it calls `init_secp`. Any build that includes the root
+  crate has them on through the root's own `secp256k1` dependency, so
   `fipsctl`, `fipstop`, `fips-gateway` and library users that never
   call `init_secp` still get a blinded context. Blinding protects
   secret keys from side channels; it never changes a key or signature.

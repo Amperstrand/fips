@@ -125,12 +125,19 @@ asked for. Check what the core gets on its own:
 cargo tree -p fips-core -e features
 ```
 
-If a dependency's `std` feature is unavoidable for now (for example, to
-get `std::error::Error` impls on its error types), enable it in
-`core/Cargo.toml` with a comment saying why. The core still cannot name
-`std` itself, but that dependency will link it, and the comment marks
-what has to change before the crate can build for a target without
-`std`.
+Never enable a dependency's `std` feature under `[dependencies]`: the
+crate builds for targets that have no `std` (see Checks), and that
+build fails on any dependency that links it. When a dependency
+implements a trait only with `std`, as `secp256k1`, `bech32` and `hex`
+do for the error trait, write the code so it does not need the impl;
+`IdentityError`'s hand-written `From` impls are the example.
+`[dev-dependencies]` may enable `std` features, since tests run on the
+host only; the core's `secp256k1` dev-dependency does, for the
+`sign_schnorr` the test fixtures call. A dev-dependency's features
+also reach the library in any build that includes the crate's tests:
+`cargo test`, and `cargo clippy` or `cargo check` with
+`--all-targets`. That is why the Checks below lint the library on its
+own with `--lib`.
 
 ## Tests
 
@@ -211,18 +218,46 @@ test this crate along with the root, because the workspace lists it in
 resolution:
 
 ```bash
+cargo clippy -p fips-core --lib -- -D warnings
 cargo clippy -p fips-core --all-targets -- -D warnings
 cargo test -p fips-core
 ```
 
-Run those two before sending a change here. The repository guards in
+The first lints the library with only the features its
+`[dependencies]` ask for. The second also type-checks the tests, and
+in doing so gives the library the dev-dependencies' features, so code
+that needs `secp256k1`'s `rand` or `std` passes it; the first does
+not. Run all three before sending a change here. The repository guards in
 `testing/` (atomics, comment references, log strings) scan `core/src/`
 as well as `src/`.
 
-These checks run on the host. No CI job yet builds the crate for a
-target without `std`, so a dependency that links `std` is not caught
-automatically; the dependency comments described above are what track
-it until that build exists.
+These checks run on the host, where `std` exists, so they cannot catch
+a dependency that links it. A separate build of the library for two
+targets with no `std` at all, `thumbv7em-none-eabihf` (Cortex-M4F) and
+`riscv32imac-unknown-none-elf`, fails on any such dependency with
+"can't find crate for `std`":
+
+```bash
+testing/build-core-baremetal.sh
+```
+
+GitHub CI runs it on every push. Local CI runs it only when asked for,
+with `testing/ci-local.sh --baremetal` or `FIPS_CI_BAREMETAL=1` in the
+environment, because of the prerequisites below; a landing or merge-up
+on a trunk path runs it explicitly.
+
+It needs the two targets (`rustup target add thumbv7em-none-eabihf
+riscv32imac-unknown-none-elf`), `clang` and `llvm-ar`, which compile
+and archive the C in `secp256k1-sys`. The targets are not in
+`rust-toolchain.toml`, so not every rustup user fetches them; they
+belong to one toolchain, so they have to be added again when
+`rust-toolchain.toml` moves to a new release. The Nix dev shell
+provides neither target. Run the script after any change to this crate
+if you have them; without them, the `--lib` lint above still catches
+code that needs a `std` feature, but not a dependency that links
+`std`. It builds `-p fips-core` only: the root crate needs `std`, and
+building it alongside would turn `std` back on for the shared
+dependencies.
 
 ## Versioning
 

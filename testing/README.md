@@ -204,6 +204,9 @@ profiling` pass; the musl
 leg exists because interface presence is built on `getifaddrs`/`ifa_flags`,
 which musl reimplements independently, and OpenWrt is a musl target. A local
 green run does not certify those four.
+GitHub's `core-baremetal` job also builds the `no_std` core for two
+bare-metal targets on every push; a local run does that only with
+`--baremetal` or `FIPS_CI_BAREMETAL=1`.
 
 The Linux and musl legs also create an address-less dummy interface
 (`fips-probe0`) and pass its name to the tests as

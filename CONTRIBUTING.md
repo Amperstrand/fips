@@ -133,6 +133,7 @@ cargo build
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy -p fips-core --lib -- -D warnings
 cargo clippy -p fips-core --all-targets -- -D warnings
 cargo test -p fips-core
 ```
@@ -141,10 +142,23 @@ CI runs clippy twice, once with `--all-features` and once with the
 default feature set, because an optional feature means two source
 trees and each pass lints only one of them. Run both locally.
 
-The last two commands build the `fips-core` crate under its own feature
+The last three commands build the `fips-core` crate under its own feature
 resolution. The workspace-wide commands unify features across the root
 crate and the core, so they can pass while the core depends on a feature
-only the root turns on; see `core/README.md`.
+only the root turns on; see `core/README.md`. The `--lib` pass is the
+one that sees the core library's own features: building the tests
+gives the library the test dependencies' features as well.
+
+If you change `core/`, also run `testing/build-core-baremetal.sh`,
+which builds the core for two targets without `std`. It needs those two
+Rust targets, `clang` and `llvm-ar`; the script names what is missing,
+and `core/README.md` has the details. GitHub CI runs it on every push;
+the full local CI run includes it only when asked for, with
+`testing/ci-local.sh --baremetal` or `FIPS_CI_BAREMETAL=1`, and a
+missing prerequisite then fails the run. A landing or merge-up on a
+trunk path runs it explicitly. The Nix dev shell does not provide the
+targets or `llvm-ar`, so under `nix develop` the script stops at that
+check.
 
 `fmt` and `clippy -D warnings` are CI gates — PRs with formatting
 drift or new clippy warnings will fail CI and be sent back.

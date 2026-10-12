@@ -61,8 +61,8 @@ fn install(cell: &OnceBox<Secp256k1<All>>, seed: &[u8; 32]) -> bool {
 ///
 /// If [`init_secp`] has not run, the first call builds the context with
 /// `Secp256k1::new()`. That context is blinded only when the `secp256k1`
-/// crate is built with its `rand` and `std` features; in a build that
-/// includes the root `fips` crate they are on.
+/// crate is built with its `rand` and `std` features, which this crate does
+/// not enable; in a build that includes the root `fips` crate they are on.
 ///
 /// If two threads race on first use, each may build a context; one is kept
 /// and the other dropped, so every caller sees the same context afterwards.

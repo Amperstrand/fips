@@ -166,14 +166,63 @@ jobs:
       # The no_std core fence. A workspace build unifies dependency features
       # across members, so a feature the root crate enables can hide one the
       # core needs and does not ask for. Linting the core alone resolves only
-      # its own features. --all-targets type-checks the core's tests under that
-      # resolution too; a plain build would cover the lib only. Mirrored in
-      # testing/ci-local.sh; check-ci-parity.sh compares integration suites
-      # only and would not catch a step added to one runner and not the other.
-      - name: Clippy the no_std core on its own
+      # its own features. Two passes, because a build that includes the core's
+      # tests also gives the library its dev-dependencies' features
+      # (secp256k1's rand and std): --lib lints the library with its
+      # [dependencies] features alone, and --all-targets type-checks the tests.
+      # Mirrored in testing/ci-local.sh; check-ci-parity.sh compares
+      # integration suites only and would not catch a step added to one runner
+      # and not the other.
+      - name: Clippy the no_std core library on its own
+        run: cargo clippy -p fips-core --lib -- -D warnings
+      - name: Clippy the no_std core and its tests on their own
         run: cargo clippy -p fips-core --all-targets -- -D warnings
       - name: Build with the tick-body profiler enabled
         run: cargo build --workspace --features profiling
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Bare-metal core build
+  #
+  # Builds the no_std fips-core crate for two targets with no standard
+  # library, so a dependency that links std fails here; the host fence in the
+  # clippy job cannot see one. testing/build-core-baremetal.sh holds the
+  # command and the C toolchain choice (clang, llvm-ar) for secp256k1-sys.
+  # The runner image has clang but not llvm-ar, which the llvm package adds.
+  # Runs on every push, so this job is the always-on gate: testing/ci-local.sh
+  # runs the same script only when asked for (--baremetal or
+  # FIPS_CI_BAREMETAL=1), since it needs the targets, clang and llvm-ar.
+  # check-ci-parity.sh compares integration suites only and would not catch a
+  # step added to one runner and not the other.
+  # ───────────────────────────────────────────────────────────────────────────
+  core-baremetal:
+    name: Bare-metal core build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install llvm-ar
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
+      - name: Install Rust toolchain (+ bare-metal targets)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: thumbv7em-none-eabihf,riscv32imac-unknown-none-elf
+          cache: false
+          rustflags: ''
+      - name: Cache Cargo registry + build
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-baremetal-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Only this job's own entries: the wider prefix the other jobs use
+          # would restore a whole workspace target directory to build one crate.
+          # The key itself stays outside that prefix, so those jobs never
+          # restore this one-crate target directory either.
+          restore-keys: |
+            ${{ runner.os }}-baremetal-cargo-
+      - name: Build the no_std core for bare-metal targets
+        run: testing/build-core-baremetal.sh
 
   # ───────────────────────────────────────────────────────────────────────────
   # Android cross-check

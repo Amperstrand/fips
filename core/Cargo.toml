@@ -9,15 +9,13 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# Debt to clear before the crate can build for a target without `std`:
-# - `std` on secp256k1, bech32 and hex provides the `std::error::Error` impls
-#   that thiserror's `#[from]` needs on IdentityError's fields.
-# - `rand` (with `std`) on secp256k1 makes `Secp256k1::new()` blind the shared
-#   context from `rand::thread_rng()`, an exception to the rule that randomness
-#   is passed in. Removing it must come with an explicit `randomize` call.
-secp256k1 = { version = "0.30", default-features = false, features = ["alloc", "std", "rand"] }
-bech32 = { version = "0.12", default-features = false, features = ["std"] }
-hex = { version = "0.4", default-features = false, features = ["std"] }
+# `alloc` only on secp256k1, bech32 and hex: their `std` features would link
+# `std`, which the bare-metal build (testing/build-core-baremetal.sh) rejects.
+# Without `rand`, `Secp256k1::new()` does not blind the context; the host
+# blinds it through `identity::init_secp`.
+secp256k1 = { version = "0.30", default-features = false, features = ["alloc"] }
+bech32 = { version = "0.12", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # Left without `zeroize`: only public keys and data to be signed or verified
 # pass through the hasher here.
@@ -45,6 +43,10 @@ test-hooks = []
 # Host-only test dependencies; tests may use `std`.
 # Random keys for the test fixtures (`testutil::make_keypair`, the lookup tests).
 rand = "0.10.1"
+# `sign_schnorr` for the protocol tests' signing fixtures, which secp256k1
+# provides only with `rand` and `std`. Tests only: the library stays on
+# `alloc`.
+secp256k1 = { version = "0.30", default-features = false, features = ["rand", "std"] }
 # `MmpMode`'s configuration spelling, checked with the parser the node
 # configuration uses.
 serde_yaml = "0.9"
