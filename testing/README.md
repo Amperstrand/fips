@@ -143,6 +143,13 @@ Standalone cargo project (`ble_spike`) that validates the `bluer` API
 assumptions behind the `BleIo` trait against real adapters on two
 machines. Not a Docker harness.
 
+### [package-isolation/](package-isolation/) -- Package Build Isolation
+
+Builds two marked trees in the package build container, in turn and
+together, sharing a target volume, and checks that each package holds
+its own tree's code and revision. Run by hand when changing the package
+build; not part of `ci-local.sh` or GitHub CI.
+
 ## Running CI locally (`ci-local.sh`)
 
 [`ci-local.sh`](ci-local.sh) runs the full local CI pipeline — build,
