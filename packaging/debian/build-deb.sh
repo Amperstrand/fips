@@ -2,8 +2,8 @@
 # Build a .deb package for FIPS using cargo-deb.
 #
 # Usage: ./build-deb.sh [--target <triple>] [--version <version>] [--no-build]
-#                       [--features <list>] [--output-dir <dir>]
-#                       [--name-file <path>]
+#                       [--features <list>] [--built-with <list>]
+#                       [--output-dir <dir>] [--name-file <path>]
 #
 # Prerequisites: cargo-deb (install with: cargo install cargo-deb)
 # Output: deploy/fips_<version>_<arch>.deb
@@ -24,6 +24,10 @@ Options:
   --features <list>   Cargo features to build with (comma-separated). Marks the
                       auto-derived Version so the package is distinguishable
                       from a default build of the same commit.
+  --built-with <list> Package binaries the caller has already built with these
+                      features: marks the Version as --features does, and
+                      runs no build, as --no-build does. Cannot be combined
+                      with --features.
   --output-dir <dir>  Where to put the finished .deb. Defaults to deploy/ under
                       the project root. Exists so the container build can write
                       to a mount and leave the source tree read-only.
@@ -39,6 +43,7 @@ TARGET_TRIPLE=""
 VERSION_OVERRIDE=""
 NO_BUILD=0
 FEATURES=""
+BUILT_WITH=""
 DEST_DIR=""
 NAME_FILE=""
 
@@ -58,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --features)
             FEATURES="${2:?missing value for --features}"
+            shift 2
+            ;;
+        --built-with)
+            BUILT_WITH="${2:?missing value for --built-with}"
             shift 2
             ;;
         --output-dir)
@@ -88,6 +97,17 @@ if [[ -n "${FEATURES}" && "${NO_BUILD}" -eq 1 ]]; then
     echo "--features cannot be combined with --no-build: the features would not" >&2
     echo "reach the binaries, but the Version would claim they had." >&2
     exit 1
+fi
+
+# --built-with is the caller's word that the binaries in target/ were built
+# with those features, which --no-build with --features cannot be.
+if [[ -n "${BUILT_WITH}" ]]; then
+    if [[ -n "${FEATURES}" ]]; then
+        echo "--built-with cannot be combined with --features" >&2
+        exit 1
+    fi
+    FEATURES="${BUILT_WITH}"
+    NO_BUILD=1
 fi
 
 cd "${PROJECT_ROOT}"
