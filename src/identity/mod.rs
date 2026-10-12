@@ -9,8 +9,6 @@ pub use fips_core::identity::{
     AuthResponse, IPV6_ADDRESS_PREFIX, IdentityError, Ipv6Address, NodeAddr, PeerIdentity,
     decode_npub, decode_nsec, decode_secret, encode_npub, encode_nsec, init_secp,
 };
-#[cfg(test)]
-pub(crate) use fips_core::identity::{secp, sha256};
 
 /// The local node's identity, drawing its random bytes from [`OsEntropy`].
 pub type Identity = fips_core::identity::Identity<OsEntropy>;
@@ -36,6 +34,3 @@ pub type FipsAddress = Ipv6Address;
 /// Former name of [`IPV6_ADDRESS_PREFIX`].
 #[deprecated(note = "renamed to IPV6_ADDRESS_PREFIX")]
 pub const FIPS_ADDRESS_PREFIX: u8 = IPV6_ADDRESS_PREFIX;
-
-#[cfg(test)]
-mod tests;

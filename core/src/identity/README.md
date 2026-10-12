@@ -54,10 +54,10 @@ algebraic structure.
   when it goes out of scope.
 - `auth.rs`: the authentication challenge-response: `AuthChallenge`
   (32 random bytes, and the check of a response to them),
-  `AuthResponse`, and the digest both sides sign.
-- `tests.rs`: the unit tests for the items above. Tests that need
-  `Identity` or the authentication types live in the root crate's
-  `src/identity/tests.rs`.
+  `AuthResponse`, and the digest the response signs.
+- `tests.rs`: the unit tests for the items above. They build `Identity`
+  and `AuthChallenge` with the test entropy source, through aliases at
+  the top of the file.
 
 ## Invariants
 
@@ -88,8 +88,8 @@ algebraic structure.
 - **Public only for the root crate.** `secp`, `sha256` and
   `ErasingKeypair` are `pub` so the root crate can reach them, and
   `#[doc(hidden)]` because they are not part of the crate's interface.
-  The root crate re-exports them as `pub(crate)`, `secp` and `sha256`
-  for its tests only.
+  The root crate re-exports `ErasingKeypair` as `pub(crate)`; it does
+  not name `secp` or `sha256`.
 - **`hex_encode` stays private.** It formats `NodeAddr` for display and
   is not re-exported.
 - **`IdentityError`.** The `From` impls for the `secp256k1`, `bech32`
