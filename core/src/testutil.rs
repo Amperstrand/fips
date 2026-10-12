@@ -17,3 +17,14 @@ pub(crate) fn make_keypair() -> secp256k1::Keypair {
         secp256k1::SecretKey::from_slice(&secret).expect("32 random bytes is a valid secret key");
     secp256k1::Keypair::from_secret_key(crate::identity::secp(), &key)
 }
+
+/// An entropy source that fills every byte with `B`, so a test can tell
+/// which source a value was drawn from.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FixedEntropy<const B: u8>;
+
+impl<const B: u8> crate::entropy::EntropySource for FixedEntropy<B> {
+    fn fill(dest: &mut [u8]) {
+        dest.fill(B);
+    }
+}

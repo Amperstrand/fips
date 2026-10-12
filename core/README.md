@@ -50,9 +50,10 @@ cannot.
 **`no_std` with `alloc`.** The crate is `#![no_std]` and uses
 `extern crate alloc`. Use `core::` and `alloc::` paths (`core::fmt`,
 `core::net::Ipv6Addr`, `alloc::vec::Vec`, `alloc::string::String`).
-`std::collections::HashMap` and `HashSet` are not available; use
-`alloc::collections::BTreeMap` and `BTreeSet`, or propose a `no_std`
-hash map dependency in review.
+`std::collections::HashMap` and `HashSet` are not available. For a map
+whose keys a peer can choose and that is looked up on a hot path, use
+`utils::hash::HashMap`, keyed from the host's entropy source; otherwise
+use `alloc::collections::BTreeMap` and `BTreeSet`.
 
 **Sans-IO.** The core never performs I/O. It takes inputs (bytes that
 arrived, the current time, an event) and returns values that describe

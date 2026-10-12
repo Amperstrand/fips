@@ -4,11 +4,14 @@
 //! to be routed without carrying coordinates in every packet. Populated
 //! by SessionSetup packets.
 
-use std::collections::HashMap;
+use core::marker::PhantomData;
+
+use fips_core::entropy::EntropySource;
+use fips_core::utils::hash::{HashMap, KeyedHasher};
 
 use super::CacheStats;
 use super::entry::CacheEntry;
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 use crate::proto::stp::TreeCoordinate;
 
 /// Default maximum entries in coordinate cache.
@@ -48,23 +51,30 @@ pub enum HintOutcome {
 /// Maps node addresses to their tree coordinates, enabling data packets
 /// to be routed without carrying coordinates in every packet. Populated
 /// by SessionSetup packets.
+///
+/// `E` is the host's random source, which keys the map's hasher.
 #[derive(Clone, Debug)]
-pub struct CoordCache {
+pub struct CoordCache<E> {
     /// NodeAddr -> coordinates mapping.
     entries: HashMap<NodeAddr, CacheEntry>,
     /// Maximum number of entries.
     max_entries: usize,
     /// Default TTL for entries (milliseconds).
     default_ttl_ms: u64,
+    entropy: PhantomData<fn() -> E>,
 }
 
-impl CoordCache {
+impl<E: EntropySource> CoordCache<E> {
     /// Create a new coordinate cache.
     pub fn new(max_entries: usize, default_ttl_ms: u64) -> Self {
         Self {
-            entries: HashMap::with_capacity(max_entries.min(1000)),
+            entries: HashMap::with_capacity_and_hasher(
+                max_entries.min(1000),
+                KeyedHasher::new::<E>(),
+            ),
             max_entries,
             default_ttl_ms,
+            entropy: PhantomData,
         }
     }
 
@@ -397,7 +407,7 @@ impl CoordCache {
     }
 }
 
-impl Default for CoordCache {
+impl<E: EntropySource> Default for CoordCache<E> {
     fn default() -> Self {
         Self::with_defaults()
     }

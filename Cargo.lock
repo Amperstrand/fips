@@ -1218,6 +1218,7 @@ name = "fips-core"
 version = "0.0.0"
 dependencies = [
  "bech32 0.12.0",
+ "hashbrown 0.16.1",
  "hex",
  "libm",
  "once_cell",
@@ -1226,6 +1227,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sha2 0.11.0",
+ "siphasher",
  "thiserror 2.0.20",
  "zeroize",
 ]

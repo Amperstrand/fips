@@ -1,5 +1,5 @@
 use super::*;
-use crate::NodeAddr;
+use crate::identity::NodeAddr;
 
 fn make_node_addr(val: u8) -> NodeAddr {
     let mut bytes = [0u8; 16];
