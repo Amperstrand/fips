@@ -157,10 +157,10 @@ if [ "$BUILT_IMAGE" -eq 1 ]; then
     fi
 fi
 
-# Derive the version and the timestamp on the host and pass both in, because a
-# worktree's .git is a file pointing outside the mount and does not resolve in
-# the container. The image's git is there only for build.rs's revision, which is
-# empty for a worktree build for the same reason.
+# Derive the version and the timestamp on the host and pass both in. Git in the
+# container reads the same repository, through the mounts set up below, but it
+# is there for build.rs's revision and for the check that the package carries
+# it; the version is decided here.
 if [ -z "$VERSION" ]; then
     CRATE_VERSION=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO_ROOT/Cargo.toml")
     if [[ "$CRATE_VERSION" == *-dev ]]; then
@@ -235,8 +235,108 @@ trap cleanup EXIT
 # volume names are set above.
 REPO_PHYS=$(cd "$REPO_ROOT" && pwd -P)
 
+# build.rs embeds the tree's revision and dirty flag from git, and the check
+# after packaging reads them back, so git in the container must reach the whole
+# repository. A worktree's .git is a file naming a directory outside the tree,
+# and a clone made with --shared borrows objects from another repository, which
+# may borrow from a third. Each such directory outside the tree is mounted
+# read-only at the path those references name, so git finds it there. Without
+# them a worktree build carried no revision and a --shared clone's build could
+# not see that its tree was dirty.
+#
+# Alternates are followed as deep as git follows them: an alternates file is
+# read at nesting depths 0 to 5 and ignored beyond. A directory git needs and
+# this does not mount shows up as a tree whose state git cannot read, which the
+# check after packaging fails on.
+#
+# An alternate is mounted at the path git in the container will open, which is
+# the path as written in the alternates file, made absolute against the
+# container's path for the objects directory holding the file, with no symlink
+# resolved: inside the container the mount point is a plain directory. The
+# mount's source is the directory that path reaches here. The two differ when
+# the alternate was named through a symlink, as `git clone -s` does when its
+# source was.
+#
+# --mount refuses a missing source, where -v would create an empty directory.
+# Its value is comma-separated, so a path is quoted for docker's CSV parser.
+GIT_MOUNTS=()
+declare -A GIT_SEEN=()
+# Print an absolute path with . and .. removed by text alone, as git does.
+# Fails, as git does, on a .. that would climb above /.
+lexical_path() {
+    local part out=() parts
+    IFS=/ read -ra parts <<<"$1"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ''|.) ;;
+            ..) [ "${#out[@]}" -gt 0 ] || return 1; unset 'out[-1]' ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    (IFS=/; printf '/%s\n' "${out[*]}")
+}
+# Mount host directory $1 at container path $2, unless the source mount at
+# /src already shows it there.
+mount_git_dir() {
+    local src=$1 dst=$2
+    case "$src/" in
+        "$REPO_PHYS"/*) [ "$dst" != "/src${src#"$REPO_PHYS"}" ] || return 0 ;;
+    esac
+    GIT_MOUNTS+=(--mount "type=bind,\"src=${src//\"/\"\"}\",\"dst=${dst//\"/\"\"}\",readonly")
+    return 0
+}
+# Follow the alternates of the objects directory at host path $1, which the
+# container opens at $2.
+follow_alternates() {
+    local src=$1 dst=$2 depth=$3 alt asrc adst
+    [ "$depth" -le 5 ] && [ -f "$src/info/alternates" ] || return 0
+    while IFS= read -r alt; do
+        case "$alt" in ''|'#'*) continue ;; esac
+        asrc=$(cd "$src" && cd -P "$alt" 2>/dev/null && pwd -P) || continue
+        case "$alt" in
+            /*) adst=$alt ;;
+            *)  adst=$dst/$alt ;;
+        esac
+        # A relative entry is read from where the container sees its objects
+        # directory, which for the tree's own is /src/.git/objects; one that
+        # climbs further than that cannot be followed there.
+        adst=$(lexical_path "$adst") || {
+            echo "build-deb-container: $src/info/alternates names $alt, which git in the" >&2
+            echo "build-deb-container: container would read from $dst and cannot follow above /." >&2
+            echo "build-deb-container: Write the entry as an absolute path." >&2
+            exit 1
+        }
+        [ -z "${GIT_SEEN[$adst]+x}" ] || continue
+        GIT_SEEN[$adst]=1
+        mount_git_dir "$asrc" "$adst"
+        follow_alternates "$asrc" "$adst" $((depth + 1))
+    done <"$src/info/alternates"
+    return 0
+}
+# The tree is a checkout only when it is the top of a work tree. A tree inside
+# another repository, such as a release tarball unpacked in a packaging
+# repository, is built as no checkout and its binaries carry no revision: git
+# in the container cannot reach that outer repository from /src, and the outer
+# HEAD is not this tree's revision anyway.
+HOST_HEAD=""
+HOST_TOP=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null) || HOST_TOP=""
+if [ -n "$HOST_TOP" ] && [ "$(cd "$HOST_TOP" && pwd -P)" = "$REPO_PHYS" ] \
+        && HOST_HEAD=$(git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD 2>/dev/null); then
+    GIT_COMMON=$(cd "$REPO_ROOT" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
+    case "$GIT_COMMON/" in
+        "$REPO_PHYS"/*) GIT_COMMON_DST="/src${GIT_COMMON#"$REPO_PHYS"}" ;;
+        *)              GIT_COMMON_DST=$GIT_COMMON ;;
+    esac
+    GIT_SEEN[$GIT_COMMON_DST/objects]=1
+    mount_git_dir "$GIT_COMMON" "$GIT_COMMON_DST"
+    follow_alternates "$GIT_COMMON/objects" "$GIT_COMMON_DST/objects" 0
+else
+    HOST_HEAD=""
+fi
+
 docker run --rm \
     -v "$REPO_ROOT":/src:ro \
+    "${GIT_MOUNTS[@]}" \
     -v "$DEST_ABS":/out \
     -v "$NAME_DIR":/name \
     -v "$TARGET_VOLUME":/target \
@@ -244,6 +344,7 @@ docker run --rm \
     -e CARGO_TARGET_DIR=/target \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e FIPS_BUILD_ORIGIN="$(hostname):$REPO_PHYS" \
+    -e FIPS_HOST_HEAD="$HOST_HEAD" \
     -w /src \
     "$IMAGE_TAG" \
     bash packaging/debian/build-in-container.sh "${build_args[@]}" >&2

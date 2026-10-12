@@ -31,6 +31,15 @@
 #   4. The binaries cargo left in the target volume are hashed after the build
 #      and again after packaging, so a binary replaced in between, by a build
 #      that does not take the lock, fails the build rather than shipping.
+#
+# After packaging, testing/check-deb-revision.sh checks that every binary in
+# the package carries the revision and dirty flag of this tree, as git reads it
+# here. That needs git here to read the tree's repository, which
+# build-deb-container.sh arranges with its git mounts; HEAD is compared with the
+# host's on entry so a gap in those mounts fails at once. A commit made in the
+# tree while this build runs, including while it waits for the lock, fails the
+# build: the package's version names one commit and its binaries may name
+# another. Build again once the tree has settled.
 
 set -euo pipefail
 
@@ -60,6 +69,37 @@ say() {
 # The binaries cargo-deb packages from the target directory.
 BINARIES=(fips fipsctl fips-gateway fipstop)
 
+# ── The tree's git metadata ─────────────────────────────────────────────────
+# Read before the lock wait, which can be minutes, so the comparison with the
+# host's HEAD tests the mounts and not a commit made during the wait.
+HOST_HEAD=${FIPS_HOST_HEAD:-}
+ENTRY_HEAD=""
+if ENTRY_HEAD=$(git rev-parse --verify --quiet HEAD 2>/dev/null); then
+    if [ -n "$HOST_HEAD" ] && [ "$ENTRY_HEAD" != "$HOST_HEAD" ]; then
+        say "git here reads HEAD $ENTRY_HEAD, but the host read $HOST_HEAD as the build"
+        say "started. Either the git metadata mounted here is not this tree's, or a"
+        say "commit was made in the tree just then."
+        exit 1
+    fi
+else
+    ENTRY_HEAD=""
+    if [ -n "$HOST_HEAD" ]; then
+        say "the host reads HEAD $HOST_HEAD, but git here cannot read the tree, so"
+        say "the git metadata mounts are incomplete and the binaries would carry no"
+        say "revision."
+        exit 1
+    fi
+fi
+
+# none: no git checkout; unreadable: git reads HEAD but not the tree's state.
+tree_state() {
+    git rev-parse --verify --quiet HEAD >/dev/null 2>&1 || { echo none; return 0; }
+    local s
+    s=$(git status --porcelain 2>/dev/null) || { echo unreadable; return 0; }
+    if [ -n "$s" ]; then echo dirty; else echo clean; fi
+    return 0
+}
+
 # ── The lock ────────────────────────────────────────────────────────────────
 # The lock file lives in the target volume because the volume is the shared
 # resource; a lock file on the host would not reach a build running under a
@@ -74,6 +114,9 @@ if ! flock -n 9; then
     flock 9
 fi
 printf '%s, since %s\n' "${FIPS_BUILD_ORIGIN:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$HOLDER"
+
+# The state build.rs is about to read, sampled again after packaging.
+STATE_BEFORE=$(tree_state)
 
 # ── Clean ───────────────────────────────────────────────────────────────────
 # --workspace is required, not a style choice. With it, cargo resolves the
@@ -172,3 +215,17 @@ if [ "$PACKAGED_HASHES" != "$BUILT_HASHES" ]; then
     say "probably run alongside this one."
     exit 1
 fi
+
+# ── The package's revision ──────────────────────────────────────────────────
+# The dirty flag is checked only when the tree's state held for the whole
+# build; ci-local writes into the tree while its suites run.
+STATE_AFTER=$(tree_state)
+if [ "$STATE_BEFORE" = "$STATE_AFTER" ]; then
+    revision_state=$STATE_BEFORE
+else
+    say "the tree went from $STATE_BEFORE to $STATE_AFTER during the build, so only"
+    say "the commit is checked, not the dirty flag."
+    revision_state=changed
+fi
+bash testing/check-deb-revision.sh "$DEST_DIR/$(head -n 1 "$NAME_FILE")" \
+    "$ENTRY_HEAD" "$revision_state"
