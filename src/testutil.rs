@@ -9,11 +9,6 @@ pub(crate) fn make_node_addr(val: u8) -> NodeAddr {
     NodeAddr::from_bytes(bytes)
 }
 
-/// The random source for tests that build the core's randomized types
-/// directly: the host's own. `crate::testutil::TestEntropy` names a source in
-/// the core's tests too, so a test file reads the same in either crate.
-pub(crate) type TestEntropy = crate::identity::OsEntropy;
-
 /// Collects emitted tracing events so a test can assert on a log line.
 ///
 /// Some behaviour is reported only in the log: a structured field an operator

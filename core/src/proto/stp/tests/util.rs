@@ -43,8 +43,8 @@ pub(super) fn make_costs(entries: &[(u8, f64)]) -> BTreeMap<NodeAddr, f64> {
         .collect()
 }
 
-/// A random signing key, standing in for the root crate's `Identity`: the
-/// codec tests need a declaration signed by the node it names.
+/// A random signing key that signs the way `Identity::sign` does: the codec
+/// tests need a declaration signed by the node it names.
 pub(super) struct Signer {
     keypair: secp256k1::Keypair,
     node_addr: NodeAddr,

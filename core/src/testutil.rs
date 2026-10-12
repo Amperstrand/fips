@@ -28,3 +28,13 @@ impl<const B: u8> crate::entropy::EntropySource for FixedEntropy<B> {
         dest.fill(B);
     }
 }
+
+/// The random source for tests: `rand`'s thread-local generator.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TestEntropy;
+
+impl crate::entropy::EntropySource for TestEntropy {
+    fn fill(dest: &mut [u8]) {
+        rand::Rng::fill_bytes(&mut rand::rng(), dest);
+    }
+}

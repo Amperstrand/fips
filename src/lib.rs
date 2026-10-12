@@ -32,7 +32,6 @@ pub mod nostr;
 mod packaging_tests;
 pub mod peer;
 pub mod perf_profile;
-pub(crate) use fips_core::entropy;
 pub(crate) use fips_core::proto;
 #[cfg(test)]
 pub(crate) mod testutil;

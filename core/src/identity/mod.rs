@@ -5,7 +5,9 @@
 //! prefix followed by the first 15 bytes of the node_addr.
 
 mod address;
+mod auth;
 mod encoding;
+mod local;
 mod node_addr;
 mod peer;
 
@@ -19,7 +21,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use address::Ipv6Address;
+pub use auth::{AuthChallenge, AuthResponse};
 pub use encoding::{decode_npub, decode_nsec, decode_secret, encode_npub, encode_nsec};
+#[doc(hidden)]
+pub use local::ErasingKeypair;
+pub use local::Identity;
 pub use node_addr::NodeAddr;
 pub use peer::PeerIdentity;
 

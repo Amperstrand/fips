@@ -8,10 +8,9 @@ mod entry;
 
 use thiserror::Error;
 
-pub use coord_cache::{DEFAULT_COORD_CACHE_SIZE, DEFAULT_COORD_CACHE_TTL_MS, HintOutcome};
-
-/// The coordinate cache, its hasher keyed from [`OsEntropy`](crate::identity::OsEntropy).
-pub type CoordCache = coord_cache::CoordCache<crate::identity::OsEntropy>;
+pub use coord_cache::{
+    CoordCache, DEFAULT_COORD_CACHE_SIZE, DEFAULT_COORD_CACHE_TTL_MS, HintOutcome,
+};
 pub use entry::{CacheEntry, CoordSource, VERIFIED_TTL_MS};
 
 /// Errors related to cache operations.

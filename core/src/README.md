@@ -8,6 +8,8 @@ changing anything here.
 
 - `lib.rs`: the crate root. It declares `#![no_std]`, brings in `alloc`,
   brings in `std` for tests only, and lists the crate's modules.
+- `cache/`: the coordinate cache, which maps node addresses to tree
+  coordinates for routing. Its own README describes it.
 - `entropy.rs`: the `EntropySource` trait, through which the host supplies
   random bytes. A type that needs them takes the source as a type
   parameter; the core never reads a random source of its own.
@@ -25,8 +27,9 @@ changing anything here.
   map for keys a peer can choose, keyed from the host's entropy source.
   Its own README describes it.
 - `testutil.rs`: fixtures shared by the crate's unit tests
-  (`make_node_addr`, `make_keypair`, and `FixedEntropy`, an entropy
-  source that fills every byte with one value). Compiled for tests only.
+  (`make_node_addr`, `make_keypair`; `TestEntropy`, the random source
+  tests build randomized types with; and `FixedEntropy`, a source that
+  fills every byte with one value). Compiled for tests only.
 
 ## Rules for this level
 

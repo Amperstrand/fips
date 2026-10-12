@@ -9,10 +9,14 @@ supplying its own I/O around it.
 The crate is a workspace member next to the root `fips` package. Code
 moves in from the root crate one module at a time. So far it holds:
 
-- the identity types: `NodeAddr`, `Ipv6Address`, `PeerIdentity`, the
-  npub and nsec encodings and `IdentityError`, re-exported by the root
-  crate under `fips::identity`. `Identity`, which signs, stays in the
-  root crate until randomness can be passed in;
+- the identity types: `Identity`, which holds the node's keypair and
+  signs, `NodeAddr`, `Ipv6Address`, `PeerIdentity`, the authentication
+  challenge and response, the npub and nsec encodings and
+  `IdentityError`, re-exported by the root crate under
+  `fips::identity`;
+- the coordinate cache, `CoordCache`, re-exported under `fips::cache`;
+- `EntropySource`, the trait through which the host supplies random
+  bytes;
 - the transport value types: `TransportId`, `LinkId`, `LinkDirection`,
   `TransportAddr` and `LinkStats`, re-exported under `fips::transport`.
   The transports themselves stay in the root crate;
@@ -74,11 +78,17 @@ schedules. This is what makes the state machines testable with
 synthetic timestamps.
 
 **Randomness is an argument.** Never reach for a thread-local or OS
-random source. Code that needs random bytes or a nonce takes an RNG or
-the bytes from its caller. The shared secp256k1 context in `identity`
-follows this too: the host blinds it by calling
-`identity::init_secp(seed)` at start-up with 32 bytes from its own
-random source, as the daemon does.
+random source. Code that needs random bytes or a nonce takes them from
+its caller, or takes the host's source as a type parameter bounded by
+`entropy::EntropySource`, as `Identity<E>`, `AuthChallenge<E>` and
+`CoordCache<E>` do. The host fixes the parameter once, in a type alias
+at the path its callers already use: the root crate's
+`fips::identity::Identity`, for example, is `Identity<OsEntropy>`, and
+`OsEntropy` is `rand`'s thread-local generator. The source must be
+cryptographically secure; keys derived from predictable bytes are
+predictable. The shared secp256k1 context in `identity` follows this
+too: the host blinds it by calling `identity::init_secp(seed)` at
+start-up with 32 bytes from its own random source, as the daemon does.
 
 **No OS calls and no target `cfg`.** No `cfg(target_os = ...)`,
 `cfg(unix)`, `cfg(windows)` or similar. If behaviour differs by

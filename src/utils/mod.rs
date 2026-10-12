@@ -4,7 +4,6 @@
 //! session index allocation, Unix socket binding and its permission
 //! primitives, and other cross-cutting concerns.
 
-pub(crate) use fips_core::utils::hash;
 pub mod index;
 pub mod logfile;
 pub mod onlink;
