@@ -5,7 +5,8 @@
 # Usage: ./ci-local.sh [options]
 #
 # Options:
-#   --build-only         Only run build + clippy
+#   --build-only         Only run build + clippy (and the cross-target check,
+#                        with --cross-check)
 #   --test-only          Only run unit tests (skip build, skip integration)
 #   --skip-integration   Skip integration tests
 #   --skip-chaos         Skip chaos scenarios
@@ -16,6 +17,11 @@
 #                        llvm-ar. When asked for, a missing prerequisite fails
 #                        the run. FIPS_CI_BAREMETAL=1 in the environment turns
 #                        it on too. GitHub CI runs it on every push.
+#   --cross-check        Also compile the macOS, Windows and FreeBSD targets in
+#                        the build stage (testing/cross-check/check.sh). Off
+#                        by default: it needs zig. When asked for, a missing
+#                        zig or a Rust target rustup cannot install fails the
+#                        run.
 #   --with-tor           Include Tor harnesses (off by default — needs live Tor)
 #   --only <suite>       Run a single integration suite
 #   -j, --jobs <N>       Max parallel chaos scenarios (default: 4)
@@ -164,6 +170,7 @@ TEST_ONLY=false
 SKIP_INTEGRATION=false
 SKIP_CHAOS=false
 BAREMETAL=false
+CROSS_CHECK=false
 WITH_TOR=false
 ONLY_SUITE=""
 
@@ -333,6 +340,7 @@ while [[ $# -gt 0 ]]; do
         --skip-integration) SKIP_INTEGRATION=true; shift ;;
         --skip-chaos)       SKIP_CHAOS=true; shift ;;
         --baremetal)        BAREMETAL=true; shift ;;
+        --cross-check)      CROSS_CHECK=true; shift ;;
         --with-tor)         WITH_TOR=true; shift ;;
         --only)             ONLY_SUITE="$2"; shift 2 ;;
         -j|--jobs)          PARALLEL_JOBS="$2"; shift 2 ;;
@@ -688,6 +696,13 @@ run_build() {
         fi
     fi
 
+    # Everything above compiles for this host's target only, so a Unix-only
+    # item used without a cfg gate passes here and first fails on GitHub's
+    # macOS, Windows or FreeBSD jobs. Run with --cross-check to catch it here.
+    if ! run_cross_check; then
+        return 1
+    fi
+
     # Tick-body profiler: the feature-on tree must build too. Added alongside
     # the default-feature stages rather than replacing them. Mirrored in
     # .github/workflows/ci.yml — check-ci-parity.sh compares integration suites
@@ -714,6 +729,34 @@ run_build() {
     else
         record "node-context-guard" 0
     fi
+}
+
+# With --cross-check, compile each target testing/cross-check/check.sh lists,
+# recording one result per target. Off by default, since it needs zig, and then
+# nothing is recorded. When asked for, a missing zig or a Rust target that
+# cannot be installed is a failure: check.sh exits 2 naming what is missing,
+# and that is recorded against each target, since none was checked.
+# Deliberately local-only: GitHub CI builds and tests on real macOS, Windows
+# and FreeBSD runners, and check-ci-parity.sh compares integration suites only.
+run_cross_check() {
+    local check="$SCRIPT_DIR/cross-check/check.sh" targets=() t rc any=0
+    if [[ "$CROSS_CHECK" != true ]]; then
+        return 0
+    fi
+    mapfile -t targets < <(bash "$check" --list)
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        fail "$check --list printed no targets"
+        record "cross-check" 1
+        return 1
+    fi
+    for t in "${targets[@]}"; do
+        info "cargo check --workspace --all-targets --target $t"
+        rc=0
+        bash "$check" "$t" || rc=$?
+        record "cross-check-$t" "$rc"
+        [[ $rc -eq 0 ]] || any=1
+    done
+    return $any
 }
 
 # ── Stage 2: Unit Tests ───────────────────────────────────────────────────

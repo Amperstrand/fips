@@ -223,6 +223,31 @@ probing it asks whether `getifaddrs` works rather than whether it reports an
 interface that has none — which is exactly what `fips-mesh0` and `fips-ap0`
 are on OpenWrt. Set the variable by hand to run the assertion locally against
 an interface you have created; leave it unset and the assertion does not run.
+### Cross-target compile check
+
+`--cross-check` adds a stage to the build that compiles the crate and all its
+test, example and bench targets for macOS, Windows and FreeBSD
+(`x86_64-apple-darwin`, `x86_64-pc-windows-gnu`, `x86_64-unknown-freebsd`),
+recording one result per target as `cross-check-<target>`. Everything else in
+the run compiles for the Linux host only, so without it a Unix-only item used
+without a `cfg` gate passes local CI and first fails on GitHub's macOS, Windows
+or FreeBSD jobs. [`cross-check/check.sh`](cross-check/check.sh) runs
+`cargo check --workspace --all-targets --target <target>` for each, with
+`zig cc` as the C compiler for the crates that build C, and can be run on its
+own, for all targets or for the ones named.
+
+The stage is off by default, because it needs `zig` (0.16.0; found on `PATH`,
+or named by `ZIG`). It also needs the three Rust targets for the pinned
+toolchain; a missing one is installed with `rustup target add`, which needs the
+rustup download server the first time. The targets are not listed in
+`rust-toolchain.toml`, which would make every cargo call in the repository fetch
+them, the package builds included. When the stage is asked for, a missing
+`zig`, or a target that cannot be installed, fails the run with a message
+naming it. All three targets build in `target/cross-check/`, reused between
+runs.
+
+The check is deliberately local-only: GitHub CI builds and tests on real
+macOS, Windows and FreeBSD runners instead.
 
 ### Per-run isolation and the `FIPS_CI_RUN_ID` override
 

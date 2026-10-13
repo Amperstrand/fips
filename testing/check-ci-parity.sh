@@ -16,6 +16,14 @@
 #                    arm64 package. The GitHub leg installs the arm64 package
 #                    and starts the daemon on an arm runner.
 #
+# Deliberately local-only, and outside this comparison altogether:
+#   cross-check    — with --cross-check, ci-local.sh's build stage compiles
+#                    the macOS, Windows and FreeBSD targets with zig as the C
+#                    compiler (testing/cross-check/check.sh). GitHub CI has no such
+#                    stage because it builds and tests on real macOS, Windows
+#                    and FreeBSD runners. It is a build stage, not an
+#                    integration suite, so nothing below compares it.
+#
 # What is compared, and at what granularity:
 #   chaos          — per scenario, plus its flags. GitHub fans each scenario
 #                    into its own matrix leg carrying `scenario:` (and
