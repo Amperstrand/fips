@@ -42,6 +42,46 @@ CARGO_TARGET="x86_64-unknown-linux-musl"
 
 TARGET_ROOT="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
 
+# A target directory outside this checkout may be shared with another checkout.
+# Cargo fingerprints a workspace crate relative to the workspace root and judges
+# it by file modification times, so a checkout whose files are older than
+# another checkout's last build in that directory compiles nothing, and the
+# binaries copied below are the other checkout's. A directory outside the tree
+# that only this checkout uses is fine, and nothing here can tell the two
+# apart, so this warns rather than refuses. A path that names a place inside
+# the checkout is accepted even when a symlink there leads outside it: that
+# link is the checkout's own, as iperf-compare-refs.sh makes one per ref.
+warn_shared_target() {
+    local dir="$1" abs root head="$1" tail=""
+    case "$dir" in
+        /*) abs="$dir" ;;
+        *) abs="$PWD/$dir" ;;
+    esac
+    case "$abs/" in
+        */../*|*/./*) ;;
+        "$PROJECT_ROOT"/*) return 0 ;;
+    esac
+    root="$(cd "$PROJECT_ROOT" && pwd -P)"
+    # Resolve the deepest part of the path that exists, since cargo creates
+    # the rest.
+    while [ ! -d "$head" ] && [ "$head" != "$(dirname "$head")" ]; do
+        tail="/$(basename "$head")$tail"
+        head="$(dirname "$head")"
+    done
+    abs="$(cd "$head" && pwd -P)$tail"
+    case "$abs/" in
+        "$root"/*) return 0 ;;
+    esac
+    echo "Warning: CARGO_TARGET_DIR ($dir) is outside this checkout. If another" >&2
+    echo "checkout also builds there, this build can reuse that checkout's crates" >&2
+    echo "and put its binaries in the test image. Unset it, or give each checkout" >&2
+    echo "its own directory." >&2
+    return 0
+}
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    warn_shared_target "$CARGO_TARGET_DIR"
+fi
+
 if [ "$UNAME_S" = "Darwin" ]; then
     echo "Detected macOS host — using cross-compilation for Linux..."
 
