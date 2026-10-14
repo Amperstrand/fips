@@ -1,5 +1,13 @@
 # Fork policy (decided 2026-08-30)
 
+> **ARCHIVED 2026-10-14.** Amperstrand is a **fips user** — testing,
+> research, BLE and microcontroller use cases — not a fork maintainer.
+> The maintained-fork model below is retired. The active line is
+> `amperstrand/lab-ble`: pure upstream (d208a9db) + the BLE
+> learned-address-type patch, rebased per-release only when the bench
+> needs a newer daemon. mipsel and rfcomm remain standalone topic
+> branches; this archive keeps the full history and this ledger.
+
 - `master` is a **protected, pure mirror of jmcorgan/fips:master**. Nothing
   of ours ever lands there — no merges, no direct commits. It is updated
   only by fast-forwarding to upstream (`git fetch upstream && git push
