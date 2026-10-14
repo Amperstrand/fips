@@ -5,6 +5,13 @@
   only by fast-forwarding to upstream (`git fetch upstream && git push
   origin upstream/master:master`), which branch protection permits; force
   pushes and deletions are blocked, linear history enforced.
+  **Update 2026-10-14: this policy is broken in practice — see the sync
+  entry at the bottom; master needs an owner decision.**
+- **Interaction policy (2026-10-14): never post, PR, issue, or link to
+  upstream or any other non-Amperstrand repository — upstream does not
+  permit automated AI posts. Upstream is fetch/read only. The one
+  standing exception among collaborators is felix (felixfelix-bot), which
+  is itself an AI bot we may interact with.**
 - All Amperstrand work lives on `fork/main` (this branch) and topic branches
   off it. When upstream releases, we study it, check whether any of our
   changes now have better upstream solutions, and **rebase what we still
@@ -141,3 +148,63 @@ just not used in `next_due()`). Branch deleted; port sketch in #152.
   verified). Zero regressions. NEXT: push-trigger the MIPS cross-compile
   workflow on the branch (it carries the workflow), then the upstream-PR
   decision (mipsel/OpenWrt is in upstream's interest).
+
+## 2026-10-14 Upstream sync (v0.6.0-dev line, d208a9db)
+
+Rebased fork/main onto upstream master `d208a9db` — 407 upstream commits
+since the v0.5.0 mirror (66f0de8a). Headlines upstream: macOS CoreBluetooth
+BLE backend with a login-session radio-lending agent; the Android radio
+bridge neutralized into `io_radio` under platform-neutral names; a **no_std
+`fips-core` workspace crate** (identity, protocol state machines, noise,
+coordinate cache, host-supplied entropy seam, bare-metal CI build via
+`testing/build-core-baremetal.sh`) — the microcontroller-support trajectory
+has visibly started; DNS security hardening; gateway NAT lifecycle fixes;
+BLE simultaneous-dial arbitration; RPM install tests; opt-in cross-target
+compile check.
+
+### What we did
+
+- Ported the BLE learned-address-type fix across upstream's io_radio/
+  io_macos layout split. `io_android.rs` is now a re-export shim; the
+  `BleAddrKind` literals live in `io_radio.rs` and `io_macos/*`. macOS
+  synthesized locally-administered hashes read as `BleAddrKind::Random`;
+  the agent-proto wire form is unchanged (decode defaults `kind`, the
+  encoder never sends it). Host verification: `cargo check
+  --workspace --all-targets` clean; BLE suite 208/208; full lib suite
+  **2759 passed / 0 failed** (the 2026-08-31 baseline's 5 environmental
+  nostr socket-bind failures did not reproduce).
+- Preserved the org gitleaks enrollment (cc4d7081, merged onto origin/
+  master as PR #156) on fork/main as a2d21faf.
+- The held upstream-PR idea for the BLE fix (#151 verdict) is withdrawn
+  under the no-posts policy; the fix stays fork-local.
+
+### The master mirror is broken and needs an owner decision
+
+PR #156 (gitleaks enrollment) was merged onto `origin/master` after the
+mirror policy was written. Upstream history can never contain that commit,
+branch protection blocks force pushes, and linear-history enforcement
+blocks merges — so **master can never fast-forward to upstream again**.
+Options: (a) an admin temporarily lifts protection and resets master to
+upstream/master (gitleaks content already preserved on fork/main), or
+(b) accept master as "mirror + gitleaks" and record future syncs here
+only. Until decided, master stays at cc4d7081 and fork/main is the
+de-facto upstream line.
+
+### Novelty remaining in the fork (post-sync)
+
+1. **BLE learned-address-type dial fix** — upstream still hardcodes
+   `LePublic` (`addr.rs` to_socket_addr, `io_linux.rs` listen). Fully
+   current; verified against d208a9db.
+2. **mipsel build** — upstream's `package-openwrt.yml` has the mipsel
+   target *commented out* citing `portable_atomic` and `-Zbuild-std`,
+   exactly the problems `feature/mipsel-support-rebased` solved. We hold
+   a working mipsel line upstream lacks.
+3. **rfcomm transport** (`feature/rfcomm-transport`) — zero rfcomm
+   presence upstream.
+4. **cargo-deny advisories/licenses/bans tracking** — upstream CI runs
+   fmt/clippy/nextest but no cargo-deny.
+5. **Secret-detection hooks + gitleaks config** — fork-local; upstream
+   has neither.
+6. `fork-ci.yml`'s plain test+clippy now duplicates upstream's own CI
+   (clippy `-D warnings`, nextest + flaky reporter) — candidate for
+   slimming at the next cleanup.
