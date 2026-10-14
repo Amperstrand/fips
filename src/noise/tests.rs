@@ -1046,3 +1046,95 @@ fn test_clear_slot_drops_a_present_value_once_and_leaves_none() {
     clear_slot(&mut flag);
     assert_eq!(flag, None);
 }
+
+static KEYLOG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn keylog_field(line: &str, name: &str) -> String {
+    let key = format!("\"{name}\":\"");
+    let start = line.find(&key).unwrap() + key.len();
+    let end = start + line[start..].find('"').unwrap();
+    line[start..end].to_string()
+}
+
+#[test]
+fn lab_keylog_records_a_matching_pair_of_transport_keys() {
+    let _guard = KEYLOG_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("fips-keylog-test-{}", std::process::id()));
+    let log = dir.join("keylog.jsonl");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // SAFETY: serialized via KEYLOG_ENV_MUTEX; other tests never read this
+    // variable, and their concurrent handshakes are handled by grouping on
+    // the handshake hash below.
+    unsafe {
+        std::env::set_var("FIPS_LAB_KEYLOG", &log);
+    }
+
+    let initiator_keypair = generate_keypair();
+    let responder_keypair = generate_keypair();
+    let mut initiator =
+        HandshakeState::new_initiator(initiator_keypair, responder_keypair.public_key());
+    initiator.set_local_epoch(generate_epoch());
+    let mut responder = HandshakeState::new_responder(responder_keypair);
+    responder.set_local_epoch(generate_epoch());
+    let msg1 = initiator.write_message_1().unwrap();
+    responder.read_message_1(&msg1).unwrap();
+    let msg2 = responder.write_message_2().unwrap();
+    initiator.read_message_2(&msg2).unwrap();
+    let initiator_peer_hex = {
+        let mut s = String::new();
+        for b in responder_keypair.public_key().serialize() {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    };
+    let responder_peer_hex = {
+        let mut s = String::new();
+        for b in initiator_keypair.public_key().serialize() {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    };
+    let _initiator_session = initiator.into_session().unwrap();
+    let _responder_session = responder.into_session().unwrap();
+
+    // SAFETY: still under KEYLOG_ENV_MUTEX.
+    unsafe {
+        std::env::remove_var("FIPS_LAB_KEYLOG");
+    }
+
+    let text = std::fs::read_to_string(&log).expect("keylog file exists after handshakes");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Other tests may complete handshakes concurrently while the variable
+    // is set, adding lines to the same file; group by handshake hash and
+    // require OUR pair to be present among them. split() is symmetric, so
+    // k1 is the initiator->responder key on BOTH lines and k2 the reverse
+    // — a pair matches when h, k1 and k2 agree and the roles/peers differ.
+    let mut found_pair = false;
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, a) in lines.iter().enumerate() {
+        for b in lines.iter().skip(i + 1) {
+            let pair_matches = keylog_field(a, "h") == keylog_field(b, "h")
+                && keylog_field(a, "k1") == keylog_field(b, "k1")
+                && keylog_field(a, "k2") == keylog_field(b, "k2")
+                && keylog_field(a, "peer") != keylog_field(b, "peer")
+                && keylog_field(a, "role") != keylog_field(b, "role");
+            if !pair_matches {
+                continue;
+            }
+            assert_eq!(keylog_field(a, "pattern"), "ik");
+            assert_eq!(keylog_field(b, "pattern"), "ik");
+            assert_eq!(keylog_field(a, "k1").len(), 64);
+            assert_eq!(keylog_field(a, "k2").len(), 64);
+            let peers = [keylog_field(a, "peer"), keylog_field(b, "peer")];
+            assert!(peers.contains(&initiator_peer_hex));
+            assert!(peers.contains(&responder_peer_hex));
+            found_pair = true;
+        }
+    }
+    assert!(
+        found_pair,
+        "expected a same-h mirrored-key pair for our handshake in:\n{text}"
+    );
+}

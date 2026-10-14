@@ -36,6 +36,7 @@
 //! initiator identity protection.
 
 mod handshake;
+mod keylog;
 mod replay;
 mod session;
 
@@ -402,10 +403,10 @@ impl CipherState {
         self.has_key
     }
 
-    /// Copy out the retained key bytes, so a test can observe zeroization
-    /// without reading freed memory.
-    #[cfg(test)]
-    fn key_bytes(&self) -> [u8; 32] {
+    /// Copy out the retained key bytes: the lab keylog reads them when a
+    /// handshake completes, and tests observe zeroization through the same
+    /// accessor without reading freed memory.
+    pub(crate) fn key_bytes(&self) -> [u8; 32] {
         self.key
     }
 

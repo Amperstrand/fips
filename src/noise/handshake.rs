@@ -1067,6 +1067,30 @@ impl HandshakeState {
             .remote_static
             .expect("remote static must be known after handshake");
 
+        // Lab bench only: when FIPS_LAB_KEYLOG names a file, record this
+        // handshake's transport keys so a paired packet capture can be
+        // decrypted offline. Link IK, session XK and every rekey all pass
+        // through here, because a rekey is a fresh handshake. No-op with
+        // the variable unset, which is every non-bench deployment.
+        let mut k1 = c1.key_bytes();
+        let mut k2 = c2.key_bytes();
+        super::keylog::transport_keys(
+            match self.pattern {
+                NoisePattern::Ik => "ik",
+                NoisePattern::Xk => "xk",
+            },
+            match self.role {
+                HandshakeRole::Initiator => "initiator",
+                HandshakeRole::Responder => "responder",
+            },
+            &remote_static.serialize(),
+            &handshake_hash,
+            &k1,
+            &k2,
+        );
+        k1.zeroize();
+        k2.zeroize();
+
         // Initiator sends with c1, receives with c2
         // Responder sends with c2, receives with c1
         let (send_cipher, recv_cipher) = match self.role {
