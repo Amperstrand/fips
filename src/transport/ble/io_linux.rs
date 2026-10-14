@@ -442,7 +442,11 @@ impl BleIo for BluerIo {
         let kind = futures::executor::block_on(self.adapter.address_type())
             .map(BleAddrKind::from)
             .unwrap_or(BleAddrKind::Public);
-        Ok(BleAddr::from_bluer_with_kind(addr, kind, &self.adapter_name))
+        Ok(BleAddr::from_bluer_with_kind(
+            addr,
+            kind,
+            &self.adapter_name,
+        ))
     }
 
     fn adapter_name(&self) -> &str {

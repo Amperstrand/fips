@@ -94,11 +94,7 @@ impl From<bluer::AddressType> for BleAddrKind {
 impl BleAddr {
     /// Construct from a bluer `Address` and adapter name, learning the peer
     /// address type from discovery/accept.
-    pub fn from_bluer_with_kind(
-        addr: bluer::Address,
-        kind: BleAddrKind,
-        adapter: &str,
-    ) -> Self {
+    pub fn from_bluer_with_kind(addr: bluer::Address, kind: BleAddrKind, adapter: &str) -> Self {
         Self {
             adapter: adapter.to_string(),
             device: addr.0,
@@ -246,7 +242,13 @@ mod tests {
     #[cfg(bluer_available)]
     #[test]
     fn test_bluer_address_type_conversion() {
-        assert_eq!(BleAddrKind::from(bluer::AddressType::LeRandom), BleAddrKind::Random);
-        assert_eq!(BleAddrKind::from(bluer::AddressType::LePublic), BleAddrKind::Public);
+        assert_eq!(
+            BleAddrKind::from(bluer::AddressType::LeRandom),
+            BleAddrKind::Random
+        );
+        assert_eq!(
+            BleAddrKind::from(bluer::AddressType::LePublic),
+            BleAddrKind::Public
+        );
     }
 }
