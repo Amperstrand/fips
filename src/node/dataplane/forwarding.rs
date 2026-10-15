@@ -19,7 +19,7 @@ use crate::proto::link::{SessionDatagram, SessionDatagramRef};
 use crate::proto::routing::{DropReason, LimitVerdict, NextHop, RouteAction, RouteOutcome};
 use crate::proto::stp::TreeCoordinate;
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 impl Node {
     /// Handle an incoming SessionDatagram from a peer.
@@ -119,6 +119,13 @@ impl Node {
                     .forwarding
                     .record_reject_bytes(ForwardingReject::NoRoute, payload.len());
                 let original = datagram_ref.into_owned();
+                info!(
+                    src_hex = %hex::encode(original.src_addr.as_bytes()),
+                    dest_hex = %hex::encode(original.dest_addr.as_bytes()),
+                    from_hex = %hex::encode(from.as_bytes()),
+                    peers_n = self.peers.len(),
+                    "SessionDatagram no route"
+                );
                 debug!(
                     src = %self.peer_display_name(&original.src_addr),
                     dest = %self.peer_display_name(&original.dest_addr),
